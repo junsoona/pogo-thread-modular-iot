@@ -1,0 +1,63 @@
+menu "POGO UART Protocol"
+
+    config POGO_UART_PORT_NUM
+        int "POGO UART port number"
+        default 1
+        help
+            UART peripheral used for the POGO wired link (UART0 is normally
+            reserved for the console/programming port).
+
+    config POGO_UART_TX_GPIO
+        int "POGO UART TX GPIO"
+        default 10
+        help
+            Upper TX -> Lower RX. Chosen to avoid ESP32-H2 USB (GPIO26/27),
+            boot strapping pins (GPIO8/9/25) and the SuperMini onboard LED
+            (GPIO8/13). Change here if the real board wiring differs.
+
+    config POGO_UART_RX_GPIO
+        int "POGO UART RX GPIO"
+        default 11
+        help
+            Upper RX <- Lower TX. See POGO_UART_TX_GPIO for pin selection notes.
+
+    config POGO_UART_BAUD_RATE
+        int "POGO UART baud rate"
+        default 115200
+
+    config POGO_UART_RX_BUF_SIZE
+        int "POGO UART driver RX ring buffer size"
+        default 512
+
+    config POGO_UART_TX_BUF_SIZE
+        int "POGO UART driver TX ring buffer size"
+        default 512
+
+    config POGO_PING_INTERVAL_MS
+        int "Upper: docking-detection PING interval (ms)"
+        default 1000
+        help
+            While no lower module has answered, the upper module sends a
+            PING at this interval and treats a valid PONG as "docked".
+
+    config POGO_ACK_TIMEOUT_MS
+        int "Control message ACK/NACK timeout (ms)"
+        default 300
+        help
+            Timeout for short request/response exchanges (identify, assign
+            UUID, assign slot, dataset transfer). Separate from the Thread
+            join timeout, which is much longer.
+
+    config POGO_JOIN_TIMEOUT_MS
+        int "Thread join timeout (ms)"
+        default 20000
+        help
+            Maximum time the lower module waits after applying the Active
+            Dataset for its Thread role to leave DETACHED before reporting
+            join failure to the upper module.
+
+    config POGO_MAX_RETRY
+        int "Max retries per pairing step"
+        default 3
+
+endmenu

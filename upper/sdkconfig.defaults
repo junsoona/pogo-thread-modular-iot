@@ -1,0 +1,23 @@
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+#
+# OpenThread -- upper module is the Thread Leader/Router (FTD).
+# Network name/channel/panid/extpanid/key/pskc use this component's
+# built-in Kconfig defaults (see components/openthread/Kconfig) so the
+# dataset esp_openthread_auto_start(NULL) builds on first boot is
+# deterministic across rebuilds.
+#
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+
+#
+# ESP System Settings
+#
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
