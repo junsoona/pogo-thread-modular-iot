@@ -21,7 +21,6 @@ static module_config_t s_cfg;
 static const sensor_provider_ops_t *s_ops;
 static sensor_provider_ctx_t *s_ctx;
 static SemaphoreHandle_t s_measure_mutex;
-static SemaphoreHandle_t s_agg_mutex;
 
 static uint32_t s_sample_seq;
 static uint8_t s_provisioned_uuid[SENSOR_SERVICE_UUID_LEN];
@@ -32,8 +31,6 @@ static volatile bool s_thread_joined;
 static volatile module_role_t s_role = MODULE_ROLE_UNASSIGNED;
 static sensor_service_sample_ready_cb_t s_sample_ready_cb;
 static int64_t s_boot_time_us;
-
-static sensor_service_node_record_t s_nodes[SENSOR_SERVICE_MAX_NODES];
 
 uint32_t sensor_service_get_driver_min_period_ms(void)
 {
@@ -189,9 +186,12 @@ esp_err_t sensor_service_init(const module_config_t *cfg)
     }
 
     s_measure_mutex = xSemaphoreCreateMutex();
-    s_agg_mutex = xSemaphoreCreateMutex();
-    if (s_measure_mutex == NULL || s_agg_mutex == NULL) {
+    if (s_measure_mutex == NULL) {
         return ESP_ERR_NO_MEM;
+    }
+    esp_err_t agg_err = sensor_root_aggregator_init();
+    if (agg_err != ESP_OK) {
+        return agg_err;
     }
     s_sample_seq = 0;
     s_has_provisioned_uuid = false;
@@ -200,7 +200,6 @@ esp_err_t sensor_service_init(const module_config_t *cfg)
     s_thread_joined = false;
     s_role = MODULE_ROLE_UNASSIGNED;
     s_boot_time_us = esp_timer_get_time();
-    memset(s_nodes, 0, sizeof(s_nodes));
 
     /* Self-calibration measurement: doubles as this component's ownership of
      * "프로비저닝용 응답시간 측정" (section 3) and seeds an initial
@@ -228,105 +227,26 @@ esp_err_t sensor_service_init(const module_config_t *cfg)
     return ESP_OK;
 }
 
-/* --- ROOT-side local aggregator --- */
+/* --- ROOT-side local aggregator: thin wrappers around sensor_root_aggregator
+ * (see sensor_service.h's doc comment on this section for why the actual
+ * storage/dedup logic moved there) --- */
 
 void sensor_service_root_record_sample(const sensor_sample_t *sample)
 {
-    if (sample == NULL || s_agg_mutex == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(s_agg_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        ESP_LOGW(TAG, "aggregator busy -- dropping one sample (uuid suffix ..%02x%02x)",
-                 sample->module_uuid[6], sample->module_uuid[7]);
-        return;
-    }
-
-    int slot = -1;
-    int free_slot = -1;
-    for (int i = 0; i < SENSOR_SERVICE_MAX_NODES; i++) {
-        if (s_nodes[i].valid && memcmp(s_nodes[i].module_uuid, sample->module_uuid, SENSOR_SERVICE_UUID_LEN) == 0) {
-            slot = i;
-            break;
-        }
-        if (!s_nodes[i].valid && free_slot < 0) {
-            free_slot = i;
-        }
-    }
-    if (slot < 0) {
-        if (free_slot < 0) {
-            ESP_LOGW(TAG, "aggregator full (%d nodes) -- dropping sample from a new module (uuid suffix ..%02x%02x)",
-                     SENSOR_SERVICE_MAX_NODES, sample->module_uuid[6], sample->module_uuid[7]);
-            xSemaphoreGive(s_agg_mutex);
-            return;
-        }
-        slot = free_slot;
-        s_nodes[slot].valid = true;
-        memcpy(s_nodes[slot].module_uuid, sample->module_uuid, SENSOR_SERVICE_UUID_LEN);
-    }
-
-    sensor_service_node_record_t *rec = &s_nodes[slot];
-    if (rec->has_sample && rec->last_sample_seq == sample->sample_seq) {
-        /* Exact repeat of the last-recorded (uuid, sample_seq) -- section 8
-         * dedup, applied here too so a retransmitted CoAP request (child
-         * retrying because it never saw our ACK) never double-counts. */
-        xSemaphoreGive(s_agg_mutex);
-        return;
-    }
-
-    rec->last_sample = *sample;
-    rec->last_sample_seq = sample->sample_seq;
-    rec->has_sample = true;
-    rec->last_seen_us = esp_timer_get_time();
-    xSemaphoreGive(s_agg_mutex);
-
-    ESP_LOGI(TAG, "sample recorded: uuid=..%02x%02x seq=%u channels=%u", sample->module_uuid[6],
-             sample->module_uuid[7], (unsigned)sample->sample_seq, sample->channel_count);
+    sensor_root_aggregator_record_sample(sample);
 }
 
 void sensor_service_root_record_error(const uint8_t module_uuid[SENSOR_SERVICE_UUID_LEN])
 {
-    if (module_uuid == NULL || s_agg_mutex == NULL) {
-        return;
-    }
-    if (xSemaphoreTake(s_agg_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        return;
-    }
-    for (int i = 0; i < SENSOR_SERVICE_MAX_NODES; i++) {
-        if (s_nodes[i].valid && memcmp(s_nodes[i].module_uuid, module_uuid, SENSOR_SERVICE_UUID_LEN) == 0) {
-            s_nodes[i].error_count++;
-            break;
-        }
-    }
-    xSemaphoreGive(s_agg_mutex);
+    sensor_root_aggregator_record_error(module_uuid);
 }
 
 size_t sensor_service_root_get_node_count(void)
 {
-    size_t count = 0;
-    if (s_agg_mutex == NULL || xSemaphoreTake(s_agg_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        return 0;
-    }
-    for (int i = 0; i < SENSOR_SERVICE_MAX_NODES; i++) {
-        if (s_nodes[i].valid) {
-            count++;
-        }
-    }
-    xSemaphoreGive(s_agg_mutex);
-    return count;
+    return sensor_root_aggregator_get_node_count();
 }
 
 bool sensor_service_root_get_node(size_t index, sensor_service_node_record_t *out)
 {
-    if (out == NULL || index >= SENSOR_SERVICE_MAX_NODES || s_agg_mutex == NULL) {
-        return false;
-    }
-    if (xSemaphoreTake(s_agg_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        return false;
-    }
-    bool valid = s_nodes[index].valid;
-    if (valid) {
-        *out = s_nodes[index];
-    }
-    xSemaphoreGive(s_agg_mutex);
-    return valid;
+    return sensor_root_aggregator_get_node(index, out);
 }

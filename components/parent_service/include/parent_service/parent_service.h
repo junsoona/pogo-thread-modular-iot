@@ -1,19 +1,31 @@
 /*
  * parent_service owns the DOWNSTREAM pogo_port only (section 7): it drives
  * the full downstream provisioning sequence (section 12) -- IDENTIFY,
- * UUID/slot(+depth) assignment, SENSOR_HELLO/SENSOR_INFO_ACK, the computed
- * POLL_CONFIG, the Active Dataset TLV handoff, and the JOIN_RESULT wait.
- * Runs for role_manager roles ROOT and INTERMEDIATE; LEAF never runs it.
+ * UUID/slot(+depth) assignment, ASSIGN_PARENT_INFO (power-base follow-up
+ * section 7), SENSOR_HELLO/SENSOR_INFO_ACK, the computed POLL_CONFIG, the
+ * Active Dataset TLV handoff, and the JOIN_RESULT wait.
  *
- * Per section 7, it must not start a session until role_manager_is_upstream_ready()
- * is true, even if a DOWNSTREAM module docked earlier -- it defers and
- * re-checks instead.
+ * This component is reused VERBATIM by both a sensor module (ROOT/
+ * INTERMEDIATE role) and the dedicated power-base project -- neither is a
+ * compile-time choice. Rather than reaching into role_manager/child_service
+ * directly (which a power base does not have -- it has no UPSTREAM port and
+ * never runs role_manager at all, see docs/power-base.md), the caller
+ * supplies a small parent_service_context_t at init: "may I provision a
+ * child right now", "what is my own topology depth" (0 for ROOT/power base
+ * itself; parent_service always assigns depth+1 downstream), "what is my own
+ * UUID" (for ASSIGN_PARENT_INFO), and an optional per-call ACK-timeout
+ * override (0 = the pogo_proto Kconfig default -- see CONFIG_POGO_ACK_TIMEOUT_MS).
+ * A sensor module's app_main.c wires this to role_manager/child_service/
+ * sensor_service; power_base/main/app_main.c wires it to its own
+ * always-ready-once-Leader / fixed-depth-0 / power_base_config-derived
+ * identity instead. Neither side is "pretending" to be the other -- see
+ * docs/power-base.md's "POGO provisioning reuse" section.
  */
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
-#include "module_config/module_config.h"
 #include "pogo_port/pogo_port.h"
 #include "pogo_proto/pogo_protocol.h"
 
@@ -21,7 +33,48 @@
 extern "C" {
 #endif
 
-esp_err_t parent_service_init(const module_config_t *cfg);
+typedef struct {
+    /* True if a docked child may be provisioned right now. A sensor module
+     * wires this to (role==ROOT||role==INTERMEDIATE) && role_manager_is_upstream_ready();
+     * a power base wires it to "my own Thread network has reached
+     * Leader/Router" (see docs/power-base.md's boot sequence). Re-checked on
+     * every loop iteration while a peer is docked and idle -- never assumed
+     * true just because it was true once. */
+    bool (*provisioning_allowed)(void *ctx);
+    /* This parent's OWN topology depth: 0 for the true network root (ROOT
+     * sensor module fixture, or the power base itself), or this module's own
+     * child_service_get_own_topology_depth() otherwise. The child docked on
+     * this parent is always assigned depth+1. */
+    uint8_t (*get_own_depth)(void *ctx);
+    /* Fills out_uuid (POGO_UUID_LEN bytes) with this parent's own identity,
+     * for ASSIGN_PARENT_INFO. A sensor module uses
+     * sensor_service_get_module_uuid(); the power base uses its own
+     * efuse/NVS-derived stable UUID (see power_base_identity.h). */
+    void (*get_own_uuid)(uint8_t out_uuid[POGO_UUID_LEN], void *ctx);
+    /* Role name for logging only (e.g. "ROOT", "INTERMEDIATE", "POWER_BASE"). */
+    const char *(*role_name)(void *ctx);
+    /* True if THIS parent is the dedicated power-base project (its own POGO
+     * peer type is POGO_PEER_TYPE_POWER_BASE) -- carried in
+     * ASSIGN_PARENT_INFO.parent_is_power_base so the child can cross-check it
+     * against its own BASE_ID+PEER_HELLO-derived role. */
+    bool is_power_base;
+    /* 0 = use CONFIG_POGO_ACK_TIMEOUT_MS (the pogo_proto Kconfig default, and
+     * every sensor module's choice, unchanged from before this refactor);
+     * otherwise this many ms per provisioning-step retry attempt. Lets
+     * power_base_config's handshake_timeout_ms field genuinely control
+     * something instead of being a decorative field nobody reads. */
+    uint32_t ack_timeout_ms;
+    void *ctx;
+} parent_service_context_t;
+
+/*
+ * No module_config_t parameter here (an earlier revision took one, unused --
+ * power_base has no module_config_t at all, so a genuinely-needed parameter
+ * would only ever have been a sensor-module concept leaking into a
+ * component both projects share). Everything this component needs comes
+ * from `provider`.
+ */
+esp_err_t parent_service_init(const parent_service_context_t *provider);
 
 /* Feed every DOWNSTREAM pogo_port event here (events for UPSTREAM are
  * ignored). Safe to call from the pogo_port callback context -- only enqueues. */

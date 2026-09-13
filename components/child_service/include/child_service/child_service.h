@@ -42,6 +42,17 @@ void child_service_on_role_change(module_role_t new_role, module_role_t old_role
  */
 uint8_t child_service_get_own_topology_depth(void);
 
+/*
+ * This module's immediate upstream parent's own identity, as told by
+ * POGO_MSG_ASSIGN_PARENT_INFO (power-base follow-up spec section 7: "부모
+ * UUID 전달"). All-zero / false until that step of the current provisioning
+ * session has completed. Used by topology_reporter to fill a topology
+ * report's parent_uuid/upstream-is-power-base fields -- child_service itself
+ * never sends a topology report.
+ */
+void child_service_get_parent_uuid(uint8_t out_uuid[POGO_UUID_LEN]);
+bool child_service_get_parent_is_power_base(void);
+
 #ifdef __cplusplus
 }
 #endif

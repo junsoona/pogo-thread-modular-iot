@@ -55,6 +55,39 @@ typedef enum {
      * seq=0, fire-and-forget, unmodified) -- purely additive.
      */
     POGO_MSG_JOIN_RESULT_ACK = 0x10,
+    /*
+     * parent -> child: tells the child THIS parent's own identity, so the
+     * child can name a real parent_uuid in its own topology reports (section
+     * 7 of the power-base follow-up spec: "부모 UUID 전달"). Sent once per
+     * provisioning session, right after ASSIGN_SLOT is ACKed and before
+     * SENSOR_HELLO -- a NEW additive step, not a reuse of ASSIGN_SLOT's
+     * existing wire format (which stays exactly as it was: slot_id +
+     * topology_depth, 2 bytes, unchanged for upper/lower's 2-line
+     * topology_depth addition). upper/lower and the pre-power-base module
+     * firmware never sent/expected this type, so it is purely additive to
+     * the regression baseline, same as JOIN_RESULT_ACK before it.
+     */
+    POGO_MSG_ASSIGN_PARENT_INFO = 0x11,
+    /*
+     * parent -> child: "tell me your permanent identity". Empty payload.
+     * Sent right after IDENTIFY_RESP, before ASSIGN_UUID -- see
+     * POGO_MSG_PROPOSE_UUID's own comment for why this pair exists (code
+     * review follow-up, section 1: "센서 모듈 UUID를 영구 식별자로 변경").
+     */
+    POGO_MSG_REQUEST_UUID = 0x12,
+    /*
+     * child -> parent: this module's own PERMANENT identifier, derived from
+     * its own efuse EUI-64 (never randomly generated, never assigned by a
+     * parent) -- see pogo_propose_uuid_t. The parent's ONLY valid response
+     * is to echo these same 8 bytes back via the existing ASSIGN_UUID
+     * message (now a CONFIRMATION, not an assignment of a new value) --
+     * ASSIGN_UUID's own wire format is completely unchanged, so this is
+     * purely additive to the regression baseline, same as every other
+     * follow-up message before it. A parent that tries to confirm anything
+     * other than exactly what the child proposed gets NACKed
+     * (POGO_NACK_UUID_MISMATCH) -- see child_service.c's handle_assign_uuid().
+     */
+    POGO_MSG_PROPOSE_UUID = 0x13,
 } pogo_msg_type_t;
 
 typedef enum {
@@ -64,6 +97,8 @@ typedef enum {
     POGO_NACK_SENSOR_ERROR       = 4, /* the permanently-attached sensor failed to respond */
     POGO_NACK_POLL_CONFIG_RANGE  = 5, /* POLL_CONFIG polling_period_ms outside the child's accepted range */
     POGO_NACK_PEER_TYPE_CONFLICT = 6, /* PEER_HELLO peer_type contradicts BASE_ID hardware read */
+    POGO_NACK_UUID_MISMATCH     = 7, /* ASSIGN_UUID tried to confirm bytes other than what PROPOSE_UUID sent -- a
+                                          parent must never invent its own uuid (code review follow-up section 1) */
 } pogo_nack_reason_t;
 
 #define POGO_UUID_LEN 8
@@ -102,8 +137,19 @@ typedef struct {
 } pogo_identify_resp_t;
 
 typedef struct {
-    uint8_t uuid[POGO_UUID_LEN];
+    uint8_t uuid[POGO_UUID_LEN]; /* CONFIRMS the child's own proposed permanent uuid -- see POGO_MSG_PROPOSE_UUID */
 } pogo_assign_uuid_t;
+
+/*
+ * Payload of POGO_MSG_PROPOSE_UUID (8 bytes, the child's own efuse-derived
+ * permanent identifier -- see child_service.c's handle_request_uuid()). A
+ * distinct type from pogo_assign_uuid_t (identical byte shape, opposite
+ * direction) so the wire-format layer names the two sides of this exchange
+ * explicitly rather than overloading one struct's meaning by context.
+ */
+typedef struct {
+    uint8_t uuid[POGO_UUID_LEN];
+} pogo_propose_uuid_t;
 
 typedef struct {
     uint8_t slot_id;         /* position among this parent's downstream children (currently always 0: one DOWNSTREAM port) */
@@ -134,6 +180,19 @@ typedef struct {
     uint8_t success; /* 1 = joined, 0 = failed/timed out */
     uint8_t role;    /* otDeviceRole at the time of reporting */
 } pogo_join_result_t;
+
+/*
+ * Payload of POGO_MSG_ASSIGN_PARENT_INFO (9 bytes on the wire: 8-byte uuid +
+ * 1-byte flag, no multi-byte integers so no endian conversion is needed --
+ * see pogo_pack_assign_parent_info()/pogo_unpack_assign_parent_info()).
+ */
+typedef struct {
+    uint8_t parent_uuid[POGO_UUID_LEN]; /* the SENDING parent's own module UUID (or a stable
+                                            MAC-derived UUID if the parent itself was never
+                                            provisioned by anyone, e.g. it is the power base) */
+    uint8_t parent_is_power_base;       /* 1 if the sending parent is the power base itself, 0 if
+                                            it is an ordinary sensor module (INTERMEDIATE/ROOT-dev-fixture) */
+} pogo_assign_parent_info_t;
 
 /*
  * Each pack_* serializes `in` into `out` (capacity out_size) and returns the
@@ -167,6 +226,12 @@ bool   pogo_unpack_sensor_info_ack(const uint8_t *data, uint16_t len, pogo_senso
 
 size_t pogo_pack_poll_config(const pogo_poll_config_t *in, uint8_t *out, size_t out_size);
 bool   pogo_unpack_poll_config(const uint8_t *data, uint16_t len, pogo_poll_config_t *out);
+
+size_t pogo_pack_assign_parent_info(const pogo_assign_parent_info_t *in, uint8_t *out, size_t out_size);
+bool   pogo_unpack_assign_parent_info(const uint8_t *data, uint16_t len, pogo_assign_parent_info_t *out);
+
+size_t pogo_pack_propose_uuid(const pogo_propose_uuid_t *in, uint8_t *out, size_t out_size);
+bool   pogo_unpack_propose_uuid(const uint8_t *data, uint16_t len, pogo_propose_uuid_t *out);
 
 #ifdef __cplusplus
 }

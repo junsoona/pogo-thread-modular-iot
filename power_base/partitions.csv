@@ -1,0 +1,22 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+#
+# "nvs" holds only DYNAMIC state: OpenThread's own Active Dataset (see
+# thread_manager_start_as_root() -- resumed here across every reboot, never
+# regenerated while a commissioned dataset already exists in this partition).
+# The power base has no role_manager/child_service dynamic state of its own
+# (it never runs either) -- this partition is smaller than module's for that
+# reason, but otherwise the exact same idea.
+nvs,        data, nvs,      0x9000,  0x6000,
+phy_init,   data, phy,      0xf000,  0x1000,
+factory,    app,  factory,  0x10000, 1500K,
+#
+# "cfg" holds the FIXED power-base board configuration (power_base_config,
+# namespace "power_base_cfg" -- see docs/power-base.md,
+# components/power_base_config). Generated offline by
+# tools/pack_power_base_config.py from configs/power_base.json, and is
+# treated as read-only by the application at runtime. This is a physically
+# separate flash image from module/partitions.csv's own "cfg" partition (a
+# different board, a different binary) -- reusing the partition NAME is not
+# a collision.
+cfg,        data, nvs,      0x187000, 0x3000,

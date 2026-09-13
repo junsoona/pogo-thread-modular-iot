@@ -23,9 +23,19 @@ extern "C" {
 
 typedef enum {
     MODULE_ROLE_UNASSIGNED = 0, /* no valid UPSTREAM relationship yet (undocked, or still mid-handshake) */
-    MODULE_ROLE_ROOT,           /* UPSTREAM peer is POWER_BASE */
-    MODULE_ROLE_INTERMEDIATE,   /* UPSTREAM peer is MODULE, and a MODULE is also attached DOWNSTREAM */
-    MODULE_ROLE_LEAF,           /* UPSTREAM peer is MODULE, DOWNSTREAM is empty */
+    /*
+     * NEVER reachable via AUTO-mode port-event derivation any more (see
+     * recompute()) -- the dedicated power base is the system's one and only
+     * ROOT/Leader (docs/power-base.md). Kept only as the value
+     * MODULE_DEV_MODE_DEV_ROOT forces directly (a pre-power-base bench-test/
+     * regression fixture, see docs/pogo-interface.md's "development compat
+     * mode"). A numeric value AND enumerator name are both kept unchanged so
+     * every existing wire/log/topology-report use of this numbering (e.g.
+     * topology_proto.h's TOPOLOGY_ROLE_ROOT) still lines up.
+     */
+    MODULE_ROLE_ROOT,
+    MODULE_ROLE_INTERMEDIATE,   /* UPSTREAM peer is POWER_BASE or MODULE, and a MODULE is also attached DOWNSTREAM */
+    MODULE_ROLE_LEAF,           /* UPSTREAM peer is POWER_BASE or MODULE, DOWNSTREAM is empty */
     MODULE_ROLE_ERROR,          /* contradictory port state (e.g. a PEER_TYPE_CONFLICT on either port) */
 } module_role_t;
 

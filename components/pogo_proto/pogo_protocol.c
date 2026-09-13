@@ -189,3 +189,41 @@ bool pogo_unpack_poll_config(const uint8_t *data, uint16_t len, pogo_poll_config
         ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
     return true;
 }
+
+size_t pogo_pack_assign_parent_info(const pogo_assign_parent_info_t *in, uint8_t *out, size_t out_size)
+{
+    if (out_size < POGO_UUID_LEN + 1) {
+        return 0;
+    }
+    memcpy(out, in->parent_uuid, POGO_UUID_LEN);
+    out[POGO_UUID_LEN] = in->parent_is_power_base;
+    return POGO_UUID_LEN + 1;
+}
+
+bool pogo_unpack_assign_parent_info(const uint8_t *data, uint16_t len, pogo_assign_parent_info_t *out)
+{
+    if (len != POGO_UUID_LEN + 1) {
+        return false;
+    }
+    memcpy(out->parent_uuid, data, POGO_UUID_LEN);
+    out->parent_is_power_base = data[POGO_UUID_LEN];
+    return true;
+}
+
+size_t pogo_pack_propose_uuid(const pogo_propose_uuid_t *in, uint8_t *out, size_t out_size)
+{
+    if (out_size < POGO_UUID_LEN) {
+        return 0;
+    }
+    memcpy(out, in->uuid, POGO_UUID_LEN);
+    return POGO_UUID_LEN;
+}
+
+bool pogo_unpack_propose_uuid(const uint8_t *data, uint16_t len, pogo_propose_uuid_t *out)
+{
+    if (len != POGO_UUID_LEN) {
+        return false;
+    }
+    memcpy(out->uuid, data, POGO_UUID_LEN);
+    return true;
+}

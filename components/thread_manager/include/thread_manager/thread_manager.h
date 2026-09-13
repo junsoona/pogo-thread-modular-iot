@@ -88,6 +88,16 @@ esp_err_t thread_manager_get_leader_address(otIp6Address *out_addr);
  * callback), false if nothing new. */
 bool thread_manager_poll_role_change(otDeviceRole *out_role);
 
+/*
+ * Human-readable otDeviceRole name ("DISABLED"/"DETACHED"/"CHILD"/"ROUTER"/
+ * "LEADER", or "UNKNOWN" for anything else) -- code review follow-up
+ * section 5: "로그에는 숫자만 출력하지 말고 LEADER, ROUTER, CHILD 문자열을
+ * 함께 출력한다". Every log line that names an otDeviceRole in this codebase
+ * (power_base/main/app_main.c, child_service.c, parent_service.c) uses this
+ * one function rather than each re-deriving its own mapping.
+ */
+const char *thread_manager_role_to_str(otDeviceRole role);
+
 #ifdef __cplusplus
 }
 #endif

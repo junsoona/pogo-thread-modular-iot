@@ -1,5 +1,6 @@
 #include "sensor_transport/sensor_transport.h"
 
+#include <stdint.h>
 #include "esp_log.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
@@ -22,18 +23,51 @@ static const char *TAG = "sensor_transport";
 #define SENSOR_TRANSPORT_MAX_ATTEMPTS (1 + SENSOR_TRANSPORT_MAX_RETRIES)
 #define SENSOR_TRANSPORT_ACK_TIMEOUT_MS 1000
 
-typedef struct {
-    SemaphoreHandle_t done_sem;
-    otError result;
-} send_wait_ctx_t;
+/*
+ * CoAP client send state -- code review follow-up section 3 (the same fix
+ * applied to topology_reporter.c, which sends to a sibling resource on the
+ * same power base): an earlier revision created/deleted a
+ * SemaphoreHandle_t per attempt on the caller's own stack, so a callback
+ * firing late (after the waiter already timed out, deleted the semaphore,
+ * and returned) touched freed/stack-unwound memory. This component now
+ * creates ONE semaphore for its whole lifetime (never deleted) and versions
+ * each attempt with a monotonically-increasing token instead:
+ * coap_response_handler() only acts (records the result, gives the
+ * semaphore) if the token it captured at send time still matches the
+ * CURRENT token -- a late callback for an attempt the waiter already gave
+ * up on simply finds a mismatch and does nothing. s_send_lock is a short
+ * critical section around the token compare-and-write on both sides (the
+ * OpenThread task runs the callback; the sensor_service periodic task runs
+ * the waiter), so the two can never race on a half-updated token/result.
+ */
+static SemaphoreHandle_t s_send_done_sem;
+static portMUX_TYPE s_send_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_send_token;
+static otError s_send_result;
+static otCoapCode s_send_response_code;
+static bool s_send_got_message;
 
 static void coap_response_handler(void *ctx_v, otMessage *message, const otMessageInfo *message_info, otError result)
 {
-    (void)message;
     (void)message_info;
-    send_wait_ctx_t *ctx = (send_wait_ctx_t *)ctx_v;
-    ctx->result = result;
-    xSemaphoreGive(ctx->done_sem);
+    uint32_t my_token = (uint32_t)(uintptr_t)ctx_v;
+    bool stale;
+
+    taskENTER_CRITICAL(&s_send_lock);
+    stale = (my_token != s_send_token);
+    if (!stale) {
+        s_send_result = result;
+        s_send_got_message = false;
+        if (result == OT_ERROR_NONE && message != NULL) {
+            s_send_response_code = otCoapMessageGetCode(message);
+            s_send_got_message = true;
+        }
+    }
+    taskEXIT_CRITICAL(&s_send_lock);
+
+    if (!stale) {
+        xSemaphoreGive(s_send_done_sem);
+    }
 }
 
 /*
@@ -88,6 +122,11 @@ static otCoapResource s_resource = {
 
 esp_err_t sensor_transport_init(void)
 {
+    s_send_done_sem = xSemaphoreCreateBinary();
+    if (s_send_done_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     otInstance *instance = esp_openthread_get_instance();
     if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
         ESP_LOGE(TAG, "failed to acquire OpenThread lock during init");
@@ -120,10 +159,14 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
         return false;
     }
 
-    send_wait_ctx_t ctx = {.done_sem = xSemaphoreCreateBinary()};
-    if (ctx.done_sem == NULL) {
-        return false;
-    }
+    uint32_t my_token;
+    taskENTER_CRITICAL(&s_send_lock);
+    my_token = ++s_send_token;
+    s_send_got_message = false;
+    taskEXIT_CRITICAL(&s_send_lock);
+    /* Defensive: drain any stale "give" left over from a truly-ancient
+     * attempt -- see coap_response_handler()'s doc comment. */
+    xSemaphoreTake(s_send_done_sem, 0);
 
     otInstance *instance = esp_openthread_get_instance();
     otError err = OT_ERROR_NO_BUFS;
@@ -153,7 +196,8 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
                     .mAckRandomFactorDenominator = 2,
                     .mMaxRetransmit = 0,
                 };
-                err = otCoapSendRequestWithParameters(instance, message, &info, coap_response_handler, &ctx, &tx);
+                err = otCoapSendRequestWithParameters(instance, message, &info, coap_response_handler,
+                                                       (void *)(uintptr_t)my_token, &tx);
             }
             if (err != OT_ERROR_NONE) {
                 otMessageFree(message);
@@ -164,19 +208,30 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
         err = OT_ERROR_BUSY;
     }
 
-    bool ok = false;
-    if (err == OT_ERROR_NONE) {
-        /* Generous relative to the tx params' own ack timeout above so we
-         * always hear back from OpenThread's response handler one way or
-         * another before giving up on this attempt. */
-        if (xSemaphoreTake(ctx.done_sem, pdMS_TO_TICKS(SENSOR_TRANSPORT_ACK_TIMEOUT_MS * 3)) == pdTRUE &&
-            ctx.result == OT_ERROR_NONE) {
-            ok = true;
-        }
-    } else {
+    if (err != OT_ERROR_NONE) {
         ESP_LOGW(TAG, "failed to send CoAP request: %s", otThreadErrorToString(err));
+        return false;
     }
-    vSemaphoreDelete(ctx.done_sem);
+
+    bool ok = false;
+    /* Generous relative to the tx params' own ack timeout above so we
+     * always hear back from OpenThread's response handler one way or
+     * another before giving up on this attempt. */
+    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(SENSOR_TRANSPORT_ACK_TIMEOUT_MS * 3)) == pdTRUE) {
+        if (s_send_result == OT_ERROR_NONE && s_send_got_message) {
+            /* code review follow-up section 3: a successful OpenThread
+             * transport is not enough -- the power base's own CoAP response
+             * code (now varied, see power_base_transport.c) must also be a
+             * 2.xx success. */
+            uint8_t code_class = (uint8_t)(s_send_response_code >> 5);
+            if (code_class == 2) {
+                ok = true;
+            } else {
+                ESP_LOGW(TAG, "sensor sample rejected by receiver: CoAP %u.%02u", code_class,
+                         (unsigned)(s_send_response_code & 0x1F));
+            }
+        }
+    }
     return ok;
 }
 

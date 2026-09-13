@@ -299,3 +299,21 @@ bool thread_manager_poll_role_change(otDeviceRole *out_role)
 {
     return xQueueReceive(s_role_change_queue, out_role, 0) == pdTRUE;
 }
+
+const char *thread_manager_role_to_str(otDeviceRole role)
+{
+    switch (role) {
+    case OT_DEVICE_ROLE_DISABLED:
+        return "DISABLED";
+    case OT_DEVICE_ROLE_DETACHED:
+        return "DETACHED";
+    case OT_DEVICE_ROLE_CHILD:
+        return "CHILD";
+    case OT_DEVICE_ROLE_ROUTER:
+        return "ROUTER";
+    case OT_DEVICE_ROLE_LEADER:
+        return "LEADER";
+    default:
+        return "UNKNOWN";
+    }
+}

@@ -4,14 +4,11 @@
 #include <stdint.h>
 #include "sdkconfig.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
 #include "pogo_proto/pogo_frame.h"
-#include "child_service/child_service.h"
-#include "role_manager/role_manager.h"
 #include "thread_manager/thread_manager.h"
 #include "node_calc/node_calc.h"
 
@@ -55,6 +52,7 @@ typedef struct {
 } ps_evt_t;
 
 static QueueHandle_t s_evt_queue;
+static parent_service_context_t s_provider;
 static ps_state_t s_state = PS_STATE_IDLE;
 static bool s_peer_currently_ready = false;
 static bool s_peer_ready_pending = false;
@@ -188,7 +186,8 @@ static bool run_provisioning_session(void)
     s_session_aborted = false;
     memset(&s_node, 0, sizeof(s_node));
 
-    const TickType_t ack_timeout = pdMS_TO_TICKS(CONFIG_POGO_ACK_TIMEOUT_MS);
+    const TickType_t ack_timeout =
+        pdMS_TO_TICKS(s_provider.ack_timeout_ms != 0 ? s_provider.ack_timeout_ms : CONFIG_POGO_ACK_TIMEOUT_MS);
     const TickType_t join_timeout = pdMS_TO_TICKS(CONFIG_POGO_JOIN_TIMEOUT_MS);
     const int max_retry = CONFIG_POGO_MAX_RETRY;
     pogo_frame_t frame = {0};
@@ -206,7 +205,34 @@ static bool run_provisioning_session(void)
     ESP_LOGI(TAG, "child identified: mac=%02x:%02x:%02x:%02x:%02x:%02x fw=%u sensor_bitmap=0x%02x", ident.mac[0],
              ident.mac[1], ident.mac[2], ident.mac[3], ident.mac[4], ident.mac[5], ident.fw_version,
              ident.sensor_bitmap);
-    esp_fill_random(s_node.uuid, POGO_UUID_LEN);
+
+    /*
+     * Code review follow-up, section 1: the child's module_uuid is a
+     * PERMANENT identifier it owns (efuse-derived) -- this parent NEVER
+     * invents one. REQUEST_UUID/PROPOSE_UUID retrieves it; ASSIGN_UUID (its
+     * existing wire format, unchanged) is now used purely to CONFIRM the
+     * exact same bytes back, never to assign something new.
+     */
+    if (!send_and_wait(POGO_MSG_REQUEST_UUID, NULL, 0, POGO_MSG_PROPOSE_UUID, 0, &frame, max_retry, ack_timeout)) {
+        ESP_LOGW(TAG, "REQUEST_UUID failed -> abandoning session");
+        return false;
+    }
+    pogo_propose_uuid_t proposed;
+    if (!pogo_unpack_propose_uuid(frame.payload, frame.len, &proposed)) {
+        ESP_LOGE(TAG, "malformed PROPOSE_UUID -> abandoning session");
+        return false;
+    }
+    static const uint8_t all_zero_uuid[POGO_UUID_LEN] = {0};
+    if (memcmp(proposed.uuid, all_zero_uuid, POGO_UUID_LEN) == 0) {
+        /* section 1: "실패 시 all-zero UUID를 정상 식별자로 사용하지 않는다"
+         * -- applies on the parent side too: never provision a child under
+         * an identifier that could never legitimately belong to any real
+         * device. */
+        ESP_LOGE(TAG, "child proposed an all-zero UUID -- refusing to treat that as a valid permanent identifier, "
+                      "abandoning session");
+        return false;
+    }
+    memcpy(s_node.uuid, proposed.uuid, POGO_UUID_LEN);
 
     pogo_assign_uuid_t uuid_msg;
     memcpy(uuid_msg.uuid, s_node.uuid, POGO_UUID_LEN);
@@ -216,14 +242,16 @@ static bool run_provisioning_session(void)
                         ack_timeout) ||
         frame.type != POGO_MSG_ACK) {
         log_nack_if_any(&frame);
-        ESP_LOGW(TAG, "ASSIGN_UUID failed -> abandoning session");
+        ESP_LOGW(TAG, "ASSIGN_UUID (confirming the child's own proposed uuid) failed -> abandoning session");
         return false;
     }
 
     /* Exactly one DOWNSTREAM port on this hardware generation -> slot_id is
-     * always 0, but topology_depth still reflects this module's own depth
-     * (not hardcoded), so a chain of INTERMEDIATE modules is traceable. */
-    uint8_t depth = (role_manager_get_role() == MODULE_ROLE_ROOT) ? 1 : (uint8_t)(child_service_get_own_topology_depth() + 1);
+     * always 0, but topology_depth still reflects this PARENT's own depth+1
+     * (not hardcoded), so a chain of INTERMEDIATE modules -- or a power base
+     * at the very top -- is traceable. get_own_depth() is 0 for the true
+     * network root (ROOT sensor-module fixture, or the power base itself). */
+    uint8_t depth = (uint8_t)(s_provider.get_own_depth(s_provider.ctx) + 1);
     pogo_assign_slot_t slot_msg = {.slot_id = 0, .topology_depth = depth};
     uint8_t slot_payload[2];
     size_t slot_len = pogo_pack_assign_slot(&slot_msg, slot_payload, sizeof(slot_payload));
@@ -236,6 +264,22 @@ static bool run_provisioning_session(void)
     }
     s_node.topology_depth = depth;
     s_node.backoff_delay_ms = parent_service_calc_backoff_ms(s_node.uuid);
+
+    /* ASSIGN_PARENT_INFO (power-base follow-up section 7): tells the child
+     * THIS parent's own uuid + whether this parent is the power base, so the
+     * child can name a real parent in its own topology reports instead of
+     * only knowing "my upstream peer_type". */
+    pogo_assign_parent_info_t pinfo_msg = {.parent_is_power_base = s_provider.is_power_base ? 1 : 0};
+    s_provider.get_own_uuid(pinfo_msg.parent_uuid, s_provider.ctx);
+    uint8_t pinfo_payload[POGO_UUID_LEN + 1];
+    size_t pinfo_len = pogo_pack_assign_parent_info(&pinfo_msg, pinfo_payload, sizeof(pinfo_payload));
+    if (!send_and_wait(POGO_MSG_ASSIGN_PARENT_INFO, pinfo_payload, pinfo_len, POGO_MSG_ACK, POGO_MSG_NACK, &frame,
+                        max_retry, ack_timeout) ||
+        frame.type != POGO_MSG_ACK) {
+        log_nack_if_any(&frame);
+        ESP_LOGW(TAG, "ASSIGN_PARENT_INFO failed -> abandoning session");
+        return false;
+    }
 
     if (!send_and_wait(POGO_MSG_SENSOR_HELLO, NULL, 0, POGO_MSG_SENSOR_INFO_ACK, POGO_MSG_NACK, &frame, max_retry,
                         ack_timeout) ||
@@ -314,13 +358,15 @@ static bool run_provisioning_session(void)
 
     pogo_join_result_t result;
     if (!pogo_unpack_join_result(frame.payload, frame.len, &result) || !result.success) {
-        ESP_LOGW(TAG, "JOIN FAILED -- child otDeviceRole=%u", frame.len >= 2 ? frame.payload[1] : 0);
+        otDeviceRole failed_role = (otDeviceRole)(frame.len >= 2 ? frame.payload[1] : 0);
+        ESP_LOGW(TAG, "JOIN FAILED -- child otDeviceRole=%u(%s)", failed_role, thread_manager_role_to_str(failed_role));
         return false;
     }
     s_node.child_role = (otDeviceRole)result.role;
     s_node.last_seen = xTaskGetTickCount();
-    ESP_LOGI(TAG, "JOIN OK -- child otDeviceRole=%u uuid_backoff=%ums depth=%u polling=%ums", result.role,
-             s_node.backoff_delay_ms, s_node.topology_depth, s_node.polling_period_ms);
+    ESP_LOGI(TAG, "JOIN OK -- child otDeviceRole=%u(%s) uuid_backoff=%ums depth=%u polling=%ums", result.role,
+             thread_manager_role_to_str(s_node.child_role), s_node.backoff_delay_ms, s_node.topology_depth,
+             s_node.polling_period_ms);
     return true;
 }
 
@@ -370,12 +416,10 @@ static void parent_service_task(void *arg)
         }
 
         if (s_peer_ready_pending && s_state == PS_STATE_IDLE) {
-            module_role_t role = role_manager_get_role();
-            bool role_ok = (role == MODULE_ROLE_ROOT || role == MODULE_ROLE_INTERMEDIATE);
-            if (role_ok && role_manager_is_upstream_ready()) {
+            if (s_provider.provisioning_allowed(s_provider.ctx)) {
                 s_peer_ready_pending = false;
                 s_state = PS_STATE_PROVISIONING;
-                ESP_LOGI(TAG, "starting downstream provisioning as %s", role_manager_role_to_str(role));
+                ESP_LOGI(TAG, "starting downstream provisioning as %s", s_provider.role_name(s_provider.ctx));
                 bool joined = run_provisioning_session();
                 if (joined) {
                     s_state = PS_STATE_JOINED;
@@ -399,9 +443,13 @@ static void parent_service_task(void *arg)
     }
 }
 
-esp_err_t parent_service_init(const module_config_t *cfg)
+esp_err_t parent_service_init(const parent_service_context_t *provider)
 {
-    (void)cfg;
+    if (provider == NULL || provider->provisioning_allowed == NULL || provider->get_own_depth == NULL ||
+        provider->get_own_uuid == NULL || provider->role_name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_provider = *provider; /* owned copy -- same reasoning as child_service's s_cfg */
     s_evt_queue = xQueueCreate(16, sizeof(ps_evt_t));
     if (s_evt_queue == NULL) {
         return ESP_ERR_NO_MEM;

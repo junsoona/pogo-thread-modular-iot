@@ -29,7 +29,16 @@
  *                                    parent_service (DOWNSTREAM only).
  *  10. child_service_init() / parent_service_init() -- always both; each
  *                                    only ever acts on its own port's events.
- *  11. pogo_port_enable() x2     -- only for ports this board actually wires
+ *                                    parent_service_init() takes a small
+ *                                    context struct (see parent_service.h) so
+ *                                    the SAME component is reused unmodified
+ *                                    by power_base/main/app_main.c.
+ *  11. topology_reporter_init() -- reports this module's role/parent/depth/
+ *                                    connection state to the power base over
+ *                                    Thread CoAP ("/t", see docs/power-base.md);
+ *                                    a sensor module never runs the receiving
+ *                                    side of that resource, only power_base does.
+ *  12. pogo_port_enable() x2     -- only for ports this board actually wires
  *                                    (module_config-driven; a dev board's
  *                                    "missing" port is simply not enabled).
  */
@@ -57,6 +66,7 @@
 #include "thread_manager/thread_manager.h"
 #include "child_service/child_service.h"
 #include "parent_service/parent_service.h"
+#include "topology_reporter/topology_reporter.h"
 
 static const char *TAG = "module_main";
 
@@ -70,7 +80,56 @@ static void port_event_dispatcher(pogo_port_id_t port_id, pogo_port_event_t even
     } else {
         parent_service_on_port_event(port_id, event, data);
     }
+    topology_reporter_on_port_event(port_id, event, data);
 }
+
+/*
+ * parent_service_context_t wiring for a sensor module (see
+ * parent_service.h's header comment for why this indirection exists instead
+ * of parent_service reaching into role_manager/child_service directly -- the
+ * same component is reused verbatim by power_base/main/app_main.c with a
+ * completely different context). A sensor module in AUTO mode is never
+ * MODULE_ROLE_ROOT's provisioning parent by policy (role_manager_get_role()
+ * simply never returns ROOT there -- see role_manager.c and
+ * docs/pogo-interface.md's determination table); MODULE_DEV_MODE_DEV_ROOT's
+ * forced-ROOT regression fixture is the only path where get_own_depth()
+ * returns 0 for a module.
+ */
+static bool module_parent_provisioning_allowed(void *ctx)
+{
+    (void)ctx;
+    module_role_t role = role_manager_get_role();
+    return (role == MODULE_ROLE_ROOT || role == MODULE_ROLE_INTERMEDIATE) && role_manager_is_upstream_ready();
+}
+
+static uint8_t module_parent_get_own_depth(void *ctx)
+{
+    (void)ctx;
+    return (role_manager_get_role() == MODULE_ROLE_ROOT) ? 0 : child_service_get_own_topology_depth();
+}
+
+static void module_parent_get_own_uuid(uint8_t out_uuid[POGO_UUID_LEN], void *ctx)
+{
+    (void)ctx;
+    /* SENSOR_SERVICE_UUID_LEN == POGO_UUID_LEN (both 8) -- see sensor_service.h. */
+    sensor_service_get_module_uuid(out_uuid);
+}
+
+static const char *module_parent_role_name(void *ctx)
+{
+    (void)ctx;
+    return role_manager_role_to_str(role_manager_get_role());
+}
+
+static const parent_service_context_t s_module_parent_ctx = {
+    .provisioning_allowed = module_parent_provisioning_allowed,
+    .get_own_depth = module_parent_get_own_depth,
+    .get_own_uuid = module_parent_get_own_uuid,
+    .role_name = module_parent_role_name,
+    .is_power_base = false,
+    .ack_timeout_ms = 0, /* use CONFIG_POGO_ACK_TIMEOUT_MS, unchanged from before this refactor */
+    .ctx = NULL,
+};
 
 /*
  * Bumped every time a NEW root_ready_watcher_task is started, and every time
@@ -117,6 +176,13 @@ static void on_role_change(module_role_t new_role, module_role_t old_role, void 
     (void)ctx;
     child_service_on_role_change(new_role, old_role);
     sensor_service_on_role_change(new_role, old_role);
+    /* topology_reporter does NOT hook this callback: role_manager's role
+     * settles (LEAF/INTERMEDIATE) independently of, and generally BEFORE,
+     * role_manager_is_upstream_ready() becoming true (that only happens once
+     * child_service finishes the full Thread join) -- see
+     * topology_reporter.c's header comment for why it instead polls
+     * role_manager_is_upstream_ready()/role_manager_get_role() on its own
+     * short tick rather than reacting to this callback. */
 
     if (old_role == MODULE_ROLE_ROOT && new_role != MODULE_ROLE_ROOT) {
         /* Leaving ROOT: invalidate any in-flight watcher immediately. */
@@ -254,7 +320,8 @@ void app_main(void)
     ESP_ERROR_CHECK(pogo_port_init(POGO_PORT_DOWNSTREAM, &down_cfg, port_event_dispatcher, NULL));
 
     ESP_ERROR_CHECK(child_service_init(&cfg));
-    ESP_ERROR_CHECK(parent_service_init(&cfg));
+    ESP_ERROR_CHECK(parent_service_init(&s_module_parent_ctx));
+    ESP_ERROR_CHECK(topology_reporter_init(&cfg));
 
     if (up_cfg.enabled) {
         ESP_ERROR_CHECK(pogo_port_enable(POGO_PORT_UPSTREAM, POGO_PEER_TYPE_MODULE));

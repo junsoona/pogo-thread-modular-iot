@@ -1,4 +1,5 @@
 #include "pogo_port/pogo_port.h"
+#include "pogo_port/pogo_port_cleanup.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -72,6 +73,8 @@ typedef struct {
     int        liveness_fail_count;
 
     bool inited;
+    bool enabled; /* true from a successful pogo_port_enable() until pogo_port_disable() -- see that function's doc comment on idempotency */
+    uint32_t detect_isr_drops; /* xQueueSendFromISR() failures in detect_isr_handler() -- diagnostic only, see that function's comment */
 } pogo_port_ctx_t;
 
 static pogo_port_ctx_t s_ports[POGO_PORT_ID_COUNT];
@@ -93,20 +96,67 @@ static void IRAM_ATTR detect_isr_handler(void *arg)
     evt.tick = xTaskGetTickCountFromISR();
     evt.level = gpio_get_level((gpio_num_t)p->cfg.detect_in_gpio);
     BaseType_t hpw = pdFALSE;
-    xQueueSendFromISR(p->detect_queue, &evt, &hpw);
+    if (xQueueSendFromISR(p->detect_queue, &evt, &hpw) != pdTRUE) {
+        /* Queue full (DETECT_QUEUE_LEN edges without the port task getting
+         * a chance to drain any of them -- should not happen in practice,
+         * process_debounce() drains unconditionally every loop iteration).
+         * Nothing safe to do from ISR context beyond counting it -- surfaced
+         * the next time the port task runs process_debounce() (diagnostic
+         * only; nothing to log-flood from an ISR either way, no state edge
+         * is guaranteed to have been lost since the queue already held at
+         * least DETECT_QUEUE_LEN more-recent edges). */
+        p->detect_isr_drops++;
+    }
     if (hpw) {
         portYIELD_FROM_ISR();
     }
 }
 
-static void set_detect_out(pogo_port_ctx_t *p, bool asserted)
+static esp_err_t set_detect_out(pogo_port_ctx_t *p, bool asserted)
 {
     if (p->cfg.detect_out_gpio < 0) {
-        return;
+        return ESP_OK;
     }
     /* Open-drain: level 0 drives Low (asserted, "I am here"); level 1
      * releases the line so the external pull-up takes it High. */
-    gpio_set_level((gpio_num_t)p->cfg.detect_out_gpio, asserted ? 0 : 1);
+    esp_err_t err = gpio_set_level((gpio_num_t)p->cfg.detect_out_gpio, asserted ? 0 : 1);
+    if (err != ESP_OK) {
+        /* Logged, not escalated to a hard failure here: gpio_set_level()
+         * failing on a pin whose gpio_config() just succeeded moments
+         * earlier would mean a driver-internal problem, not a config
+         * mistake this code can meaningfully recover from -- see this
+         * function's callers for how each one decides whether that is
+         * fatal for ITS OWN operation. */
+        ESP_LOGW(TAG, "port %d: gpio_set_level(DETECT_OUT=%d, %s) failed: %s", p->id, p->cfg.detect_out_gpio,
+                 asserted ? "asserted" : "released", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/*
+ * Adapters binding pogo_port_run_cleanup_ops()'s generic `pogo_port_cleanup_op_t`
+ * signature to this component's real hardware calls -- used by BOTH
+ * pogo_port_enable()'s failure-unwind path and pogo_port_disable(), so the
+ * "attempt everything, keep the first error" policy in pogo_port_cleanup.c
+ * is exercised by real hardware calls here and directly, with fault
+ * injection, by tools/test_pogo_port_cleanup_ops.c.
+ */
+static esp_err_t cleanup_op_isr_remove(void *ctx)
+{
+    pogo_port_ctx_t *p = (pogo_port_ctx_t *)ctx;
+    return gpio_isr_handler_remove((gpio_num_t)p->cfg.detect_in_gpio);
+}
+
+static esp_err_t cleanup_op_detect_release(void *ctx)
+{
+    pogo_port_ctx_t *p = (pogo_port_ctx_t *)ctx;
+    return set_detect_out(p, false);
+}
+
+static esp_err_t cleanup_op_uart_delete(void *ctx)
+{
+    pogo_port_ctx_t *p = (pogo_port_ctx_t *)ctx;
+    return uart_driver_delete((uart_port_t)p->cfg.uart_num);
 }
 
 static bool base_id_present(const pogo_port_ctx_t *p)
@@ -532,6 +582,16 @@ esp_err_t pogo_port_init(pogo_port_id_t id, const pogo_port_config_t *cfg, pogo_
     return ESP_OK;
 }
 
+/*
+ * Every ESP-IDF/FreeRTOS call below has its return value checked (code
+ * review follow-up section 6). On ANY failure, everything already set up in
+ * THIS call is unwound in reverse order (the `fail`/`fail_no_uart` labels)
+ * before returning -- so a caller that fixes whatever failed and calls
+ * pogo_port_enable() again always starts from a clean, fully-DISABLED
+ * state, never a half-initialized one (DETECT_OUT released, any installed
+ * ISR handler removed, the UART driver removed, no task left running,
+ * `enabled` left false).
+ */
 esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
 {
     if (id >= POGO_PORT_ID_COUNT || !s_ports[id].inited) {
@@ -541,7 +601,11 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
     if (!p->cfg.enabled) {
         return ESP_ERR_NOT_SUPPORTED; /* logical port not wired on this board */
     }
+    if (p->enabled) {
+        return ESP_ERR_INVALID_STATE; /* already enabled -- call pogo_port_disable() first */
+    }
     p->own_peer_type = own_peer_type;
+    bool isr_added = false;
 
     uart_config_t uart_cfg = {
         .baud_rate = p->cfg.baud_rate,
@@ -554,7 +618,7 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
     esp_err_t err = uart_driver_install((uart_port_t)p->cfg.uart_num, 512, 512, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "port %d: uart_driver_install failed: %s", id, esp_err_to_name(err));
-        return err;
+        goto fail_no_uart;
     }
     err = uart_param_config((uart_port_t)p->cfg.uart_num, &uart_cfg);
     if (err == ESP_OK) {
@@ -563,7 +627,7 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "port %d: UART config failed: %s", id, esp_err_to_name(err));
-        return err;
+        goto fail;
     }
 
     if (p->cfg.detect_out_gpio >= 0) {
@@ -574,8 +638,19 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        gpio_config(&out_cfg);
-        set_detect_out(p, true); /* announce presence: drive Low */
+        err = gpio_config(&out_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "port %d: DETECT_OUT gpio_config failed: %s", id, esp_err_to_name(err));
+            goto fail;
+        }
+        err = set_detect_out(p, true); /* announce presence: drive Low */
+        if (err != ESP_OK) {
+            /* Do NOT return success with DETECT_OUT left unasserted -- a
+             * peer would never see "I am here" even though pogo_port_enable()
+             * claimed to have brought the port up. */
+            ESP_LOGE(TAG, "port %d: failed to assert DETECT_OUT during enable: %s", id, esp_err_to_name(err));
+            goto fail;
+        }
     }
 
     if (p->cfg.base_id_gpio >= 0) {
@@ -586,7 +661,11 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
-        gpio_config(&base_cfg);
+        err = gpio_config(&base_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "port %d: BASE_ID gpio_config failed: %s", id, esp_err_to_name(err));
+            goto fail;
+        }
     }
 
     if (p->cfg.detect_in_gpio >= 0) {
@@ -597,24 +676,40 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_ANYEDGE,
         };
-        gpio_config(&in_cfg);
+        err = gpio_config(&in_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "port %d: DETECT_IN gpio_config failed: %s", id, esp_err_to_name(err));
+            goto fail;
+        }
 
         if (!s_isr_service_installed) {
             esp_err_t isr_err = gpio_install_isr_service(GPIO_ISR_FLAGS);
             if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
                 ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(isr_err));
-                return isr_err;
+                err = isr_err;
+                goto fail;
             }
             s_isr_service_installed = true;
         }
-        gpio_isr_handler_add((gpio_num_t)p->cfg.detect_in_gpio, detect_isr_handler, p);
+        err = gpio_isr_handler_add((gpio_num_t)p->cfg.detect_in_gpio, detect_isr_handler, p);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "port %d: gpio_isr_handler_add failed: %s", id, esp_err_to_name(err));
+            goto fail;
+        }
+        isr_added = true;
 
         /* Seed the debounce state from whatever DETECT_IN reads right now,
          * so an already-docked module is detected on enable, not only on
-         * the next edge. */
+         * the next edge. A dropped seed is non-fatal (a fresh queue should
+         * never actually be full) -- the port simply picks up the real
+         * level on the next genuine edge instead; logged, not unwound. */
         detect_edge_evt_t seed = {.tick = xTaskGetTickCount(),
                                    .level = gpio_get_level((gpio_num_t)p->cfg.detect_in_gpio)};
-        xQueueSend(p->detect_queue, &seed, 0);
+        if (xQueueSend(p->detect_queue, &seed, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "port %d: failed to seed initial DETECT_IN level (queue full?) -- will pick up the "
+                          "next edge instead",
+                     id);
+        }
     }
 
     char name[16];
@@ -622,11 +717,59 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type)
     p->state = PORT_STATE_DISABLED; /* port_task moves this forward on entry */
     BaseType_t ok = xTaskCreate(port_task, name, PORT_TASK_STACK, p, PORT_TASK_PRIO, &p->task);
     if (ok != pdPASS) {
-        return ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "port %d: xTaskCreate failed", id);
+        err = ESP_ERR_NO_MEM;
+        p->task = NULL;
+        goto fail;
     }
+
+    p->enabled = true;
     return ESP_OK;
+
+fail: {
+    /* Preserve the ORIGINAL failure (`err`, already set above) as the
+     * function's return value even if cleanup itself also fails -- a
+     * cleanup failure is logged, never allowed to overwrite or hide what
+     * actually caused pogo_port_enable() to fail in the first place. Every
+     * requested step is still attempted (pogo_port_run_cleanup_ops()'s own
+     * contract) -- e.g. a failing DETECT_OUT release must not skip the UART
+     * teardown that follows it. */
+    esp_err_t original_err = err;
+    esp_err_t cleanup_err =
+        pogo_port_run_cleanup_ops(isr_added, cleanup_op_isr_remove, cleanup_op_detect_release,
+                                   /* uart_driver_install() always succeeded by the time any `goto fail;` above is
+                                    * reached (the only path that skips this is `fail_no_uart:`, taken directly on
+                                    * uart_driver_install()'s own failure) -- so a UART delete is always in order here. */
+                                   true, cleanup_op_uart_delete, p);
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGE(TAG, "port %d: cleanup after enable() failure ALSO failed: %s (original failure preserved: %s)", id,
+                 esp_err_to_name(cleanup_err), esp_err_to_name(original_err));
+    }
+    err = original_err;
+}
+fail_no_uart:
+    p->task = NULL;
+    p->state = PORT_STATE_DISABLED;
+    p->enabled = false;
+    return err;
 }
 
+/*
+ * Idempotent: a second (or Nth) call while already disabled (or never
+ * enabled) is a safe no-op that still leaves DETECT_OUT released -- it does
+ * not re-run vTaskDelete/gpio_isr_handler_remove/uart_driver_delete against
+ * resources that were already torn down (which the underlying ESP-IDF
+ * drivers would otherwise just log an error for, but this avoids that noise
+ * and keeps the "safe to call repeatedly" contract explicit rather than
+ * incidental).
+ *
+ * Returns the FIRST error encountered among ISR removal / DETECT_OUT
+ * release / UART deletion (ESP_OK if all succeeded) -- but every one of
+ * those steps is still attempted regardless of an earlier failure, via the
+ * same pogo_port_run_cleanup_ops() policy pogo_port_enable()'s
+ * failure-unwind path uses (see that function and
+ * tools/test_pogo_port_cleanup_ops.c).
+ */
 esp_err_t pogo_port_disable(pogo_port_id_t id)
 {
     if (id >= POGO_PORT_ID_COUNT || !s_ports[id].inited) {
@@ -634,18 +777,32 @@ esp_err_t pogo_port_disable(pogo_port_id_t id)
     }
     pogo_port_ctx_t *p = &s_ports[id];
 
+    if (!p->enabled) {
+        /* Always ensure DETECT_OUT is released, even if enable() was never
+         * called -- still reported (not silently swallowed) even in this
+         * already-disabled shortcut path. */
+        esp_err_t err = set_detect_out(p, false);
+        p->state = PORT_STATE_DISABLED;
+        p->peer_type = POGO_PEER_TYPE_UNKNOWN;
+        return err;
+    }
+
     if (p->task != NULL) {
         vTaskDelete(p->task);
         p->task = NULL;
     }
-    if (p->cfg.detect_in_gpio >= 0) {
-        gpio_isr_handler_remove((gpio_num_t)p->cfg.detect_in_gpio);
+
+    esp_err_t err = pogo_port_run_cleanup_ops(p->cfg.detect_in_gpio >= 0, cleanup_op_isr_remove,
+                                               cleanup_op_detect_release, true, cleanup_op_uart_delete, p);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "port %d: pogo_port_disable() cleanup encountered an error (first: %s) -- every cleanup step "
+                      "was still attempted",
+                 id, esp_err_to_name(err));
     }
-    set_detect_out(p, false); /* release to High-Z */
-    uart_driver_delete((uart_port_t)p->cfg.uart_num);
     p->state = PORT_STATE_DISABLED;
     p->peer_type = POGO_PEER_TYPE_UNKNOWN;
-    return ESP_OK;
+    p->enabled = false;
+    return err;
 }
 
 bool pogo_port_is_attached(pogo_port_id_t id)

@@ -1,5 +1,13 @@
 # Module config
 
+**This document covers `module/`'s `module_config` (the sensor-pairing
+config). The dedicated power-base project (`power_base/`) has its own,
+separate, much smaller `power_base_config` (no sensor fields at all) -- see
+[power-base.md](power-base.md) section 14 for its schema and
+`tools/pack_power_base_config.py` for its generator. It reuses this
+document's `gpio_profile.c` GPIO-usability policy directly rather than
+duplicating it.**
+
 ## Fixed vs. dynamic, and why they're in separate NVS partitions
 
 | Fixed (this document)                          | Dynamic (`role_manager`/`child_service`/`parent_service`/OpenThread) |

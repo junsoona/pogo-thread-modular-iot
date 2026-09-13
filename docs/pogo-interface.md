@@ -1,5 +1,14 @@
 # POGO interface
 
+**A dedicated power-base project now exists and is the system's one and
+only ROOT/Leader -- see [power-base.md](power-base.md).** The
+ROOT/INTERMEDIATE/LEAF determination table below has been updated
+accordingly (an AUTO-mode sensor module never becomes ROOT any more); the
+rest of this document (POGO frame/port mechanics, BASE_ID/DETECT_IN/DETECT_OUT
+electrical contract, the confirmed GPIO profile, dev-compat mode) is
+unchanged and still applies identically to the power base's own one POGO
+port.
+
 ## Final hardware: two physical ports, six signal pins each
 
 ```
@@ -45,7 +54,14 @@ only the numbers in `module_config`.
 
 Read (not driven) on the UPSTREAM port only. Active-low: a power base drives
 it Low; a normal module does not drive it at all (external pull-up keeps it
-High). `pogo_port` cross-checks this hardware read against the peer's
+High). **On the real power-base hardware (see [power-base.md](power-base.md)),
+"a power base drives it Low" means a GND contact on the power base's
+connector -- there is no BASE_ID GPIO on the power base's own ESP32-H2 at
+all; its firmware never configures or reads one.** GPIO2 (the module's
+DETECT_IN) and GPIO14 (the module's BASE_ID) are two different signals with
+two different local pull-ups -- never tie them together, and never wire
+either one directly to GND on the module side (only the power base's BASE_ID
+contact is GND). `pogo_port` cross-checks this hardware read against the peer's
 declared `peer_type` (from `HELLO_REQ`/`HELLO_RESP`, see below):
 
 - both agree -> `POGO_PORT_EVENT_PEER_READY`.
@@ -96,20 +112,41 @@ frame; they only ever see `POGO_PORT_EVENT_PEER_READY` and, from then on,
 so replacing it with this REQ/RESP pair is purely additive to the
 regression baseline.
 
-## ROOT / INTERMEDIATE / LEAF determination table
+## ROOT / INTERMEDIATE / LEAF determination table (updated -- see docs/power-base.md)
+
+**A dedicated power-base project (`power_base/`) now exists and is the
+system's one and only Thread ROOT/Leader.** A sensor module in AUTO mode
+never becomes ROOT any more, regardless of what its UPSTREAM peer is -- see
+[power-base.md](power-base.md) for the full rationale, wiring, and the fix
+this required in `role_manager.c`. The table below is current:
 
 | UPSTREAM peer | DOWNSTREAM peer     | Role          |
 |---------------|----------------------|---------------|
-| POWER_BASE    | (irrelevant)         | ROOT          |
-| MODULE        | MODULE               | INTERMEDIATE  |
-| MODULE        | none attached        | LEAF          |
+| POWER_BASE or MODULE | none attached | LEAF          |
+| POWER_BASE or MODULE | MODULE        | INTERMEDIATE  |
 | not attached / unknown | (any)       | UNASSIGNED    |
 | either port ERROR       | (any)      | ROLE_ERROR    |
+
+`MODULE_ROLE_ROOT` still exists as an enum value but is reachable ONLY via
+`MODULE_DEV_MODE_DEV_ROOT` (forced directly, bypassing this table entirely --
+see "development compat mode" below), never through AUTO-mode port-event
+derivation.
 
 See `components/role_manager/role_manager.c`'s `recompute()` for the exact
 (deterministic, order-sensitive) implementation, and
 [state-machine.md](state-machine.md) for how a role change propagates into
 `thread_manager`.
+
+**The "ROOT용 passive power-base 시험 지그" bench rig described in earlier
+revisions of this document and of `README.md` (BASE_ID tied directly to GND,
+no MCU on the other end, making a MODULE become ROOT) is now obsolete.** A
+module whose BASE_ID reads POWER_BASE is LEAF/INTERMEDIATE, never ROOT --
+the same table row as any other UPSTREAM peer. To actually test AUTO-mode
+BASE_ID/PEER_HELLO behavior end to end now requires either a real
+`power_base/` board, or `power_base/`'s host-tested mirror logic (see
+`tools/test_power_base_peer_hello.c`); a bare GND jig with no MCU no longer
+demonstrates a meaningfully different code path than the one already
+exercised by module-to-module docking.
 
 ## Confirmed GPIO profile (final prototype hardware)
 

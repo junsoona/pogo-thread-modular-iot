@@ -1,5 +1,14 @@
 # Architecture
 
+**A dedicated power-base project (`power_base/`) now exists and is the
+system's one and only Thread ROOT/Leader -- see [power-base.md](power-base.md)
+for its full architecture, boot sequence, and component reuse table.** This
+document's component map/boot sequence below describe `module/` (the sensor
+module firmware) specifically; `power_base/` is a separate ESP-IDF
+project/binary that reuses `pogo_port`/`pogo_proto`/`thread_manager`/
+`parent_service`/`sensor_channel` unmodified and never runs
+`role_manager`/`child_service`/`sensor_provider`/`sensor_service` at all.
+
 ## Why this refactor exists
 
 The original two-project MVP (`upper/`, `lower/`) proved the vertical slice
@@ -79,11 +88,69 @@ components/
   parent_service/              Owns the DOWNSTREAM port only. Drives the
                               full provisioning sequence toward a docked
                               child: IDENTIFY -> UUID/slot(+depth) ->
-                              SENSOR_HELLO -> computed POLL_CONFIG -> Active
-                              Dataset TLV -> JOIN_RESULT. Holds the per-child
-                              node record and the polling-period/backoff
-                              calculations (pure, boundary-tested -- see
-                              tools/test_polling_calc.c).
+                              ASSIGN_PARENT_INFO -> SENSOR_HELLO -> computed
+                              POLL_CONFIG -> Active Dataset TLV -> JOIN_RESULT.
+                              Holds the per-child node record and the
+                              polling-period/backoff calculations (pure,
+                              boundary-tested -- see tools/test_polling_calc.c).
+                              Reused UNMODIFIED by power_base/ (see
+                              power-base.md): it takes a small
+                              parent_service_context_t at init instead of
+                              reaching into role_manager/child_service
+                              directly, so the same component serves both "a
+                              sensor module that is ROOT/INTERMEDIATE" and
+                              "the dedicated power base".
+
+  topology_proto/              Fixed-length, versioned binary wire format for
+                              topology reports (a module's role/parent/depth/
+                              connection state), sent over Thread CoAP --
+                              separate from pogo_proto (POGO) and
+                              sensor_channel (sensor samples). No ESP-IDF
+                              dependency. See power-base.md section 9.
+
+  topology_registry/           Power base's pure, dependency-free, RAM-only,
+                              UUID-keyed topology table: validates and
+                              applies topology reports (self-parent/cycle/
+                              depth-jump/stale-session/duplicate-sequence
+                              rejection), and handles direct- and
+                              intermediate-downstream-detach subtree
+                              offlining plus stale-timeout sweeping. See
+                              power-base.md section 10 and
+                              tools/test_topology_registry.c.
+
+  topology_reporter/            Module-side sender: reports this module's own
+                              role/parent/depth/connection state to the power
+                              base's "/t" CoAP resource (ATTACHED/UPDATED/
+                              DETACHED/HEARTBEAT), with the same bounded
+                              UUID-hash backoff sensor_transport already
+                              uses. Polls role_manager rather than hooking
+                              its role-change callback -- see that
+                              component's own header comment for why.
+
+  sensor_root_aggregator/       The bounded, mutex-protected,
+                              (module_uuid,sample_seq)-deduplicating sample
+                              store, extracted out of sensor_service so
+                              power_base_transport can use the exact same
+                              logic with no sensor driver dependency at all
+                              (the power base has no sensor of its own).
+                              sensor_service's own public
+                              sensor_service_root_*() functions are now thin
+                              wrappers around this component, unchanged in
+                              behavior/signature.
+
+  power_base_config/            power_base/'s analogue of module_config --
+                              its own small, independent fixed-config NVS
+                              blob (no sensor fields at all), reusing
+                              module_config/gpio_profile.h's ESP32-H2 GPIO
+                              policy and pogo_proto/pogo_crc16.h's CRC16
+                              integrity scheme rather than duplicating either.
+
+  power_base_transport/         power_base/'s Thread CoAP receiving side:
+                              registers "/s" (sensor data, reusing
+                              sensor_channel unmodified) and "/t" (topology
+                              reports), owns the topology_registry instance
+                              and its mutex, cross-checks a sensor sample's
+                              UUID against the registry before storing it.
 
   module_config/               Loads+validates the fixed sensor/board pairing
                               from the "cfg" NVS partition, including the
@@ -202,8 +269,13 @@ upper/, lower/                Preserved reference projects (regression
 9. `child_service_init()` / `parent_service_init()` -- always both; each only
    ever acts on its own port's events, so nothing special is needed for
    "this board doesn't have a DOWNSTREAM peer" -- parent_service simply never
-   sees a DOWNSTREAM PEER_READY.
-10. `pogo_port_enable()` x2 -- but only for a port `module_config` actually
+   sees a DOWNSTREAM PEER_READY. `parent_service_init()` here passes a
+   context wired to role_manager/child_service/sensor_service (see
+   power-base.md section 7 -- power_base/'s own app_main.c wires a
+   completely different context to the same component).
+10. `topology_reporter_init()` -- starts reporting this module's state to the
+   power base over Thread CoAP ("/t"); see power-base.md section 9.
+11. `pogo_port_enable()` x2 -- but only for a port `module_config` actually
    marks `enabled` (i.e. its `uart_num >= 0`). A dev-compat image disables
    one of the two entirely.
 

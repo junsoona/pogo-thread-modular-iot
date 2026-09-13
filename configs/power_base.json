@@ -1,0 +1,23 @@
+{
+  "_comment": "Fixed config for the dedicated power-base project (power_base/, NOT module/) -- see docs/power-base.md. The power base's one physical POGO port is electrically identical to a sensor module's DOWNSTREAM port (same GPIO numbers as module/'s confirmed profile: UART1, GPIO10/11, DETECT_OUT=22, DETECT_IN=23) -- it connects to the first sensor module's UPSTREAM port. BASE_ID is a GND contact on the power-base connector itself, not a GPIO on this board -- there is no base_id field here at all (see docs/pogo-interface.md's BASE_ID section and docs/power-base.md's wiring table).",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_downstream_comment": "Same UART1/GPIO10-11/DETECT pins as module/'s confirmed DOWNSTREAM profile -- this is what makes the power base electrically a drop-in replacement for 'the module that would otherwise be ROOT'.",
+  "downstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": 23, "detect_out_gpio": 22,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_timeout_comment": "ack_timeout_ms=0 means parent_service uses its own CONFIG_POGO_ACK_TIMEOUT_MS Kconfig default (same value module/ uses) -- set a nonzero value here only if the power base's own POGO handshake genuinely needs a different timeout than a sensor module's. heartbeat_timeout_ms must stay comfortably larger than topology_reporter's own CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS Kconfig default (30000ms) so ordinary jitter is never mistaken for a real detach.",
+  "ack_timeout_ms": 0,
+  "topology_stale_timeout_ms": 120000,
+  "heartbeat_timeout_ms": 90000,
+
+  "_power_comment": "No power-switching GPIO has been decided on current hardware -- -1 means the 5V rail is assumed always-on; this firmware never claims to be able to cut real 5V power (see docs/power-base.md's safety notes on USB+5V co-connection).",
+  "power_enable_gpio": -1,
+  "power_enable_active_high": true,
+  "power_startup_delay_ms": 0
+}

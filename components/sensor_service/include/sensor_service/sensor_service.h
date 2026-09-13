@@ -111,19 +111,18 @@ typedef void (*sensor_service_sample_ready_cb_t)(const sensor_sample_t *sample);
 void sensor_service_set_sample_ready_cb(sensor_service_sample_ready_cb_t cb);
 
 /* --- ROOT-side local aggregator (also fed by sensor_transport's CoAP
- * resource handler for samples received from INTERMEDIATE/LEAF modules) --- */
+ * resource handler for samples received from INTERMEDIATE/LEAF modules) ---
+ *
+ * The actual storage/dedup logic now lives in sensor_root_aggregator (see
+ * that component's header for why: power_base_transport needs the exact
+ * same logic with no sensor driver at all). Everything below is a thin,
+ * behavior-preserving wrapper -- every existing caller (module/main/
+ * app_main.c, sensor_transport.c) keeps using these exact names/signatures. */
+#include "sensor_root_aggregator/sensor_root_aggregator.h"
 
-#define SENSOR_SERVICE_MAX_NODES 16
+#define SENSOR_SERVICE_MAX_NODES SENSOR_ROOT_AGGREGATOR_MAX_NODES
 
-typedef struct {
-    bool     valid;
-    uint8_t  module_uuid[SENSOR_SERVICE_UUID_LEN];
-    bool     has_sample;
-    uint32_t last_sample_seq;
-    int64_t  last_seen_us; /* esp_timer_get_time() timestamp of the last accepted sample */
-    uint32_t error_count;
-    sensor_sample_t last_sample;
-} sensor_service_node_record_t;
+typedef sensor_root_aggregator_node_t sensor_service_node_record_t;
 
 /*
  * Records one sample (this module's own, if ROOT, or one relayed up over

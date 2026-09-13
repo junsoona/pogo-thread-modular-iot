@@ -1,5 +1,11 @@
 # State machines
 
+**See [power-base.md](power-base.md) for the dedicated power-base project's
+own boot sequence and its (unmodified) reuse of `parent_service`.** The
+sequences below describe `module/`'s state machines; `role_manager`'s
+determination has been updated so a sensor module never reaches ROOT in AUTO
+mode any more (see that section below).
+
 ## pogo_port (per instance -- UPSTREAM and DOWNSTREAM are fully independent)
 
 ```
@@ -85,16 +91,25 @@ peer while the wire says something is connected).
 
 ## role_manager (AUTO dev_mode; forced modes just report ROOT/LEAF once)
 
+**Updated by the power-base follow-up: a sensor module in AUTO mode never
+becomes ROOT any more, regardless of what its UPSTREAM peer is -- the
+dedicated power base is the system's one and only ROOT/Leader. See
+[power-base.md](power-base.md).**
+
 Recomputed on every `ATTACHED`/`DETACHED`/`PEER_READY`/`ERROR` event from
 either port (see the determination table in pogo-interface.md):
 
 ```
-UNASSIGNED  <-> ROOT            (UPSTREAM peer becomes/stops being POWER_BASE)
-UNASSIGNED  <-> LEAF            (UPSTREAM peer is MODULE, DOWNSTREAM empty)
+UNASSIGNED  <-> LEAF            (UPSTREAM peer is POWER_BASE or MODULE, DOWNSTREAM empty)
 LEAF        <-> INTERMEDIATE    (a MODULE docks/undocks DOWNSTREAM while
-                                  UPSTREAM stays MODULE)
+                                  UPSTREAM stays POWER_BASE or MODULE)
 (any)       ->  ROLE_ERROR      (either port reports ERROR)
 ```
+
+`MODULE_ROLE_ROOT` is reachable only via the forced `MODULE_DEV_MODE_DEV_ROOT`
+override (`role_manager_init()` sets it directly and `recompute()` is never
+called at all while forced -- see `s_forced` in role_manager.c), never
+through this AUTO-mode state diagram.
 
 A DOWNSTREAM module docking before this module's own UPSTREAM role/dataset
 are settled does **not** immediately start provisioning: `parent_service`
@@ -129,7 +144,11 @@ READY -> IDENTIFIED (IDENTIFY_REQ answered; a later re-IDENTIFY is answered
                       again without changing state -- harmless, no side effect)
 IDENTIFIED -> UUID_ASSIGNED (ASSIGN_UUID)
 UUID_ASSIGNED -> SLOT_ASSIGNED (ASSIGN_SLOT)
-SLOT_ASSIGNED -> SENSOR_DONE (SENSOR_HELLO -> sensor_provider measurement -> SENSOR_INFO_ACK)
+SLOT_ASSIGNED -> PARENT_INFO_SET (ASSIGN_PARENT_INFO -- power-base follow-up
+                      section 7: "부모 UUID 전달"; the parent's own uuid +
+                      whether it is the power base, see
+                      child_service_get_parent_uuid()/_get_parent_is_power_base())
+PARENT_INFO_SET -> SENSOR_DONE (SENSOR_HELLO -> sensor_provider measurement -> SENSOR_INFO_ACK)
 SENSOR_DONE -> POLL_SET (POLL_CONFIG range-checked, then acked)
 POLL_SET -> JOINING (SET_DATASET validated via otDatasetIsValid(), durably
                       saved via save_dynamic_record(), acked, THEN
@@ -203,6 +222,8 @@ fact that storage failed.
 1. IDENTIFY_REQ -> IDENTIFY_RESP
 2. ASSIGN_UUID (random 8 bytes) -> ACK/NACK
 3. ASSIGN_SLOT (slot_id=0, topology_depth=own_depth+1) -> ACK/NACK
+3.5. ASSIGN_PARENT_INFO (this parent's own uuid + is_power_base) -> ACK/NACK
+     -- power-base follow-up section 7, see power-base.md
 4. SENSOR_HELLO -> SENSOR_INFO_ACK (response_time_ms measured by the CHILD's
                     own sensor_provider) or NACK(SENSOR_ERROR)
 5. compute polling_period_ms = f(response_time_ms)  (see below)
@@ -210,6 +231,13 @@ fact that storage failed.
 6. SET_DATASET (this module's own Active Dataset TLVs) -> ACK/NACK
 7. wait for (unsolicited) JOIN_RESULT, up to CONFIG_POGO_JOIN_TIMEOUT_MS
 ```
+
+`own_depth` above comes from `parent_service_context_t.get_own_depth()`, not
+from reaching into `role_manager`/`child_service` directly any more -- 0 for
+the true network root (the power base itself, or the `MODULE_DEV_MODE_DEV_ROOT`
+fixture), or `child_service_get_own_topology_depth()` for an INTERMEDIATE
+module. See power-base.md section 7 for why this indirection exists (the
+SAME `parent_service` component is reused, unmodified, by `power_base/`).
 
 Any step's `send_and_wait()` retries up to `CONFIG_POGO_MAX_RETRY` times
 *with the same seq* (so the child's dedup table recognizes a retransmit).

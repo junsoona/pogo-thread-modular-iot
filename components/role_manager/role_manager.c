@@ -62,11 +62,19 @@ static void recompute(void)
         set_role(MODULE_ROLE_UNASSIGNED);
         return;
     }
-    if (s_up.peer_type == POGO_PEER_TYPE_POWER_BASE) {
-        set_role(MODULE_ROLE_ROOT);
-        return;
-    }
-    /* s_up.peer_type == POGO_PEER_TYPE_MODULE from here on. */
+    /*
+     * Power-base follow-up spec, section 2: an AUTO-mode sensor module NEVER
+     * becomes ROOT -- the dedicated power base is the system's one and only
+     * ROOT/Leader (see docs/power-base.md). Whether the UPSTREAM peer is the
+     * power base or another sensor module, this module's own role is always
+     * LEAF/INTERMEDIATE, decided purely by its own DOWNSTREAM state -- see
+     * the determination table in docs/pogo-interface.md. (An earlier
+     * revision of this refactor -- before the power base existed -- treated
+     * UPSTREAM peer_type==POWER_BASE as this module becoming ROOT itself;
+     * that is exactly what this follow-up supersedes. MODULE_ROLE_ROOT is
+     * kept only for the MODULE_DEV_MODE_DEV_ROOT forced-role regression
+     * fixture, which bypasses this function entirely -- see s_forced above.)
+     */
     if (!s_down.attached) {
         set_role(MODULE_ROLE_LEAF);
         return;

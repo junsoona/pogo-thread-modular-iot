@@ -1,0 +1,15 @@
+menu "Topology Reporter"
+
+    config TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS
+        int "Topology heartbeat report interval (ms)"
+        default 30000
+        help
+            While attached (role_manager_is_upstream_ready() and role is
+            LEAF or INTERMEDIATE) with nothing else to report, send a
+            TOPOLOGY_REPORT_HEARTBEAT this often. Should be comfortably
+            shorter than the power base's own configured
+            heartbeat_timeout_ms/topology_stale_timeout_ms (see
+            power_base_config.h and configs/power_base.json) so a
+            momentarily-delayed report is not mistaken for a real detach.
+
+endmenu
