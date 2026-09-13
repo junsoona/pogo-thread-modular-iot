@@ -64,7 +64,19 @@ typedef struct {
 } dedup_entry_t;
 
 static QueueHandle_t s_evt_queue;
-static const module_config_t *s_cfg;
+/*
+ * Owned copy, not a pointer into the caller's storage: child_service_init()
+ * is called with the address of a LOCAL module_config_t in
+ * module/main/app_main.c's app_main(), which goes out of scope once
+ * app_main() returns. Storing that pointer directly (the original bug) left
+ * every later s_cfg-> read dereferencing a stale stack address -- reusable
+ * by whatever function's frame happened to land there next -- which is why
+ * IDENTIFY_RESP's sensor_bitmap and handle_sensor_hello()'s measurement
+ * timeout read back as garbage instead of the configured values. Copying
+ * the whole struct by value here means its lifetime is this component's own
+ * static storage duration, independent of the caller's.
+ */
+static module_config_t s_cfg;
 static const sensor_provider_ops_t *s_sensor_ops;
 static sensor_provider_ctx_t *s_sensor_ctx;
 
@@ -119,15 +131,53 @@ static void dedup_remember(int idx, uint8_t seq, uint8_t resp_type, const uint8_
     memcpy(s_dedup[idx].resp_payload, resp_payload, resp_len);
 }
 
-static void reset_session(void)
+/* Clears every per-session temporary -- dedup cache, uuid, slot/depth,
+ * polling_period, staged (not-yet-joined) dataset, join deadline -- without
+ * touching s_state or role_manager's upstream_ready. Shared by
+ * reset_session() (ATTACHED/DETACHED: goes to WAIT_PEER) and
+ * begin_new_provisioning_session() (PEER_READY / a restarting IDENTIFY_REQ:
+ * goes straight to READY or IDENTIFIED, see below). */
+static void clear_provisioning_temporaries(void)
 {
-    s_state = CS_STATE_WAIT_PEER;
     memset(s_dedup, 0, sizeof(s_dedup));
     memset(s_uuid, 0, sizeof(s_uuid));
     s_slot_id = s_topology_depth = 0;
     s_polling_period_ms = 0;
     s_dataset_len = 0;
     s_join_deadline = 0;
+}
+
+static void reset_session(void)
+{
+    s_state = CS_STATE_WAIT_PEER;
+    clear_provisioning_temporaries();
+}
+
+/*
+ * Starts a brand new provisioning session, discarding anything left over
+ * from a previous one -- successful (JOINED), half-finished, or CS_STATE_ERROR
+ * -- instead of getting stuck in ERROR forever or resuming with stale
+ * uuid/slot/dataset. upstream_ready drops back to false until the new
+ * session reaches JOINED again (a stale "ready" must not outlive the session
+ * that produced it).
+ *
+ * Two call sites need this, both from the unified module role manager fix:
+ *   - POGO_PORT_EVENT_PEER_READY: covers a dev-mode handshake retry that
+ *     reaches PEER_READY again after POGO_PORT_EVENT_ERROR left s_state in
+ *     CS_STATE_ERROR (the old code only left CS_STATE_WAIT_PEER on this
+ *     transition, so a retry after ERROR never became READY and every
+ *     later request in the sequence NACKed with BAD_STATE).
+ *   - A new IDENTIFY_REQ arriving while already past CS_STATE_IDENTIFIED --
+ *     see handle_identify_req(): the ROOT side rebooting alone does not
+ *     make THIS side's own PEER_READY re-fire (pogo_port on this side never
+ *     saw a detach), so the new IDENTIFY_REQ is the only signal available
+ *     that the parent discarded its old session and started over.
+ */
+static void begin_new_provisioning_session(cs_state_t next_state)
+{
+    clear_provisioning_temporaries();
+    role_manager_set_upstream_ready(false);
+    s_state = next_state;
 }
 
 /*
@@ -183,19 +233,52 @@ static void send_join_result(bool success, otDeviceRole role)
 
 static void handle_identify_req(const pogo_frame_t *frame)
 {
+    /* esp_efuse_mac_get_default() always writes a full 8-byte EUI-64 on a
+     * chip with IEEE 802.15.4 support (ESP32-H2) -- it takes a bare
+     * uint8_t* with no length parameter, so it trusts the caller for the
+     * buffer size. Read into a proper 8-byte scratch buffer, not directly
+     * into resp.mac (6 bytes): the old code overran resp.mac by 2 bytes,
+     * corrupting whatever followed it on the stack (resp.fw_version /
+     * resp.sensor_bitmap), which is why sensor_bitmap in the IDENTIFY log
+     * changed on every boot instead of reading the configured 0x01.
+     */
+    uint8_t mac8[8];
+    esp_err_t mac_err = esp_efuse_mac_get_default(mac8);
+    if (mac_err != ESP_OK) {
+        ESP_LOGE(TAG, "IDENTIFY_REQ: esp_efuse_mac_get_default failed: %s -- not sending an uninitialized identity",
+                 esp_err_to_name(mac_err));
+        return; /* No IDENTIFY_RESP at all; the parent's own retry/timeout re-requests. */
+    }
+
     pogo_identify_resp_t resp = {0};
-    esp_efuse_mac_get_default(resp.mac);
+    /* Wire field is only 6 bytes and is informational only (not used to key
+     * any state) -- explicitly take the first 6 of the 8 EUI-64 bytes
+     * rather than widening the protocol field. */
+    memcpy(resp.mac, mac8, sizeof(resp.mac));
     resp.fw_version = CHILD_FW_VERSION;
-    resp.sensor_bitmap = (uint8_t)(s_cfg->sensor_type_bitmap & 0xFF);
+    resp.sensor_bitmap = (uint8_t)(s_cfg.sensor_type_bitmap & 0xFF);
     uint8_t payload[8];
     size_t len = pogo_pack_identify_resp(&resp, payload, sizeof(payload));
     pogo_port_send(POGO_PORT_UPSTREAM, POGO_MSG_IDENTIFY_RESP, frame->seq, payload, len);
+
     if (s_state == CS_STATE_READY) {
         s_state = CS_STATE_IDENTIFIED;
+    } else if (s_state >= CS_STATE_UUID_ASSIGNED) {
+        /* Past IDENTIFIED already (UUID_ASSIGNED..JOINED, or ERROR from an
+         * earlier failed attempt): a new IDENTIFY_REQ here means the parent
+         * itself restarted provisioning from scratch (e.g. ROOT rebooted
+         * while this LEAF's own PEER_READY never re-fired -- see
+         * begin_new_provisioning_session()'s doc comment). Discard the old
+         * session's uuid/slot/dataset instead of leaving them stale, or
+         * every following ASSIGN_UUID/etc. from the new session NACKs with
+         * BAD_STATE. */
+        ESP_LOGI(TAG, "IDENTIFY_REQ while state=%d -- parent restarted, beginning a new provisioning session",
+                 (int)s_state);
+        begin_new_provisioning_session(CS_STATE_IDENTIFIED);
     }
-    /* A later re-IDENTIFY (state already past IDENTIFIED) is harmless --
-     * no side effect to redo -- and intentionally still answered without
-     * regressing state or NACKing. */
+    /* else: s_state == CS_STATE_IDENTIFIED already -- no side effect to
+     * redo, and intentionally still answered without regressing state or
+     * NACKing. */
 }
 
 static void handle_assign_uuid(const pogo_frame_t *frame)
@@ -278,7 +361,7 @@ static void handle_sensor_hello(const pogo_frame_t *frame)
     esp_err_t err = s_sensor_ops->start_measurement(s_sensor_ctx);
     sensor_measurement_t meas = {0};
     if (err == ESP_OK) {
-        err = s_sensor_ops->read_measurement(s_sensor_ctx, &meas, pdMS_TO_TICKS(s_cfg->measurement_timeout_ms));
+        err = s_sensor_ops->read_measurement(s_sensor_ctx, &meas, pdMS_TO_TICKS(s_cfg.measurement_timeout_ms));
     }
 
     if (err == ESP_OK) {
@@ -476,9 +559,16 @@ static void child_service_task(void *arg)
             role_manager_set_upstream_ready(false);
             break;
         case POGO_PORT_EVENT_PEER_READY:
-            if (s_state == CS_STATE_WAIT_PEER) {
-                s_state = CS_STATE_READY;
-            }
+            /* Always starts a fresh provisioning session, regardless of the
+             * previous state -- not just from CS_STATE_WAIT_PEER. A
+             * dev-mode handshake retry (pogo_port.c auto-retries the
+             * handshake cycle after POGO_PORT_EVENT_ERROR in dev compat
+             * mode) reaches PEER_READY again with s_state left at
+             * CS_STATE_ERROR by the earlier POGO_PORT_EVENT_ERROR below; the
+             * old `== CS_STATE_WAIT_PEER` check silently ignored that
+             * PEER_READY, so s_state stayed ERROR and every subsequent
+             * IDENTIFY_REQ/ASSIGN_UUID kept NACKing BAD_STATE forever. */
+            begin_new_provisioning_session(CS_STATE_READY);
             break;
         case POGO_PORT_EVENT_FRAME_RECEIVED:
             handle_frame(&evt.data.frame);
@@ -493,13 +583,21 @@ static void child_service_task(void *arg)
 
 esp_err_t child_service_init(const module_config_t *cfg)
 {
-    s_cfg = cfg;
-    s_sensor_ops = sensor_provider_lookup(cfg->driver_id);
+    if (cfg == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_cfg = *cfg; /* owned copy -- see s_cfg's doc comment above */
+    s_sensor_ops = sensor_provider_lookup(s_cfg.driver_id);
     if (s_sensor_ops == NULL) {
-        ESP_LOGE(TAG, "CONFIG_ERROR: no sensor_provider for driver_id=%u", (unsigned)cfg->driver_id);
+        ESP_LOGE(TAG, "CONFIG_ERROR: no sensor_provider for driver_id=%u", (unsigned)s_cfg.driver_id);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    esp_err_t err = s_sensor_ops->init(cfg, &s_sensor_ctx);
+    /* &s_cfg, not cfg: the sensor_provider must not outlive its init() call
+     * holding a pointer into the caller's (possibly short-lived) storage
+     * either -- see mock_sensor_provider.c's mock_init(), which itself only
+     * copies the fields it needs and does not retain the pointer, but any
+     * future driver should be handed our stable copy regardless. */
+    esp_err_t err = s_sensor_ops->init(&s_cfg, &s_sensor_ctx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "sensor_provider '%s' init failed: %s", s_sensor_ops->name, esp_err_to_name(err));
         return err;

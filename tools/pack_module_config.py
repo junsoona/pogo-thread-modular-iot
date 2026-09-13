@@ -110,6 +110,60 @@ def find_nvs_partition_gen() -> str:
     return tool
 
 
+def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
+    """
+    Re-parses the just-generated NVS image and asserts module_cfg's "blob"
+    entry is exactly `expected_len` bytes on the wire -- a regression guard
+    for the CSV-row encoding bug where "blob,data,binary,<path>" (wrong)
+    stored the temp file *path string itself* as the blob's bytes instead of
+    "blob,file,binary,<path>" (correct), which reads the file at that path.
+    Both forms make nvs_partition_gen.py exit 0 -- pack_config()'s own
+    len(blob) == 90 assert never sees this, since it only checks the bytes
+    written to the temp file, not what actually ends up in the NVS image --
+    so this is the only check that would have caught it.
+
+    Reuses ESP-IDF's own nvs_partition_tool parser (same component that
+    ships nvs_partition_gen.py, already required on PATH via IDF_PATH)
+    rather than re-implementing the NVS binary format a second time.
+    """
+    idf_path = os.environ.get("IDF_PATH", "")
+    tool_dir = os.path.join(idf_path, "components", "nvs_flash", "nvs_partition_tool")
+    if not os.path.isdir(tool_dir):
+        sys.exit(f"cannot verify the generated image: nvs_partition_tool not found at {tool_dir}")
+    if tool_dir not in sys.path:
+        sys.path.insert(0, tool_dir)
+    import nvs_parser  # noqa: E402 -- IDF_PATH-dependent, must be imported at runtime
+
+    with open(image_path, "rb") as f:
+        raw = bytearray(f.read())
+    partition = nvs_parser.NVS_Partition(os.path.basename(image_path), raw)
+
+    namespace_id = None
+    blob_size = None
+    for page in partition.pages:
+        for entry in page.entries:
+            if entry.key == "module_cfg" and entry.metadata["namespace"] == 0 and entry.data:
+                namespace_id = entry.data.get("value")
+            elif (
+                entry.key == "blob"
+                and entry.data
+                and namespace_id is not None
+                and entry.metadata["namespace"] == namespace_id
+            ):
+                blob_size = entry.data.get("size")
+
+    if namespace_id is None:
+        sys.exit(f"verify_module_cfg_blob_len: 'module_cfg' namespace not found in {image_path}")
+    if blob_size is None:
+        sys.exit(f"verify_module_cfg_blob_len: module_cfg:blob entry not found in {image_path}")
+    if blob_size != expected_len:
+        sys.exit(
+            f"verify_module_cfg_blob_len: module_cfg:blob is {blob_size} bytes in {image_path}, "
+            f"expected {expected_len} -- check the CSV row uses 'blob,file,binary,<path>', "
+            f"not 'blob,data,binary,<path>' (see tools/pack_module_config.py)"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config_json", help="e.g. configs/dev_root.json")
@@ -155,7 +209,7 @@ def main():
         with open(csv_path, "w", encoding="utf-8") as f:
             f.write("key,type,encoding,value\n")
             f.write("module_cfg,namespace,,\n")
-            f.write(f"blob,data,binary,{blob_path}\n")
+            f.write(f"blob,file,binary,{blob_path}\n")
             f.write(f"crc,data,u16,{crc}\n")
             f.write("dev_cfg,namespace,,\n")
             f.write(f"dev_mode,data,u8,{dev_mode_val}\n")
@@ -168,8 +222,10 @@ def main():
             check=True,
         )
 
+    verify_module_cfg_blob_len(out_path, len(blob))
+
     print(f"wrote {args.output_bin} (dev_mode={dev_mode_name}, driver_id=0x{as_int(cfg['driver_id']):x}, "
-          f"blob_crc=0x{crc:04x})")
+          f"blob_crc=0x{crc:04x}, verified module_cfg:blob={len(blob)} bytes)")
 
 
 if __name__ == "__main__":
