@@ -1,0 +1,19 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+#
+# "nvs" holds only DYNAMIC state: OpenThread's own Active Dataset copy, the
+# UUID/slot/topology_depth/polling_period/parent-context this module received
+# as a child, and pairing session bookkeeping (see role_manager/child_service/
+# parent_service). It is erased/rewritten routinely as a module gets
+# re-docked in different positions.
+nvs,        data, nvs,      0x9000,  0x6000,
+phy_init,   data, phy,      0xf000,  0x1000,
+factory,    app,  factory,  0x10000, 1500K,
+#
+# "cfg" holds the FIXED ESP32-H2<->sensor pairing (module_config, namespace
+# "module_cfg") and, in a separate namespace ("dev_cfg"), the development
+# board override (see docs/module-config.md, docs/pogo-interface.md). It is
+# generated offline by tools/pack_module_config.py + the ESP-IDF NVS
+# partition generator from configs/*.json, and is treated as read-only by
+# the application at runtime.
+cfg,        data, nvs,      0x187000, 0x3000,

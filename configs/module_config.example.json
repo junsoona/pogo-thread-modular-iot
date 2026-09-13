@@ -1,0 +1,38 @@
+{
+  "_comment": "ILLUSTRATIVE TEMPLATE ONLY -- not generated, not flashed to any board. Shows the schema a real production module_config.json would follow once a real sensor driver, its GPIOs, and the final POGO port GPIOs are decided (explicitly out of scope for this refactor -- see section 9 of the implementation spec). Copy this file and fill in real values when that information exists; do not invent numbers here.",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_driver_id_comment": "Selects one compiled-in sensor_provider driver (see components/sensor_provider). 0 here is a placeholder that matches no registered driver on purpose -- module_config_load()/sensor_provider_lookup() will both correctly reject it as CONFIG_ERROR rather than silently accepting a fake driver id.",
+  "driver_id": 0,
+  "sensor_type_bitmap": 0,
+
+  "_bus_comment": "bus_type: 0=I2C, 1=SPI. GPIO numbers below are NOT final hardware pin assignments -- placeholders until the real PCB is routed.",
+  "bus_type": 0,
+  "bus_number": 0,
+  "i2c_sda_gpio": -1,
+  "i2c_scl_gpio": -1,
+  "i2c_address": 0,
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "calibration": [0, 0, 0, 0],
+  "measurement_timeout_ms": 1000,
+
+  "dev_mode": "AUTO",
+
+  "_port_comment": "Final UPSTREAM/DOWNSTREAM GPIOs (TX/RX/DETECT_IN/DETECT_OUT/BASE_ID) are not decided yet -- see docs/pogo-interface.md. -1 placeholders below are NOT valid for a real board; they exist only so this template packs successfully for schema demonstration.",
+  "upstream_port": {
+    "uart_num": -1, "tx_gpio": -1, "rx_gpio": -1,
+    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+  "downstream_port": {
+    "uart_num": -1, "tx_gpio": -1, "rx_gpio": -1,
+    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

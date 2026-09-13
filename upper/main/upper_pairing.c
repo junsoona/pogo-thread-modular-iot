@@ -157,8 +157,8 @@ static void upper_pairing_task(void *arg)
             if (send_and_wait(seq, POGO_MSG_ASSIGN_UUID, uuid_payload, uuid_len, POGO_MSG_ACK, POGO_MSG_NACK, &frame,
                                max_retry, ack_timeout) &&
                 frame.type == POGO_MSG_ACK) {
-                pogo_assign_slot_t slot_msg = {.slot_id = FIXED_SLOT_ID};
-                uint8_t slot_payload[1];
+                pogo_assign_slot_t slot_msg = {.slot_id = FIXED_SLOT_ID, .topology_depth = 1};
+                uint8_t slot_payload[2];
                 size_t slot_len = pogo_pack_assign_slot(&slot_msg, slot_payload, sizeof(slot_payload));
 
                 seq++;

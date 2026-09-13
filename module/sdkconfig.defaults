@@ -1,0 +1,23 @@
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+#
+# OpenThread -- module always builds FTD exactly once (section 8 of the
+# implementation spec). Which of ROOT/INTERMEDIATE/LEAF applies at runtime
+# is entirely decided by role_manager + thread_manager, never by a
+# compile-time choice; a LEAF is simply an FTD build configured at runtime
+# with router_eligible=false and rx-on-when-idle=false (see thread_manager.c).
+#
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+
+#
+# ESP System Settings
+#
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

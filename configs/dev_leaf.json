@@ -1,0 +1,38 @@
+{
+  "_comment": "Development-board config image for the CURRENT two-board setup (see docs/pogo-interface.md 'development compat mode'). Generates dev_leaf_config.bin, which makes pogo_module.bin behave like the old, separate 'lower' reference project on this one board. NOT representative of final hardware: there is no DETECT/BASE_ID wiring yet, and the sensor is the development-only mock (see docs/module-config.md).",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "driver_id": "0x4D4F434B",
+  "sensor_type_bitmap": 1,
+
+  "bus_type": 0,
+  "bus_number": 0,
+  "i2c_sda_gpio": -1,
+  "i2c_scl_gpio": -1,
+  "i2c_address": 0,
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "calibration": [0, 0, 0, 0],
+  "measurement_timeout_ms": 1000,
+
+  "dev_mode": "DEV_LEAF",
+
+  "_upstream_comment": "The board's only physical UART, mapped to UPSTREAM -- matches the original lower project's GPIO10(TX)/GPIO11(RX)/UART1/115200 8N1.",
+  "upstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "Disabled entirely on this board: role_manager is forced to LEAF by dev_mode instead of deriving it from a (nonexistent) DOWNSTREAM peer.",
+  "downstream_port": {
+    "uart_num": -1, "tx_gpio": -1, "rx_gpio": -1,
+    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

@@ -1,0 +1,11 @@
+menu "Thread Manager"
+
+    config THREAD_MANAGER_DEFAULT_LEAF_POLL_PERIOD_MS
+        int "Default LEAF SED poll period (ms), used if parent doesn't send one"
+        default 3000
+        help
+            Fallback otLinkSetPollPeriod() value for a LEAF that has not (yet)
+            received a POLL_CONFIG from its parent -- see parent_service's
+            dynamic polling-period calculation for the value normally used.
+
+endmenu
