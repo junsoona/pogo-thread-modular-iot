@@ -270,6 +270,20 @@ bool thread_manager_validate_dataset_tlvs(const uint8_t *dataset_tlvs, uint16_t 
     return valid;
 }
 
+esp_err_t thread_manager_get_leader_address(otIp6Address *out_addr)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otError err = otThreadGetLeaderRloc(instance, out_addr);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
 otDeviceRole thread_manager_get_role(void)
 {
     otInstance *instance = esp_openthread_get_instance();

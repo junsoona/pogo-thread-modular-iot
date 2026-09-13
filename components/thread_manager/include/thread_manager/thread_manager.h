@@ -68,6 +68,21 @@ esp_err_t thread_manager_get_active_dataset_tlvs(otOperationalDatasetTlvs *out_t
 bool thread_manager_validate_dataset_tlvs(const uint8_t *dataset_tlvs, uint16_t dataset_len);
 otDeviceRole thread_manager_get_role(void);
 
+/*
+ * Current Leader's on-mesh (RLOC) address, via otThreadGetLeaderRloc() --
+ * never a hardcoded/cached address (section 8 of the follow-up spec: "ROOT
+ * 주소를 문자열로 하드코딩하지 말고 OpenThread API를 통해 현재 Leader/ROOT
+ * 주소를 구한다"). In this topology ROOT is always the one node that forms
+ * the network and is therefore always Leader (INTERMEDIATE/LEAF only ever
+ * join an existing dataset, see thread_manager_join_with_dataset()), so "the
+ * current Leader" and "ROOT" are the same node for as long as this module
+ * chain runs -- sensor_transport uses this to reach ROOT's CoAP resource
+ * without ever assuming a fixed IPv6 address. Returns ESP_ERR_INVALID_STATE
+ * if this device is not yet attached to a Thread network (no Leader to
+ * report).
+ */
+esp_err_t thread_manager_get_leader_address(otIp6Address *out_addr);
+
 /* Non-blocking: true and fills *out_role if the role changed since the last
  * call (backed by a small queue fed from the OpenThread state-changed
  * callback), false if nothing new. */

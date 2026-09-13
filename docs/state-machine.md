@@ -14,7 +14,27 @@ HANDSHAKE --[protocol_version mismatch]--> ERROR (PROTOCOL_VERSION_ERROR)
 (HANDSHAKE or PEER_READY) --[HELLO_REQ received from peer]--> answer with HELLO_RESP (same seq), own state unchanged
 PEER_READY --[FRAME_RECEIVED, not a hello]--> (event forwarded up, state unchanged)
 (any of HANDSHAKE/PEER_READY/ERROR) --[DETECT_IN debounced High]--> WAIT_ATTACH
+PEER_READY --[idle CONFIG_POGO_PING_INTERVAL_MS with no traffic]--> send PING, state unchanged
+PEER_READY --[CONFIG_POGO_MAX_RETRY consecutive PING timeouts]--> ERROR (LIVENESS_LOST)
 ```
+
+### Idle PING/PONG liveness (section 9 of the follow-up spec)
+
+Once `PEER_READY`, `process_peer_ready()` also tracks `last_activity` (any
+successfully parsed frame, including PING/PONG itself) and, when idle for
+`CONFIG_POGO_PING_INTERVAL_MS`, sends one `POGO_MSG_PING` with its own
+dedicated seq counter (`p->ping_seq`, distinct from `hello_seq` and from
+whatever seq a higher layer's provisioning uses). PING/PONG are answered/
+consumed entirely inside `pogo_port` -- never forwarded up as
+`FRAME_RECEIVED` -- so there is exactly one place (this port's own task,
+which is also the only reader of this port's UART) deciding whether an
+incoming byte belongs to the idle-liveness check or a higher layer's
+in-flight provisioning wait; the two can never race for "who gets this
+reply". `CONFIG_POGO_MAX_RETRY` consecutive PING timeouts fire
+`POGO_PORT_EVENT_ERROR(POGO_PORT_ERR_LIVENESS_LOST)` and follow the exact
+same AUTO-vs-dev-compat recovery policy as `DOCK_TIMEOUT` (see
+`handle_liveness_lost()`, which mirrors
+`handle_dock_timeout_or_silent_power_base()`).
 
 30ms debounce (configurable) is applied uniformly to both attach and detach
 edges, in the port's own task -- never in the GPIO ISR, which only pushes
@@ -122,6 +142,38 @@ JOINING -> ERROR (join timeout) -- sends JOIN_RESULT(success=false)
           happens to Thread itself, which child_service does not decide)
 ```
 
+### JOIN_RESULT reliability (section 7 of the follow-up spec)
+
+`JOIN_RESULT` is no longer fire-and-forget with a hardcoded seq of 0.
+`begin_join_result_retry()` assigns it a fresh, monotonically-increasing seq
+(`s_join_result_seq_counter`, never reused across a session) and arms a
+retry: `poll_join_result_retry()` (called every `child_service_task` loop
+iteration, independent of `s_state`) resends the SAME seq after
+`CONFIG_POGO_ACK_TIMEOUT_MS` with no ACK, up to `CONFIG_POGO_MAX_RETRY`
+times, then gives up (logged, not retried forever -- the same bounded-retry
+policy as every other request/response exchange here). A matching
+`POGO_MSG_JOIN_RESULT_ACK` (checked in `handle_frame()`) clears the pending
+retry immediately. `clear_provisioning_temporaries()` -- run on
+ATTACHED/DETACHED and on a fresh provisioning generation
+(`begin_new_provisioning_session()`) -- is the ONLY thing that cancels a
+still-pending retry early; nothing else does.
+
+On the parent side, `run_provisioning_session()` records the JOIN_RESULT's
+seq (`s_node.has_join_result`/`last_join_result_seq`) and sends
+`POGO_MSG_JOIN_RESULT_ACK` immediately after validating it, before deciding
+success/failure. If the child's ACK was lost and it retransmits the exact
+same seq, `parent_service_task()`'s main loop (which sees this AFTER
+`run_provisioning_session()` has already returned) recognizes the match and
+re-sends the ACK only -- it never re-enters provisioning or touches the node
+record a second time. A brand-new session (`memset(&s_node, ...)` at the top
+of `run_provisioning_session()`, or the DETACHED handler) is the only thing
+that invalidates a previously-recorded seq, so a stale JOIN_RESULT from an
+old generation can never be mistaken for the current one's. See
+`tools/test_join_result_reliability.c` for the seven regression scenarios
+this is checked against (clean delivery, first JOIN_RESULT lost, first ACK
+lost, an exact duplicate delivery, a mid-retry detach, retries exhausted,
+and a new generation getting a distinct seq).
+
 Any message received out of its exact required state (e.g. `ASSIGN_SLOT`
 before `UUID_ASSIGNED`, or `SET_DATASET` before `POLL_SET`) is rejected with
 `POGO_NACK_BAD_STATE` -- see `handle_assign_uuid`/`handle_assign_slot`/
@@ -197,12 +249,61 @@ low 8 bits of an FNV-1a hash of the UUID (always in `[0, 255]`) --
 retransmission scheduling is future work (explicitly out of scope for this
 refactor); only the field and its calculation are implemented now.
 
+## Periodic Thread sensor reporting (section 8 of the follow-up spec)
+
+```
+sensor_service_init() -- one self-calibration measurement (doubles as the
+                          "provisioning response-time measurement" this
+                          component owns) seeds an initial effective period,
+                          so ROOT (which never gets a POLL_CONFIG from
+                          anyone) still has one.
+child_service: POLL_CONFIG received -> effective = sensor_service_compute_effective_period_ms(received)
+                                     -> sensor_service_set_polling_period_ms(effective)
+                                     -> s_polling_period_ms = effective (same value used for
+                                        otLinkSetPollPeriod() once JOINING starts)
+sensor_service's periodic task, every effective_polling_period_ms:
+  measure via sensor_service_measure_once() (same mutex as SENSOR_HELLO)
+    -> role==ROOT: sensor_service_root_record_sample() (local aggregator, no wireless hop)
+    -> role!=ROOT AND Thread-joined: sample-ready callback -> sensor_transport_send_sample()
+    -> role!=ROOT AND NOT Thread-joined: measurement still happens, wireless hand-off skipped
+```
+
+`sensor_transport_send_sample()` (INTERMEDIATE/LEAF) sends one Confirmable
+CoAP POST of the `sensor_channel_pack()`-encoded sample to
+`thread_manager_get_leader_address()` (current Leader's RLOC -- ROOT is
+always Leader in this topology, so this is never a hardcoded address). On no
+response, it retries with the UUID-hash backoff schedule (section 13):
+1st retry 0..255ms, 2nd 0..511ms, 3rd 0..1023ms (`node_calc_uuid_hash()`,
+masking progressively more bits of the same per-module hash), up to 3
+retries (4 attempts total), always resending the same `sample_seq`'s
+already-packed bytes. `otCoapTxParameters.mMaxRetransmit=0` disables
+OpenThread's own CoAP retransmission so it never compounds with this
+application-level schedule.
+
+ROOT's CoAP resource handler unpacks the sample and calls
+`sensor_service_root_record_sample()`, which dedups by
+`(module_uuid, sample_seq)`: an exact repeat of the last-recorded seq for
+that UUID is dropped without re-storing (a retransmit the child sent because
+it never saw our earlier CoAP ACK). The aggregator is bounded
+(`SENSOR_SERVICE_MAX_NODES`); a brand-new UUID past that bound is dropped
+and logged, not silently overwriting an existing node's slot.
+
+Thread detach: `child_service`'s DETACHED/ERROR handling calls
+`sensor_service_set_thread_joined(false)` immediately, which gates OFF only
+the wireless hand-off step in the periodic task -- the task itself keeps
+running (measuring) at whatever period was last set, it just stops calling
+the sample-ready callback until `sensor_service_set_thread_joined(true)`
+fires again on a fresh successful join. There is therefore no busy-retry
+loop while detached: `sensor_transport_send_sample()` is simply never called
+during that window.
+
 ## Error handling (section 16)
 
 | Error                    | Where it's raised                              | Recovery path |
 |---------------------------|------------------------------------------------|----------------|
 | `CONFIG_ERROR`             | `module_config_load()`/`validate_config()` (unsupported `driver_id`/`bus_type`, `measurement_timeout_ms==0`, bad/duplicate/missing GPIOs, `detect_out_active_low=false`, mock driver with `dev_mode=AUTO`, ...) | halt at boot (no sensor/pairing/Thread) |
 | `DOCK_TIMEOUT`             | `pogo_port` (no HELLO_RESP reply, BASE_ID doesn't explain it) | AUTO: port -> ERROR until next DETACHED. Dev compat mode (no DETECT_IN): port -> ERROR, logged, then auto-retries a fresh handshake cycle after `CONFIG_POGO_PING_INTERVAL_MS` |
+| `LIVENESS_LOST`            | `pogo_port` (`CONFIG_POGO_MAX_RETRY` consecutive idle PING timeouts while `PEER_READY`, section 9) | Same recovery policy as `DOCK_TIMEOUT`: AUTO waits for the next DETACHED; dev compat mode auto-retries a fresh handshake after `CONFIG_POGO_PING_INTERVAL_MS` |
 | `PEER_TYPE_CONFLICT`       | `pogo_port` (BASE_ID vs. declared peer_type disagree, or peer_type is neither MODULE nor POWER_BASE) | port -> ERROR until next DETACHED (both AUTO and dev compat mode -- this is a real config/compatibility problem, not a timing issue, so it is not auto-retried) |
 | `PROTOCOL_VERSION_ERROR`   | `pogo_port` (HELLO_REQ/RESP version mismatch)   | port -> ERROR until next DETACHED (not auto-retried, same reasoning as above) |
 | `UART_TIMEOUT` / `FRAME_CRC_ERROR` | `pogo_frame_parser_feed()` (silent resync, see pogo_frame.c) | parser resyncs on the next valid SOF; the request/response layer above times out and retries |
@@ -272,8 +373,15 @@ Thread join wait.
   scale; a future revision could poll the sensor in smaller increments
   interleaved with port-event checks if that matters for a much longer
   `measurement_timeout_ms`.
-- **Periodic sensor-data reporting is not implemented.** `polling_period_ms`
-  is computed, transmitted, validated, and stored (and, for a LEAF, actually
-  applied to `otLinkSetPollPeriod()`), but no code yet wakes up every
-  `polling_period_ms` to read the sensor and report a value upstream --
-  explicitly future work per section 12/13 of the implementation spec.
+- **Periodic sensor-data reporting IS implemented** (section 8 of the
+  follow-up spec) -- this used to be future work; it no longer is.
+  `sensor_service`'s periodic task wakes up every
+  `effective_polling_period_ms` (= `max(dynamic POLL_CONFIG-derived period,
+  the paired driver's own minimum)`, computed once by
+  `sensor_service_compute_effective_period_ms()` and used both for what
+  `child_service` ACKs/applies and for the task's own schedule), measures
+  the paired sensor, and either records the sample straight into ROOT's own
+  local aggregator or hands it to `sensor_transport_send_sample()` for
+  INTERMEDIATE/LEAF -- see docs/architecture.md's `sensor_service`/
+  `sensor_transport` component descriptions and this file's new "Periodic
+  Thread sensor reporting" section below.

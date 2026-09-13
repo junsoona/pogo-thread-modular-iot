@@ -54,6 +54,23 @@ typedef struct {
     TickType_t hello_deadline;
     pogo_peer_type_t peer_type;
 
+    /*
+     * Idle PING/PONG liveness (section 9 of the follow-up spec), owned
+     * entirely by this port's own task -- the same task that already owns
+     * every UART read via process_peer_ready(), so a periodic liveness PING
+     * and a higher layer's provisioning frame wait (pogo_port_send() +
+     * FRAME_RECEIVED) never race for who gets to read the reply: there is
+     * exactly one reader. PING/PONG frames themselves are consumed HERE and
+     * never forwarded up as FRAME_RECEIVED (see process_peer_ready()) -- to
+     * a higher layer, this component's PEER_READY state is either "still
+     * ready" or an ERROR event, PING/PONG is invisible plumbing.
+     */
+    TickType_t last_activity;     /* last time ANY byte was successfully parsed while PEER_READY */
+    bool       ping_outstanding;
+    uint8_t    ping_seq;
+    TickType_t ping_deadline;
+    int        liveness_fail_count;
+
     bool inited;
 } pogo_port_ctx_t;
 
@@ -116,11 +133,26 @@ static esp_err_t pogo_transport_send_on(pogo_port_ctx_t *p, uint8_t type, uint8_
     return (written >= 0 && (size_t)written == n) ? ESP_OK : ESP_FAIL;
 }
 
+/* Consecutive idle-PING failures tolerated before liveness is declared lost
+ * (section 9) -- reuses CONFIG_POGO_MAX_RETRY as the same bounded-retry
+ * budget every other request/response exchange in this codebase already
+ * uses, rather than inventing a second retry-count knob. */
+#define LIVENESS_MAX_CONSECUTIVE_FAILURES CONFIG_POGO_MAX_RETRY
+
+static void reset_liveness(pogo_port_ctx_t *p)
+{
+    p->last_activity = xTaskGetTickCount();
+    p->ping_outstanding = false;
+    p->ping_seq = 0;
+    p->liveness_fail_count = 0;
+}
+
 static void enter_wait_attach(pogo_port_ctx_t *p)
 {
     p->state = PORT_STATE_WAIT_ATTACH;
     p->peer_type = POGO_PEER_TYPE_UNKNOWN;
     pogo_frame_parser_init(&p->parser);
+    reset_liveness(p);
 }
 
 static void send_hello_req(pogo_port_ctx_t *p, uint8_t seq)
@@ -148,6 +180,7 @@ static void handle_dock_timeout_or_silent_power_base(pogo_port_ctx_t *p)
          * hardware alone is authoritative for this case. */
         p->peer_type = POGO_PEER_TYPE_POWER_BASE;
         p->state = PORT_STATE_PEER_READY;
+        reset_liveness(p);
         pogo_port_event_data_t data = {.peer_type = p->peer_type};
         ESP_LOGI(TAG, "port %d: no HELLO_RESP reply, but BASE_ID reads POWER_BASE -> PEER_READY", p->id);
         notify(p, POGO_PORT_EVENT_PEER_READY, &data);
@@ -170,6 +203,28 @@ static void handle_dock_timeout_or_silent_power_base(pogo_port_ctx_t *p)
          * physical detach/attach before trying again. */
         vTaskDelay(pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS));
         ESP_LOGI(TAG, "port %d: dev compat mode -- retrying handshake cycle", p->id);
+        begin_handshake(p);
+    }
+}
+
+/* Mirrors handle_dock_timeout_or_silent_power_base()'s dev-compat recovery
+ * policy, for the idle-liveness-lost case instead of the initial-handshake
+ * one (section 9): fire the ERROR event either way, and only auto-retry a
+ * fresh handshake when there is no DETECT_IN to wait on. AUTO mode (real
+ * DETECT_IN) stays in ERROR until the next physical detach/attach -- a
+ * liveness loss while the wire still reads "attached" is exactly the kind of
+ * "something is actually wrong" case that policy exists for. */
+static void handle_liveness_lost(pogo_port_ctx_t *p)
+{
+    p->state = PORT_STATE_ERROR;
+    pogo_port_event_data_t data = {.error_code = POGO_PORT_ERR_LIVENESS_LOST};
+    ESP_LOGW(TAG, "port %d: LIVENESS_LOST (idle PING/PONG failed %d times in a row)", p->id,
+             p->liveness_fail_count);
+    notify(p, POGO_PORT_EVENT_ERROR, &data);
+
+    if (p->cfg.detect_in_gpio < 0) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS));
+        ESP_LOGI(TAG, "port %d: dev compat mode -- retrying handshake cycle after liveness loss", p->id);
         begin_handshake(p);
     }
 }
@@ -243,6 +298,7 @@ static void handle_incoming_hello_resp(pogo_port_ctx_t *p, const pogo_frame_t *f
     }
     p->peer_type = peer_type;
     p->state = PORT_STATE_PEER_READY;
+    reset_liveness(p);
     pogo_port_event_data_t data = {.peer_type = p->peer_type};
     ESP_LOGI(TAG, "port %d: PEER_READY (peer_type=%d)", p->id, (int)p->peer_type);
     notify(p, POGO_PORT_EVENT_PEER_READY, &data);
@@ -328,17 +384,59 @@ static void process_handshake(pogo_port_ctx_t *p)
     }
 }
 
+/*
+ * Idle liveness (section 9): while PEER_READY and nothing else has been
+ * heard for CONFIG_POGO_PING_INTERVAL_MS, send one PING (own dedicated seq
+ * space -- p->ping_seq -- distinct from the handshake's hello_seq and from
+ * whatever seq numbers higher layers use for provisioning, so none of them
+ * can collide in meaning). This never competes with a higher layer's own
+ * pogo_port_send()-driven request/response: sending is fire-and-forget from
+ * this port task's point of view (uart_write_bytes has its own buffering),
+ * and RECEIVING is exclusively this task's job either way (process_peer_ready
+ * is the only reader of this port's UART), so there is exactly one place
+ * that ever decides "is this byte a PING/PONG or a provisioning frame".
+ */
+static void maybe_send_idle_ping(pogo_port_ctx_t *p)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (p->ping_outstanding) {
+        if ((int32_t)(now - p->ping_deadline) >= 0) {
+            p->ping_outstanding = false;
+            p->liveness_fail_count++;
+            ESP_LOGD(TAG, "port %d: PING timeout (%d/%d consecutive)", p->id, p->liveness_fail_count,
+                     LIVENESS_MAX_CONSECUTIVE_FAILURES);
+            if (p->liveness_fail_count >= LIVENESS_MAX_CONSECUTIVE_FAILURES) {
+                handle_liveness_lost(p);
+            }
+        }
+        return;
+    }
+    if ((now - p->last_activity) < pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS)) {
+        return;
+    }
+    p->ping_seq++;
+    pogo_transport_send_on(p, POGO_MSG_PING, p->ping_seq, NULL, 0);
+    p->ping_outstanding = true;
+    p->ping_deadline = now + pdMS_TO_TICKS(CONFIG_POGO_ACK_TIMEOUT_MS);
+}
+
 static void process_peer_ready(pogo_port_ctx_t *p)
 {
     uint8_t byte;
     int n = uart_read_bytes((uart_port_t)p->cfg.uart_num, &byte, 1, pdMS_TO_TICKS(20));
     if (n != 1) {
+        maybe_send_idle_ping(p);
         return;
     }
     pogo_frame_t frame;
     if (!pogo_frame_parser_feed(&p->parser, byte, &frame)) {
-        return;
+        return; /* mid-frame, or a dropped malformed frame -- not "activity" yet */
     }
+
+    /* Any complete, valid frame -- including PING/PONG -- counts as real
+     * link activity, resetting the idle countdown to the next PING. */
+    p->last_activity = xTaskGetTickCount();
+
     if (frame.type == POGO_MSG_PEER_HELLO_REQ) {
         /* The peer (re-)sent HELLO_REQ, e.g. it rebooted while still
          * docked and is starting its own handshake fresh. We are already
@@ -350,6 +448,22 @@ static void process_peer_ready(pogo_port_ctx_t *p)
         /* Late/duplicate reply to an old request of ours (e.g. after we
          * already reached PEER_READY via a different retry). No outstanding
          * request to match it against here; ignore. */
+        return;
+    }
+    if (frame.type == POGO_MSG_PING) {
+        /* Answered here, not forwarded up -- see this function's top
+         * comment. Higher layers never see a PING/PONG frame. */
+        pogo_transport_send_on(p, POGO_MSG_PONG, frame.seq, NULL, 0);
+        return;
+    }
+    if (frame.type == POGO_MSG_PONG) {
+        if (p->ping_outstanding && frame.seq == p->ping_seq) {
+            p->ping_outstanding = false;
+            p->liveness_fail_count = 0;
+        }
+        /* A stray/late PONG that doesn't match our current outstanding PING
+         * is simply ignored -- not an error, just a race with a just-timed-
+         * out PING. */
         return;
     }
     pogo_port_event_data_t data = {.frame = frame};

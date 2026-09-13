@@ -13,6 +13,7 @@
 #include "child_service/child_service.h"
 #include "role_manager/role_manager.h"
 #include "thread_manager/thread_manager.h"
+#include "node_calc/node_calc.h"
 
 static const char *TAG = "parent_service";
 
@@ -33,6 +34,19 @@ typedef struct {
     uint8_t   retry_count;
     otDeviceRole child_role;
     TickType_t last_seen;
+    /* JOIN_RESULT reliability (section 7 of the follow-up spec): the seq of
+     * the JOIN_RESULT this session has already processed and ACKed, kept
+     * alive PAST run_provisioning_session() returning (unlike everything
+     * else session-scoped above, which a NEW session simply overwrites) so
+     * a late retransmit of the SAME JOIN_RESULT -- the child never saw our
+     * first ACK -- gets re-ACKed without re-running provisioning or
+     * touching this record again. Reset to false only by memset(&s_node,...)
+     * at the start of a new run_provisioning_session() or on DETACHED --
+     * i.e. only a new provisioning generation or an explicit session
+     * teardown clears it, matching child_service's own retry-cancellation
+     * policy. */
+    bool      has_join_result;
+    uint8_t   last_join_result_seq;
 } node_record_t;
 
 typedef struct {
@@ -50,38 +64,14 @@ static uint8_t s_seq;
 
 esp_err_t parent_service_calc_polling_period_ms(uint32_t response_time_ms, uint32_t *out_period_ms)
 {
-    if (response_time_ms == 0 || out_period_ms == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint64_t period;
-    if (response_time_ms < 50) {
-        period = (uint64_t)response_time_ms * 15;
-    } else if (response_time_ms < 100) {
-        period = (uint64_t)response_time_ms * 10;
-    } else if (response_time_ms < 500) {
-        period = (uint64_t)response_time_ms * 8;
-    } else if (response_time_ms <= 1000) {
-        period = (uint64_t)response_time_ms * 3;
-    } else if (response_time_ms <= 10000) {
-        period = (uint64_t)response_time_ms * 3 / 2; /* M=1.5, integer-safe */
-    } else {
-        period = (uint64_t)response_time_ms * 1;
-    }
-    if (period > UINT32_MAX) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    *out_period_ms = (uint32_t)period;
-    return ESP_OK;
+    /* Thin wrapper -- see components/node_calc/node_calc.h's header comment
+     * for why the actual implementation moved there. */
+    return node_calc_polling_period_ms(response_time_ms, out_period_ms);
 }
 
 uint16_t parent_service_calc_backoff_ms(const uint8_t uuid[POGO_UUID_LEN])
 {
-    uint32_t h = 2166136261u; /* FNV-1a offset basis */
-    for (int i = 0; i < POGO_UUID_LEN; i++) {
-        h ^= uuid[i];
-        h *= 16777619u; /* FNV-1a prime */
-    }
-    return (uint16_t)(h & 0xFF); /* low 8 bits -> 0..255 */
+    return node_calc_backoff_ms(uuid);
 }
 
 static void log_nack_if_any(const pogo_frame_t *frame)
@@ -311,6 +301,17 @@ static bool run_provisioning_session(void)
         ESP_LOGW(TAG, "THREAD_JOIN_TIMEOUT: no JOIN_RESULT from child -> abandoning session");
         return false;
     }
+    /* Record + ACK this JOIN_RESULT's seq BEFORE deciding success/failure --
+     * section 7: "parent는 성공/실패 결과를 처리한 뒤 ACK" (processed here
+     * means "the frame was validated and its seq captured", not necessarily
+     * "join succeeded"). Once has_join_result is set, a later retransmit of
+     * this exact seq (our ACK got lost) is re-ACKed by the main task loop's
+     * FRAME_RECEIVED handling below without ever re-entering this function
+     * or touching s_node again. */
+    s_node.has_join_result = true;
+    s_node.last_join_result_seq = frame.seq;
+    pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, frame.seq, NULL, 0);
+
     pogo_join_result_t result;
     if (!pogo_unpack_join_result(frame.payload, frame.len, &result) || !result.success) {
         ESP_LOGW(TAG, "JOIN FAILED -- child otDeviceRole=%u", frame.len >= 2 ? frame.payload[1] : 0);
@@ -350,10 +351,20 @@ static void parent_service_task(void *arg)
                 s_peer_ready_pending = false;
                 break;
             case POGO_PORT_EVENT_FRAME_RECEIVED:
-                /* Only meaningful mid-session; run_provisioning_session()
-                 * drains these itself via wait_for_frame()/wait_for_type().
-                 * A frame arriving outside any session is a stray retransmit
-                 * or protocol error and is simply ignored here. */
+                /* Mid-session frames are drained by run_provisioning_session()
+                 * itself via wait_for_frame()/wait_for_type() and never reach
+                 * here. A JOIN_RESULT arriving here (i.e. AFTER the session
+                 * that processed it already returned) means the child never
+                 * saw our JOIN_RESULT_ACK and is retrying with the same seq
+                 * (section 7) -- re-ACK it without re-running provisioning or
+                 * touching the node record again. Anything else arriving
+                 * outside any session is a stray retransmit/protocol error
+                 * and is simply ignored, as before. */
+                if (evt.data.frame.type == POGO_MSG_JOIN_RESULT && s_node.has_join_result &&
+                    evt.data.frame.seq == s_node.last_join_result_seq) {
+                    ESP_LOGI(TAG, "duplicate JOIN_RESULT (seq=%u) -- re-sending ACK only", evt.data.frame.seq);
+                    pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, evt.data.frame.seq, NULL, 0);
+                }
                 break;
             }
         }

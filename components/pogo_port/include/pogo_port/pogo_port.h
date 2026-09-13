@@ -62,6 +62,7 @@ typedef enum {
     POGO_PORT_ERR_DOCK_TIMEOUT,        /* attached, but the peer never answered HELLO_REQ and BASE_ID doesn't explain why */
     POGO_PORT_ERR_PEER_TYPE_CONFLICT,  /* BASE_ID hardware contradicts the peer's declared peer_type, OR the peer declared a peer_type that is neither MODULE nor POWER_BASE */
     POGO_PORT_ERR_PROTOCOL_VERSION,    /* peer's HELLO_REQ/RESP protocol_version does not match ours */
+    POGO_PORT_ERR_LIVENESS_LOST,       /* PEER_READY, but idle PING/PONG failed too many times in a row while DETECT_IN still reads attached (section 9) */
 } pogo_port_error_t;
 
 typedef struct {

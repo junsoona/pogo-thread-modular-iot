@@ -1,7 +1,9 @@
 #include "module_config/module_config.h"
+#include "module_config/gpio_profile.h"
 #include "pogo_proto/pogo_crc16.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -108,24 +110,45 @@ static void unpack_blob(const uint8_t *blob, module_config_t *out)
     unpack_port(blob + CFG_HEADER_LEN + PORT_BLOB_LEN, &out->downstream_port);
 }
 
-static bool gpio_in_range(int32_t gpio)
+/*
+ * ESP32-H2 GPIO usability profile (section 1 of the follow-up spec, GPIO
+ * classification corrected in the follow-up GPIO-correction pass -- see
+ * components/module_config/gpio_profile.h for the exact policy and why
+ * GPIO2/3 are NOT strapping pins and GPIO6/7 ARE rejected here even though
+ * they are not "reserved" in the strapping/flash/USB sense: they are simply
+ * not bonded out on the ESP32-H2 SuperMini/SiP package at all).
+ */
+static esp_err_t check_gpio_field(const char *field_name, int32_t gpio)
 {
-    /* -1 means "not present on this board" and is always allowed; any other
-     * negative value, or a value clearly outside a plausible GPIO count, is
-     * a config authoring mistake. Deliberately generous (not tied to one
-     * specific chip's exact usable pin list) since final GPIO numbers are
-     * not decided by this refactor -- see docs/pogo-interface.md. */
-    return gpio == -1 || (gpio >= 0 && gpio <= 31);
+    if (!gpio_profile_in_range(gpio)) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: %s=%d is out of range for ESP32-H2 (valid: -1 or 0..%d)", field_name,
+                 (int)gpio, GPIO_PROFILE_MAX);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *reason = gpio_profile_reserved_reason(gpio);
+    if (reason != NULL) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: %s=%d is reserved on ESP32-H2 (%s) -- see docs/pogo-interface.md", field_name,
+                 (int)gpio, reason);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
 }
 
 /*
  * Sanity-checks the unpacked config beyond CRC/schema (which module_config_load()
  * already checked): a value that unpacks cleanly but describes an
  * impossible or unsupported board is still CONFIG_ERROR, not "try it and
- * see" (section 8 of the follow-up spec). Every failure logs one
- * "CONFIG_ERROR: ..." line naming the specific problem.
+ * see" (section 8 of the follow-up spec, tightened further by section 1 of
+ * the follow-up hardware-bring-up spec). Every failure logs one
+ * "CONFIG_ERROR: ..." line naming the specific field and value.
+ *
+ * dev_mode gates the checks that only make sense for a real two-port AUTO
+ * board (full DETECT_IN/DETECT_OUT wiring, a real UPSTREAM BASE_ID) --
+ * configs/dev_root.json and configs/dev_leaf.json are deliberately preserved
+ * as a one-UART, no-DETECT regression fixture (see docs/pogo-interface.md
+ * "development compat mode") and must keep validating exactly as before.
  */
-static esp_err_t validate_config(const module_config_t *cfg)
+static esp_err_t validate_config(const module_config_t *cfg, module_dev_mode_t dev_mode)
 {
     if (cfg->bus_type != MODULE_BUS_I2C && cfg->bus_type != MODULE_BUS_SPI) {
         ESP_LOGE(TAG, "CONFIG_ERROR: unsupported bus_type=%d", (int)cfg->bus_type);
@@ -140,22 +163,52 @@ static esp_err_t validate_config(const module_config_t *cfg)
      * one function. -1 ("not present") entries are skipped. Sized for 2
      * ports x 5 GPIOs each, plus up to 4 bus GPIOs (SPI's worst case). */
     int32_t used_gpios[2 * 5 + 4];
+    const char *used_field_names[2 * 5 + 4];
     int used_count = 0;
 
     const module_port_config_t *ports[2] = {&cfg->upstream_port, &cfg->downstream_port};
     const char *port_names[2] = {"upstream_port", "downstream_port"};
+    static const char *field_suffix[5] = {".tx_gpio", ".rx_gpio", ".detect_in_gpio", ".detect_out_gpio",
+                                           ".base_id_gpio"};
+    char field_buf[2][5][40];
+
+    bool auto_mode = (dev_mode == MODULE_DEV_MODE_AUTO);
 
     for (int i = 0; i < 2; i++) {
         const module_port_config_t *p = ports[i];
-        if (!gpio_in_range(p->tx_gpio) || !gpio_in_range(p->rx_gpio) || !gpio_in_range(p->detect_in_gpio) ||
-            !gpio_in_range(p->detect_out_gpio) || !gpio_in_range(p->base_id_gpio)) {
-            ESP_LOGE(TAG, "CONFIG_ERROR: %s has a GPIO number out of range", port_names[i]);
-            return ESP_ERR_INVALID_ARG;
+        int32_t candidates[5] = {p->tx_gpio, p->rx_gpio, p->detect_in_gpio, p->detect_out_gpio, p->base_id_gpio};
+        for (int j = 0; j < 5; j++) {
+            snprintf(field_buf[i][j], sizeof(field_buf[i][j]), "%s%s", port_names[i], field_suffix[j]);
+            esp_err_t gerr = check_gpio_field(field_buf[i][j], candidates[j]);
+            if (gerr != ESP_OK) {
+                return gerr;
+            }
         }
         if (p->uart_num >= 0) {
+            /* ESP32-H2 has exactly two UART controllers (UART0/UART1) --
+             * both are committed to the two POGO ports, so a valid uart_num
+             * for an enabled port is 0 or 1, never anything else. */
+            if (p->uart_num != 0 && p->uart_num != 1) {
+                ESP_LOGE(TAG, "CONFIG_ERROR: %s.uart_num=%d is not a valid ESP32-H2 UART controller (0 or 1)",
+                         port_names[i], (int)p->uart_num);
+                return ESP_ERR_INVALID_ARG;
+            }
             if (p->tx_gpio < 0 || p->rx_gpio < 0) {
                 ESP_LOGE(TAG, "CONFIG_ERROR: %s is enabled (uart_num=%d) but tx_gpio/rx_gpio is not set", port_names[i],
                          (int)p->uart_num);
+                return ESP_ERR_INVALID_ARG;
+            }
+            if (auto_mode && (p->detect_in_gpio < 0 || p->detect_out_gpio < 0)) {
+                /* Real hardware (dev_mode=AUTO): an enabled port must have
+                 * DETECT_IN and DETECT_OUT wired, or attach/detach can never
+                 * be sensed and role_manager can never derive a role for it
+                 * (section 1: "활성화된 포트에 UART, TX, RX, DETECT_IN,
+                 * DETECT_OUT이 모두 있는지 검사"). The dev_root/dev_leaf
+                 * compat images are exempt (dev_mode != AUTO) -- see
+                 * docs/pogo-interface.md "development compat mode". */
+                ESP_LOGE(TAG, "CONFIG_ERROR: %s is enabled with dev_mode=AUTO but detect_in_gpio=%d/detect_out_gpio=%d "
+                              "-- both are required on real (AUTO) hardware",
+                         port_names[i], (int)p->detect_in_gpio, (int)p->detect_out_gpio);
                 return ESP_ERR_INVALID_ARG;
             }
             if (p->detect_out_gpio >= 0 && !p->detect_out_active_low) {
@@ -169,10 +222,11 @@ static esp_err_t validate_config(const module_config_t *cfg)
                 return ESP_ERR_NOT_SUPPORTED;
             }
         }
-        int32_t candidates[5] = {p->tx_gpio, p->rx_gpio, p->detect_in_gpio, p->detect_out_gpio, p->base_id_gpio};
         for (int j = 0; j < 5; j++) {
             if (candidates[j] >= 0) {
-                used_gpios[used_count++] = candidates[j];
+                used_gpios[used_count] = candidates[j];
+                used_field_names[used_count] = field_buf[i][j];
+                used_count++;
             }
         }
     }
@@ -184,29 +238,59 @@ static esp_err_t validate_config(const module_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* BASE_ID is only ever meaningful on the UPSTREAM-facing side of a
+     * module (see docs/pogo-interface.md) -- a DOWNSTREAM port declaring one
+     * is always a config authoring mistake, in every dev_mode, not just AUTO. */
+    if (cfg->downstream_port.base_id_gpio != -1) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: downstream_port.base_id_gpio=%d must be -1 (BASE_ID is UPSTREAM-only)",
+                 (int)cfg->downstream_port.base_id_gpio);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (auto_mode && cfg->upstream_port.base_id_gpio < 0) {
+        /* Real hardware (AUTO): ROOT/power-base detection depends entirely
+         * on reading UPSTREAM BASE_ID -- see role_manager's determination
+         * table. Missing it here would silently make ROOT unreachable. */
+        ESP_LOGE(TAG, "CONFIG_ERROR: dev_mode=AUTO but upstream_port.base_id_gpio is not set (-1) -- "
+                      "ROOT cannot ever be derived without it");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (cfg->bus_type == MODULE_BUS_I2C) {
-        if (!gpio_in_range(cfg->i2c_sda_gpio) || !gpio_in_range(cfg->i2c_scl_gpio)) {
-            ESP_LOGE(TAG, "CONFIG_ERROR: i2c_sda_gpio/i2c_scl_gpio out of range");
-            return ESP_ERR_INVALID_ARG;
+        esp_err_t gerr = check_gpio_field("i2c_sda_gpio", cfg->i2c_sda_gpio);
+        if (gerr == ESP_OK) {
+            gerr = check_gpio_field("i2c_scl_gpio", cfg->i2c_scl_gpio);
         }
-        if (cfg->i2c_sda_gpio >= 0) used_gpios[used_count++] = cfg->i2c_sda_gpio;
-        if (cfg->i2c_scl_gpio >= 0) used_gpios[used_count++] = cfg->i2c_scl_gpio;
+        if (gerr != ESP_OK) {
+            return gerr;
+        }
+        if (cfg->i2c_sda_gpio >= 0) {
+            used_gpios[used_count] = cfg->i2c_sda_gpio;
+            used_field_names[used_count++] = "i2c_sda_gpio";
+        }
+        if (cfg->i2c_scl_gpio >= 0) {
+            used_gpios[used_count] = cfg->i2c_scl_gpio;
+            used_field_names[used_count++] = "i2c_scl_gpio";
+        }
     } else {
-        if (!gpio_in_range(cfg->spi_mosi_gpio) || !gpio_in_range(cfg->spi_miso_gpio) ||
-            !gpio_in_range(cfg->spi_sclk_gpio) || !gpio_in_range(cfg->spi_cs_gpio)) {
-            ESP_LOGE(TAG, "CONFIG_ERROR: spi_*_gpio out of range");
-            return ESP_ERR_INVALID_ARG;
+        const char *spi_names[4] = {"spi_mosi_gpio", "spi_miso_gpio", "spi_sclk_gpio", "spi_cs_gpio"};
+        int32_t spi_gpios[4] = {cfg->spi_mosi_gpio, cfg->spi_miso_gpio, cfg->spi_sclk_gpio, cfg->spi_cs_gpio};
+        for (int i = 0; i < 4; i++) {
+            esp_err_t gerr = check_gpio_field(spi_names[i], spi_gpios[i]);
+            if (gerr != ESP_OK) {
+                return gerr;
+            }
+            if (spi_gpios[i] >= 0) {
+                used_gpios[used_count] = spi_gpios[i];
+                used_field_names[used_count++] = spi_names[i];
+            }
         }
-        if (cfg->spi_mosi_gpio >= 0) used_gpios[used_count++] = cfg->spi_mosi_gpio;
-        if (cfg->spi_miso_gpio >= 0) used_gpios[used_count++] = cfg->spi_miso_gpio;
-        if (cfg->spi_sclk_gpio >= 0) used_gpios[used_count++] = cfg->spi_sclk_gpio;
-        if (cfg->spi_cs_gpio >= 0) used_gpios[used_count++] = cfg->spi_cs_gpio;
     }
 
     for (int i = 0; i < used_count; i++) {
         for (int j = i + 1; j < used_count; j++) {
             if (used_gpios[i] == used_gpios[j]) {
-                ESP_LOGE(TAG, "CONFIG_ERROR: GPIO%d is assigned to more than one function", (int)used_gpios[i]);
+                ESP_LOGE(TAG, "CONFIG_ERROR: GPIO%d is assigned to more than one function (%s and %s)",
+                         (int)used_gpios[i], used_field_names[i], used_field_names[j]);
                 return ESP_ERR_INVALID_ARG;
             }
         }
@@ -288,7 +372,14 @@ esp_err_t module_config_load(module_config_t *out)
             result = ESP_ERR_INVALID_VERSION;
             break;
         }
-        result = validate_config(out);
+        /* module_config_load_dev_mode() reads a different namespace on the
+         * same partition and is safe to call before nvs_close(h) below (it
+         * opens its own handle) -- see its own doc comment. Needed here
+         * (not just by module main, which also calls it separately) so the
+         * AUTO-only checks inside validate_config() (full DETECT wiring,
+         * UPSTREAM BASE_ID) are enforced at load time, not left to whatever
+         * happens later at runtime with a half-wired port. */
+        result = validate_config(out, module_config_load_dev_mode());
         if (result != ESP_OK) {
             break; /* validate_config() already logged the specific CONFIG_ERROR */
         }

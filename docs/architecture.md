@@ -86,15 +86,85 @@ components/
                               tools/test_polling_calc.c).
 
   module_config/               Loads+validates the fixed sensor/board pairing
-                              from the "cfg" NVS partition. CONFIG_ERROR (no
+                              from the "cfg" NVS partition, including the
+                              ESP32-H2 GPIO profile (strapping/flash/USB
+                              exclusion, UART0/1-only, AUTO-only DETECT/
+                              BASE_ID requirements -- see
+                              docs/module-config.md). CONFIG_ERROR (no
                               sensor, no pairing, no Thread) on anything
                               wrong with it -- never a guess, never a
                               fallback driver.
 
-  sensor_provider/             init/get_sensor_bitmap/start_measurement/
-                              read_measurement/get_status/deinit interface +
-                              a registry keyed by module_config.driver_id,
-                              plus the development-only mock driver.
+  sensor_provider/             init/get_sensor_bitmap/get_min_polling_period_ms/
+                              start_measurement/read_measurement/get_status/
+                              deinit interface + a registry keyed by
+                              module_config.driver_id (mock built in;
+                              bh1750/sht45/sgp40/sgp41/pms5003 register
+                              themselves at boot via sensor_provider_register()
+                              -- see that function's doc comment for why real
+                              drivers live in their own components instead of
+                              inside sensor_provider itself).
+
+  sensor_channel/               The common per-sample wire format (section 6
+                              of the follow-up spec): pack/unpack a
+                              sensor_sample_t (module UUID, sample_seq,
+                              uptime, sensor_bitmap, and N typed/scaled
+                              fixed-point channel readings) to/from bytes.
+                              No ESP-IDF dependency; also defines
+                              sensor_channel_type_t, the one shared channel
+                              numbering module_config.sensor_type_bitmap and
+                              this wire format both use.
+
+  node_calc/                    Pure integer math shared by parent_service
+                              and sensor_service/sensor_transport: the
+                              response-time -> polling-period formula and the
+                              UUID-hash backoff (both originally
+                              parent_service-only; moved here once
+                              sensor_service also needed them, to avoid a
+                              parent_service <-> child_service <-> sensor_service
+                              dependency cycle).
+
+  sensor_service/               Owns the ONE permanently-paired sensor driver
+                              (section 3), independent of role: initializes
+                              it exactly once, serializes every measurement
+                              (provisioning AND periodic) through one mutex,
+                              runs the periodic sampling task at whatever
+                              effective_polling_period_ms is current, records
+                              ROOT's own samples into a local aggregator, and
+                              hands non-ROOT samples to a registered
+                              "sample ready" callback (wired to
+                              sensor_transport by module/main/app_main.c).
+                              child_service now only ever calls
+                              sensor_service_measure_once() for SENSOR_HELLO,
+                              never sensor_provider_ops_t directly.
+
+  sensor_transport/              The Thread data-plane (CoAP) transport for
+                              periodic samples (section 8) -- deliberately
+                              separate from pogo_proto (left alone). ROOT
+                              runs a CoAP resource that unpacks a
+                              sensor_channel-encoded POST into
+                              sensor_service's aggregator; INTERMEDIATE/LEAF
+                              send via Confirmable POST to
+                              thread_manager_get_leader_address() (never a
+                              hardcoded address), retrying with the
+                              node_calc UUID-hash backoff schedule.
+
+  bh1750/, sht45/, sgp40/, sgp41/, pms5003/
+                                Real sensor_provider drivers (sections 4/5/10/11).
+                              bh1750 and sht45 use the real ESP-IDF
+                              i2c_master API against the address module_config
+                              specifies (never auto-detected). sgp40/sgp41
+                              compute VOC/NOx Index via the vendored,
+                              unmodified Sensirion Gas Index Algorithm (see
+                              components/sensirion_gas_index_algorithm/THIRD_PARTY_NOTICE.md)
+                              and share components/sensirion_crc8's word CRC.
+                              pms5003 is a complete, host-tested 32-byte
+                              frame parser plus a registrable
+                              sensor_provider_ops_t whose init() always fails
+                              honestly -- ESP32-H2's two UART controllers are
+                              both committed to the POGO ports, so no
+                              hardware transport exists yet (see
+                              docs/pogo-interface.md's PMS5003 section).
 
 upper/, lower/                Preserved reference projects (regression
                               baseline). Unchanged except for the
@@ -107,25 +177,33 @@ upper/, lower/                Preserved reference projects (regression
 
 1. `nvs_flash_init()` -- the dynamic `"nvs"` partition (Thread's own dataset
    copy, plus whatever role_manager/child_service/parent_service persist).
-2. `module_config_load()` -- the fixed `"cfg"` partition. Any failure halts
+2. `sensor_provider_register()` x N -- registers every real driver this
+   image is compiled with (bh1750, sht45, sgp40, sgp41, pms5003) into
+   sensor_provider's runtime registry, before it is ever looked up.
+3. `module_config_load()` -- the fixed `"cfg"` partition. Any failure halts
    here (see module-config.md) -- nothing below this line ever runs on a bad
    config.
-3. `module_config_load_dev_mode()` -- AUTO / DEV_ROOT / DEV_LEAF. A non-AUTO
+4. `module_config_load_dev_mode()` -- AUTO / DEV_ROOT / DEV_LEAF. A non-AUTO
    value is loudly logged (development compat mode, see pogo-interface.md)
    and refuses to run if it would silently activate the mock sensor in a
    production (`AUTO`) image.
-4. `thread_manager_init()` -- OpenThread FTD stack up, but Thread itself not
+5. `thread_manager_init()` -- OpenThread FTD stack up, but Thread itself not
    yet enabled.
-5. `role_manager_init()` -- starts deriving a role from port events (or is
+6. `sensor_service_init()` -- initializes the one paired sensor driver
+   exactly once (section 3); `sensor_transport_init()` starts the CoAP
+   sample-receiving resource (needs the OT instance from step 5); the
+   sample-ready callback then wires sensor_service's periodic samples into
+   sensor_transport.
+7. `role_manager_init()` -- starts deriving a role from port events (or is
    forced by the dev override).
-6. `pogo_port_init()` x2, both routed through one dispatcher that always
+8. `pogo_port_init()` x2, both routed through one dispatcher that always
    feeds `role_manager_on_port_event()`, and additionally feeds
    `child_service` (UPSTREAM events) or `parent_service` (DOWNSTREAM events).
-7. `child_service_init()` / `parent_service_init()` -- always both; each only
+9. `child_service_init()` / `parent_service_init()` -- always both; each only
    ever acts on its own port's events, so nothing special is needed for
    "this board doesn't have a DOWNSTREAM peer" -- parent_service simply never
    sees a DOWNSTREAM PEER_READY.
-8. `pogo_port_enable()` x2 -- but only for a port `module_config` actually
+10. `pogo_port_enable()` x2 -- but only for a port `module_config` actually
    marks `enabled` (i.e. its `uart_num >= 0`). A dev-compat image disables
    one of the two entirely.
 
@@ -155,3 +233,13 @@ building and behaving identically:
 Both `upper` and `lower` were rebuilt from a clean `fullclean` after this
 change and still link with zero warnings (see the build results in the
 final report).
+
+A second, later addition (the follow-up hardware bring-up spec's section 7,
+JOIN_RESULT reliability) is the same kind of change: one new message type,
+`POGO_MSG_JOIN_RESULT_ACK` (empty payload, seq matches the JOIN_RESULT it
+acknowledges). `upper`/`lower` never send or expect it -- `lower_pairing.c`
+still sends `JOIN_RESULT` with a hardcoded seq of 0 and never waits for an
+ACK; `upper_pairing.c` still matches `JOIN_RESULT` by type only, ignoring
+seq -- so this, too, is purely additive to the regression baseline. See
+docs/state-machine.md's `child_service`/`parent_service` sections for the
+actual retry/ACK behavior this enables in `module`.

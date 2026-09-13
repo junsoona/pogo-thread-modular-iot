@@ -1,0 +1,40 @@
+{
+  "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a Sensirion SHT45 (temperature + humidity). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. Both prototype configs (this file and prototype_bh1750.json) share the EXACT SAME upstream_port/downstream_port block -- the only per-board differences are driver_id, i2c_address, sensor_type_bitmap and calibration, exactly as section 2 of the follow-up spec requires.",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_driver_comment": "SENSOR_DRIVER_ID_SHT45 (see components/sensor_provider/include/sensor_provider/sensor_provider.h) and the TEMPERATURE/HUMIDITY channel bits (see components/sensor_channel/include/sensor_channel/sensor_channel.h) are resolved by name here -- tools/pack_module_config.py's DRIVER_IDS/CHANNEL_BITS tables mirror those two C headers bit-for-bit, so this file never repeats a magic number by hand.",
+  "driver_id": "SHT45",
+  "sensor_type_bitmap": ["TEMPERATURE", "HUMIDITY"],
+
+  "bus_type": 0,
+  "bus_number": 0,
+  "i2c_sda_gpio": 0,
+  "i2c_scl_gpio": 1,
+  "i2c_address": "0x44",
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "calibration": [0, 0, 0, 0],
+  "_timeout_comment": "SHT45 high-precision measurement takes ~8.2ms max per the datasheet; 200ms leaves generous margin for I2C bus contention/retries without stalling child_service's SENSOR_HELLO handler for long.",
+  "measurement_timeout_ms": 200,
+
+  "dev_mode": "AUTO",
+
+  "_upstream_comment": "UART0. DETECT_IN uses GPIO2, NOT GPIO13 (documented onboard LED pin, see docs/pogo-interface.md) and NOT GPIO6 (an earlier draft of this profile used GPIO6, but GPIO6/7 are not bonded out on the ESP32-H2 SuperMini/SiP package at all -- corrected to GPIO2, which IS exposed and is an ordinary GPIO under this firmware's USB-Serial/JTAG console configuration; see docs/pogo-interface.md's 'Confirmed GPIO profile' section for the full history/evidence).",
+  "upstream_port": {
+    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
+    "detect_in_gpio": 2, "detect_out_gpio": 12, "base_id_gpio": 14,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "UART1, matches the previous dev-board UART1 pin choice (GPIO10/11) plus real DETECT_IN/OUT. base_id_gpio is always -1 on DOWNSTREAM -- BASE_ID is only ever read on UPSTREAM (see docs/pogo-interface.md).",
+  "downstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

@@ -12,5 +12,7 @@ mkdir -p "$OUT_DIR"
 
 python3 "$ROOT_DIR/tools/pack_module_config.py" "$ROOT_DIR/configs/dev_root.json" "$OUT_DIR/dev_root_config.bin"
 python3 "$ROOT_DIR/tools/pack_module_config.py" "$ROOT_DIR/configs/dev_leaf.json" "$OUT_DIR/dev_leaf_config.bin"
+python3 "$ROOT_DIR/tools/pack_module_config.py" "$ROOT_DIR/configs/prototype_sht45.json" "$OUT_DIR/prototype_sht45_config.bin"
+python3 "$ROOT_DIR/tools/pack_module_config.py" "$ROOT_DIR/configs/prototype_bh1750.json" "$OUT_DIR/prototype_bh1750_config.bin"
 
 echo "config images written to $OUT_DIR"

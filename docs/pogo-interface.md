@@ -111,14 +111,109 @@ See `components/role_manager/role_manager.c`'s `recompute()` for the exact
 [state-machine.md](state-machine.md) for how a role change propagates into
 `thread_manager`.
 
-## Development compat mode (current two boards)
+## Confirmed GPIO profile (final prototype hardware)
 
-The current development boards (ESP32-H2 SuperMini x2) have exactly **one**
-physical POGO UART pair each (UART1, GPIO10=TX, GPIO11=RX, 115200 8N1) and
-**no** DETECT_IN/DETECT_OUT/BASE_ID wiring at all. This is a temporary
-hardware limitation, not a design choice -- the code above is written
-against the final two-port design; the dev boards just can't exercise all
-of it yet.
+The ESP32-H2 SuperMini development boards ARE the final graduation-project
+prototype hardware -- no separate PCB is planned. Both boards run the exact
+same `pogo_module.bin`, and both use the **exact same** UPSTREAM/DOWNSTREAM
+POGO GPIO assignment (only the permanently-paired sensor's `driver_id`,
+I2C address, and `calibration`/`config_revision` differ between boards --
+see `configs/prototype_sht45.json`/`configs/prototype_bh1750.json` and
+docs/module-config.md).
+
+| Function              | GPIO | Notes |
+|-----------------------|-----:|-------|
+| I2C SDA                |    0 | sensor bus |
+| I2C SCL                |    1 | sensor bus |
+| UPSTREAM UART0 TX      |    4 | |
+| UPSTREAM UART0 RX      |    5 | |
+| UPSTREAM DETECT_OUT    |   12 | open-drain, active-low |
+| UPSTREAM DETECT_IN     |    2 | pull-up input -- **not GPIO13, not GPIO6**, see below |
+| UPSTREAM BASE_ID       |   14 | active-low input, local pull-up |
+| DOWNSTREAM UART1 TX    |   10 | |
+| DOWNSTREAM UART1 RX    |   11 | |
+| DOWNSTREAM DETECT_OUT  |   22 | open-drain, active-low |
+| DOWNSTREAM DETECT_IN   |   23 | pull-up input |
+| DOWNSTREAM BASE_ID     |   -1 | BASE_ID is UPSTREAM-only, enforced by module_config validation |
+
+### ESP32-H2 GPIO usability policy (as enforced by `module_config`/`pack_module_config.py`)
+
+| Category | GPIOs | Reason |
+|---|---|---|
+| Boot strapping (reject) | 8, 9, 25 | would perturb boot mode if driven the wrong way at reset |
+| Not bonded out on the SuperMini/SiP package (reject) | 6, 7 | the ESP32-H2 SiP flash model does not expose these pins at all, and no SuperMini header pin carries them either -- see the GPIO6 correction below |
+| Internal SPI flash (reject) | 15-21 | wired internally to the SiP's flash die |
+| USB Serial/JTAG (reject) | 26, 27 | native USB D-/D+, also flash/monitor's own transport (see the console change below) |
+| Allowed, ordinary GPIOs | 2, 3, 4, 5 | **not** strapping pins -- freely usable as POGO/sensor GPIOs under this firmware's current configuration (USB-Serial/JTAG console, no external pad JTAG enabled). The one caveat: enabling the chip's separate *external pad* JTAG interface would need some of these pins back -- this firmware never enables pad JTAG and never touches any JTAG-related eFuse, so the caveat is documentation only, not a runtime restriction. |
+| Not chip-restricted, but avoided by this board profile | 13 | documented ESP32-H2 SuperMini onboard LED pin (`components/pogo_proto/Kconfig`) -- a board-level fact, not a chip-level rule, so `module_config`'s validation does NOT reject GPIO13 outright (see the GPIO13/GPIO6 history below) |
+
+`components/module_config/gpio_profile.c` (`gpio_profile_in_range()`/
+`gpio_profile_reserved_reason()`) is the single source of truth for this
+table; `tools/pack_module_config.py`'s `STRAPPING_GPIOS`/
+`NOT_BONDED_OUT_GPIOS`/`FLASH_GPIOS`/`USB_GPIOS` mirror it exactly, checked
+mechanically by `tools/test_gpio_profile_parity.py` rather than by two
+hand-maintained lists silently drifting apart. `module_config.c`'s
+`validate_config()` additionally rejects a GPIO number outside `[-1, 27]`,
+reusing one GPIO for two functions, or giving an enabled port anything other
+than `uart_num` 0 or 1 -- see docs/module-config.md.
+
+### History: UPSTREAM DETECT_IN's GPIO -- 13, then 6, now 2
+
+The follow-up spec's originally proposed profile put UPSTREAM DETECT_IN on
+**GPIO13**. This repository already documented (see
+`components/pogo_proto/Kconfig`'s `POGO_UART_TX_GPIO` help text, predating
+this GPIO-profile work) that GPIO13 is the ESP32-H2 SuperMini's **onboard
+LED** pin -- wiring an external DETECT_IN input there would conflict with
+whatever drives that LED. Per the follow-up spec's own instruction ("남는
+안전한 노출 GPIO로 설정만 변경하고 그 근거를 보고한다"), UPSTREAM DETECT_IN
+was first moved to **GPIO6**.
+
+That first correction was itself wrong: **GPIO6 and GPIO7 are not bonded out
+at all** on the ESP32-H2 SiP flash package this project uses, and the
+SuperMini board's own header does not expose them either -- there is no
+physical pad to wire a DETECT_IN signal to, regardless of what the firmware
+config claims. This was caught before any board was flashed and is now
+corrected: UPSTREAM DETECT_IN is **GPIO2** (an ordinary, exposed,
+non-strapping GPIO under this firmware's USB-Serial/JTAG console
+configuration -- see the table above). `gpio_profile.c` now rejects GPIO6/7
+outright (`"not bonded out on ESP32-H2 SuperMini/SiP package"`) so this
+specific mistake cannot silently recur in a future config. Every
+config/doc/wiring instruction in this repository uses GPIO2, not GPIO6 or
+GPIO13, for UPSTREAM DETECT_IN; BASE_ID stayed on GPIO14 throughout (never
+flagged by either piece of evidence).
+
+### Console moved off UART0
+
+ESP32-H2 has exactly two UART controllers, and both are now committed to the
+POGO ports above (UPSTREAM=UART0, DOWNSTREAM=UART1) -- there is no UART left
+for a log console. `module/sdkconfig.defaults` sets
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (no secondary console): ESP_LOG/printf
+now only ever goes out over the chip's native USB-Serial/JTAG peripheral
+(GPIO26/27, already reserved and never touched by any POGO/sensor config),
+which is also what `idf.py flash`/`monitor` already use. No UART0 byte is
+ever emitted by the application or second-stage bootloader once this
+sdkconfig applies. The one caveat: the ROM's very first-stage boot messages
+(before the second-stage bootloader takes over) are baked into the chip's
+mask ROM and are emitted over UART0 by hardware default at every power-on
+reset, regardless of any `sdkconfig` -- this is a documented ESP32-family
+characteristic, not something an application `sdkconfig` can suppress
+without permanently burning an eFuse (not done here), and is a few bytes at
+the very start of boot, not a sustained console.
+
+## Development compat mode (dev_root.json / dev_leaf.json, preserved as a regression fixture)
+
+`configs/dev_root.json`/`configs/dev_leaf.json` are kept exactly as they
+were before this GPIO work, as the pre-existing two-board regression
+fixture. They describe a board with exactly **one** physical POGO UART pair
+(UART1, GPIO10=TX, GPIO11=RX, 115200 8N1) and **no** DETECT_IN/DETECT_OUT/
+BASE_ID wiring at all -- this used to be the state of the actual dev boards;
+now that the confirmed GPIO profile above is real, `dev_mode=AUTO` with the
+profile above is what every new board should actually be flashed with (see
+`configs/prototype_sht45.json`/`configs/prototype_bh1750.json`).
+`module_config`'s validation only enforces "an enabled port needs
+DETECT_IN/DETECT_OUT" and "AUTO needs a real UPSTREAM BASE_ID" when
+`dev_mode == AUTO` specifically, so these two files keep validating and
+packing exactly as before.
 
 To still validate the *same* `pogo_module.bin` on these boards, `module_config`
 carries a small, separate NVS namespace (`dev_cfg`, distinct from the fixed
@@ -153,8 +248,91 @@ and `PROTOCOL_VERSION_ERROR` are NOT auto-retried even in dev-compat mode --
 those mean something is actually wrong (config or version mismatch), not
 just "the peer isn't listening yet".
 
-This is explicitly a **temporary testing feature**: once real DETECT/BASE_ID
-hardware exists, `dev_root_config.bin`/`dev_leaf_config.bin` and the
-`MODULE_DEV_MODE_DEV_ROOT`/`DEV_LEAF` code paths stop being needed for
-day-to-day validation (they can stay as a bench-test fallback, but AUTO
-becomes the only image anyone actually flashes to a finished module).
+This was written as a **temporary testing feature** before real DETECT/
+BASE_ID hardware existed; now that it does (the confirmed GPIO profile
+above), `dev_root_config.bin`/`dev_leaf_config.bin` and the
+`MODULE_DEV_MODE_DEV_ROOT`/`DEV_LEAF` code paths are kept only as a bench-test
+fallback / regression fixture -- `configs/prototype_sht45.json`/
+`configs/prototype_bh1750.json` (`dev_mode=AUTO`) are what every real board
+is actually flashed with.
+
+## Idle PING/PONG liveness (section 9 of the follow-up spec)
+
+Once `PEER_READY`, a port that has heard nothing (no HELLO, no provisioning
+frame, no PING/PONG) for `CONFIG_POGO_PING_INTERVAL_MS` sends one
+`POGO_MSG_PING` and expects a same-seq `POGO_MSG_PONG` within
+`CONFIG_POGO_ACK_TIMEOUT_MS`. This is entirely internal to `pogo_port` --
+PING/PONG frames are answered/consumed inside `process_peer_ready()` and are
+**never** forwarded up as `POGO_PORT_EVENT_FRAME_RECEIVED`; higher layers
+(`child_service`/`parent_service`) never see them (an earlier revision had
+`child_service` answer PING itself -- that responsibility has moved into
+`pogo_port`, which is the only code that ever reads this port's UART, so
+there is exactly one place deciding "is this byte PING/PONG or a
+provisioning frame" -- see `pogo_port.c`'s `maybe_send_idle_ping()`/
+`process_peer_ready()`).
+
+A run of `CONFIG_POGO_MAX_RETRY` consecutive PING timeouts (same budget as
+every other retry in this codebase) fires `POGO_PORT_EVENT_ERROR` with the
+new `POGO_PORT_ERR_LIVENESS_LOST` code and moves the port to `ERROR` --
+`AUTO` mode then waits for the next physical detach/attach (a liveness loss
+while `DETECT_IN` still reads attached means something is genuinely wrong,
+the same reasoning as `DOCK_TIMEOUT`); dev-compat mode (no `DETECT_IN`)
+auto-retries a fresh handshake after one `CONFIG_POGO_PING_INTERVAL_MS`
+cooldown, mirroring `handle_dock_timeout_or_silent_power_base()`'s recovery
+policy. Any real traffic (a HELLO, a provisioning frame, or a successful
+PING/PONG round trip) resets the idle countdown, so a busy link never sends
+gratuitous PINGs.
+
+## PMS5003 (section 11): parser complete, hardware transport blocked
+
+ESP32-H2 has exactly two UART controllers, and the confirmed GPIO profile
+above commits both permanently to the UPSTREAM/DOWNSTREAM POGO ports. There
+is no third hardware UART left for the PMS5003's continuous 9600 8N1
+output stream, on either of these two boards, in any role.
+
+What this repository actually implements: `components/pms5003/pms5003_parser.h/.c`
+is a complete, fully host-tested (`tools/test_pms5003_parser.c`) 32-byte
+frame parser (header/length/checksum/endian/range validation, split
+reception, garbage-prefix resync, back-to-back frames), plus a registrable
+`sensor_provider_ops_t` (`components/pms5003/pms5003.h/.c`) shaped exactly
+like BH1750/SHT45/SGP40/SGP41's, so the parser and channel mapping
+(`SENSOR_CHANNEL_PM1_0`/`PM2_5`/`PM10`) need no further change once a real
+transport exists -- only `pms5003.c`'s `init()`/`start_measurement()`/
+`read_measurement()` would gain real I/O. Today, `init()` always fails with
+a loud, honest `PMS5003 hardware transport blocked by two-UART allocation`
+log line -- selecting `SENSOR_DRIVER_ID_PMS5003` in a real config never
+silently no-ops or fabricates a reading.
+
+Transport options considered:
+
+1. **RMT peripheral in RX mode, decoding UART in software.** ESP32-H2's RMT
+   block can capture GPIO edge timings with hardware timestamps, and this is
+   a real, ESP-IDF-supported capability. But RMT RX is designed around pulse
+   trains with idle gaps between symbols (IR remotes, WS2812 readback), not
+   a continuous 9600-baud byte stream with no inter-byte idle time within a
+   frame; decoding it reliably would mean converting raw edges to bits/bytes
+   in real time, competing for CPU with the IEEE 802.15.4 radio stack Thread
+   already depends on. Technically possible, not attempted here -- the risk
+   of intermittently corrupted frames (which the parser above would then
+   just as intermittently drop) under real radio load is unverified and
+   real.
+2. **External I2C-to-UART bridge** (e.g. an SC16IS750/752-family chip). A
+   real hardware UART behind an I2C register interface -- known-good, low
+   risk, well-supported by existing ESP-IDF I2C drivers, and shares the
+   already-used sensor I2C bus (GPIO0/1) without an address conflict against
+   BH1750 (0x23/0x5C)/SHT45 (0x44)/SGP40/SGP41 (0x59). This is the
+   recommended path if PMS5003 support becomes a real priority -- it just
+   requires sourcing and wiring a small breakout that is not on hand for
+   this session.
+3. **Busy-wait software UART, or borrowing a POGO UART.** Both explicitly
+   rejected per the follow-up spec: a busy-wait bit-banged receiver would
+   starve the Thread/OpenThread task and this port's own POGO handshake
+   task; "borrowing" a POGO UART (e.g. DOWNSTREAM when nothing is docked
+   there) would silently stop working the instant that module became
+   INTERMEDIATE -- a state this design explicitly allows any module to enter
+   at any redocking, so a transport that only works in one specific role is
+   not an acceptable design.
+
+Conclusion: **PMS5003 hardware transport blocked by two-UART allocation.**
+The parser and driver interface are done; only the transport itself is
+outstanding, and does not block BH1750/SHT45/SGP40/SGP41.

@@ -8,19 +8,28 @@
  * Boot sequence:
  *   1. nvs_flash_init()          -- dynamic "nvs" partition (Thread dataset,
  *                                    topology/session state).
- *   2. module_config_load()      -- fixed "cfg" partition (sensor pairing,
+ *   2. sensor_provider_register() x N -- register every real driver this
+ *                                    image is compiled with (bh1750, sht45, ...).
+ *   3. module_config_load()      -- fixed "cfg" partition (sensor pairing,
  *                                    port wiring). CONFIG_ERROR halts here.
- *   3. module_config_load_dev_mode() -- AUTO / DEV_ROOT / DEV_LEAF.
- *   4. thread_manager_init()     -- OpenThread FTD stack up, no network yet.
- *   5. role_manager_init()       -- starts deriving ROOT/INTERMEDIATE/LEAF
+ *   4. module_config_load_dev_mode() -- AUTO / DEV_ROOT / DEV_LEAF.
+ *   5. thread_manager_init()     -- OpenThread FTD stack up, no network yet.
+ *   6. sensor_service_init()     -- initializes the ONE paired sensor driver
+ *                                    exactly once (section 3); never touched
+ *                                    directly by child_service any more.
+ *   7. sensor_transport_init()   -- starts the CoAP sample-receiving
+ *                                    resource (section 8); the sample-ready
+ *                                    callback then wires sensor_service's
+ *                                    periodic samples into it.
+ *   8. role_manager_init()       -- starts deriving ROOT/INTERMEDIATE/LEAF
  *                                    (or is forced by a dev override).
- *   6. pogo_port_init() x2       -- UPSTREAM/DOWNSTREAM, both routed through
+ *   9. pogo_port_init() x2       -- UPSTREAM/DOWNSTREAM, both routed through
  *                                    one dispatcher into role_manager AND
  *                                    child_service (UPSTREAM only) /
  *                                    parent_service (DOWNSTREAM only).
- *   7. child_service_init() / parent_service_init() -- always both; each
+ *  10. child_service_init() / parent_service_init() -- always both; each
  *                                    only ever acts on its own port's events.
- *   8. pogo_port_enable() x2     -- only for ports this board actually wires
+ *  11. pogo_port_enable() x2     -- only for ports this board actually wires
  *                                    (module_config-driven; a dev board's
  *                                    "missing" port is simply not enabled).
  */
@@ -36,6 +45,13 @@
 #include "pogo_proto/pogo_crc16.h"
 #include "module_config/module_config.h"
 #include "sensor_provider/sensor_provider.h"
+#include "sensor_service/sensor_service.h"
+#include "sensor_transport/sensor_transport.h"
+#include "bh1750/bh1750.h"
+#include "sht45/sht45.h"
+#include "sgp40/sgp40.h"
+#include "sgp41/sgp41.h"
+#include "pms5003/pms5003.h"
 #include "pogo_port/pogo_port.h"
 #include "role_manager/role_manager.h"
 #include "thread_manager/thread_manager.h"
@@ -100,6 +116,7 @@ static void on_role_change(module_role_t new_role, module_role_t old_role, void 
 {
     (void)ctx;
     child_service_on_role_change(new_role, old_role);
+    sensor_service_on_role_change(new_role, old_role);
 
     if (old_role == MODULE_ROLE_ROOT && new_role != MODULE_ROLE_ROOT) {
         /* Leaving ROOT: invalidate any in-flight watcher immediately. */
@@ -174,6 +191,21 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* Register every real driver this firmware image is compiled with, so
+     * sensor_provider_lookup()/sensor_service_init() below can find them by
+     * module_config.driver_id -- see sensor_provider_register()'s doc
+     * comment for why this happens here (in module main) instead of each
+     * driver component depending on sensor_provider circularly. Harmless if
+     * this board's config never selects one of them. */
+    sensor_provider_register(SENSOR_DRIVER_ID_BH1750, &g_bh1750_provider_ops);
+    sensor_provider_register(SENSOR_DRIVER_ID_SHT45, &g_sht45_provider_ops);
+    sensor_provider_register(SENSOR_DRIVER_ID_SGP40, &g_sgp40_provider_ops);
+    sensor_provider_register(SENSOR_DRIVER_ID_SGP41, &g_sgp41_provider_ops);
+    /* Registered for a clear, actionable CONFIG_ERROR-style log if ever
+     * selected -- its init() always fails honestly (no working transport
+     * exists yet). See components/pms5003/pms5003.h. */
+    sensor_provider_register(SENSOR_DRIVER_ID_PMS5003, &g_pms5003_provider_ops);
+
     module_config_t cfg;
     if (module_config_load(&cfg) != ESP_OK) {
         /* module_config_load() already logged a specific CONFIG_ERROR line.
@@ -200,6 +232,20 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(thread_manager_init());
+
+    /* sensor_service owns the one permanently-paired sensor driver from
+     * here on -- initialized exactly once, before child_service_init()
+     * (which now only ever calls sensor_service_measure_once(), never
+     * sensor_provider_ops_t directly -- section 3 of the follow-up spec).
+     * sensor_transport needs the OpenThread instance thread_manager_init()
+     * just brought up, so it comes after that, and the sample-ready
+     * callback wiring (sensor_service -> sensor_transport, see that
+     * callback's own doc comment for why it's a function pointer and not a
+     * direct component dependency) happens right after both exist. */
+    ESP_ERROR_CHECK(sensor_service_init(&cfg));
+    ESP_ERROR_CHECK(sensor_transport_init());
+    sensor_service_set_sample_ready_cb(sensor_transport_send_sample);
+
     ESP_ERROR_CHECK(role_manager_init(dev_mode, on_role_change, NULL));
 
     pogo_port_config_t up_cfg = to_port_cfg(&cfg.upstream_port);

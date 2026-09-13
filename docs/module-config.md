@@ -101,6 +101,99 @@ The output size (`0x3000` = 12288 bytes by default) must match the `cfg`
 partition's size in `module/partitions.csv` -- `pack_module_config.py`
 takes `--size` if you ever change that.
 
+## ESP32-H2 GPIO validation (section 1 of the follow-up spec)
+
+`validate_config()` now also enforces a chip-specific GPIO profile, since
+`module_config` is only ever used by the `module` project and that project
+only ever targets ESP32-H2 (and, per the follow-up spec, the ESP32-H2
+SuperMini dev boards ARE the final prototype hardware -- no separate PCB is
+planned):
+
+- Every GPIO actually assigned must be `-1` or in `[0, 27]`.
+- No GPIO may be one of the boot strapping pins (8, 9, 25), the pins not
+  bonded out on the ESP32-H2 SuperMini/SiP package at all (6, 7), the
+  internal SPI flash pins (15-21), or the USB Serial/JTAG pins (26, 27) --
+  see docs/pogo-interface.md's confirmed GPIO profile for the reasoning and
+  the two corrections this forced (UPSTREAM `DETECT_IN` moved off GPIO13,
+  the SuperMini's onboard LED pin, to GPIO6, and then off GPIO6 -- not
+  actually bonded out on this package -- to GPIO2). GPIO2-5 are ordinary,
+  allowed GPIOs under this firmware's USB-Serial/JTAG console configuration
+  (NOT strapping pins); GPIO13 is not rejected by this chip-level check at
+  all (its avoidance is a board-level LED-conflict decision, made in
+  `configs/prototype_*.json`, not a chip-level rule). The exact
+  classification lives in `components/module_config/gpio_profile.c`
+  (`gpio_profile_reserved_reason()`), mirrored bit-for-bit by
+  `tools/pack_module_config.py`'s `STRAPPING_GPIOS`/`NOT_BONDED_OUT_GPIOS`/
+  `FLASH_GPIOS`/`USB_GPIOS` and checked for drift by
+  `tools/test_gpio_profile_parity.py`.
+- An enabled port's `uart_num` must be exactly 0 or 1 -- ESP32-H2 has only
+  two UART controllers, and both are permanently committed to the two POGO
+  ports.
+- `downstream_port.base_id_gpio` must always be `-1` (BASE_ID is
+  UPSTREAM-only), regardless of `dev_mode`.
+- **Only when `dev_mode == AUTO`**: an enabled port must also have both
+  `detect_in_gpio` and `detect_out_gpio` set, and `upstream_port.base_id_gpio`
+  must be set -- real hardware cannot derive ROOT/INTERMEDIATE/LEAF without
+  them. `configs/dev_root.json`/`configs/dev_leaf.json` (`dev_mode` !=
+  `AUTO`) are exempt from this specific check and keep validating exactly as
+  before -- see docs/pogo-interface.md's "development compat mode" section.
+
+Every failure logs one `CONFIG_ERROR: <field>=<value> ...` line naming the
+specific field and value, e.g.
+`CONFIG_ERROR: upstream_port.detect_in_gpio=6 is reserved on ESP32-H2 (not bonded out on ESP32-H2 SuperMini/SiP package)`.
+
+## driver_id, sensor_type_bitmap, and the common registries
+
+Section 2 of the follow-up spec asks that `driver_id` and the channel
+bitmap live in one explicit common header each, never repeated as bare
+numbers per config file:
+
+- `driver_id` values are `#define`d once in
+  `components/sensor_provider/include/sensor_provider/sensor_provider.h`
+  (`SENSOR_DRIVER_ID_MOCK`/`BH1750`/`SHT45`/`SGP40`/`SGP41`/`PMS5003`, each a
+  4-byte ASCII tag like the pre-existing `MOCK`).
+- Channel bit positions (shared by `module_config.sensor_type_bitmap` and
+  the per-sample wire format's channel `type` byte -- see the next section)
+  are the `sensor_channel_type_t` enum in
+  `components/sensor_channel/include/sensor_channel/sensor_channel.h`.
+
+`tools/pack_module_config.py`'s `DRIVER_IDS`/`CHANNEL_BITS` dicts mirror
+these two headers bit-for-bit (with a "must match" comment, the same pattern
+already used for `MOCK_DRIVER_ID`) and let a `configs/*.json` file reference
+either the mnemonic name or the raw numeric value:
+
+```json
+"driver_id": "SHT45",
+"sensor_type_bitmap": ["TEMPERATURE", "HUMIDITY"],
+```
+
+resolves to exactly the same bytes as the old numeric style still used by
+`configs/dev_root.json`/`configs/dev_leaf.json` (`"driver_id": "0x4D4F434B"`,
+`"sensor_type_bitmap": 1`) -- both forms remain valid, so the pre-existing
+dev configs needed no change.
+
+## Prototype configs (real AUTO-mode hardware)
+
+`configs/prototype_sht45.json` and `configs/prototype_bh1750.json` are the
+two real, `dev_mode=AUTO` configs for the confirmed GPIO profile (see
+docs/pogo-interface.md) -- both share the identical `upstream_port`/
+`downstream_port` block; only `driver_id`, `i2c_address`,
+`sensor_type_bitmap`, and `calibration` differ:
+
+| | SHT45 | BH1750 |
+|---|---|---|
+| `driver_id` | `SHT45` (`0x53483435`) | `BH1750` (`0x42483137`) |
+| `i2c_address` | `0x44` | `0x23` (ADDR low/floating -- confirm the actual breakout's strap) |
+| `sensor_type_bitmap` | `["TEMPERATURE", "HUMIDITY"]` | `["ILLUMINANCE"]` |
+| `measurement_timeout_ms` | 200 | 300 |
+
+```bash
+python3 tools/pack_module_config.py configs/prototype_sht45.json build/cfg_images/prototype_sht45_config.bin
+python3 tools/pack_module_config.py configs/prototype_bh1750.json build/cfg_images/prototype_bh1750_config.bin
+# or, along with dev_root/dev_leaf, all at once:
+bash tools/gen_config.sh build/cfg_images
+```
+
 ## driver_id and the mock sensor
 
 `driver_id` selects exactly one compiled-in `sensor_provider` driver (see

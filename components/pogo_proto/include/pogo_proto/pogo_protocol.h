@@ -46,6 +46,15 @@ typedef enum {
     POGO_MSG_SENSOR_INFO_ACK = 0x0D, /* child -> parent: sensor_type_bitmap/response_time_ms/status (see below). */
     POGO_MSG_POLL_CONFIG     = 0x0E, /* parent -> child: computed polling_period_ms for this child to use. */
     POGO_MSG_PEER_HELLO_RESP = 0x0F, /* reply to POGO_MSG_PEER_HELLO_REQ, same seq. */
+    /*
+     * parent -> child: acknowledges one JOIN_RESULT (same seq), so the
+     * child can stop retrying it (section 7 of the follow-up spec: JOIN_RESULT
+     * reliability). Empty payload -- the seq alone identifies which
+     * JOIN_RESULT this acks, the same pattern PING/PONG already use.
+     * upper/lower never send/expect this (JOIN_RESULT there is always
+     * seq=0, fire-and-forget, unmodified) -- purely additive.
+     */
+    POGO_MSG_JOIN_RESULT_ACK = 0x10,
 } pogo_msg_type_t;
 
 typedef enum {

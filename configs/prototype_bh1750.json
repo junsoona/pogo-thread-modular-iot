@@ -1,0 +1,42 @@
+{
+  "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a ROHM BH1750 (ambient light / illuminance). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. Both prototype configs (this file and prototype_sht45.json) share the EXACT SAME upstream_port/downstream_port block -- the only per-board differences are driver_id, i2c_address, sensor_type_bitmap and calibration, exactly as section 2 of the follow-up spec requires.",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_driver_comment": "SENSOR_DRIVER_ID_BH1750 and the ILLUMINANCE channel bit are resolved by name -- see prototype_sht45.json's _driver_comment for how tools/pack_module_config.py keeps this in sync with the C headers.",
+  "driver_id": "BH1750",
+  "sensor_type_bitmap": ["ILLUMINANCE"],
+
+  "bus_type": 0,
+  "bus_number": 0,
+  "i2c_sda_gpio": 0,
+  "i2c_scl_gpio": 1,
+  "_addr_comment": "BH1750 ADDR pin LOW or floating -> 7-bit address 0x23 (most breakout boards pull ADDR low/leave it floating by default -- CONFIRM the actual breakout's ADDR strap before flashing; if it is tied HIGH instead, the address is 0x5C and this field must change to match, per section 4 of the follow-up spec: 'ADDR 상태에 맞는 주소').",
+  "i2c_address": "0x23",
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "_calibration_comment": "calibration[0] is an optional lux correction-factor override in milli-units (0 = use the driver's default MTreg/1.2 conversion, no correction) -- see components/bh1750/bh1750.c.",
+  "calibration": [0, 0, 0, 0],
+  "_timeout_comment": "BH1750 one-time high-resolution mode takes up to 180ms per the datasheet; 300ms leaves margin for I2C bus contention/retries.",
+  "measurement_timeout_ms": 300,
+
+  "dev_mode": "AUTO",
+
+  "_upstream_comment": "Identical to prototype_sht45.json's upstream_port -- see that file's _upstream_comment for why DETECT_IN is GPIO2, not GPIO13 or GPIO6.",
+  "upstream_port": {
+    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
+    "detect_in_gpio": 2, "detect_out_gpio": 12, "base_id_gpio": 14,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port.",
+  "downstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

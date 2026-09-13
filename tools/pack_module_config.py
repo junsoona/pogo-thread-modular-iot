@@ -25,8 +25,107 @@ import tempfile
 
 CFG_PARTITION_SIZE = 0x3000  # must match module/partitions.csv's "cfg" partition size
 
+# ESP32-H2 GPIO usability profile -- MUST match
+# components/module_config/gpio_profile.c's gpio_profile_in_range()/
+# gpio_profile_reserved_reason() exactly (checked mechanically by
+# tools/test_gpio_profile_parity.py, not just by this comment). See that C
+# file's own header comment for the full policy and why GPIO2/3 are ordinary
+# GPIOs here (not strapping) while GPIO6/7 are rejected (not bonded out on
+# the ESP32-H2 SuperMini/SiP package at all, regardless of strapping/flash/
+# USB status).
+GPIO_MAX = 27
+STRAPPING_GPIOS = {8, 9, 25}
+NOT_BONDED_OUT_GPIOS = {6, 7}  # ESP32-H2 SuperMini/SiP package
+FLASH_GPIOS = set(range(15, 22))  # 15..21 inclusive
+USB_GPIOS = {26, 27}
+
+
+def gpio_reserved_reason(gpio: int):
+    """Returns the same reason strings as gpio_profile_reserved_reason(), or
+    None if `gpio` is a plain, assignable GPIO (or -1)."""
+    if gpio < 0:
+        return None
+    if gpio in STRAPPING_GPIOS:
+        return "boot strapping pin"
+    if gpio in NOT_BONDED_OUT_GPIOS:
+        return "not bonded out on ESP32-H2 SuperMini/SiP package"
+    if gpio in FLASH_GPIOS:
+        return "internal SPI flash pin"
+    if gpio in USB_GPIOS:
+        return "USB Serial/JTAG pin"
+    return None
+
+
+def check_gpio(field_name: str, gpio) -> None:
+    """Mirrors module_config.c's check_gpio_field(): -1 or 0..GPIO_MAX only,
+    and not one of the reserved sets above."""
+    gpio = as_int(gpio)
+    if not (gpio == -1 or 0 <= gpio <= GPIO_MAX):
+        sys.exit(f"refusing to pack: {field_name}={gpio} is out of range for ESP32-H2 (valid: -1 or 0..{GPIO_MAX})")
+    reason = gpio_reserved_reason(gpio)
+    if reason is not None:
+        sys.exit(f"refusing to pack: {field_name}={gpio} is reserved on ESP32-H2 ({reason}) -- "
+                  f"see docs/pogo-interface.md")
+
+
 DEV_MODES = {"AUTO": 0, "DEV_ROOT": 1, "DEV_LEAF": 2}
 MOCK_DRIVER_ID = 0x4D4F434B  # ASCII "MOCK" -- must match sensor_provider.h's SENSOR_DRIVER_ID_MOCK
+
+# Single common registry for driver_id (section 2 of the follow-up spec: "driver
+# ID와 sensor bitmap은 명시적인 공통 헤더에서 관리한다") -- MUST match
+# components/sensor_provider/include/sensor_provider/sensor_provider.h's
+# SENSOR_DRIVER_ID_* #defines bit-for-bit. configs/*.json may write either the
+# mnemonic string below or the raw numeric value; both end up packing the same
+# 4 bytes, so no magic number needs to be retyped/reinvented per config file.
+DRIVER_IDS = {
+    "MOCK": 0x4D4F434B,
+    "BH1750": 0x42483137,
+    "SHT45": 0x53483435,
+    "SGP40": 0x53473430,
+    "SGP41": 0x53473431,
+    "PMS5003": 0x504D3530,
+}
+
+# Bit position of each channel in sensor_type_bitmap (u16) -- MUST match
+# components/sensor_channel/include/sensor_channel/sensor_channel.h's
+# sensor_channel_type_t enum values exactly (same reasoning as DRIVER_IDS
+# above: one numbering, never duplicated by hand per config file).
+CHANNEL_BITS = {
+    "ILLUMINANCE": 0,
+    "TEMPERATURE": 1,
+    "HUMIDITY": 2,
+    "VOC_RAW": 3,
+    "VOC_INDEX": 4,
+    "NOX_RAW": 5,
+    "NOX_INDEX": 6,
+    "PM1_0": 7,
+    "PM2_5": 8,
+    "PM10": 9,
+}
+
+
+def resolve_driver_id(v):
+    """Accepts a mnemonic string ("SHT45"), or falls back to as_int() for a
+    raw JSON int / "0x.." string (kept for configs/dev_root.json,
+    configs/dev_leaf.json, which predate this registry)."""
+    if isinstance(v, str) and v in DRIVER_IDS:
+        return DRIVER_IDS[v]
+    return as_int(v)
+
+
+def resolve_sensor_bitmap(v):
+    """Accepts a list of channel-name strings (["TEMPERATURE", "HUMIDITY"]),
+    or falls back to as_int() for a raw JSON int (kept for
+    configs/dev_root.json, configs/dev_leaf.json)."""
+    if isinstance(v, list):
+        bitmap = 0
+        for name in v:
+            if name not in CHANNEL_BITS:
+                raise ValueError(f"unknown channel name {name!r} in sensor_type_bitmap "
+                                  f"(known: {sorted(CHANNEL_BITS)})")
+            bitmap |= 1 << CHANNEL_BITS[name]
+        return bitmap
+    return as_int(v)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -76,8 +175,8 @@ def pack_config(cfg: dict) -> bytes:
         ">IIIHBBhhHhhhhI4iI",
         as_int(cfg["schema_version"]),
         as_int(cfg["config_revision"]),
-        as_int(cfg["driver_id"]),
-        as_int(cfg["sensor_type_bitmap"]),
+        resolve_driver_id(cfg["driver_id"]),
+        resolve_sensor_bitmap(cfg["sensor_type_bitmap"]),
         as_int(cfg["bus_type"]),
         as_int(cfg["bus_number"]),
         as_int(cfg["i2c_sda_gpio"]),
@@ -183,19 +282,38 @@ def main():
     # The same checks module_config.c / module/main/app_main.c enforce at
     # boot (see docs/module-config.md) -- catch them here too, before ever
     # producing a .bin someone might flash.
-    driver_id_val = as_int(cfg["driver_id"])
+    driver_id_val = resolve_driver_id(cfg["driver_id"])
     if driver_id_val == MOCK_DRIVER_ID and dev_mode_name == "AUTO":
         sys.exit("refusing to pack: driver_id is the MOCK sensor but dev_mode=AUTO -- "
                   "mock is development-only (see docs/module-config.md)")
     if as_int(cfg["measurement_timeout_ms"]) == 0:
         sys.exit("refusing to pack: measurement_timeout_ms must not be 0")
-    if as_int(cfg["bus_type"]) not in (0, 1):
+    bus_type_val = as_int(cfg["bus_type"])
+    if bus_type_val not in (0, 1):
         sys.exit("refusing to pack: bus_type must be 0 (I2C) or 1 (SPI)")
+
+    # ESP32-H2 GPIO profile -- same reserved-pin policy module_config.c
+    # enforces at boot (see gpio_reserved_reason() above), caught here too
+    # before ever producing a .bin.
     for port_name in ("upstream_port", "downstream_port"):
         p = cfg[port_name]
+        for field in ("tx_gpio", "rx_gpio", "detect_in_gpio", "detect_out_gpio", "base_id_gpio"):
+            check_gpio(f"{port_name}.{field}", p[field])
         if as_int(p["detect_out_gpio"]) >= 0 and not p.get("detect_out_active_low", True):
             sys.exit(f"refusing to pack: {port_name}.detect_out_active_low=false is not supported yet "
                       f"(DETECT_OUT is open-drain active-low only -- see docs/pogo-interface.md)")
+    if bus_type_val == 0:
+        check_gpio("i2c_sda_gpio", cfg["i2c_sda_gpio"])
+        check_gpio("i2c_scl_gpio", cfg["i2c_scl_gpio"])
+    else:
+        for field in ("spi_mosi_gpio", "spi_miso_gpio", "spi_sclk_gpio", "spi_cs_gpio"):
+            check_gpio(field, cfg[field])
+    if as_int(cfg["downstream_port"]["base_id_gpio"]) != -1:
+        sys.exit("refusing to pack: downstream_port.base_id_gpio must be -1 (BASE_ID is UPSTREAM-only, "
+                  "see docs/pogo-interface.md)")
+    if dev_mode_name == "AUTO" and as_int(cfg["upstream_port"]["base_id_gpio"]) < 0:
+        sys.exit("refusing to pack: dev_mode=AUTO but upstream_port.base_id_gpio is not set "
+                  "(see docs/module-config.md)")
 
     blob = pack_config(cfg)
     crc = crc16_ccitt(blob)
@@ -224,7 +342,7 @@ def main():
 
     verify_module_cfg_blob_len(out_path, len(blob))
 
-    print(f"wrote {args.output_bin} (dev_mode={dev_mode_name}, driver_id=0x{as_int(cfg['driver_id']):x}, "
+    print(f"wrote {args.output_bin} (dev_mode={dev_mode_name}, driver_id=0x{driver_id_val:x}, "
           f"blob_crc=0x{crc:04x}, verified module_cfg:blob={len(blob)} bytes)")
 
 
