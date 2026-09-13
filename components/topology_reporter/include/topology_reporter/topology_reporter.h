@@ -42,6 +42,17 @@
  * topology_reporter_init()'s own comment. The local per-boot sequence
  * counter never wraps: nearing its limit triggers a fresh persisted
  * generation and a sequence reset instead (see maybe_roll_over_sequence()).
+ *
+ * Data-plane readiness gate (real-hardware first-sample/topology race, see
+ * components/topology_gate's header comment): this component is the ONLY
+ * writer of that gate. It opens it the moment a TOPOLOGY_REPORT_ATTACHED (or
+ * a later re-registration -- see topology_gate_request_reregister()) gets a
+ * real CoAP 2.xx response, and closes it the instant `settled`
+ * (role_manager_is_upstream_ready() && role in {LEAF, INTERMEDIATE}) turns
+ * false -- upstream DETACHED/ERROR, role settling to UNASSIGNED/ROLE_ERROR,
+ * this module's own Thread membership being lost, or a brand new
+ * provisioning session starting all reach this component as `settled`
+ * becoming false, within at most one TOPOLOGY_REPORTER_POLL_TICK_MS.
  */
 #pragma once
 

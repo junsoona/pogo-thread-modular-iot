@@ -20,6 +20,7 @@
 #include "sensor_service/sensor_service.h"
 #include "thread_manager/thread_manager.h"
 #include "node_calc/node_calc.h"
+#include "topology_gate/topology_gate.h"
 
 static const char *TAG = "topology_reporter";
 
@@ -423,6 +424,14 @@ static void topology_reporter_task(void *arg)
     bool has_attached = false;
     module_role_t last_role = MODULE_ROLE_UNASSIGNED;
     TickType_t last_heartbeat = xTaskGetTickCount();
+    /* Rate-limits the "still not registered" warning below -- an ATTACHED
+     * attempt that keeps failing (the power base unreachable, or -- in
+     * DEV_ROOT/DEV_LEAF module-to-module regression -- a peer that never
+     * runs power_base_transport and so has no "/t" resource at all) must
+     * not flood the log every single TOPOLOGY_REPORTER_POLL_TICK_MS
+     * (section 4 of the follow-up spec: "매 주기마다 경고를 출력하지
+     * 않는다"). 0 means "never logged yet". */
+    TickType_t last_attach_fail_log = 0;
 
     while (1) {
         tr_port_evt_t evt;
@@ -445,19 +454,66 @@ static void topology_reporter_task(void *arg)
          * function's own doc comment. */
         resync_downstream_connected(has_attached);
 
+        /*
+         * Power base reboot recovery (section 8 of the follow-up spec,
+         * docs/power-base.md section 11): sensor_transport requests an
+         * immediate fresh ATTACHED attempt the moment the power base
+         * rejects a "/s" sample as unknown-module (CoAP 4.04) -- its
+         * RAM-only registry forgot this module across a reboot. Forcing
+         * has_attached back to false here means the `settled && !has_attached`
+         * branch below retries THIS SAME tick, bounded by one poll tick
+         * (<=TOPOLOGY_REPORTER_POLL_TICK_MS) -- never the up-to-
+         * CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS wait a plain
+         * heartbeat schedule would otherwise impose ("30초 heartbeat만
+         * 기다리지 않는다"). Consuming the request when has_attached is
+         * already false is harmless: the retry path below is already
+         * active on its own.
+         */
+        if (topology_gate_take_reregister_request() && has_attached) {
+            ESP_LOGW(TAG, "power base no longer recognizes this module (a sensor sample was rejected as "
+                          "unknown-module) -- closing the data-plane gate and re-registering now");
+            has_attached = false;
+            topology_gate_close();
+        }
+
         bool ready = role_manager_is_upstream_ready();
         module_role_t role = role_manager_get_role();
         bool settled = ready && (role == MODULE_ROLE_LEAF || role == MODULE_ROLE_INTERMEDIATE);
         TickType_t now = xTaskGetTickCount();
 
         if (settled && !has_attached) {
-            has_attached = true;
             last_role = role;
-            send_live_report(TOPOLOGY_REPORT_ATTACHED);
-            last_heartbeat = now;
+            if (send_live_report(TOPOLOGY_REPORT_ATTACHED)) {
+                has_attached = true;
+                last_heartbeat = now;
+                /* The ONLY place the data-plane gate ever opens (section 5):
+                 * a real CoAP 2.xx response to THIS ATTACHED report, never
+                 * merely "the OpenThread transport delivered the bytes" --
+                 * send_live_report()/transmit()/send_one_attempt() already
+                 * enforce that (code review follow-up section 3), unchanged
+                 * here. */
+                topology_gate_open();
+            } else if (last_attach_fail_log == 0 ||
+                       (now - last_attach_fail_log) > pdMS_TO_TICKS(5000)) {
+                last_attach_fail_log = now;
+                ESP_LOGW(TAG, "still not registered with the power base -- retrying (this module's own sensor "
+                              "sample sending, if any, stays paused until this succeeds)");
+            }
+            /* has_attached stays false on failure (section 6: an ATTACHED
+             * failure is never marked as registered): the next poll tick
+             * tries again, paced by this task's own
+             * TOPOLOGY_REPORTER_POLL_TICK_MS wait plus transmit()'s existing
+             * bounded 1+3 CoAP attempt/backoff cycle -- never a tight busy
+             * loop, and never more than one ATTACHED attempt cycle per
+             * tick. The data-plane gate stays closed the whole time. */
         } else if (!settled && has_attached) {
             send_detached_report();
             has_attached = false;
+            /* Section 7: upstream/Thread/role loss closes the gate within
+             * at most one poll tick -- see this function's own doc comment
+             * on topology_gate_close()'s "immediately" for what bound that
+             * actually is. */
+            topology_gate_close();
         } else if (settled && has_attached && role != last_role) {
             last_role = role;
             send_live_report(TOPOLOGY_REPORT_UPDATED);

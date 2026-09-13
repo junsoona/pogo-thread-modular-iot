@@ -17,10 +17,18 @@
  *   6. sensor_service_init()     -- initializes the ONE paired sensor driver
  *                                    exactly once (section 3); never touched
  *                                    directly by child_service any more.
- *   7. sensor_transport_init()   -- starts the CoAP sample-receiving
+ *   7. topology_gate_init()       -- creates the cross-task-safe data-plane
+ *                                    readiness gate (real-hardware
+ *                                    first-sample/topology race fix, see
+ *                                    components/topology_gate); must exist
+ *                                    before sensor_transport_init() or
+ *                                    topology_reporter_init() run.
+ *   7b. sensor_transport_init()  -- starts the CoAP sample-receiving
  *                                    resource (section 8); the sample-ready
  *                                    callback then wires sensor_service's
- *                                    periodic samples into it.
+ *                                    periodic samples into it. In AUTO mode,
+ *                                    also gates every "/s" send on the
+ *                                    topology_gate above.
  *   8. role_manager_init()       -- starts deriving ROOT/INTERMEDIATE/LEAF
  *                                    (or is forced by a dev override).
  *   9. pogo_port_init() x2       -- UPSTREAM/DOWNSTREAM, both routed through
@@ -38,6 +46,11 @@
  *                                    Thread CoAP ("/t", see docs/power-base.md);
  *                                    a sensor module never runs the receiving
  *                                    side of that resource, only power_base does.
+ *                                    Also the sole writer of the topology_gate
+ *                                    from step 7: opens it once its own
+ *                                    ATTACHED report gets a real CoAP 2.xx
+ *                                    response, closes it on upstream/Thread/
+ *                                    role loss or a fresh provisioning session.
  *  12. pogo_port_enable() x2     -- only for ports this board actually wires
  *                                    (module_config-driven; a dev board's
  *                                    "missing" port is simply not enabled).
@@ -67,6 +80,7 @@
 #include "child_service/child_service.h"
 #include "parent_service/parent_service.h"
 #include "topology_reporter/topology_reporter.h"
+#include "topology_gate/topology_gate.h"
 
 static const char *TAG = "module_main";
 
@@ -309,7 +323,20 @@ void app_main(void)
      * callback's own doc comment for why it's a function pointer and not a
      * direct component dependency) happens right after both exist. */
     ESP_ERROR_CHECK(sensor_service_init(&cfg));
-    ESP_ERROR_CHECK(sensor_transport_init());
+    /*
+     * topology_gate must exist before sensor_transport_init() (reads it on
+     * every send) or topology_reporter_init() (the only thing that ever
+     * opens/closes it) run -- see topology_gate.h's header comment and this
+     * file's own top comment (steps 7/7b/11). require_topology_registration
+     * is true only for the AUTO path against an active power base:
+     * DEV_ROOT/DEV_LEAF module-to-module regression peers never run
+     * power_base_transport and so never have a "/t" resource at all --
+     * gating their "/s" sends on a registration that could never succeed
+     * would permanently block sensor data in that mode (section 10 of the
+     * follow-up spec).
+     */
+    ESP_ERROR_CHECK(topology_gate_init());
+    ESP_ERROR_CHECK(sensor_transport_init(dev_mode == MODULE_DEV_MODE_AUTO));
     sensor_service_set_sample_ready_cb(sensor_transport_send_sample);
 
     ESP_ERROR_CHECK(role_manager_init(dev_mode, on_role_change, NULL));

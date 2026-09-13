@@ -261,6 +261,13 @@ Confirmable CoAP POST with the same bounded UUID-hash backoff schedule
 `sensor_transport` already uses for sensor samples (1 initial + 3 retries) --
 no infinite retry loop, no busy polling while not Thread-joined.
 
+**Data-plane readiness gate (real-hardware finding, see section 18):** on real
+hardware, a sensor module's first `"/s"` sample can reach the power base
+before its OWN `ATTACHED` report has been accepted into `topology_registry` --
+`sensor_service`'s periodic task and `topology_reporter`'s task run on
+independent schedules. `components/topology_gate` closes this window; see
+section 18 for the full design and section 15 for its host test.
+
 `role` and `topology_depth` reuse `module_role_t`'s exact numeric values
 (`topology_proto.h`'s `topology_role_t` mirrors them by convention, the same
 pattern `sensor_channel_type_t` already uses for `module_config.sensor_type_bitmap`).
@@ -320,7 +327,13 @@ the real, unmodified component.
   repopulated purely by modules' own ordinary `ATTACHED`/`HEARTBEAT` reports
   arriving into what looks like "an unknown uuid" -- no special "recovery
   mode" exists or is needed (see `tools/test_topology_registry.c`'s
-  `scenario_base_reboot_registry_repopulated_by_heartbeat`).
+  `scenario_base_reboot_registry_repopulated_by_heartbeat`). A module that was
+  already sending sensor samples before the reboot does not just wait for its
+  next scheduled `HEARTBEAT` to notice, though: `power_base_transport`'s `"/s"`
+  handler still returns CoAP 4.04 Not Found for that now-forgotten uuid (an
+  unchanged, pre-existing response), and `sensor_transport` reacts to that
+  specific code by closing `topology_gate` and asking `topology_reporter` to
+  re-attach immediately -- see section 18.
 
 ## 12. Dataset ownership
 
@@ -407,27 +420,60 @@ All pre-existing 17 host tests (15 C + 2 Python) plus the first round's 7
 power-base tests were re-run and still pass -- see the final report for the
 exact run.
 
+**Added by the real-hardware race fix (this session, section 18):**
+
+| File | Links against | Covers |
+|---|---|---|
+| `tools/test_topology_gate.c` | real `components/topology_gate/topology_gate.c` (FreeRTOS event group shadowed by `tools/host_test_stubs/freertos/`), mirrors `topology_reporter.c`'s ATTACHED/gate state machine and `sensor_transport.c`'s gate check + 4.04 reaction | no send before ATTACHED ack, send allowed after 2.xx, a failing ATTACHED keeps the gate closed and retries (bounded, no busy loop), the gate closes on detach/error/new session, power-base-reboot 4.04 -> immediate re-registration -> 2.xx -> resumed sending, DEV_ROOT/DEV_LEAF (`require_topology_registration=false`) unaffected, a duplicate/late callback never opens the gate early, sample_seq policy unaffected |
+
+All pre-existing 27 host tests (25 C + 2 Python) were re-run and still pass
+alongside this new one -- 30 total (28 C + 2 Python). See the final report for
+the exact run.
+
 ## 16. What is still unverified on real hardware
 
-Everything in this document is verified at the source/build/host-test level
-only, in this session, on the CURRENT bench wiring (no power-base <-> module
-harness has been built yet). In particular, still needing real hardware:
+**Update (this session, see section 18):** a real power base + one real SHT45
+sensor module (depth=1, single hop) has since been wired and exercised.
+Confirmed on that real hardware: the power base reaching `otDeviceRole=4
+(LEADER)`; POGO `PEER_READY` between the two boards; the module's permanent
+efuse-derived uuid being proposed/confirmed; `polling_period_ms=195` delivered
+via `POLL_CONFIG`; a 110-byte Active Dataset delivered and durably stored;
+the module joining Thread as `otDeviceRole=2 (CHILD)`; `JOIN_RESULT_ACK`;
+a topology report applied at the power base; and an SHT45 2-channel sample
+recorded in `sensor_root_aggregator`. Everything below that is not covered by
+that specific run is still unverified exactly as before.
 
-- The actual POGO wiring table in section 4 above, on a real power-base
-  board + a real first sensor module.
-- `pogo_port`'s BASE_ID/PEER_HELLO cross-check with a REAL power-base MCU on
-  the other end (this session's tests mirror the logic; they do not exercise
-  real UART/GPIO timing).
+That same run also surfaced a real startup race (a sensor sample reaching
+`"/s"` before this module's own topology `ATTACHED` report had been applied,
+rejected once as CoAP 4.04 -- see section 18) -- fixed in this session via
+`components/topology_gate`, but **the fix itself has not yet been reflashed
+and re-verified on real hardware**; only host tests + clean builds cover it
+so far. This is the single most important thing to reflash and re-check next.
+
+In particular, still needing real hardware:
+
+- **The `topology_gate` fix from section 18 itself** -- reflash both boards
+  and confirm: no sensor sample before the ATTACHED ack; the CoAP-4.04
+  power-base-reboot recovery path re-registers within one poll tick, not a
+  30s heartbeat wait; DEV_ROOT/DEV_LEAF regression images are unaffected.
+- The actual POGO wiring table in section 4 above, on a BH1750 sensor module
+  (only SHT45 has been tried) and on chains of more than one sensor module.
+- `pogo_port`'s BASE_ID/PEER_HELLO cross-check with more than one sensor
+  module attached (only a single depth=1 module has been tried against the
+  real power-base MCU so far).
 - `thread_manager_start_as_root()`'s dataset resume path across a REAL power
   cycle of the power-base board.
-- CoAP delivery of both `"/s"` and `"/t"` over a real multi-hop Thread mesh,
-  including the UUID-hash backoff schedule's real timing.
-- The 30s strictly-LEADER boot-wait budget under real radio conditions.
+- CoAP delivery of both `"/s"` and `"/t"` over a real MULTI-HOP Thread mesh
+  (only a single depth=1 hop has been tried), including the UUID-hash backoff
+  schedule's real timing.
+- The 30s strictly-LEADER boot-wait budget under adverse real radio
+  conditions (the one run so far reached LEADER without issue).
 - Any of section 11's detach/reconnect/stale behaviors under a real physical
-  detach (as opposed to the host-tested pure registry logic).
+  detach (as opposed to the host-tested pure registry logic) -- the power
+  base reboot / registry-loss path specifically is section 18's concern.
 
 See the final report's "실물 검증 절차" for the exact flash order and
-pass/fail criteria to run once the new wiring exists.
+pass/fail criteria to run next.
 
 ## 17. Code review follow-up (this session)
 
@@ -528,3 +574,107 @@ host-test level only, same as the rest of this document.
 All four projects (`module`, `power_base`, `upper`, `lower`) were rebuilt
 from a clean `fullclean` after these fixes and still link with zero
 warnings -- see the final report for the exact build/test results.
+
+## 18. Real-hardware validation and the first-sample/topology race fix (this session)
+
+**Real-hardware result.** A power base + one SHT45 sensor module (depth=1,
+single hop) has been wired and exercised on real hardware. Confirmed:
+`power_base` reaching `otDeviceRole=4 (LEADER)`; POGO `PEER_READY` between the
+two boards; the module's permanent efuse-derived uuid proposed and confirmed;
+`polling_period_ms=195` delivered via `POLL_CONFIG`; a 110-byte Active Dataset
+delivered and durably stored; the module joining Thread as `otDeviceRole=2
+(CHILD)`; `JOIN_RESULT_ACK`; a topology report applied at the power base
+(`role=3`, LEAF); and an SHT45 2-channel sample recorded in
+`sensor_root_aggregator`. This is the first real-hardware confirmation of the
+whole chain described in sections 1-17.
+
+**The race.** The same run also showed this sequence, right after boot:
+
+```text
+power_base_transport: sensor sample from unknown module uuid=..d357 -- dropped, not stored
+sensor_transport: sensor sample rejected by receiver: CoAP 4.04
+power_base_transport: topology report applied: uuid=..d357 ...
+sensor_root_aggregator: sample recorded: uuid=..d357 ...
+```
+
+`sensor_service`'s periodic sampling task starts measuring the instant it has
+a polling period, and its sample-ready callback (`sensor_transport_send_sample()`)
+was previously gated ONLY on Thread-joined state (`sensor_service_set_thread_joined()`,
+flipped by `child_service` the moment `otDeviceRole` settles). `topology_reporter`
+runs its own, independent `TOPOLOGY_REPORTER_POLL_TICK_MS` (500ms) poll loop and
+only notices `role_manager_is_upstream_ready()` becoming true on its next tick.
+On real hardware, this module's first `"/s"` sample can therefore reach the
+power base before its own `ATTACHED` report has been applied to
+`topology_registry` -- an unknown-uuid rejection (CoAP 4.04, section 13's
+existing, unchanged semantics), recovered a moment later once the `ATTACHED`
+report itself succeeds. One sample lost, not data corruption, but a policy
+violation of "no `"/s"` before this module is actually registered".
+
+**The fix: `components/topology_gate`.** A small, dependency-free (one
+FreeRTOS event group) component holding two bits: whether this module is
+CURRENTLY registered (data-plane gate), and whether a re-registration has been
+requested. It is the only thing `topology_reporter` (the sole writer of the
+first bit) and `sensor_transport` (the reader of the first bit, and the writer
+of the second) share -- neither gains a direct dependency on the other, so no
+component-dependency cycle is introduced (`topology_reporter` already depends
+on `sensor_service`; `sensor_transport` already depends on `sensor_service`
+too; both simply gain a one-way dependency on this one leaf component).
+
+- **Where the gate opens:** `topology_reporter_task()`'s `settled &&
+  !has_attached` branch now only sets `has_attached = true` (and calls
+  `topology_gate_open()`) when `send_live_report(TOPOLOGY_REPORT_ATTACHED)`
+  itself returns true -- i.e. a real CoAP 2.xx response, unchanged from the
+  existing "2.xx only" success check `send_one_attempt()` already enforced
+  (code review follow-up section 3, section 17 item 3 above). Previously
+  `has_attached` was set unconditionally, before the send even happened; a
+  failed ATTACHED attempt is now retried on the next poll tick instead of
+  silently giving up on ever registering until the next heartbeat.
+- **Where it closes:** the same task's `!settled && has_attached` branch
+  (upstream DETACHED/ERROR, role settling to UNASSIGNED/ROLE_ERROR, this
+  module's own Thread membership lost, or a fresh provisioning session
+  starting -- `role_manager_is_upstream_ready()`/`role_manager_get_role()`
+  fold all of these into the one `settled` boolean this branch already
+  checked), within at most one `TOPOLOGY_REPORTER_POLL_TICK_MS` -- the same
+  bound `resync_downstream_connected()` already documents for a dropped port
+  event, not a new synchronous cross-task guarantee.
+- **`sensor_transport_send_sample()`** now takes a `require_topology_registration`
+  bool (from `sensor_transport_init()`, true only for the AUTO path against an
+  active power base) and, when true, refuses to even attempt a `"/s"` send
+  while `topology_gate_is_open()` is false -- not a warning every sample
+  period, an `ESP_LOGD` (section 4 of this session's task: "매 주기마다
+  경고를 출력하지 않는다"). `sensor_service`'s own measurement, `sample_seq`
+  increment, and local state updates are all untouched -- only the wireless
+  hand-off is skipped, exactly like the existing Thread-joined gate.
+- **Power base reboot recovery:** its `topology_registry` is RAM-only (section
+  10), so a reboot can make it reject an already-registered module's sample as
+  CoAP 4.04 Not Found -- the ONLY meaning that code has for `"/s"` (section
+  13, unchanged). `sensor_transport`'s `send_one_attempt()` reacts to that
+  specific code (when `require_topology_registration` is true) by calling
+  `topology_gate_close()` and `topology_gate_request_reregister()` right away.
+  `topology_reporter_task()` checks (and atomically clears)
+  `topology_gate_take_reregister_request()` every poll tick; when set, it
+  forces `has_attached = false`, so the very same tick's `settled &&
+  !has_attached` branch retries `ATTACHED` immediately -- bounded by one poll
+  tick, not the up to `CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS` (30s
+  default) a plain heartbeat schedule would otherwise impose.
+- **DEV_ROOT/DEV_LEAF regression is unaffected.** `require_topology_registration`
+  is false for that module-to-module path (`module/main/app_main.c` passes
+  `dev_mode == MODULE_DEV_MODE_AUTO`): DEV_ROOT's peer never runs
+  `power_base_transport` and so has no `"/t"` resource at all, meaning its
+  ATTACHED reports could never succeed -- gating `"/s"` sending on that would
+  have permanently blocked DEV_LEAF's sensor data. `topology_reporter` still
+  runs its ATTACHED-retry loop uniformly for every mode (harmless -- a bounded,
+  rate-limited-logged retry against a peer with no `"/t"` resource), but
+  `sensor_transport` simply never consults the gate in that mode. `upper`/
+  `lower` never call `sensor_transport_init()` at all and are untouched.
+- **No shared semaphores/callback state.** This gate never touches
+  `topology_reporter.c`'s or `sensor_transport.c`'s own token-guarded async
+  CoAP response-handler state (section 17 item 3) -- it only ever reads
+  `send_live_report()`'s/`send_one_attempt()`'s already-finished boolean
+  result or a CoAP response code, after those functions' own stale-callback
+  protection has already resolved.
+
+See `components/topology_gate/include/topology_gate/topology_gate.h` for the
+full design comment and `tools/test_topology_gate.c` for the host test
+(section 15). **This fix itself has not yet been reflashed and re-verified on
+real hardware** -- see section 16.

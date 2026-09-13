@@ -13,10 +13,13 @@
 더 이상 ROOT가 되지 않는다. 시스템의 유일한 ROOT/Leader는 별도 프로젝트
 `power_base/`로 구현된 전용 전원 모듈이다. 이 절 아래의 "실물 배선"/"ROOT용 passive
 power-base 시험 지그" 관련 옛 서술은 이 변경으로 대체되었다 -- 자세한 내용과 근거는
-[`docs/power-base.md`](docs/power-base.md) 참고. **이번 세션에서는 전원 모듈<->센서
-모듈 간 새 배선을 아직 실제로 연결하지 않았다** -- 소프트웨어 구현/빌드/host test는
-모두 완료했지만 실물 연동 검증은 배선 완료 후 별도로 필요하다 (아래 "네 프로젝트 빌드
-결과"와 `docs/power-base.md`의 "아직 실물 하드웨어에서 확인되지 않은 항목" 참고).
+[`docs/power-base.md`](docs/power-base.md) 참고. **전원 모듈<->센서 모듈 간 배선은
+이후 세션에서 실제로 연결되었고, POGO 프로비저닝부터 Thread 가입, topology 보고,
+SHT45 sample 수집까지 실물에서 성공했다** -- 자세한 내용은 아래 "실물 검증 결과 및
+데이터플레인 registration gate 수정" 절 참고. 이 절에서 설명하는 첫 sample/topology
+경쟁 수정 자체는 이 문서를 쓰는 시점 기준 아직 실물 flash/monitor로 재검증되지
+않았다 (아래 "네 프로젝트 빌드 결과"와 `docs/power-base.md`의 "아직 실물 하드웨어에서
+확인되지 않은 항목" 참고).
 
 **최종 졸업작품 프로토타입은 ESP32-H2 SuperMini 기반 전원 모듈 1대(`power_base/`)와
 센서 모듈 N대(`module/`, 현재 보유·검증 대상은 SHT45 1대 + BH1750 1대, 총 2대)로
@@ -27,6 +30,57 @@ DOWNSTREAM UART, DETECT_IN/OUT, BASE_ID, 센서 I2C)이 그대로 이 개발보�
 절대 산출되지 않는다 -- `docs/power-base.md` 참고). `configs/dev_root.json`/
 `configs/dev_leaf.json`(DETECT/BASE_ID 없는 1-UART 개발모드, module-to-module 전용)은
 과거 회귀 시험용으로만 보존한다.
+
+## 실물 검증 결과 및 데이터플레인 registration gate 수정 (이번 세션)
+
+**이전 세션에서 이미 실물로 성공한 항목** (전원 모듈 1대 + SHT45 센서 모듈 1대,
+depth=1 단일 홉):
+
+- `power_base`가 OpenThread LEADER가 됨.
+- POGO PEER_READY 성공 (전원 모듈<->센서 모듈).
+- 영구(efuse 기반) UUID 확인 및 프로비저닝 성공.
+- `polling_period_ms=195`가 `POLL_CONFIG`로 정상 전달됨.
+- Thread Active Dataset 110바이트가 정상 전달·저장됨.
+- 센서 모듈이 `otDeviceRole=2(CHILD)`로 Thread에 가입.
+- `JOIN_RESULT_ACK` 성공.
+- topology report(`"/t"`) 적용 성공.
+- SHT45 2채널 sample이 `sensor_root_aggregator`에 저장됨.
+
+**같은 실물 시험에서 다음 시작 직후 순서 경쟁이 관측되었다:**
+
+```text
+power_base_transport: sensor sample from unknown module uuid=..d357 -- dropped, not stored
+sensor_transport: sensor sample rejected by receiver: CoAP 4.04
+power_base_transport: topology report applied: uuid=..d357 ...
+sensor_root_aggregator: sample recorded: uuid=..d357 ...
+```
+
+원인: `sensor_service`의 주기적 측정 task는 polling 설정을 받은 즉시 시작하고,
+Thread 가입 직후 `sensor_transport`의 `"/s"` 무선 전송을 허용한다. `topology_reporter`는
+별도의 500ms polling task에서 `ATTACHED` report를 보내므로, 첫 sensor sample이 전원
+모듈의 topology registry 등록보다 먼저 도착할 수 있다 -- 이 경우 전원 모듈은 아직 모르는
+uuid이므로 CoAP 4.04 Not Found로 그 sample을 거부한다 (드물게 손실되는 하나의 sample,
+치명적이지는 않지만 정책 위반).
+
+**이번 세션에서 적용한 수정 (아직 실물 flash/monitor로 재검증되지 않음):** 새 컴포넌트
+`components/topology_gate`가 FreeRTOS 이벤트 그룹 기반의 cross-task-safe
+data-plane readiness gate를 제공한다. `topology_reporter`(유일한 writer)는 자신의
+`TOPOLOGY_REPORT_ATTACHED`가 실제 CoAP 2.xx 응답을 받은 순간에만 이 gate를 열고,
+upstream DETACHED/ERROR·role UNASSIGNED/ROLE_ERROR·Thread 가입 해제·새 provisioning
+세션 시작 시 즉시(최대 한 poll tick, `TOPOLOGY_REPORTER_POLL_TICK_MS`) 닫는다.
+`sensor_transport_send_sample()`(AUTO 모드에서만, `require_topology_registration=true`)은
+이 gate가 열려 있을 때만 `"/s"` 무선 전송을 시도한다 -- 측정/시퀀스 갱신 자체는 gate와
+무관하게 기존 정책대로 계속된다. 전원 모듈이 재부팅해 이미 등록된 모듈의 sample을 CoAP
+4.04로 거부하면, `sensor_transport`가 즉시 gate를 닫고 `topology_gate_request_reregister()`로
+재등록을 요청해 30초 heartbeat 주기를 기다리지 않고 다음 poll tick에 재등록을 시도한다.
+DEV_ROOT/DEV_LEAF(module-to-module 회귀, `"/t"` 리소스가 아예 없는 피어)는
+`require_topology_registration=false`로 이 gate의 영향을 받지 않는다. 자세한 설계는
+`components/topology_gate`의 헤더 주석, `docs/power-base.md`의 관련 절 참고.
+
+**이 수정 자체는 host test(`tools/test_topology_gate.c` 포함 30개 전체 통과)와
+`module`/`power_base`/`upper`/`lower` clean build(경고 0건)까지만 검증되었다 -- 실물
+보드에 다시 flash해 위 경쟁이 재현되지 않고 회귀도 없는지는 아직 확인되지 않았다** (아래
+"네 프로젝트 빌드 결과", "아직 실물 보드에서 확인되지 않은 항목" 참고).
 
 ## 구조
 
@@ -64,6 +118,8 @@ components/
   topology_proto/           토폴로지 보고 고정 길이 versioned binary wire format (신규)
   topology_registry/        전원 모듈의 UUID 키 토폴로지 레지스트리, 순수 로직 (신규)
   topology_reporter/        센서 모듈 측 토폴로지 보고 송신자 (신규)
+  topology_gate/            첫 sample/topology 등록 경쟁 수정용 data-plane readiness gate
+                            (FreeRTOS 이벤트 그룹 기반, 신규 -- 이번 세션)
   power_base_transport/     전원 모듈의 Thread CoAP 수신측 -- "/s"(센서데이터)+"/t"(토폴로지)
                             (신규)
   node_calc/                polling period / UUID backoff 순수 계산 (공유)
@@ -380,11 +436,19 @@ I (..) child_service: JOIN_RESULT_ACK received (seq=1) -- provisioning session f
 로그에서 확인된다. Network Key가 포함된 Dataset 원문, 전체 UUID(짧은 suffix만 표시)는
 어떤 로그에도 출력되지 않는다.
 
-### 전원 모듈 + 센서 모듈 배치 -- 기대 로그 (신규, 새 배선 필요)
+### 전원 모듈 + 센서 모듈 배치 -- 기대 로그
 
-**아래는 새 배선을 완료한 뒤 위 "전원 모듈 + 센서 모듈 배치" 절차를 실행했을 때
-기대되는 로그다 -- 이번 세션에서 실물로 확인한 것이 아니라, 구현된 코드가 그렇게
-동작하도록 작성/host-test된 것이다.**
+**아래 로그는 실물로 확인되었다** (전원 모듈 1대 + SHT45 센서 모듈 1대, depth=1 단일
+홉 -- 위 "실물 검증 결과 및 데이터플레인 registration gate 수정" 절 참고). 다만 그
+실물 시험에서는 시작 직후 첫 sensor sample이 topology 등록보다 먼저 도착해 CoAP
+4.04로 한 번 거부되는 순서 경쟁도 함께 관측되었다 -- 아래 로그는 그 경쟁이 없는
+정상 경로를 보여준다 (실제로 경쟁이 발생하면 `power_base_transport: sensor sample
+from unknown module uuid=.. -- dropped, not stored`/`sensor_transport: sensor sample
+rejected by receiver: CoAP 4.04`가 `topology report applied`보다 먼저 한 번 나타날
+수 있다). **이번 세션에서 추가한 `topology_gate` 수정(같은 절 참고)은 정확히 이 경쟁을
+없애기 위한 것이며, 아직 이 수정 자체를 다시 flash/monitor로 실물 재검증하지는
+않았다** -- 수정이 적용된 상태에서 기대되는 추가 로그는 아래 두 블록 다음에 별도로
+적어 둔다.
 
 #### 전원 모듈 (`power_base`)
 
@@ -437,6 +501,29 @@ I (..) topology_reporter: topology report sent OK (type=0 seq=1 attempt=1/4)
 것. `otDeviceRole=2`(CHILD)로 join 성공할 것. `topology_reporter`가 최소 한 번은 성공
 전송(`sent OK`, `type=0`=ATTACHED)할 것.
 
+#### `topology_gate` 수정 적용 후 기대되는 추가 로그 (아직 실물 미검증)
+
+이 수정을 반영해 다시 flash한 뒤에는, `topology_reporter`의 `ATTACHED` 성공 로그(위
+`topology report sent OK (type=0 ...)`)가 이 module의 첫 sensor sample 전송보다 먼저
+(또는 늦어도 같은 poll tick 안에) 나타나야 하고, 그 사이 짧은 창에서 `DEBUG` 레벨로만
+아래와 같은 로그가 보일 수 있다 (기본 `INFO` 레벨 모니터에는 나타나지 않는다):
+
+```
+D (..) sensor_transport: topology registration not yet confirmed -- sample uuid=..xxyy seq=1 held back
+```
+
+전원 모듈을 재부팅해 재현하는 4.04 복구 경로는:
+
+```
+W (..) sensor_transport: sensor sample rejected by receiver: CoAP 4.04
+W (..) topology_reporter: power base no longer recognizes this module (a sensor sample was rejected as unknown-module) -- closing the data-plane gate and re-registering now
+I (..) topology_reporter: topology report sent OK (type=0 seq=.. attempt=1/4)
+```
+
+`sensor_transport: sensor sample rejected ...: CoAP 4.04` 다음에 (최대 30초가 아니라)
+`topology_reporter`의 다음 poll tick(<=500ms) 안에 새 `topology report sent OK
+(type=0 ...)`가 나타나면 이 수정이 의도대로 동작하는 것이다.
+
 ### 위치 교환 배치 -- 기대 로그
 
 동일한 로그가 A/B 역할만 뒤바뀌어 나타난다: 이전에 LEAF였던 보드(B, BH1750)가 이제
@@ -464,8 +551,11 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   offset/크기와 일치.
 - `bash tools/gen_power_base_config.sh build/cfg_images` -> `power_base_config.bin`
   44 bytes로 생성 확인, pack-time 검증 통과 (신규).
-- 기존 17개 host test(15 C + 2 Python) 전부 재통과 + 신규 7개 host test 전부 통과
-  (정확한 항목별 통과 수는 최종 보고 참고). `git diff --check` -> 공백 오류 없음.
+- 기존 27개 host test(25 C + 2 Python) 전부 재통과 + 이번 세션 신규
+  `tools/test_topology_gate.c` 1개(실제 `components/topology_gate/topology_gate.c`를
+  링크, FreeRTOS 이벤트 그룹은 `tools/host_test_stubs/freertos/`로 대체) 통과 -- 총 30개
+  (28 C + 2 Python) 전부 통과 (정확한 항목별 통과 수는 최종 보고 참고). `git diff --check`
+  -> 공백 오류 없음.
 
 ## 보유 센서 현황
 
@@ -485,23 +575,44 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
 
 ## 아직 실물 보드에서 확인되지 않은 항목
 
-**전원 모듈 관련 항목 전체 (신규, 이번 세션 최우선 미검증 대상)**: 이번 세션에서는
-전원 모듈<->센서 모듈 간 새 배선을 아직 실제로 연결하지 않았다. 아래는 소프트웨어
-구현/host test/빌드는 완료했지만 실물 검증이 필요한 항목이다 (자세한 목록은
-[`docs/power-base.md`](docs/power-base.md) 16절):
+**이번 세션의 `topology_gate` 데이터플레인 registration gate 수정 (최우선 미검증
+대상)**: 전원 모듈 1대 + SHT45 센서 모듈 1대 조합 자체는 이미 실물로 성공했고, 그
+시험에서 첫 sample/topology 순서 경쟁도 실제로 관측되었다 (위 "실물 검증 결과 및
+데이터플레인 registration gate 수정" 절). 하지만 그 경쟁을 없애기 위해 이번 세션에서
+추가한 `components/topology_gate`/`sensor_transport`/`topology_reporter` 변경 자체는
+host test(`tools/test_topology_gate.c` 포함)와 `module`/`power_base`/`upper`/`lower`
+clean build까지만 확인했다 -- 다음이 아직 실물로 재검증되지 않았다:
 
-- `docs/power-base.md` 4절의 실제 배선표를 실물 전원 모듈 보드 + 실물 첫 센서 모듈
-  보드에 적용했을 때의 동작 전체.
-- 실물 전원 모듈 MCU와의 BASE_ID/PEER_HELLO 교차검증 (이번 세션은 host-test 모델로만
-  검증, 실제 UART/GPIO 타이밍은 미검증).
+- 정상 경로에서 첫 sensor sample이 topology `ATTACHED` 확인 전에 전송되지 않는지
+  (기존에 관측된 CoAP 4.04 경쟁이 실제로 사라지는지).
+- 전원 모듈을 실물로 재부팅했을 때 4.04 -> 즉시 재등록 -> 2.xx -> sample 재개 흐름이
+  30초 heartbeat를 기다리지 않고 실제로 다음 poll tick 안에 일어나는지.
+- DEV_ROOT/DEV_LEAF 회귀 이미지(`upper`/`lower`, 그리고 `module`의 dev_root/dev_leaf
+  config)가 이 gate의 영향을 받지 않고 기존과 동일하게 동작하는지.
+
+**전원 모듈 관련 나머지 항목 (자세한 목록은 [`docs/power-base.md`](docs/power-base.md)
+16절)**: 위에서 실물로 확인된 것은 전원 모듈 1대 + SHT45 센서 모듈 1대, depth=1 단일
+홉 조합뿐이다. 아래는 소프트웨어 구현/host test/빌드는 완료했지만 여전히 실물 검증이
+필요한 항목이다:
+
+- `docs/power-base.md` 4절의 실제 배선표: 전원 모듈 1대 + SHT45 센서 모듈 1대(depth=1
+  단일 홉) 조합에서는 **실물로 확인됨**. BH1750 보드, 3단 이상 체인은 아직 미확인.
+- 실물 전원 모듈 MCU와의 BASE_ID/PEER_HELLO 교차검증: 이 SHT45 1대 조합에서는 **실물로
+  확인됨** (POGO PEER_READY 성공, 위 절 참고). 두 번째/세 번째 모듈이 동시에 붙는 경우의
+  타이밍은 아직 미확인.
 - `thread_manager_start_as_root()`의 Dataset 재사용 경로를 실물 전원 모듈의 실제
-  전원 재投입(power cycle)으로 확인.
-- `"/s"`/`"/t"` CoAP 전송이 실물 다중 홉 Thread 메시 위에서 정상 동작하는지 (UUID-hash
-  backoff의 실제 타이밍 포함).
-- 전원 모듈의 30초 **LEADER(엄격, ROUTER는 더 이상 허용하지 않음)** 부팅 대기 예산이
-  실제 무선 환경에서 충분한지.
+  전원 재投입(power cycle)으로 확인 -- 아직 미확인.
+- `"/s"`/`"/t"` CoAP 전송: SHT45 1대와의 단일 홉에서는 **실물로 확인됨** (sample이
+  `sensor_root_aggregator`에 저장됨, topology report가 적용됨 -- 다만 첫 sample이
+  4.04로 한 번 거부되는 경쟁도 함께 관측됨, 위 절 참고). 다중 홉 Thread 메시 위에서의
+  동작과 UUID-hash backoff의 실제 타이밍은 아직 미확인.
+- 전원 모듈의 30초 **LEADER(엄격, ROUTER는 더 이상 허용하지 않음)** 부팅 대기 예산:
+  이번 시험에서는 실제로 LEADER에 도달했다 -- 더 열악한 무선 환경에서도 충분한지는
+  아직 미확인.
 - topology registry의 detach/reconnect/stale 처리가 실물 물리적 detach(단순 host-test
-  아님)에서도 동일하게 동작하는지.
+  아님)에서도 동일하게 동작하는지 -- 아직 미확인 (전원 모듈 재부팅에 의한 등록 소실
+  자체는 이번 세션 `topology_gate` 수정이 다루지만, 그 수정 자체도 아직 실물 미검증 --
+  위 절 참고).
 - DETECT_OUT이 실물에서도 Leader 준비 전에는 절대 활성화되지 않는지 (이번 세션은
   `power_base/main/app_main.c`의 순서 자체와 그 순서를 그대로 mirror한 host test로만
   확인 -- 실제 GPIO 레벨은 미측정).
@@ -512,12 +623,17 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   배선된 실물 두 보드에서의 attach/detach 디바운스, PEER_HELLO/BASE_ID 교차검증.
   (passive power-base 지그를 이용한 ROOT 판정은 위 "실물 배선" 절에서 설명한 대로
   이제 유효하지 않은 시나리오다 -- 대신 전원 모듈 관련 항목 참고.)
-- BH1750/SHT45 실물 I2C 통신, 변환값이 실제 조도/온습도와 맞는지.
+- SHT45 실물 I2C 통신·변환값: 전원 모듈과의 조합에서 **실물로 확인됨** (위 절 참고).
+  BH1750은 아직 미확인.
 - SGP40/SGP41: 코드/알고리즘/host test는 완료했으나 실물 배선·실행은 미검증 (위 "보유 센서
   현황" 참고).
 - PMS5003: 파서는 완성했으나 실물 UART transport가 없어 센서 자체의 실물 동작은 애초에
   시험할 수 없다 (하드웨어 결정이 먼저 필요 -- docs/pogo-interface.md 참고).
-- JOIN_RESULT/ACK 유실·중복 재시도 로직의 실물 동작 (host test 시나리오는 통과).
-- 주기적 CoAP 센서 전송, ROOT aggregator 적재, Thread 재가입 후 세션 재개의 실물 동작.
-- idle PING/PONG liveness 및 `LIVENESS_LOST` 판정의 실물 동작.
-- 여러 DOWNSTREAM 세대(3단 이상 체인)에서의 topology_depth 전달과 INTERMEDIATE 역할 전환.
+- JOIN_RESULT/ACK: SHT45 1대와의 정상 경로는 **실물로 확인됨** (`JOIN_RESULT_ACK
+  received` 로그). 유실·중복 재시도 경로 자체(ACK가 실제로 유실되는 경우)는 host test
+  시나리오만 통과, 아직 실물 미확인.
+- 주기적 CoAP 센서 전송, ROOT aggregator 적재: SHT45 1대에서는 **실물로 확인됨**. Thread
+  재가입 후 세션 재개는 아직 미확인.
+- idle PING/PONG liveness 및 `LIVENESS_LOST` 판정의 실물 동작 -- 아직 미확인.
+- 여러 DOWNSTREAM 세대(3단 이상 체인)에서의 topology_depth 전달과 INTERMEDIATE 역할 전환
+  -- 아직 미확인 (지금까지 확인된 것은 depth=1 단일 홉뿐).

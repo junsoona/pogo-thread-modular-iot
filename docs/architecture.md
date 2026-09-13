@@ -257,10 +257,12 @@ upper/, lower/                Preserved reference projects (regression
 5. `thread_manager_init()` -- OpenThread FTD stack up, but Thread itself not
    yet enabled.
 6. `sensor_service_init()` -- initializes the one paired sensor driver
-   exactly once (section 3); `sensor_transport_init()` starts the CoAP
-   sample-receiving resource (needs the OT instance from step 5); the
-   sample-ready callback then wires sensor_service's periodic samples into
-   sensor_transport.
+   exactly once (section 3); `topology_gate_init()` creates the cross-task
+   data-plane readiness gate (see docs/power-base.md section 18); then
+   `sensor_transport_init()` starts the CoAP sample-receiving resource
+   (needs the OT instance from step 5) and, in AUTO mode, gates every "/s"
+   send on that gate; the sample-ready callback then wires sensor_service's
+   periodic samples into sensor_transport.
 7. `role_manager_init()` -- starts deriving a role from port events (or is
    forced by the dev override).
 8. `pogo_port_init()` x2, both routed through one dispatcher that always

@@ -13,6 +13,7 @@
 #include "sensor_service/sensor_service.h"
 #include "thread_manager/thread_manager.h"
 #include "node_calc/node_calc.h"
+#include "topology_gate/topology_gate.h"
 
 static const char *TAG = "sensor_transport";
 
@@ -22,6 +23,10 @@ static const char *TAG = "sensor_transport";
 #define SENSOR_TRANSPORT_MAX_RETRIES 3
 #define SENSOR_TRANSPORT_MAX_ATTEMPTS (1 + SENSOR_TRANSPORT_MAX_RETRIES)
 #define SENSOR_TRANSPORT_ACK_TIMEOUT_MS 1000
+
+/* true only for the AUTO path against an active power base -- see this
+ * component's header comment and sensor_transport_init(). */
+static bool s_require_topology_gate;
 
 /*
  * CoAP client send state -- code review follow-up section 3 (the same fix
@@ -120,8 +125,9 @@ static otCoapResource s_resource = {
     .mNext = NULL,
 };
 
-esp_err_t sensor_transport_init(void)
+esp_err_t sensor_transport_init(bool require_topology_registration)
 {
+    s_require_topology_gate = require_topology_registration;
     s_send_done_sem = xSemaphoreCreateBinary();
     if (s_send_done_sem == NULL) {
         return ESP_ERR_NO_MEM;
@@ -229,6 +235,27 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
             } else {
                 ESP_LOGW(TAG, "sensor sample rejected by receiver: CoAP %u.%02u", code_class,
                          (unsigned)(s_send_response_code & 0x1F));
+                /*
+                 * Power base reboot recovery (docs/power-base.md section 11):
+                 * its topology_registry is RAM-only, so a reboot makes it
+                 * reject an already-registered module's sample as CoAP 4.04
+                 * Not Found ("unknown module" -- power_base_transport.c's
+                 * coap_sensor_handler() is the ONLY thing that ever produces
+                 * this exact code for "/s", never any other meaning). Never
+                 * treated as success (unchanged -- code_class != 2 above
+                 * already handles that); the new part is reacting to it:
+                 * close the gate right away and ask topology_reporter to
+                 * re-attach on its very next poll tick instead of silently
+                 * waiting for its normal heartbeat schedule (section 8:
+                 * "30초 heartbeat만 기다리지 않는다"). A no-op when this
+                 * module never uses the gate at all (DEV_ROOT/DEV_LEAF,
+                 * whose peer never sends this code for "/s" in the first
+                 * place -- see sensor_transport_init()).
+                 */
+                if (s_require_topology_gate && s_send_response_code == OT_COAP_CODE_NOT_FOUND) {
+                    topology_gate_close();
+                    topology_gate_request_reregister();
+                }
             }
         }
     }
@@ -238,6 +265,26 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
 void sensor_transport_send_sample(const sensor_sample_t *sample)
 {
     if (sample == NULL) {
+        return;
+    }
+    /*
+     * Topology-registration gate (real-hardware first-sample/topology race
+     * -- see components/topology_gate's header comment and this
+     * component's own header comment): while required (AUTO path, an
+     * active power base) and not yet open, no wireless attempt is made at
+     * all -- not even the first CoAP try. sensor_service's periodic task
+     * still measured this sample and advanced sample_seq/local state
+     * exactly as before (see sensor_service.c's periodic_task()); only the
+     * "/s" hand-off is skipped here. ESP_LOGD, not a warning: this is the
+     * expected, routine state for every sample in the (usually short)
+     * window between Thread join and this module's own ATTACHED report
+     * being confirmed, and must not flood the log once per sample period
+     * (section 4 of the follow-up spec: "매 주기마다 경고를 출력하지
+     * 않는다").
+     */
+    if (s_require_topology_gate && !topology_gate_is_open()) {
+        ESP_LOGD(TAG, "topology registration not yet confirmed -- sample uuid=..%02x%02x seq=%u held back",
+                 sample->module_uuid[6], sample->module_uuid[7], (unsigned)sample->sample_seq);
         return;
     }
     uint8_t payload[SENSOR_CHANNEL_MAX_WIRE_LEN];
