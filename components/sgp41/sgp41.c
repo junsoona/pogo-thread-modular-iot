@@ -25,8 +25,19 @@ static const char *TAG = "sgp41";
 
 #define SGP41_CONDITIONING_MS_MAX 50u
 #define SGP41_MEASURE_MS_MAX      50u
-#define SGP41_SELF_TEST_MS        320u
+#define SGP41_SELF_TEST_MS        320u /* >=10ms, safe under pdMS_TO_TICKS() at CONFIG_FREERTOS_HZ=100 */
 #define SGP41_I2C_TIMEOUT_MS      200
+
+/* code review follow-up (SHT45 wake-reboot fix, item 7): the
+ * read_measurement() polling loop below re-checks elapsed time via
+ * esp_timer_get_time() every iteration -- correctness never depends on this
+ * delay's actual length. But module/sdkconfig runs CONFIG_FREERTOS_HZ=100
+ * (10ms/tick), so pdMS_TO_TICKS(2) rounds DOWN to 0 ticks and vTaskDelay(0)
+ * would return immediately, turning the wait into a tight CPU-spinning poll
+ * instead of actually blocking. Round up to at least 1 real tick so the loop
+ * still blocks; the elapsed-time check (not this tick count) remains the
+ * sole thing that decides when data is read. */
+#define SGP41_POLL_DELAY_TICKS ((pdMS_TO_TICKS(2) > 0) ? pdMS_TO_TICKS(2) : (TickType_t)1)
 
 /* Same documented default compensation values as SGP40 -- see sgp40.c's
  * comment; identical disclosure applies (section 10: never fake another
@@ -212,7 +223,7 @@ static esp_err_t sgp41_read_measurement(sensor_provider_ctx_t *ctx, sensor_measu
         if ((xTaskGetTickCount() - wait_start) >= timeout_ticks) {
             return ESP_ERR_TIMEOUT;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(SGP41_POLL_DELAY_TICKS);
     }
 
     /* Conditioning returns only SRAW_VOC (1 word, 3 bytes); the combined

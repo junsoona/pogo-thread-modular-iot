@@ -25,6 +25,17 @@ static const char *TAG = "bh1750";
 #define BH1750_CONVERSION_MS_MAX     180u /* datasheet max for (one-time) H-Res mode */
 #define BH1750_I2C_TIMEOUT_MS        200
 
+/* code review follow-up (SHT45 wake-reboot fix, item 7): the
+ * read_measurement() polling loop below re-checks elapsed time via
+ * esp_timer_get_time() every iteration -- correctness never depends on this
+ * delay's actual length. But module/sdkconfig runs CONFIG_FREERTOS_HZ=100
+ * (10ms/tick), so pdMS_TO_TICKS(5) rounds DOWN to 0 ticks and vTaskDelay(0)
+ * would return immediately, turning the wait into a tight CPU-spinning poll
+ * instead of actually blocking. Round up to at least 1 real tick so the loop
+ * still blocks; the elapsed-time check (not this tick count) remains the
+ * sole thing that decides when data is read. */
+#define BH1750_POLL_DELAY_TICKS ((pdMS_TO_TICKS(5) > 0) ? pdMS_TO_TICKS(5) : (TickType_t)1)
+
 struct sensor_provider_ctx_s {
     i2c_master_bus_handle_t bus;
     i2c_master_dev_handle_t dev;
@@ -158,7 +169,7 @@ static esp_err_t bh1750_read_measurement(sensor_provider_ctx_t *ctx, sensor_meas
         if ((xTaskGetTickCount() - wait_start) >= timeout_ticks) {
             return ESP_ERR_TIMEOUT; /* caller's own wait budget expired; measurement may still be running */
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(BH1750_POLL_DELAY_TICKS);
     }
 
     uint8_t raw_bytes[2];

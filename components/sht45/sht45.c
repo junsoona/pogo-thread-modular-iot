@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,6 +27,29 @@ static const char *TAG = "sht45";
 #define SHT45_RESET_MS        2u  /* datasheet: allow >=1ms after soft reset before the next command */
 #define SHT45_SERIAL_MS       10u
 #define SHT45_I2C_TIMEOUT_MS  200
+
+/*
+ * SHT45_RESET_MS and SHT45_SERIAL_MS are hardware-mandated minimum recovery
+ * times, not scheduling hints -- module/sdkconfig runs CONFIG_FREERTOS_HZ=100
+ * (10ms/tick), so vTaskDelay(pdMS_TO_TICKS(2)) rounds DOWN to 0 ticks and
+ * returns almost immediately: the very next command (READ_SERIAL) then goes
+ * out before the sensor has actually finished its soft reset, which the
+ * sensor NACKs. esp_rom_delay_us() busy-waits a real microsecond count
+ * regardless of CONFIG_FREERTOS_HZ, so these two waits are converted to it
+ * instead of vTaskDelay()/pdMS_TO_TICKS(). Both are one-time, sub-10ms waits
+ * during init only -- never in a hot loop -- so the busy-wait cost is
+ * negligible and does not risk the task watchdog. */
+#define SHT45_RESET_US  (SHT45_RESET_MS * 1000u)
+#define SHT45_SERIAL_US (SHT45_SERIAL_MS * 1000u)
+
+/* The read_measurement() polling loop below re-checks elapsed time via
+ * esp_timer_get_time() every iteration -- correctness never depends on this
+ * delay's actual length. But at CONFIG_FREERTOS_HZ=100, pdMS_TO_TICKS(2) is
+ * also 0, so vTaskDelay(0) would return immediately and turn the wait into a
+ * tight CPU-spinning poll instead of actually blocking. Round up to at least
+ * 1 real tick so the loop still blocks, while the elapsed-time check (not
+ * this tick count) remains the sole thing that decides when data is read. */
+#define SHT45_POLL_DELAY_TICKS ((pdMS_TO_TICKS(2) > 0) ? pdMS_TO_TICKS(2) : (TickType_t)1)
 
 struct sensor_provider_ctx_s {
     i2c_master_bus_handle_t bus;
@@ -86,14 +110,32 @@ static esp_err_t sht45_init(const module_config_t *cfg, sensor_provider_ctx_t **
         return err;
     }
 
-    err = sht45_write_cmd(ctx, SHT45_CMD_SOFT_RESET);
+    /* Probe the ONE configured address (section 5's header comment: "Uses
+     * the fixed I2C address from module_config ONLY -- never probes any
+     * other address" -- no auto address scan, no auto driver switch). This
+     * is a distinct, earlier failure mode from a command NACK below: a probe
+     * failure means nothing ACKed this address at all (wrong address,
+     * wiring, missing pull-ups, unpowered sensor), whereas a command write
+     * failure below means something IS on the bus at this address but
+     * rejected the specific command byte. Logged separately on purpose. */
+    err = i2c_master_probe(ctx->bus, (uint16_t)cfg->i2c_address, SHT45_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SHT45 SOFT_RESET write failed (addr=0x%02x): %s -- sensor not responding",
+        ESP_LOGE(TAG, "SHT45 i2c_master_probe(addr=0x%02x) failed: %s -- no device acknowledged this address "
+                      "(check wiring/pull-ups/power; this is NOT a command-level NACK)",
                  cfg->i2c_address, esp_err_to_name(err));
         ctx->status = SENSOR_STATUS_BUS_ERROR;
         return err;
     }
-    vTaskDelay(pdMS_TO_TICKS(SHT45_RESET_MS));
+
+    err = sht45_write_cmd(ctx, SHT45_CMD_SOFT_RESET);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SHT45 SOFT_RESET write failed (addr=0x%02x): %s -- device acked its address but NACKed "
+                      "this command",
+                 cfg->i2c_address, esp_err_to_name(err));
+        ctx->status = SENSOR_STATUS_BUS_ERROR;
+        return err;
+    }
+    esp_rom_delay_us(SHT45_RESET_US); /* hardware-mandated recovery time -- see SHT45_RESET_US's comment above */
 
     /* Communication self-check (section 5: "serial number 읽기 또는 명확한
      * 통신 self-check를 init 단계에 포함"): read + CRC-verify the serial
@@ -102,11 +144,12 @@ static esp_err_t sht45_init(const module_config_t *cfg, sensor_provider_ctx_t **
      * territory, not "keep going and hope a measurement works". */
     err = sht45_write_cmd(ctx, SHT45_CMD_READ_SERIAL);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SHT45 READ_SERIAL write failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "SHT45 READ_SERIAL write failed: %s -- device acked its address but NACKed this command",
+                 esp_err_to_name(err));
         ctx->status = SENSOR_STATUS_BUS_ERROR;
         return err;
     }
-    vTaskDelay(pdMS_TO_TICKS(SHT45_SERIAL_MS));
+    esp_rom_delay_us(SHT45_SERIAL_US); /* hardware-mandated recovery time -- see SHT45_SERIAL_US's comment above */
 
     uint8_t serial_bytes[6];
     err = i2c_master_receive(ctx->dev, serial_bytes, sizeof(serial_bytes), SHT45_I2C_TIMEOUT_MS);
@@ -180,7 +223,7 @@ static esp_err_t sht45_read_measurement(sensor_provider_ctx_t *ctx, sensor_measu
         if ((xTaskGetTickCount() - wait_start) >= timeout_ticks) {
             return ESP_ERR_TIMEOUT;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(SHT45_POLL_DELAY_TICKS);
     }
 
     uint8_t raw_bytes[6];
