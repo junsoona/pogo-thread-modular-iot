@@ -1,11 +1,21 @@
 /*
  * child_service owns the UPSTREAM pogo_port only (section 7): it answers a
  * parent's IDENTIFY/ASSIGN_UUID/ASSIGN_SLOT/SENSOR_HELLO/POLL_CONFIG/
- * SET_DATASET requests, then drives thread_manager to join using the
- * received dataset as either INTERMEDIATE or LEAF (whichever role_manager
- * has settled on). It runs regardless of whether role_manager's role is
- * INTERMEDIATE or LEAF -- both have an UPSTREAM parent; only ROOT does not
- * run child_service at all.
+ * SET_COLLECTOR/SET_DATASET requests, then drives thread_manager to join
+ * using the received dataset as either INTERMEDIATE or LEAF (whichever
+ * role_manager has settled on). It runs regardless of whether role_manager's
+ * role is INTERMEDIATE or LEAF -- both have an UPSTREAM parent; only ROOT
+ * does not run child_service at all.
+ *
+ * SET_COLLECTOR (POGO_MSG_SET_COLLECTOR) is a required step between
+ * POLL_CONFIG and SET_DATASET (see docs/power-base.md): it delivers the
+ * collector endpoint (the power base's own Mesh-Local EID + CoAP port +
+ * permanent UUID) this module -- and, if it becomes INTERMEDIATE, everything
+ * docked below it -- should send "/s"/"/t" traffic to, via
+ * components/collector_endpoint. SET_DATASET is now gated on this having
+ * already succeeded (POGO_NACK_BAD_STATE otherwise): starting the actual
+ * Thread join before the collector endpoint is known would let this module
+ * join and start measuring with nowhere valid to send its data.
  */
 #pragma once
 

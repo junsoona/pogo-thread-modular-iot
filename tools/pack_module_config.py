@@ -69,6 +69,8 @@ def check_gpio(field_name: str, gpio) -> None:
 
 
 DEV_MODES = {"AUTO": 0, "DEV_ROOT": 1, "DEV_LEAF": 2}
+BUS_TYPES = {"I2C": 0, "SPI": 1, "UART": 2}
+UART_MODES = {"ACTIVE": 0, "PASSIVE": 1}
 MOCK_DRIVER_ID = 0x4D4F434B  # ASCII "MOCK" -- must match sensor_provider.h's SENSOR_DRIVER_ID_MOCK
 
 # Single common registry for driver_id (section 2 of the follow-up spec: "driver
@@ -128,6 +130,18 @@ def resolve_sensor_bitmap(v):
     return as_int(v)
 
 
+def resolve_bus_type(v):
+    if isinstance(v, str) and v.upper() in BUS_TYPES:
+        return BUS_TYPES[v.upper()]
+    return as_int(v)
+
+
+def resolve_uart_mode(v):
+    if isinstance(v, str) and v.upper() in UART_MODES:
+        return UART_MODES[v.upper()]
+    return as_int(v)
+
+
 def crc16_ccitt(data: bytes) -> int:
     """CRC16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, xorout 0).
     Must match components/pogo_proto/pogo_crc16.c bit-for-bit."""
@@ -177,7 +191,7 @@ def pack_config(cfg: dict) -> bytes:
         as_int(cfg["config_revision"]),
         resolve_driver_id(cfg["driver_id"]),
         resolve_sensor_bitmap(cfg["sensor_type_bitmap"]),
-        as_int(cfg["bus_type"]),
+        resolve_bus_type(cfg["bus_type"]),
         as_int(cfg["bus_number"]),
         as_int(cfg["i2c_sda_gpio"]),
         as_int(cfg["i2c_scl_gpio"]),
@@ -193,9 +207,26 @@ def pack_config(cfg: dict) -> bytes:
         as_int(calibration[3]),
         as_int(cfg["measurement_timeout_ms"]),
     )
-    blob = header + pack_port(cfg["upstream_port"]) + pack_port(cfg["downstream_port"])
-    if len(blob) != 90:
-        raise AssertionError(f"internal error: packed blob is {len(blob)} bytes, expected 90")
+    schema_version = as_int(cfg["schema_version"])
+    if schema_version == 1:
+        blob = header + pack_port(cfg["upstream_port"]) + pack_port(cfg["downstream_port"])
+        expected_len = 90
+    elif schema_version == 2:
+        uart_extension = struct.pack(
+            ">hhIBBI",
+            as_int(cfg.get("uart_tx_gpio", -1)),
+            as_int(cfg.get("uart_rx_gpio", -1)),
+            as_int(cfg.get("uart_baud_rate", 0)),
+            resolve_uart_mode(cfg.get("uart_mode", "ACTIVE")),
+            0,
+            as_int(cfg.get("uart_warmup_ms", 0)),
+        )
+        blob = header + uart_extension + pack_port(cfg["upstream_port"]) + pack_port(cfg["downstream_port"])
+        expected_len = 104
+    else:
+        raise ValueError(f"unsupported schema_version={schema_version}; supported: 1, 2")
+    if len(blob) != expected_len:
+        raise AssertionError(f"internal error: packed blob is {len(blob)} bytes, expected {expected_len}")
     return blob
 
 
@@ -217,7 +248,7 @@ def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
     stored the temp file *path string itself* as the blob's bytes instead of
     "blob,file,binary,<path>" (correct), which reads the file at that path.
     Both forms make nvs_partition_gen.py exit 0 -- pack_config()'s own
-    len(blob) == 90 assert never sees this, since it only checks the bytes
+    pack_config()'s own length assert never sees this, since it only checks the bytes
     written to the temp file, not what actually ends up in the NVS image --
     so this is the only check that would have caught it.
 
@@ -288,9 +319,16 @@ def main():
                   "mock is development-only (see docs/module-config.md)")
     if as_int(cfg["measurement_timeout_ms"]) == 0:
         sys.exit("refusing to pack: measurement_timeout_ms must not be 0")
-    bus_type_val = as_int(cfg["bus_type"])
-    if bus_type_val not in (0, 1):
-        sys.exit("refusing to pack: bus_type must be 0 (I2C) or 1 (SPI)")
+    schema_version = as_int(cfg["schema_version"])
+    if schema_version not in (1, 2):
+        sys.exit("refusing to pack: schema_version must be 1 or 2")
+    bus_type_val = resolve_bus_type(cfg["bus_type"])
+    if bus_type_val not in (0, 1, 2):
+        sys.exit("refusing to pack: bus_type must be I2C(0), SPI(1), or UART(2)")
+    if bus_type_val == BUS_TYPES["UART"] and schema_version != 2:
+        sys.exit("refusing to pack: UART sensor bus requires schema_version=2")
+    if driver_id_val == DRIVER_IDS["PMS5003"] and bus_type_val != BUS_TYPES["UART"]:
+        sys.exit("refusing to pack: PMS5003 requires bus_type=UART")
 
     # ESP32-H2 GPIO profile -- same reserved-pin policy module_config.c
     # enforces at boot (see gpio_reserved_reason() above), caught here too
@@ -305,9 +343,36 @@ def main():
     if bus_type_val == 0:
         check_gpio("i2c_sda_gpio", cfg["i2c_sda_gpio"])
         check_gpio("i2c_scl_gpio", cfg["i2c_scl_gpio"])
-    else:
+    elif bus_type_val == BUS_TYPES["SPI"]:
         for field in ("spi_mosi_gpio", "spi_miso_gpio", "spi_sclk_gpio", "spi_cs_gpio"):
             check_gpio(field, cfg[field])
+    else:
+        uart_tx = as_int(cfg.get("uart_tx_gpio", -1))
+        uart_rx = as_int(cfg.get("uart_rx_gpio", -1))
+        uart_num = as_int(cfg["bus_number"])
+        uart_baud = as_int(cfg.get("uart_baud_rate", 0))
+        uart_mode = resolve_uart_mode(cfg.get("uart_mode", "ACTIVE"))
+        check_gpio("uart_tx_gpio", uart_tx)
+        check_gpio("uart_rx_gpio", uart_rx)
+        if uart_tx < 0 or uart_rx < 0:
+            sys.exit("refusing to pack: UART sensor bus requires uart_tx_gpio and uart_rx_gpio")
+        if uart_num not in (0, 1):
+            sys.exit("refusing to pack: UART bus_number must be 0 or 1 on ESP32-H2")
+        if uart_baud == 0:
+            sys.exit("refusing to pack: uart_baud_rate must not be 0")
+        if uart_mode not in UART_MODES.values():
+            sys.exit("refusing to pack: uart_mode must be ACTIVE(0) or PASSIVE(1)")
+
+        down = cfg["downstream_port"]
+        down_fields = ("uart_num", "tx_gpio", "rx_gpio", "detect_in_gpio", "detect_out_gpio", "base_id_gpio")
+        if any(as_int(down[field]) != -1 for field in down_fields):
+            sys.exit("refusing to pack: UART sensor modules are terminal-only; downstream_port must be fully disabled")
+        if as_int(cfg["upstream_port"]["uart_num"]) == uart_num:
+            sys.exit(f"refusing to pack: sensor UART{uart_num} conflicts with enabled upstream POGO UART")
+        if driver_id_val != DRIVER_IDS["PMS5003"]:
+            sys.exit("refusing to pack: UART sensor bus is currently supported only for PMS5003")
+        if uart_baud != 9600:
+            sys.exit("refusing to pack: PMS5003 requires uart_baud_rate=9600")
     if as_int(cfg["downstream_port"]["base_id_gpio"]) != -1:
         sys.exit("refusing to pack: downstream_port.base_id_gpio must be -1 (BASE_ID is UPSTREAM-only, "
                   "see docs/pogo-interface.md)")

@@ -13,18 +13,24 @@ too, running its own firmware, which is what this document covers.
 Before this follow-up, `role_manager` made a sensor module become
 `MODULE_ROLE_ROOT` the moment its UPSTREAM peer read `POGO_PEER_TYPE_POWER_BASE`
 (BASE_ID low). That is no longer true. **The power base is now the system's
-one and only Thread ROOT/Leader.** A sensor module's UPSTREAM peer being the
-power base or another sensor module is treated identically by
-`role_manager`: the module is `LEAF` (nothing docked below it) or
-`INTERMEDIATE` (another module docked below it) -- never `ROOT`. See
-[`role_manager.c`](../components/role_manager/role_manager.c)'s `recompute()`
-and its own comment on this fix.
+fixed physical POGO root and downstream provisioning coordinator.** (A
+LATER session -- see section 19 -- further decoupled this fixed
+application role from Thread's own `otDeviceRole`: the power base is never
+described as Thread's "ROOT" or "Leader" either, since it runs as an
+always-on FTD and treats CHILD/ROUTER/LEADER alike as ready.) A sensor
+module's UPSTREAM peer being the power base or another sensor module is
+treated identically by `role_manager`: the module is `LEAF` (nothing docked
+below it) or `INTERMEDIATE` (another module docked below it) -- never
+`ROOT`. See [`role_manager.c`](../components/role_manager/role_manager.c)'s
+`recompute()` and its own comment on this fix.
 
 ## 2. Final architecture
 
 ```
                        power_base/ (ESP32-H2, this project)
-                       - Thread ROOT/Leader, Active Dataset owner
+                       - Fixed physical POGO root, Active Dataset owner
+                         (otDeviceRole is Thread's own decision -- CHILD,
+                         ROUTER, and LEADER are all "ready"; see section 19)
                        - CoAP "/s" (sensor data) + "/t" (topology reports)
                        - topology_registry (who is attached, at what depth)
                        - parent_service (reused, unmodified) drives
@@ -51,8 +57,8 @@ share the same `components/` tree via `EXTRA_COMPONENT_DIRS`, same as
 | `pogo_port` | both UPSTREAM and DOWNSTREAM instances | ONE instance, wired as `POGO_PORT_DOWNSTREAM`, own peer type `POGO_PEER_TYPE_POWER_BASE` |
 | `role_manager` | used (derives LEAF/INTERMEDIATE/ERROR/UNASSIGNED) | **never used at all** -- the power base's role is a hardcoded fact, not derived |
 | `child_service` | used (UPSTREAM) | **never used** -- no UPSTREAM port exists |
-| `parent_service` | used (DOWNSTREAM), context wired to `role_manager`/`child_service`/`sensor_service` | used UNMODIFIED, context wired to the power base's own always-ready-once-Leader / fixed-depth-0 / efuse-derived identity (see `parent_service.h`'s `parent_service_context_t`) |
-| `thread_manager` | `thread_manager_join_with_dataset()` (INTERMEDIATE/LEAF) | `thread_manager_start_as_root()` (forms or resumes the ONE Active Dataset) |
+| `parent_service` | used (DOWNSTREAM), context wired to `role_manager`/`child_service`/`sensor_service` | used UNMODIFIED, context wired to the power base's own always-ready-once-attached (CHILD/ROUTER/LEADER, not LEADER-only -- see section 19) / fixed-depth-0 / efuse-derived identity (see `parent_service.h`'s `parent_service_context_t`) |
+| `thread_manager` | `thread_manager_join_with_dataset()` (INTERMEDIATE/LEAF) | `thread_manager_start_as_always_on_ftd()` (forms or resumes the ONE Active Dataset -- the neutral, non-Leader-claiming name; see section 19) |
 | `module_config` / sensor drivers / `sensor_service` | used | **never used** -- see `power_base_config` instead; no sensor is faked |
 | `power_base_config` | n/a | fixed board config (this project's analogue of `module_config`, no sensor fields at all) |
 | `sensor_root_aggregator` | used by `sensor_service` internally (thin wrapper, unchanged public API) | used directly by `power_base_transport` (no `sensor_service`/`sensor_provider` dependency) |
@@ -94,12 +100,24 @@ profile (UART1, GPIO10/11, DETECT GPIO22/23). It connects to the first
 sensor module's UPSTREAM port (UART0, GPIO4/5, DETECT GPIO12/2, BASE_ID
 GPIO14):
 
+**Updated by the Deep-sleep-ready GPIO follow-up (this session): the first
+module's UPSTREAM DETECT_IN/DETECT_OUT are SWAPPED** from the previously
+documented GPIO2/GPIO12 assignment -- DETECT_IN is now GPIO12 (an ESP32-H2
+RTC GPIO channel, a candidate wake source for a future terminal-leaf's
+Deep-sleep ext1 wakeup -- see section 20 below) and DETECT_OUT is now GPIO2.
+The power base's own GPIO22/GPIO23 are UNCHANGED. **A real power base +
+first-module pair already wired to the old profile must have these two
+DETECT wires swapped before flashing firmware built from this profile** --
+see README.md's rewiring notice and section 20 below; POGO 5V supply is
+still not implemented (see section 8), so 5V OUT/5V IN in the table below
+remain aspirational, not yet wired on the bench.
+
 | Power base pin | Direction | First module pin |
 |---|---|---|
 | GPIO10 (UART TX) | ---> | GPIO5 (UART RX) |
 | GPIO11 (UART RX) | <--- | GPIO4 (UART TX) |
-| GPIO22 (DETECT_OUT) | ---> | GPIO2 (DETECT_IN) |
-| GPIO23 (DETECT_IN) | <--- | GPIO12 (DETECT_OUT) |
+| GPIO22 (DETECT_OUT) | ---> | GPIO12 (DETECT_IN) |
+| GPIO23 (DETECT_IN) | <--- | GPIO2 (DETECT_OUT) |
 | BASE_ID contact (GND, **not a GPIO** -- see below) | ---> | GPIO14 (BASE_ID) |
 | GND | --- | GND |
 | 5V OUT | ---> | 5V IN |
@@ -114,12 +132,12 @@ Two facts that are easy to get wrong and must not be:
   The first sensor module's own GPIO14 has a local 3.3V pull-up and reads
   BASE_ID as Low ONLY when it is physically docked into the power base's
   connector, where that pin meets the power base's GND contact.
-- **GPIO2 (the first module's DETECT_IN) and GPIO14 (the first module's
-  BASE_ID) are two different signals with two different local pull-ups.**
-  Never tie them together, and never wire either one directly to GND on the
-  module side (only the power base's BASE_ID contact is GND; DETECT_IN is a
-  normal pull-up input driven Low by the peer's open-drain DETECT_OUT, never
-  hard-wired to GND).
+- **GPIO12 (the first module's DETECT_IN, since this session's swap -- was
+  GPIO2 before it) and GPIO14 (the first module's BASE_ID) are two different
+  signals with two different local pull-ups.** Never tie them together, and
+  never wire either one directly to GND on the module side (only the power
+  base's BASE_ID contact is GND; DETECT_IN is a normal pull-up input driven
+  Low by the peer's open-drain DETECT_OUT, never hard-wired to GND).
 
 DETECT_OUT on both sides is open-drain, active-low, release-only-High (never
 driven push-pull High) -- see [`pogo-interface.md`](pogo-interface.md)'s
@@ -133,8 +151,15 @@ table, are unchanged -- see [`pogo-interface.md`](pogo-interface.md).
 
 ## 5. Power base boot sequence
 
-`power_base/main/app_main.c`'s `app_main()`, in order (each step below is
-exactly one item of the follow-up spec's section 4):
+**Updated TWICE now -- see section 19 (module/Thread role decoupling) and
+section 19.8 (attach supervisor, this correction pass) for the full
+history.** Current policy: `power_base` never waits for strictly `Leader`,
+and (as of section 19.8) a first attach that takes longer than any fixed
+budget is NOT a fatal error -- there is no `halt_forever()` for "not
+attached yet" anywhere in this firmware any more. The numbered list below
+reflects the CURRENT control flow.
+
+`power_base/main/app_main.c`'s `app_main()`:
 
 1. `nvs_flash_init()` -- the dynamic `"nvs"` partition (OpenThread's own
    Active Dataset copy only; the power base has no role_manager/child_service
@@ -146,46 +171,74 @@ exactly one item of the follow-up spec's section 4):
    switching hardware decided yet).
 4. `esp_efuse_mac_get_default()` -- this power base's own stable 8-byte
    identity (its EUI-64), used both as its POGO UUID (for
-   `ASSIGN_PARENT_INFO`) and its topology-registry key. Never regenerated,
-   never logged in full.
+   `ASSIGN_PARENT_INFO`/`SET_COLLECTOR`) and its topology-registry key.
+   Never regenerated, never logged in full.
 5. `thread_manager_init()` -- OpenThread FTD stack up, no network yet.
-6. `thread_manager_start_as_root()` -- **the only place in the whole system
-   that ever forms or resumes an Active Dataset.** If NVS already holds a
-   commissioned dataset, it is resumed; otherwise a new one is formed from
-   Kconfig defaults. Neither the dataset bytes nor the Network Key are ever
-   logged (same policy `thread_manager.c` already enforced).
-7. Poll `thread_manager_get_role()` until strictly `Leader` (**not** "Leader
-   or Router" -- code review follow-up section 5: this power base is the
-   system's one and only Thread Leader, and in a network where it is the
-   sole device that ever forms/resumes the dataset, a solo-forming FTD node
-   attaches directly into the Leader role -- there is no partition to defer
-   Leadership to, so "merely Router" is never the correct steady state
-   here), bounded to 30s (same budget `module`'s `root_ready_watcher_task`
-   uses). **Any failure at step 2, 6, or 7 halts here and NEVER calls
-   `pogo_port_enable()`** -- see section 6.
+6. `thread_manager_start_as_always_on_ftd()` (**this correction pass**;
+   previously `thread_manager_start_as_root()` -- see section 19.8) -- **the
+   only place in the whole system that ever forms or resumes an Active
+   Dataset for this power base.** If NVS already holds a commissioned
+   dataset, it is resumed; otherwise a new one is formed from Kconfig
+   defaults. Neither the dataset bytes nor the Network Key are ever logged.
+   Logs as `always-on FTD:`, never `ROOT:` (that log prefix is reserved for
+   `module`'s DEV_ROOT regression fixture, which still calls
+   `thread_manager_start_as_root()` -- a thin wrapper around the exact same
+   underlying logic, kept only for that fixture's own unchanged logs/tests --
+   see `thread_manager.h`). A failure HERE (a genuine OpenThread API error)
+   halts immediately, `pogo_port_enable()` NEVER having been called.
+7. **(This correction pass -- no fixed timeout, no halt)**
+   `attach_supervisor_task()` is started and `app_main()` returns. This task
+   polls `thread_manager_get_role()` (200ms interval, non-busy) for this
+   device's FIRST attach -- `otDeviceRole` becoming `Child`, `Router`, OR
+   `Leader` -- with NO timeout and NO `halt_forever()` for simply "not
+   attached yet": an OTBR or another Thread device that only becomes
+   reachable much later must still work. Once 30s have passed without
+   attaching, ONE rate-limited `ESP_LOGW` appears (`power-base FTD: still
+   not attached after ...ms ... -- not halting`), repeating at most once
+   every 60s thereafter -- never a flood, never a busy loop. The instant this
+   device IS observed attached, `start_services_once()` (steps 8-12 below)
+   runs, and this task deletes itself -- it never runs those steps a second
+   time, regardless of any LATER role change (including dropping back to
+   DISABLED/DETACHED and reattaching) -- see section 19.1/19.8.
 8. `power_base_transport_init()` -- registers the CoAP `"/s"` (sensor data)
    and `"/t"` (topology report) resources.
-9. `parent_service_init()` -- wired to the power base's own context (always
-   `provisioning_allowed()` once strictly LEADER, `get_own_depth()==0`,
-   `get_own_uuid()` = the efuse identity, `is_power_base=true`).
+9. `parent_service_init()` -- wired to the power base's own context:
+   `provisioning_allowed()` re-checks LIVE, on every call, whether
+   `otDeviceRole` is currently `Child`/`Router`/`Leader` -- no caching, no
+   separate watcher task, since `parent_service`'s own idle loop already
+   re-checks this every iteration. `get_own_depth()==0`, `get_own_uuid()` =
+   the efuse identity, `is_power_base=true`, `get_collector()` fills the
+   collector endpoint (this power base's own permanent UUID + Thread
+   Mesh-Local EID + CoAP port) whenever attached, and returns false
+   (collector not currently valid) while DISABLED/DETACHED.
 10. `pogo_port_init()` + `pogo_port_enable()` for the one DOWNSTREAM-shaped
     port -- see section 6 for why this single call is also what activates
-    DETECT_OUT.
-11. A periodic (5s) stale-sweep task calls `power_base_transport_sweep_stale()`.
+    DETECT_OUT. A failure in this step or step 11 (a genuine resource-
+    creation failure, e.g. `xTaskCreate()` failing) still halts -- this is
+    NOT the same thing as "not attached yet".
+11. A periodic (5s) stale-sweep task calls `power_base_transport_sweep_stale()`,
+    created and CONFIRMED running before step 10's `pogo_port_enable()`.
 
 ## 6. DETECT_OUT gating
 
-There is no separate "now assert DETECT_OUT" step to sequence: `pogo_port_enable()`
-itself drives DETECT_OUT active (Low) as the very last part of bringing a
-port up (see `pogo_port.c`'s `set_detect_out(p, true)` call inside it), and
-`pogo_port_init()` alone never touches any GPIO. Simply never calling
-`pogo_port_enable()` before Thread is confirmed strictly LEADER (step 7
-above) IS the "DETECT_OUT only activates once Thread is ready" guarantee --
-there is
-no other place in this firmware image that can assert it. Because
-`app_main()`'s boot sequence is linear and calls `pogo_port_enable()` exactly
-once, DETECT_OUT is also activated exactly once per boot (see
-`tools/test_power_base_boot_sequencing.c`).
+**Updated by this session's attach-supervisor follow-up (section 19.8):**
+`pogo_port_enable()` (and therefore DETECT_OUT) is called from
+`start_services_once()`, invoked exactly once by `attach_supervisor_task()`
+the first time this device is ever observed attached -- CHILD, ROUTER, OR
+LEADER (not "strictly LEADER" -- that policy was already relaxed in section
+19.1, and this section previously described the OLDER strictly-LEADER wording
+verbatim; both are superseded here). There is no separate "now assert
+DETECT_OUT" step to sequence: `pogo_port_enable()` itself drives DETECT_OUT
+active (Low) as the very last part of bringing a port up (see `pogo_port.c`'s
+`set_detect_out(p, true)` call inside it), and `pogo_port_init()` alone never
+touches any GPIO. Simply never calling `pogo_port_enable()` before this
+device's first confirmed attach IS the "DETECT_OUT only activates once
+attached" guarantee -- there is no other place in this firmware image that
+can assert it. `start_services_once()` is itself only ever invoked once per
+boot (guarded by `attach_supervisor_task()` deleting itself immediately
+after calling it), so DETECT_OUT is also activated exactly once per boot,
+regardless of how long the first attach took or how many times
+`otDeviceRole` fluctuates afterward (see `tools/test_power_base_boot_sequencing.c`).
 
 ## 7. Parent UUID propagation (`POGO_MSG_ASSIGN_PARENT_INFO`)
 
@@ -461,13 +514,17 @@ In particular, still needing real hardware:
 - `pogo_port`'s BASE_ID/PEER_HELLO cross-check with more than one sensor
   module attached (only a single depth=1 module has been tried against the
   real power-base MCU so far).
-- `thread_manager_start_as_root()`'s dataset resume path across a REAL power
-  cycle of the power-base board.
+- `thread_manager_start_as_always_on_ftd()`'s dataset resume path (this
+  correction pass's name for what was `thread_manager_start_as_root()` when
+  this bullet was first written) across a REAL power cycle of the power-base
+  board.
 - CoAP delivery of both `"/s"` and `"/t"` over a real MULTI-HOP Thread mesh
   (only a single depth=1 hop has been tried), including the UUID-hash backoff
   schedule's real timing.
-- The 30s strictly-LEADER boot-wait budget under adverse real radio
-  conditions (the one run so far reached LEADER without issue).
+- The unbounded, no-halt first-attach wait (`attach_supervisor_task()`,
+  section 19.8) under adverse real radio conditions or a genuinely absent
+  Thread network for an extended period (the one run so far reached LEADER
+  quickly, before this correction pass even existed).
 - Any of section 11's detach/reconnect/stale behaviors under a real physical
   detach (as opposed to the host-tested pure registry logic) -- the power
   base reboot / registry-loss path specifically is section 18's concern.
@@ -537,15 +594,20 @@ host-test level only, same as the rest of this document.
    `topology_registry_record_sensor_error()`), not silently stored. See
    `tools/test_coap_response_semantics.c`.
 
-5. **Power base gates strictly on LEADER.** `pb_provisioning_allowed()` and
-   the boot-time role-wait in `power_base/main/app_main.c` used to accept
-   `LEADER || ROUTER`. Fixed to strictly `LEADER` -- see that function's own
-   comment for why ROUTER was never actually a correct steady state for a
-   node that is the sole former/resumer of this network's dataset. Every
-   log line naming an `otDeviceRole` (here, `child_service.c`,
-   `parent_service.c`) now prints both the numeric value and a name via the
-   new shared `thread_manager_role_to_str()`. See
-   `tools/test_power_base_boot_sequencing.c`'s `scenario_router_only_never_activates`.
+5. **Power base gates strictly on LEADER (this pass) -- SUPERSEDED by
+   section 19.** At the time of this code-review pass, `pb_provisioning_allowed()`
+   and the boot-time role-wait in `power_base/main/app_main.c` were changed
+   from accepting `LEADER || ROUTER` to strictly `LEADER`, reasoning that
+   ROUTER was never a correct steady state for a node that is the sole
+   former/resumer of this network's dataset. **A later session (section 19)
+   revisited this and relaxed it again -- to `CHILD || ROUTER || LEADER`,
+   the power base's fixed application role never actually depending on
+   Thread Leadership in the first place.** Every log line naming an
+   `otDeviceRole` (here, `child_service.c`, `parent_service.c`) still prints
+   both the numeric value and a name via the shared
+   `thread_manager_role_to_str()`, unaffected by that later change. See
+   `tools/test_power_base_boot_sequencing.c` (rewritten in section 19's
+   session for the new CHILD/ROUTER/LEADER-all-sufficient policy).
 
 6. **Initialization failure/rollback hardening.** `pogo_port_enable()` now
    checks every `gpio_config`/`gpio_set_level`/`gpio_isr_handler_add`/
@@ -678,3 +740,367 @@ See `components/topology_gate/include/topology_gate/topology_gate.h` for the
 full design comment and `tools/test_topology_gate.c` for the host test
 (section 15). **This fix itself has not yet been reflashed and re-verified on
 real hardware** -- see section 16.
+
+## 19. Module/Thread role decoupling and collector provisioning (this session)
+
+This session's task had five parts: decouple the power base's fixed
+application role from Thread's own `otDeviceRole`; remove the sensor/
+topology data plane's dependency on "the current Thread Leader"; introduce
+a POGO-delivered collector endpoint (in place of that Leader-RLOC
+dependency); swap the UPSTREAM DETECT_IN/DETECT_OUT GPIO assignment for a
+future Deep-sleep wake path; and lay only the groundwork for a future Linux
+OTBR. **None of Linux OTBR, RCP firmware, a Matter Bridge, MCU Deep-sleep, or
+POGO 5V supply were implemented this session** -- see subsection 19.6 below
+for exactly what groundwork exists and what does not.
+
+### 19.1 Fixed application role vs. dynamic Thread role
+
+The power base's fixed, permanent application role -- the physical root of
+the POGO chain, the downstream provisioning coordinator, the UUID/slot/
+topology registry owner, the sensor-data aggregator, and (in a future
+revision) the POGO 5V supplier and the gateway in front of a Linux Matter
+Bridge -- no longer requires or claims Thread Leadership. `power_base`
+always runs as an always-on FTD (`rx-on-when-idle=true`,
+`router-eligible=true` -- unchanged, `thread_manager_start_as_root()` always
+applied this link mode). `otDeviceRole` is entirely Thread's own decision;
+`CHILD`, `ROUTER`, and `LEADER` are all treated as "attached and ready"
+identically -- only `DISABLED`/`DETACHED` are "not ready". Every log line and
+doc passage claiming "the power base is Thread's one and only Leader" or
+"ROOT is always Leader" describes the OLD (pre-this-session) policy and has
+been superseded (see sections 5 and 17 item 5 above, and README.md).
+
+Sensor modules are completely unaffected by this: `role_manager`'s
+`MODULE_ROLE_ROOT`/`INTERMEDIATE`/`LEAF`/`UNASSIGNED`/`ROLE_ERROR` state
+machine (section 1-3 above) is a POGO/role_manager-layer concept, unrelated
+to `otDeviceRole`, and nothing about it changed this session.
+
+`power_base/main/app_main.c`'s boot sequence (section 5) now waits, once,
+for this device's FIRST attach as ANY of CHILD/ROUTER/LEADER, then runs its
+fixed one-time init (CoAP resources, `parent_service_init()`,
+`pogo_port_init()`+`enable()`, the stale-sweep task) EXACTLY ONCE. None of
+that is ever re-created for a LATER role change: `pb_provisioning_allowed()`
+and `pb_get_collector()` are both pure, stateless functions of the CURRENT
+`otDeviceRole`, re-evaluated fresh on every call (`parent_service`'s own
+idle loop already polls `provisioning_allowed()` every iteration -- no new
+watcher task was needed). Concretely:
+
+- A drop to DISABLED/DETACHED makes `pb_provisioning_allowed()` return
+  false (no NEW downstream provisioning session starts) and
+  `pb_get_collector()` return false (collector not currently valid) on
+  their very next call -- no explicit "pause" step.
+- An already-JOINED child's Thread membership is untouched by the power
+  base's own role fluctuation; only a session that happens to be mid-flight
+  at that moment (e.g. about to request SET_COLLECTOR) is abandoned by
+  `parent_service`, the same as any other failed provisioning step, and
+  naturally retried once the peer redocks or the power base reattaches.
+- A reattach (role becomes CHILD/ROUTER/LEADER again) makes both callbacks
+  return true/valid again on their very next call -- no explicit "resume"
+  step, and no busy-retry loop (the existing bounded, non-busy polling
+  `parent_service_task()` already used is unchanged).
+
+See `tools/test_power_base_boot_sequencing.c` (rewritten this session) for
+the host-tested model of all of the above.
+
+### 19.2 Collector provisioning replaces the Leader-RLOC dependency
+
+`sensor_transport.c` and `topology_reporter.c` (module side) used to send
+every `"/s"`/`"/t"` request to `thread_manager_get_leader_address()` --
+"the current Leader's RLOC", which happened to always be the power base in
+the old strictly-Leader topology. Both now send to
+`components/collector_endpoint`'s current snapshot instead: a small,
+FreeRTOS-task-safe, per-module cache of the power base's permanent UUID +
+Thread Mesh-Local EID + CoAP port, delivered via a new POGO message
+(`POGO_MSG_SET_COLLECTOR`, `0x14`) rather than derived from Thread role at
+all. Neither component depends on `thread_manager_get_leader_address()` any
+more (that API itself is untouched, left in `components/thread_manager` for
+any other diagnostic use); see `tools/test_no_leader_rloc_dependency.py`.
+
+This means a sensor module's data destination is now completely independent
+of the power base's OWN Thread role: it stays fixed at whatever Mesh-Local
+EID SET_COLLECTOR delivered, and Thread's own mesh routing (via RLOCs)
+handles multi-hop delivery to that address transparently regardless of
+which node currently holds Leadership.
+
+`components/collector_endpoint` (new leaf component, module-side only --
+the power base does not need one, since it computes its own identity
+directly): `init`/`set`/`clear`/`get` (a full-struct snapshot by value)/
+`is_valid`. `set()` independently validates its inputs (rejects the
+unspecified/multicast/link-local address, port 0, or an all-zero
+`power_base_uuid`) even though its only real caller (`child_service.c`)
+already validated the same fields via `pogo_unpack_set_collector()`/
+`pogo_collector_endpoint_is_valid()` -- defense in depth, not redundant
+trust. See `tools/test_collector_endpoint.c`.
+
+`thread_manager_get_mesh_local_eid()` (new) wraps
+`otThreadGetMeshLocalEid()` -- confirmed against the real
+`components/openthread/openthread/include/openthread/thread.h` shipped with
+ESP-IDF v6.1 (`const otIp6Address *otThreadGetMeshLocalEid(otInstance
+*aInstance)`), not assumed from memory. Its returned pointer is into
+OpenThread's own internal state and is only valid while the OpenThread API
+lock is held, so the wrapper copies the 16 bytes out before releasing the
+lock, exactly like `thread_manager_get_active_dataset_tlvs()` already does
+for a different OpenThread getter.
+
+### 19.3 Wire format: `POGO_MSG_SET_COLLECTOR`
+
+Purely additive (existing message types/wire formats unchanged) -- 30 bytes:
+
+```
+power_base_uuid(8) | addr(16, IPv6, network byte order) | port(2, big-endian) | generation(4, big-endian)
+```
+
+`addr` is the power base's own Mesh-Local EID; `port` is the CoAP port
+`power_base_transport_init()` bound (`OT_DEFAULT_COAP_PORT`); `generation`
+is an informational provisioning epoch (a random-per-boot value on the
+power base side today -- not read back or relied on for any wire-level
+decision, carried only so a future revision could use it). `pogo_pack_set_collector()`/
+`pogo_unpack_set_collector()` live in `components/pogo_proto` alongside
+every other message codec; `pogo_collector_endpoint_is_valid()` (and the
+lower-level `pogo_ipv6_addr_is_valid_collector()`) are the shared
+length/byte-order/address/port validators both the wire layer and
+`components/collector_endpoint`'s own independent `set()`-time check use.
+See `tools/test_collector_provisioning_pack.c`.
+
+### 19.4 Provisioning sequence and NVS storage
+
+`child_service.c`'s (module UPSTREAM) state sequence gained one state,
+`CS_STATE_COLLECTOR_SET`, between `POLL_SET` and `JOINING`:
+
+```
+... -> SENSOR_DONE -> POLL_SET -> COLLECTOR_SET -> JOINING (SET_DATASET) -> JOINED
+```
+
+`SET_DATASET` now requires `CS_STATE_COLLECTOR_SET` (was `CS_STATE_POLL_SET`)
+-- a `SET_DATASET` arriving before `SET_COLLECTOR` has succeeded is NACKed
+`POGO_NACK_BAD_STATE`, so the Thread join (and this module's own periodic
+measurement/reporting once joined) can never start before it knows where
+its data should go. A structurally invalid (wrong length) `SET_COLLECTOR`
+payload is also `POGO_NACK_BAD_STATE`; a well-formed but semantically bad
+endpoint (bad address/port/uuid) is the more specific
+`POGO_NACK_INVALID_COLLECTOR`; an NVS write failure is
+`POGO_NACK_STORAGE_FAILED` and leaves the state machine at `POLL_SET` (the
+Thread join never starts) -- the same three-way split `SET_DATASET` itself
+already used for invalid-dataset/storage-failure.
+
+The collector endpoint is durably written into the SAME runtime `"nvs"` NVS
+namespace (`child_dyn`, alongside the existing dataset TLV record) the
+dynamic Active Dataset already uses -- never the fixed `"cfg"` partition.
+Like the dataset record, it is diagnostic/forward-compatibility only and is
+never read back at boot (the same "no auto-rejoin from stored dynamic NVS"
+simplification `docs/state-machine.md` already documents for the dataset
+applies identically here: a changed upstream parent must not be trusted
+silently, so a fresh, live `SET_COLLECTOR` is always required before
+`components/collector_endpoint`'s in-RAM copy is ever populated).
+
+`clear_provisioning_temporaries()` (shared by `reset_session()` on
+ATTACHED/DETACHED and `begin_new_provisioning_session()` on PEER_READY/a
+fresh IDENTIFY_REQ) now also calls `collector_endpoint_clear()`, and the
+`POGO_PORT_EVENT_ERROR` case in `child_service_task()`'s switch (which does
+not route through either of those) gained its own explicit
+`collector_endpoint_clear()` call. Net effect: a new provisioning session,
+a physical detach, or an UPSTREAM port error all immediately invalidate
+whatever collector endpoint the OLD session had. See
+`tools/test_collector_provisioning_sequence.c`.
+
+`power_base`'s own `parent_service_context_t.get_collector` (`pb_get_collector()`)
+fills this power base's own Mesh-Local EID + CoAP port + permanent UUID
+directly on every call -- it has no `components/collector_endpoint` of its
+own (it IS the collector, never a forwarder). An INTERMEDIATE module's
+`module_parent_get_collector()` forwards the EXACT endpoint it itself
+received from its own upstream (`components/collector_endpoint`'s
+snapshot), completely unmodified -- it never substitutes its own address.
+The `MODULE_DEV_MODE_DEV_ROOT` module-to-module regression fixture (which
+has no power base at all) is the one exception: when `role_manager_get_role()
+== MODULE_ROLE_ROOT`, `module_parent_get_collector()` fills the endpoint
+from THIS module's own Mesh-Local EID instead, mirroring
+`pb_get_collector()` -- this is what lets `DEV_LEAF`'s `sensor_transport`
+keep sending its `"/s"` samples to `DEV_ROOT`, the same destination as
+before this session (previously "the current Leader", always `DEV_ROOT`
+itself in that topology).
+
+### 19.5 Capability negotiation
+
+Since the new provisioning step is mandatory on both sides of every POGO
+link once both `module`/`power_base` are rebuilt from this revision,
+`pogo_peer_hello_t` (the PEER_HELLO_REQ/RESP payload) gained a third byte,
+`capabilities` (a bitmask; `POGO_CAP_COLLECTOR_PROVISIONING` is the only bit
+defined so far). `pogo_port.c`'s `validate_incoming_hello()` now also
+requires the peer's declared `capabilities` include
+`POGO_CAP_COLLECTOR_PROVISIONING`; a peer that predates this field entirely
+(a legacy, still-2-byte HELLO payload -- `pogo_unpack_peer_hello()` now
+requires exactly 3 bytes and fails cleanly on 2) or that declares
+`capabilities=0` is rejected loudly and explicitly at the handshake with a
+new error, `POGO_PORT_ERR_CAPABILITY_MISMATCH` -- never auto-retried (same
+policy as `PEER_TYPE_CONFLICT`/`PROTOCOL_VERSION_ERROR`: this means
+something is actually wrong, not a timing issue). This is deliberately a
+capability bit inside the HELLO PAYLOAD, not a bump of `POGO_FRAME_VERSION`
+(the raw frame-level sync byte): bumping the frame version would make
+`pogo_frame_parser_feed()` silently drop EVERY frame from an old peer at the
+byte level (no diagnosable rejection at all, not even at the handshake),
+whereas this design gives a clear, logged, handshake-stage rejection while
+leaving frame-level backward parseability alone. `upper`/`lower` never use
+`pogo_port`'s PEER_HELLO handshake at all (they hand-roll their own
+provisioning directly over `pogo_transport`), so they are completely
+unaffected either way -- see `tools/test_peer_hello_handshake.c` and
+`tools/test_power_base_peer_hello.c`'s new capability-mismatch scenarios.
+
+### 19.6 GPIO swap and Deep-sleep groundwork (implemented vs. not)
+
+UPSTREAM `DETECT_IN`/`DETECT_OUT` are swapped (GPIO12/GPIO2, was
+GPIO2/GPIO12) -- see section 4 above and README.md's rewiring notice.
+GPIO12 is an ESP32-H2 RTC GPIO channel (`RTCIO_GPIO12_CHANNEL`), a candidate
+`esp_sleep_enable_ext1_wakeup_io()` Deep-sleep wake source for a future
+terminal-leaf module waking on its upstream parent's DETECT_IN edge; GPIO2
+is not. This is verified two ways: a host-testable restatement
+(`components/module_config/deep_sleep_gpio.h`,
+`deep_sleep_wake_gpio_is_capable()`, `tools/test_deep_sleep_gpio.c`) of
+ESP-IDF v6.1's own RTC GPIO channel range (GPIO7..GPIO14, per
+`soc/esp32h2/include/soc/rtc_io_channel.h`), and a compile-time
+`_Static_assert` in `components/module_config/gpio_profile.c` (built for
+every real ESP32-H2 target) against the REAL `RTCIO_GPIO12_CHANNEL` macro,
+so a future ESP-IDF revision that removed/renumbered it would fail the
+build loudly rather than silently invalidate this assumption.
+
+**Explicitly NOT implemented this session** (all deferred to a future
+revision, per this session's own scope limits):
+
+- Deep-sleep entry/exit itself -- no `esp_deep_sleep_start()`/wake-source
+  configuration/RTC-memory retention anywhere in this firmware.
+- Linux OTBR installation, RCP firmware, or any code targeting it.
+- A Matter Bridge.
+- MCU Deep-sleep for the terminal leaf (or Light-sleep for short polling
+  periods via Thread SED).
+- POGO 5V supply -- both dev boards still use independent USB power; only
+  signal lines + GND are wired.
+
+The FUTURE conditions this GPIO choice is meant to support (documented
+here, not implemented): only a terminal LEAF (nothing docked below it) may
+ever Deep-sleep -- an INTERMEDIATE module is always an always-on FTD (it
+must keep routing for whatever is docked below it) and must never
+Deep-sleep. A short polling period should use Thread SED (`mRxOnWhenIdle=false`,
+already what `thread_manager_join_with_dataset(THREAD_MANAGER_ROLE_LEAF, ...)`
+applies today) plus Light-sleep, not Deep-sleep, since Deep-sleep's RAM loss
+would require a full re-join on every wake. Before any future Deep-sleep
+entry: no unsent sensor sample, no in-flight CoAP callback, no pending UART
+transaction, and no sensor measurement may be outstanding. Wake sources:
+a timer PLUS the upstream parent's DETECT_IN edge (GPIO12) via
+`esp_sleep_enable_ext1_wakeup_io()`; a failed/unavailable Deep-sleep
+condition should fall back to Light-sleep rather than staying fully awake.
+
+### 19.7 What is still unverified on real hardware (this session's changes)
+
+Everything in sections 1-18's "still unverified" lists remains exactly as
+unverified as before. Additionally, none of this session's changes have
+been flashed to real hardware yet:
+
+- The relaxed CHILD/ROUTER/LEADER attach policy (section 19.1) -- only
+  host-tested (`tools/test_power_base_boot_sequencing.c`) and clean-built so
+  far.
+- `POGO_MSG_SET_COLLECTOR` end-to-end over a real POGO link (power base ->
+  first module, and first module -> a second, INTERMEDIATE-forwarded hop) --
+  only host-tested (wire format + sequencing) and clean-built.
+- Capability-negotiation rejection of a genuinely mismatched real peer (both
+  real boards in this project are always reflashed together in practice, so
+  this scenario has not been exercised with two ACTUALLY different firmware
+  revisions on real hardware).
+- **The swapped UPSTREAM DETECT_IN/DETECT_OUT GPIO assignment requires
+  physically re-wiring the two DETECT wires on any board previously wired to
+  the old profile before it is flashed with firmware built from this
+  session** -- see README.md for the exact rewiring table and flash/monitor
+  commands to use afterward.
+- `thread_manager_get_mesh_local_eid()` returning a real, on-mesh-reachable
+  address on actual hardware (confirmed only against the ESP-IDF v6.1 header
+  declaration and OpenThread's documented semantics, not yet exercised on a
+  real radio).
+
+## 19.8 Correction pass: neutral Thread API and no permanent halt on a slow first attach (this session)
+
+A follow-up correction pass to section 19 found two remaining problems with
+that session's own work, plus several stale docs/log strings it left behind
+(sections 4-6, 16, 17 above were all corrected in place by this pass -- see
+each for exactly what changed). Neither problem was a regression in
+already-verified real-hardware behavior; both were within section 19's own,
+still-real-hardware-unverified changes.
+
+**Problem 1: `power_base` still called `thread_manager_start_as_root()` and
+logged `ROOT:`.** Despite section 19.1's stated intent ("no longer described
+... as Thread's ROOT or Leader"), the actual boot code still called the
+ROOT-named API and inherited its `ROOT:` log prefix. Fixed with a genuinely
+neutral API, `thread_manager_start_as_always_on_ftd()` (identical underlying
+behavior -- same link mode, same resume-or-form logic -- see
+`thread_manager.h`'s comment on both names) that `power_base` now calls
+instead, logging `always-on FTD:`. `thread_manager_start_as_root()` itself
+is UNCHANGED (same name, same log text, same behavior) and remains in place
+purely for `module`'s `MODULE_DEV_MODE_DEV_ROOT` regression fixture, which
+this correction pass deliberately left untouched (see
+`docs/pogo-interface.md`'s "development compat mode").
+
+**Problem 2: a first attach that legitimately takes longer than 30s
+permanently halted this power base.** The original section 19 boot-sequence
+wait was bounded to 30s and called `halt_forever()` on expiry -- worded as
+"only DISABLED/DETACHED for the whole window is a genuine failure now", but
+in practice this makes a REAL, expected scenario (an OTBR not yet up, or a
+Thread network this power base needs to join not yet reachable) fatal. This
+power base's fixed application role does not actually require attaching
+within any particular time budget -- it should simply keep trying and start
+service the moment it succeeds, however long that takes. Fixed with
+`attach_supervisor_task()` (`power_base/main/app_main.c`): a dedicated task,
+started once from `app_main()`, that polls `thread_manager_get_role()` (200ms
+interval, non-busy) with NO timeout and NO halt for "not attached yet". Once
+30s pass without attaching, ONE rate-limited `ESP_LOGW` appears
+(`ATTACH_WARN_FIRST_MS`), repeating at most once every 60s thereafter
+(`ATTACH_WARN_REPEAT_MS`) -- visible to an operator without flooding the
+log. The moment this device IS observed attached (CHILD, ROUTER, or LEADER),
+`start_services_once()` runs (the exact same steps 8-12 from section 5,
+unchanged) and the supervisor task deletes itself -- it never runs those
+steps again, including across a LATER drop to DISABLED/DETACHED and
+reattach (which needs no supervisor involvement at all: `pb_provisioning_allowed()`/
+`pb_get_collector()` already read `otDeviceRole` live on every call, see
+section 19.1). `start_services_once()` only touches file-scope `static`
+state (`s_cfg`/`s_own_uuid`/`s_collector_generation`/`s_parent_ctx`), never a
+pointer to one of `app_main()`'s own stack locals, so it remains valid for as
+long as the supervisor task runs, independent of `app_main()` itself
+returning (which it now does, immediately after starting the supervisor
+task). A genuine resource-creation failure INSIDE `start_services_once()`
+(CoAP resource registration, `parent_service_init()`, `pogo_port_init()`/
+`enable()`, the stale-sweep task's own `xTaskCreate()`) still halts -- that
+is a real, distinct failure class from "not attached yet", and this
+correction pass did not relax it. Likewise, `thread_manager_start_as_always_on_ftd()`
+itself failing (a genuine OpenThread API error, checked in `app_main()`
+before the supervisor task is even started) still halts immediately.
+
+**Docs/log string audit.** This pass searched the whole repository (not
+just `power_base/`) for now-stale current-tense claims left over from
+section 19's own work and an earlier GPIO-swap follow-up, and corrected
+every one found outside of clearly-marked historical/superseded passages:
+`README.md`'s GPIO tables and pass/fail criteria (which still said
+`UPSTREAM DETECT_IN=GPIO2` and "전원 모듈은 엄격히 LEADER만 허용" in
+current-tense sections), this document's own architecture diagram and
+section 6 (DETECT_OUT gating, which still said "before Thread is confirmed
+strictly LEADER"), `power_base/sdkconfig.defaults`'s top comment, and
+`docs/architecture.md`/`docs/state-machine.md`/`docs/pogo-interface.md`'s
+remaining "one and only Thread ROOT/Leader" phrasing. README's real-hardware
+log block from BEFORE this session's GPIO/role-decoupling/collector changes
+is now explicitly labeled "과거 정책, SUPERSEDED -- 당시 firmware 기준" and
+kept only as a historical record of what that OLDER firmware did; a new,
+clearly-separate "현재 firmware 기대 로그 (이번 세션, 아직 실물 미검증)"
+section describes what THIS firmware is expected to log, not yet verified.
+See `tools/test_no_stale_root_leader_claims.py` (new, this pass) for the
+automated regression check.
+
+**Host tests added this pass:** `tools/test_power_base_boot_sequencing.c`
+gained scenarios for "never attaches within 30s -- does not halt, keeps
+retrying, warns once (rate-limited)", "attaches later (CHILD) -- services
+start exactly once", "further ROUTER/LEADER changes -- no duplicate
+creation", and "`thread_manager_start_as_root()` is never called by
+power_base's own boot path" (a structural/string check, since the host model
+cannot link the real ESP-IDF-dependent `app_main.c`). See the final report
+for the exact scenario list and pass/fail counts.
+
+**Still unverified on real hardware (in addition to everything in section
+19.7):** the unbounded attach-retry behavior itself under a genuinely
+extended DETACHED period (no real OTBR has been tested against this power
+base yet, at any point in this project); the rate-limited warning's actual
+cadence on a real console; confirmation that a real attach arriving well
+after 30s still triggers `start_services_once()` correctly on real hardware
+(only host-tested so far).

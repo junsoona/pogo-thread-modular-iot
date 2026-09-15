@@ -22,9 +22,14 @@
  * Sends via Confirmable CoAP POST with the SAME bounded retry/backoff
  * schedule sensor_transport already uses (node_calc's UUID-hash mask
  * widening, 1 initial + 3 retries) -- no infinite retry loop, no busy
- * polling of the radio while not Thread-joined (a send attempt against no
- * Leader address simply returns false immediately, mirroring
- * sensor_transport_send_sample()'s policy). A send is only ever considered
+ * polling of the radio while not Thread-joined. Sent to the collector
+ * endpoint (components/collector_endpoint's current snapshot -- the power
+ * base's own Mesh-Local EID + CoAP port, delivered via POGO SET_COLLECTOR),
+ * never to "the current Thread Leader": this module's own Thread role --
+ * CHILD, ROUTER, or LEADER -- never changes where its topology reports go
+ * (see docs/power-base.md). A send attempt against no valid collector
+ * endpoint simply returns false immediately, same policy
+ * sensor_transport_send_sample() uses. A send is only ever considered
  * successful once the power base's ACTUAL CoAP response code is a 2.xx --
  * an OpenThread-level "the bytes arrived" is not enough (code review
  * follow-up section 3).

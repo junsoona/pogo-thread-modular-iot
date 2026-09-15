@@ -191,8 +191,31 @@ static void test_back_to_back_frames(void)
     CHECK(p.frames_ok == 2, "both back-to-back frames are counted");
 }
 
+static void check_command(pms5003_command_t command, uint8_t data_low,
+                          const uint8_t expected[PMS5003_COMMAND_LEN], const char *name)
+{
+    uint8_t actual[PMS5003_COMMAND_LEN];
+    pms5003_build_command(command, data_low, actual);
+    CHECK(memcmp(actual, expected, PMS5003_COMMAND_LEN) == 0, name);
+}
+
+static void test_host_commands(void)
+{
+    static const uint8_t passive[] = {0x42, 0x4D, 0xE1, 0x00, 0x00, 0x01, 0x70};
+    static const uint8_t active[]  = {0x42, 0x4D, 0xE1, 0x00, 0x01, 0x01, 0x71};
+    static const uint8_t read[]    = {0x42, 0x4D, 0xE2, 0x00, 0x00, 0x01, 0x71};
+    static const uint8_t sleep[]   = {0x42, 0x4D, 0xE4, 0x00, 0x00, 0x01, 0x73};
+    static const uint8_t wake[]    = {0x42, 0x4D, 0xE4, 0x00, 0x01, 0x01, 0x74};
+    check_command(PMS5003_COMMAND_SET_MODE, 0, passive, "passive-mode command/checksum");
+    check_command(PMS5003_COMMAND_SET_MODE, 1, active, "active-mode command/checksum");
+    check_command(PMS5003_COMMAND_READ, 0, read, "passive-read command/checksum");
+    check_command(PMS5003_COMMAND_SLEEP, 0, sleep, "sleep command/checksum");
+    check_command(PMS5003_COMMAND_SLEEP, 1, wake, "wake command/checksum");
+}
+
 int main(void)
 {
+    test_host_commands();
     test_well_formed_frame();
     test_split_reception();
     test_garbage_prefix();

@@ -41,6 +41,13 @@ extern "C" {
 
 #define PMS5003_FRAME_LEN         32u
 #define PMS5003_EXPECTED_LEN_FIELD 28u /* the "frame_length" field's fixed documented value */
+#define PMS5003_COMMAND_LEN        7u
+
+typedef enum {
+    PMS5003_COMMAND_SET_MODE = 0xE1,
+    PMS5003_COMMAND_READ = 0xE2,
+    PMS5003_COMMAND_SLEEP = 0xE4,
+} pms5003_command_t;
 
 typedef struct {
     uint16_t pm1_0_cf1;
@@ -88,6 +95,11 @@ void pms5003_parser_init(pms5003_parser_t *parser);
  * resync events, same convention as pogo_frame_parser_t.
  */
 bool pms5003_parser_feed(pms5003_parser_t *parser, uint8_t byte, pms5003_frame_t *out_frame);
+
+/* Builds the datasheet's 7-byte host command and checksum. `data_low` is
+ * 0/1 for SET_MODE (passive/active) and SLEEP (sleep/wake), and 0 for READ. */
+void pms5003_build_command(pms5003_command_t command, uint8_t data_low,
+                           uint8_t out[PMS5003_COMMAND_LEN]);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,24 @@ typedef enum {
      * (POGO_NACK_UUID_MISMATCH) -- see child_service.c's handle_assign_uuid().
      */
     POGO_MSG_PROPOSE_UUID = 0x13,
+    /*
+     * parent -> child: tells the child the collector endpoint (the power
+     * base's own Mesh-Local EID + CoAP port + permanent UUID) that this
+     * child -- and, if it becomes INTERMEDIATE, everything docked below it
+     * -- should send its "/s" sensor samples and "/t" topology reports to.
+     * Sent once per provisioning session, right after POLL_CONFIG is ACKed
+     * and BEFORE SET_DATASET (child_service gates SET_DATASET on this having
+     * already succeeded -- see docs/power-base.md's "module/Thread role
+     * decoupling and collector provisioning" section). A power base fills
+     * this from its own identity/Mesh-Local EID; an INTERMEDIATE module
+     * forwards the EXACT endpoint it itself received from its own upstream,
+     * unmodified -- it never substitutes its own address. New as of this
+     * follow-up; a peer that never declared
+     * POGO_CAP_COLLECTOR_PROVISIONING in its PEER_HELLO is rejected at the
+     * handshake stage (see pogo_hello_capability_t below), long before this
+     * message type would ever be sent to it.
+     */
+    POGO_MSG_SET_COLLECTOR = 0x14,
 } pogo_msg_type_t;
 
 typedef enum {
@@ -99,6 +118,8 @@ typedef enum {
     POGO_NACK_PEER_TYPE_CONFLICT = 6, /* PEER_HELLO peer_type contradicts BASE_ID hardware read */
     POGO_NACK_UUID_MISMATCH     = 7, /* ASSIGN_UUID tried to confirm bytes other than what PROPOSE_UUID sent -- a
                                           parent must never invent its own uuid (code review follow-up section 1) */
+    POGO_NACK_INVALID_COLLECTOR  = 8, /* SET_COLLECTOR payload failed length/address/port validation --
+                                          see pogo_collector_endpoint_is_valid() */
 } pogo_nack_reason_t;
 
 #define POGO_UUID_LEN 8
@@ -113,9 +134,32 @@ typedef enum {
     POGO_PEER_TYPE_MODULE      = 2,
 } pogo_peer_type_t;
 
+/*
+ * Bitmask of optional protocol capabilities a peer supports, carried in
+ * pogo_peer_hello_t.capabilities. POGO_CAP_COLLECTOR_PROVISIONING is the
+ * only one defined today -- it means "this firmware knows POGO_MSG_SET_COLLECTOR
+ * and the provisioning-state ordering that requires it before SET_DATASET"
+ * (see docs/power-base.md). Both module/ and power_base/ are always built
+ * from this same revision going forward, so in practice this only matters
+ * when one board was flashed with older firmware and forgot to be reflashed
+ * after this follow-up -- see pogo_port.c's validate_incoming_hello(), which
+ * rejects that case cleanly at the handshake (POGO_PORT_ERR_CAPABILITY_MISMATCH)
+ * instead of letting it fail confusingly mid-provisioning at SET_COLLECTOR.
+ */
+typedef enum {
+    POGO_CAP_COLLECTOR_PROVISIONING = 1u << 0,
+} pogo_hello_capability_t;
+
+/* Every capability THIS firmware revision supports -- sent in every
+ * PEER_HELLO_REQ/RESP this component ever builds (see pogo_port.c). */
+#define POGO_HELLO_SUPPORTED_CAPABILITIES ((uint8_t)POGO_CAP_COLLECTOR_PROVISIONING)
+
 typedef struct {
     uint8_t protocol_version; /* echoes POGO_FRAME_VERSION; a mismatch is a PROTOCOL_VERSION_ERROR upstream */
     uint8_t peer_type;        /* one of pogo_peer_type_t -- what *I* am, from this module's own point of view */
+    uint8_t capabilities;     /* bitmask of pogo_hello_capability_t this sender supports (added for collector
+                                  provisioning -- a peer whose HELLO predates this field entirely, or that lacks
+                                  POGO_CAP_COLLECTOR_PROVISIONING, is rejected -- see pogo_port.c) */
 } pogo_peer_hello_t;
 
 /*
@@ -160,7 +204,9 @@ typedef struct {
     uint16_t sensor_type_bitmap;
     uint32_t response_time_ms; /* measured by the child's sensor_provider, not a protocol constant */
     uint8_t  fw_version;
-    uint8_t  sensor_status;   /* 0 = OK, nonzero = sensor_provider status code */
+    uint8_t  sensor_status;   /* 0 = OK, 7 = CONDITIONING (driver still warming up -- not fatal, parent_service
+                                 continues provisioning), any other nonzero = sensor_provider error status code
+                                 (fatal -- parent_service abandons the session) */
 } pogo_sensor_info_ack_t;
 
 typedef struct {
@@ -232,6 +278,90 @@ bool   pogo_unpack_assign_parent_info(const uint8_t *data, uint16_t len, pogo_as
 
 size_t pogo_pack_propose_uuid(const pogo_propose_uuid_t *in, uint8_t *out, size_t out_size);
 bool   pogo_unpack_propose_uuid(const uint8_t *data, uint16_t len, pogo_propose_uuid_t *out);
+
+/*
+ * Payload of POGO_MSG_SET_COLLECTOR: where a module (and, if INTERMEDIATE,
+ * everything docked below it) should send its "/s"/"/t" traffic --
+ * power_base_uuid(8) + addr(16, IPv6 network byte order) + port(2,
+ * big-endian) + generation(4, big-endian) = 30 bytes on the wire. `addr` is
+ * the power base's own Thread Mesh-Local EID (otThreadGetMeshLocalEid(),
+ * see thread_manager_get_mesh_local_eid()) -- routable across the whole
+ * Thread mesh regardless of which hop sends to it, unlike a Leader RLOC
+ * (which changes if Leadership itself ever moved -- it never does in this
+ * topology, but this design does not rely on that). `generation` is an
+ * informational provisioning epoch (bumped by whichever power base session
+ * produced this endpoint) -- not currently used for any wire-level dedup
+ * decision, but carried so a future revision can detect a stale forwarded
+ * endpoint without a protocol change.
+ */
+#define POGO_COLLECTOR_ADDR_LEN 16
+#define POGO_COLLECTOR_ENDPOINT_WIRE_LEN (POGO_UUID_LEN + POGO_COLLECTOR_ADDR_LEN + 2 + 4) /* 30 bytes */
+
+typedef struct {
+    uint8_t  power_base_uuid[POGO_UUID_LEN];
+    uint8_t  addr[POGO_COLLECTOR_ADDR_LEN]; /* IPv6, network byte order */
+    uint16_t port;
+    uint32_t generation;
+} pogo_collector_endpoint_t;
+
+/*
+ * True if `addr` (16-byte IPv6, network byte order) could ever be a real,
+ * reachable Thread Mesh-Local EID for another node to send to: not the
+ * unspecified address (::), not multicast (ff00::/8), and not link-local
+ * (fe80::/10, never routable off the sender's own link/mesh instance the way
+ * a Mesh-Local EID is). A Mesh-Local EID is never any of these, so a
+ * collector endpoint carrying one of them is definitely wrong, not merely
+ * "possibly wrong" -- see pogo_collector_endpoint_is_valid() below.
+ */
+static inline bool pogo_ipv6_addr_is_valid_collector(const uint8_t addr[POGO_COLLECTOR_ADDR_LEN])
+{
+    static const uint8_t zero[POGO_COLLECTOR_ADDR_LEN] = {0};
+    if (memcmp(addr, zero, POGO_COLLECTOR_ADDR_LEN) == 0) {
+        return false; /* unspecified */
+    }
+    if (addr[0] == 0xFF) {
+        return false; /* multicast, ff00::/8 */
+    }
+    if (addr[0] == 0xFE && (addr[1] & 0xC0) == 0x80) {
+        return false; /* link-local, fe80::/10 */
+    }
+    return true;
+}
+
+/*
+ * Full validity check for a decoded pogo_collector_endpoint_t: a non-all-zero
+ * power_base_uuid (an all-zero uuid is never a valid permanent identifier,
+ * same policy as every other uuid in this codebase), a valid unicast address
+ * per pogo_ipv6_addr_is_valid_collector(), and a nonzero port. Used by both
+ * the wire layer (pogo_unpack_set_collector()) and components/collector_endpoint's
+ * own independent set()-time validation.
+ */
+static inline bool pogo_collector_endpoint_is_valid(const pogo_collector_endpoint_t *ep)
+{
+    static const uint8_t zero_uuid[POGO_UUID_LEN] = {0};
+    if (ep == NULL) {
+        return false;
+    }
+    if (memcmp(ep->power_base_uuid, zero_uuid, POGO_UUID_LEN) == 0) {
+        return false;
+    }
+    if (!pogo_ipv6_addr_is_valid_collector(ep->addr)) {
+        return false;
+    }
+    if (ep->port == 0) {
+        return false;
+    }
+    return true;
+}
+
+size_t pogo_pack_set_collector(const pogo_collector_endpoint_t *in, uint8_t *out, size_t out_size);
+/* Structural unpack only (exact length check, like every other pogo_unpack_*
+ * here) -- semantic validity (bad address/port/uuid) is checked separately
+ * via pogo_collector_endpoint_is_valid() so a caller can choose the right
+ * NACK reason (POGO_NACK_BAD_STATE for a length mismatch vs.
+ * POGO_NACK_INVALID_COLLECTOR for a structurally-fine-but-semantically-bad
+ * payload) -- see child_service.c's handle_set_collector(). */
+bool   pogo_unpack_set_collector(const uint8_t *data, uint16_t len, pogo_collector_endpoint_t *out);
 
 #ifdef __cplusplus
 }

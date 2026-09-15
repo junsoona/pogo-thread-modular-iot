@@ -26,10 +26,10 @@
 
   "dev_mode": "AUTO",
 
-  "_upstream_comment": "Identical to prototype_sht45.json's upstream_port -- see that file's _upstream_comment for why DETECT_IN is GPIO2, not GPIO13 or GPIO6.",
+  "_upstream_comment": "Identical to prototype_sht45.json's upstream_port -- see that file's _upstream_comment for why DETECT_IN is GPIO12/DETECT_OUT is GPIO2 (deep-sleep-ready profile, swapped from the earlier DETECT_IN=2/DETECT_OUT=12), and for the required rewiring before flashing.",
   "upstream_port": {
     "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
-    "detect_in_gpio": 2, "detect_out_gpio": 12, "base_id_gpio": 14,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
     "detect_out_active_low": true, "debounce_ms": 30
   },
 

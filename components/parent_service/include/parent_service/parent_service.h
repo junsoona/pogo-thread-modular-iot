@@ -58,6 +58,23 @@ typedef struct {
      * ASSIGN_PARENT_INFO.parent_is_power_base so the child can cross-check it
      * against its own BASE_ID+PEER_HELLO-derived role. */
     bool is_power_base;
+    /*
+     * Fills *out with the collector endpoint (the power base's own
+     * Mesh-Local EID + CoAP port + permanent UUID) THIS parent should
+     * advertise to a docking child via POGO_MSG_SET_COLLECTOR, sent right
+     * after POLL_CONFIG and before SET_DATASET. Returns false if not
+     * currently known/valid (e.g. this parent's own upstream Thread
+     * membership was just lost) -- run_provisioning_session() then abandons
+     * the session exactly like any other failed step, never sending
+     * SET_DATASET without a collector endpoint already delivered. The power
+     * base fills this from its own identity (see
+     * power_base/main/app_main.c's pb_get_collector()); a sensor module
+     * forwards the EXACT endpoint it itself received from its own upstream
+     * via components/collector_endpoint, unmodified -- see
+     * module/main/app_main.c's module_parent_get_collector() and
+     * docs/power-base.md.
+     */
+    bool (*get_collector)(pogo_collector_endpoint_t *out, void *ctx);
     /* 0 = use CONFIG_POGO_ACK_TIMEOUT_MS (the pogo_proto Kconfig default, and
      * every sensor module's choice, unchanged from before this refactor);
      * otherwise this many ms per provisioning-step retry attempt. Lets

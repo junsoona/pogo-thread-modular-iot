@@ -46,6 +46,14 @@ same AUTO-vs-dev-compat recovery policy as `DOCK_TIMEOUT` (see
 edges, in the port's own task -- never in the GPIO ISR, which only pushes
 `{tick, level}` into a queue.
 
+Entering `WAIT_ATTACH` produces one INFO log with the current `DETECT_IN`
+level. While the task remains in the otherwise-quiet `WAIT_ATTACH` or `ERROR`
+state, it emits a rate-limited status heartbeat every 15 seconds containing
+the internal port state, live `DETECT_IN` level, own peer type, uptime, and
+the cumulative ISR queue-drop count. This lets a serial monitor attached
+after boot distinguish a live task from a stalled task; `PEER_READY` remains
+quiet so normal operation does not gain periodic POGO log noise.
+
 ### PEER_HELLO_REQ / PEER_HELLO_RESP is an explicit request/response, not a symmetric exchange
 
 Earlier revisions used one `PEER_HELLO` message both sides had to send with
@@ -92,9 +100,11 @@ peer while the wire says something is connected).
 ## role_manager (AUTO dev_mode; forced modes just report ROOT/LEAF once)
 
 **Updated by the power-base follow-up: a sensor module in AUTO mode never
-becomes ROOT any more, regardless of what its UPSTREAM peer is -- the
-dedicated power base is the system's one and only ROOT/Leader. See
-[power-base.md](power-base.md).**
+becomes `MODULE_ROLE_ROOT` any more, regardless of what its UPSTREAM peer
+is -- the dedicated power base is always the physical root of the POGO
+chain instead (a fixed application-layer role, decoupled from Thread's own
+`otDeviceRole` -- see [power-base.md](power-base.md)'s "module/Thread role
+decoupling" section).**
 
 Recomputed on every `ATTACHED`/`DETACHED`/`PEER_READY`/`ERROR` event from
 either port (see the determination table in pogo-interface.md):
@@ -297,9 +307,12 @@ sensor_service's periodic task, every effective_polling_period_ms:
 ```
 
 `sensor_transport_send_sample()` (INTERMEDIATE/LEAF) sends one Confirmable
-CoAP POST of the `sensor_channel_pack()`-encoded sample to
-`thread_manager_get_leader_address()` (current Leader's RLOC -- ROOT is
-always Leader in this topology, so this is never a hardcoded address). On no
+CoAP POST of the `sensor_channel_pack()`-encoded sample to the collector
+endpoint (`components/collector_endpoint`'s current snapshot -- the power
+base's own Mesh-Local EID + CoAP port, delivered via POGO `SET_COLLECTOR`;
+see docs/power-base.md's "module/Thread role decoupling and collector
+provisioning" section -- this is never derived from "the current Thread
+Leader" any more, and never a hardcoded address either way). On no
 response, it retries with the UUID-hash backoff schedule (section 13):
 1st retry 0..255ms, 2nd 0..511ms, 3rd 0..1023ms (`node_calc_uuid_hash()`,
 masking progressively more bits of the same per-module hash), up to 3

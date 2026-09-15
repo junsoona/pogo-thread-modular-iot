@@ -44,10 +44,7 @@ extern "C" {
 #define SENSOR_DRIVER_ID_SHT45   0x53483435u /* ASCII "SH45" -- Sensirion SHT45 temp/humidity sensor */
 #define SENSOR_DRIVER_ID_SGP40   0x53473430u /* ASCII "SG40" -- Sensirion SGP40 VOC sensor */
 #define SENSOR_DRIVER_ID_SGP41   0x53473431u /* ASCII "SG41" -- Sensirion SGP41 VOC+NOx sensor */
-#define SENSOR_DRIVER_ID_PMS5003 0x504D3530u /* ASCII "PM50" -- Plantower PMS5003 particulate sensor
-                                                 (parser implemented; hardware UART transport blocked
-                                                 by the two-POGO-UART allocation, see docs/pogo-interface.md
-                                                 and components/pms5003_parser) */
+#define SENSOR_DRIVER_ID_PMS5003 0x504D3530u /* ASCII "PM50" -- terminal-only Plantower PMS5003 UART sensor */
 
 typedef enum {
     SENSOR_STATUS_OK               = 0,

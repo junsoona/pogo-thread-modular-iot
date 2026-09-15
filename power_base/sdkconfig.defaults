@@ -6,12 +6,18 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
 #
-# OpenThread -- the power base is the system's one and only ROOT/Leader (see
-# docs/power-base.md). It reuses the exact same thread_manager component as
-# `module` (thread_manager_start_as_root(): resume a commissioned dataset if
+# OpenThread -- the power base's fixed application role (physical POGO root,
+# downstream provisioning coordinator) is decoupled from Thread's own
+# otDeviceRole; it is NOT described as the system's "ROOT/Leader" (see
+# docs/power-base.md's "module/Thread role decoupling" section -- SUPERSEDES
+# any earlier revision of this comment that said otherwise). It reuses the
+# exact same thread_manager component as `module`
+# (thread_manager_start_as_always_on_ftd(): resume a commissioned dataset if
 # one exists in NVS, otherwise form a new one from these same
 # OPENTHREAD_NETWORK_* Kconfig defaults -- untouched here, same defaults the
-# `openthread` component ships) -- FTD is required for a Leader/Router.
+# `openthread` component ships) -- FTD is required to be eligible for
+# Router/Leader, but this device is not guaranteed, and does not need, to
+# ever hold Leadership itself; it accepts CHILD/ROUTER/LEADER alike.
 #
 CONFIG_OPENTHREAD_ENABLED=y
 CONFIG_OPENTHREAD_FTD=y

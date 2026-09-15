@@ -103,7 +103,16 @@ esp_err_t thread_manager_stop(void)
     return ESP_OK;
 }
 
-esp_err_t thread_manager_start_as_root(void)
+/*
+ * Shared implementation behind both thread_manager_start_as_always_on_ftd()
+ * and thread_manager_start_as_root() -- the two public names apply the
+ * IDENTICAL link-mode/resume-or-form behavior and differ only in the log
+ * prefix (`log_tag`), so a real-hardware log can immediately tell which
+ * caller's policy is in play ("ROOT:" for the DEV_ROOT regression fixture,
+ * "always-on FTD:" for anything that does not itself claim to be a fixed
+ * Thread ROOT/Leader -- see thread_manager.h's comments on each).
+ */
+static esp_err_t start_always_on_ftd_impl(const char *log_tag, const char *resume_suffix)
 {
     otInstance *instance = esp_openthread_get_instance();
     if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
@@ -114,40 +123,40 @@ esp_err_t thread_manager_start_as_root(void)
     do {
         /* Thread must be disabled before link mode / router eligibility change. */
         if (otThreadSetEnabled(instance, false) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "ROOT: otThreadSetEnabled(false) failed");
+            ESP_LOGE(TAG, "%s: otThreadSetEnabled(false) failed", log_tag);
             result = ESP_FAIL;
             break;
         }
         if (otIp6SetEnabled(instance, false) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "ROOT: otIp6SetEnabled(false) failed");
+            ESP_LOGE(TAG, "%s: otIp6SetEnabled(false) failed", log_tag);
             result = ESP_FAIL;
             break;
         }
 
         otLinkModeConfig link_mode = {.mRxOnWhenIdle = true, .mDeviceType = true, .mNetworkData = true};
         if (otThreadSetLinkMode(instance, link_mode) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "ROOT: otThreadSetLinkMode failed");
+            ESP_LOGE(TAG, "%s: otThreadSetLinkMode failed", log_tag);
             result = ESP_FAIL;
             break;
         }
         if (otThreadSetRouterEligible(instance, true) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "ROOT: otThreadSetRouterEligible(true) failed");
+            ESP_LOGE(TAG, "%s: otThreadSetRouterEligible(true) failed", log_tag);
             result = ESP_FAIL;
             break;
         }
 
         if (!otDatasetIsCommissioned(instance)) {
-            ESP_LOGI(TAG, "ROOT: no dataset in NVS -- forming a new Thread network from Kconfig defaults");
+            ESP_LOGI(TAG, "%s: no dataset in NVS -- forming a new Thread network from Kconfig defaults", log_tag);
             result = esp_openthread_auto_start(NULL);
         } else {
-            ESP_LOGI(TAG, "ROOT: existing dataset found in NVS -- resuming as Leader/Router");
+            ESP_LOGI(TAG, "%s: existing dataset found in NVS -- resuming%s", log_tag, resume_suffix);
             if (otIp6SetEnabled(instance, true) != OT_ERROR_NONE) {
-                ESP_LOGE(TAG, "ROOT: otIp6SetEnabled(true) failed");
+                ESP_LOGE(TAG, "%s: otIp6SetEnabled(true) failed", log_tag);
                 result = ESP_FAIL;
                 break;
             }
             if (otThreadSetEnabled(instance, true) != OT_ERROR_NONE) {
-                ESP_LOGE(TAG, "ROOT: otThreadSetEnabled(true) failed");
+                ESP_LOGE(TAG, "%s: otThreadSetEnabled(true) failed", log_tag);
                 result = ESP_FAIL;
                 break;
             }
@@ -156,9 +165,23 @@ esp_err_t thread_manager_start_as_root(void)
 
     esp_openthread_lock_release();
     if (result != ESP_OK) {
-        ESP_LOGE(TAG, "ROOT: failed to start Thread network");
+        ESP_LOGE(TAG, "%s: failed to start Thread network", log_tag);
     }
     return result;
+}
+
+esp_err_t thread_manager_start_as_always_on_ftd(void)
+{
+    return start_always_on_ftd_impl("always-on FTD", "");
+}
+
+esp_err_t thread_manager_start_as_root(void)
+{
+    /* Log text unchanged from before this follow-up ("resuming as
+     * Leader/Router") -- see this function's own header comment: kept
+     * verbatim for the DEV_ROOT regression fixture, never unnecessarily
+     * changed by this session. */
+    return start_always_on_ftd_impl("ROOT", " as Leader/Router");
 }
 
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,
@@ -282,6 +305,25 @@ esp_err_t thread_manager_get_leader_address(otIp6Address *out_addr)
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
+}
+
+esp_err_t thread_manager_get_mesh_local_eid(otIp6Address *out_addr)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const otIp6Address *eid = otThreadGetMeshLocalEid(instance);
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    if (eid != NULL) {
+        /* Copy out WHILE still holding the lock -- `eid` points into
+         * OpenThread's own internal state and must not be dereferenced
+         * after esp_openthread_lock_release() below. */
+        *out_addr = *eid;
+        result = ESP_OK;
+    }
+    esp_openthread_lock_release();
+    return result;
 }
 
 otDeviceRole thread_manager_get_role(void)

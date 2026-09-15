@@ -13,7 +13,7 @@ duplicating it.**
 | Fixed (this document)                          | Dynamic (`role_manager`/`child_service`/`parent_service`/OpenThread) |
 |-------------------------------------------------|------------------------------------------------------------------------|
 | driver_id, sensor_type_bitmap                   | ROOT / INTERMEDIATE / LEAF                                              |
-| I2C/SPI bus, GPIOs, address/clock, calibration   | Leader / Router / Child(SED) Thread role                                |
+| I2C/SPI/UART bus, GPIOs, address/clock, calibration | Leader / Router / Child(SED) Thread role                             |
 | measurement_timeout_ms                          | Parent/child relationship, assigned UUID, slot/depth                   |
 | UPSTREAM/DOWNSTREAM port GPIOs + UART settings   | Thread Active Dataset, polling period, session/retry state             |
 
@@ -45,23 +45,24 @@ cfg   partition                            <- fixed: module_config
 `module_config_load()` (`components/module_config/module_config.c`) reads
 exactly two NVS values from the `"cfg"` partition, namespace `"module_cfg"`:
 
-- `blob` (binary, 90 bytes, big-endian multi-byte fields -- see the exact
+- `blob` (binary, 90-byte schema v1 or 104-byte schema v2, big-endian -- see the exact
   byte offsets in `module_config.c`'s header comment)
 - `crc` (u16): CRC16/CCITT-FALSE over `blob`, using the same algorithm as
   `components/pogo_proto/pogo_crc16.c`.
 
-Both must be present, `blob` must be exactly 90 bytes, the CRC must match,
-and the unpacked `schema_version` must equal `MODULE_CONFIG_SCHEMA_VERSION`
-(currently 1). Beyond that, `validate_config()` (same file) additionally
+Both must be present, the length must match its schema, and the CRC must
+match. Schema v1 remains accepted for existing I2C/SPI images; schema v2
+adds `uart_tx_gpio`, `uart_rx_gpio`, `uart_baud_rate`, `uart_mode`, and
+`uart_warmup_ms`. Beyond that, `validate_config()` additionally
 rejects a structurally-valid-but-nonsensical config:
 
-- `bus_type` other than I2C(0)/SPI(1).
+- `bus_type` other than I2C(0)/SPI(1)/UART(2).
 - `measurement_timeout_ms == 0`.
 - an enabled port (`uart_num >= 0`) with `tx_gpio`/`rx_gpio` unset.
 - UPSTREAM and DOWNSTREAM both enabled on the same `uart_num`.
 - any GPIO number outside `[-1, 31]` (`-1` = "not present on this board").
 - the same GPIO number assigned to more than one function (across both
-  ports' TX/RX/DETECT_IN/DETECT_OUT/BASE_ID and the active bus's I2C/SPI
+  ports' TX/RX/DETECT_IN/DETECT_OUT/BASE_ID and the active bus's I2C/SPI/UART
   pins).
 - `detect_out_active_low = false` on an enabled `detect_out_gpio` --
   `pogo_port`'s DETECT_OUT drive logic is hardcoded open-drain active-low
@@ -87,7 +88,7 @@ since only the dev config images below ever write it.
 
 `tools/pack_module_config.py` takes a human-editable JSON file (see
 `configs/dev_root.json`, `configs/dev_leaf.json`, and the illustrative
-`configs/module_config.example.json`), packs the 90-byte blob, computes its
+`configs/module_config.example.json`), packs the schema-specific blob, computes its
 CRC16, and calls the ESP-IDF NVS partition generator to emit a flashable
 `.bin`:
 
@@ -96,10 +97,17 @@ source ~/.espressif/v6.1/esp-idf/export.sh   # provides IDF_PATH + the nvs_parti
 
 python3 tools/pack_module_config.py configs/dev_root.json build/cfg_images/dev_root_config.bin
 python3 tools/pack_module_config.py configs/dev_leaf.json build/cfg_images/dev_leaf_config.bin
+python3 tools/pack_module_config.py configs/prototype_pms5003.json build/cfg_images/prototype_pms5003_config.bin
 
 # or, both at once:
 bash tools/gen_config.sh build/cfg_images
 ```
+
+`prototype_pms5003.json` is the terminal-only exception to the shared
+two-port I2C prototype profile. It uses schema v2, UART1/GPIO10/11 at 9600
+baud in PASSIVE mode, a 30-second warm-up marker, and a fully disabled
+downstream port. The packer and runtime loader both reject a PMS5003 config
+that violates any of those ownership rules.
 
 Each run prints the `dev_mode`, `driver_id`, and computed CRC it packed, so a
 mismatch against what you expect is visible immediately rather than only
@@ -122,9 +130,12 @@ planned):
   bonded out on the ESP32-H2 SuperMini/SiP package at all (6, 7), the
   internal SPI flash pins (15-21), or the USB Serial/JTAG pins (26, 27) --
   see docs/pogo-interface.md's confirmed GPIO profile for the reasoning and
-  the two corrections this forced (UPSTREAM `DETECT_IN` moved off GPIO13,
-  the SuperMini's onboard LED pin, to GPIO6, and then off GPIO6 -- not
-  actually bonded out on this package -- to GPIO2). GPIO2-5 are ordinary,
+  the corrections this forced (UPSTREAM `DETECT_IN` moved off GPIO13, the
+  SuperMini's onboard LED pin, to GPIO6, then off GPIO6 -- not actually
+  bonded out on this package -- to GPIO2, and (this session) off GPIO2 to
+  GPIO12, an ESP32-H2 RTC GPIO channel usable as a future terminal-leaf
+  Deep-sleep wake source -- `DETECT_OUT` took the vacated GPIO2). GPIO2-5
+  are ordinary,
   allowed GPIOs under this firmware's USB-Serial/JTAG console configuration
   (NOT strapping pins); GPIO13 is not rejected by this chip-level check at
   all (its avoidance is a board-level LED-conflict decision, made in

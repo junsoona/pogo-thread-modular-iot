@@ -29,12 +29,19 @@ extern "C" {
 #define MODULE_CONFIG_NVS_PARTITION  "cfg"
 #define MODULE_CONFIG_NAMESPACE      "module_cfg"
 #define MODULE_CONFIG_DEV_NAMESPACE  "dev_cfg"
-#define MODULE_CONFIG_SCHEMA_VERSION 1u
+#define MODULE_CONFIG_SCHEMA_VERSION 2u
+#define MODULE_CONFIG_SCHEMA_VERSION_MIN 1u
 
 typedef enum {
     MODULE_BUS_I2C = 0,
     MODULE_BUS_SPI = 1,
+    MODULE_BUS_UART = 2,
 } module_bus_type_t;
+
+typedef enum {
+    MODULE_UART_MODE_ACTIVE = 0,
+    MODULE_UART_MODE_PASSIVE = 1,
+} module_uart_mode_t;
 
 /*
  * One logical POGO port's fixed wiring. UART/GPIO numbers are "fixed" in the
@@ -72,6 +79,13 @@ typedef struct {
     uint32_t spi_clock_hz;
     int32_t  calibration[4];         /* driver-interpreted; unused slots are 0 */
     uint32_t measurement_timeout_ms;
+    /* Added by schema v2. Schema-v1 images remain readable and are unpacked
+     * with uart_tx/rx=-1 and the remaining UART fields zeroed. */
+    int32_t  uart_tx_gpio;
+    int32_t  uart_rx_gpio;
+    uint32_t uart_baud_rate;
+    module_uart_mode_t uart_mode;
+    uint32_t uart_warmup_ms;
     module_port_config_t upstream_port;
     module_port_config_t downstream_port;
 } module_config_t;

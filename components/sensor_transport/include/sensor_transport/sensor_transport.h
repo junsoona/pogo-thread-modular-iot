@@ -15,10 +15,16 @@
  * that callback's own doc comment for why the wiring goes through a
  * function pointer instead of a direct sensor_service -> sensor_transport
  * component dependency. Sends the sample as one Confirmable POST to the
- * CURRENT Leader/ROOT address (thread_manager_get_leader_address() -- never
- * a hardcoded address), retrying up to 3 times total with the UUID-hash
- * backoff schedule from section 8 (0..255ms, then 0..511ms, then
- * 0..1023ms) if no CoAP response arrives.
+ * collector endpoint (components/collector_endpoint's current snapshot --
+ * the power base's own Mesh-Local EID + CoAP port, delivered via POGO
+ * SET_COLLECTOR and never derived from "the current Thread Leader": this
+ * module's own Thread role -- CHILD, ROUTER, or LEADER -- never changes
+ * where its data goes, see docs/power-base.md), retrying up to 3 times total
+ * with the UUID-hash backoff schedule from section 8 (0..255ms, then
+ * 0..511ms, then 0..1023ms) if no CoAP response arrives. No attempt at all
+ * is made while the collector endpoint is not currently valid (e.g. before
+ * this module's own SET_COLLECTOR step has completed, or after it was
+ * invalidated by a detach) -- see send_one_attempt().
  *
  * Topology-registration gate (real-hardware first-sample/topology race,
  * see components/topology_gate's header comment): when this module is

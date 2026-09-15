@@ -53,9 +53,13 @@ def main():
     check(sht45["i2c_sda_gpio"] == bh1750["i2c_sda_gpio"], "i2c_sda_gpio matches")
     check(sht45["i2c_scl_gpio"] == bh1750["i2c_scl_gpio"], "i2c_scl_gpio matches")
 
-    # Explicitly confirm the corrected GPIO value made it into both files.
-    check(sht45["upstream_port"]["detect_in_gpio"] == 2, "prototype_sht45.json's upstream_port.detect_in_gpio is 2 (corrected from 6)")
-    check(bh1750["upstream_port"]["detect_in_gpio"] == 2, "prototype_bh1750.json's upstream_port.detect_in_gpio is 2 (corrected from 6)")
+    # Explicitly confirm the deep-sleep-ready GPIO swap made it into both
+    # files (UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2, swapped from the
+    # earlier DETECT_IN=2/DETECT_OUT=12 profile -- see docs/power-base.md).
+    check(sht45["upstream_port"]["detect_in_gpio"] == 12, "prototype_sht45.json's upstream_port.detect_in_gpio is 12 (deep-sleep-ready swap)")
+    check(bh1750["upstream_port"]["detect_in_gpio"] == 12, "prototype_bh1750.json's upstream_port.detect_in_gpio is 12 (deep-sleep-ready swap)")
+    check(sht45["upstream_port"]["detect_out_gpio"] == 2, "prototype_sht45.json's upstream_port.detect_out_gpio is 2 (deep-sleep-ready swap)")
+    check(bh1750["upstream_port"]["detect_out_gpio"] == 2, "prototype_bh1750.json's upstream_port.detect_out_gpio is 2 (deep-sleep-ready swap)")
 
     if failures == 0:
         print("ALL CHECKS PASSED")

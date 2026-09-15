@@ -12,6 +12,7 @@
 
 #include "pogo_proto/pogo_frame.h"
 #include "pogo_proto/pogo_protocol.h"
+#include "collector_endpoint/collector_endpoint.h"
 #include "sensor_service/sensor_service.h"
 #include "thread_manager/thread_manager.h"
 
@@ -30,7 +31,15 @@ static const char *TAG = "child_service";
  * handle_set_dataset below):
  *
  *   READY -> IDENTIFIED -> UUID_PROPOSED -> UUID_ASSIGNED -> SLOT_ASSIGNED
- *         -> PARENT_INFO_SET -> SENSOR_DONE -> POLL_SET -> JOINING -> JOINED
+ *         -> PARENT_INFO_SET -> SENSOR_DONE -> POLL_SET -> COLLECTOR_SET
+ *         -> JOINING -> JOINED
+ *
+ * COLLECTOR_SET (POGO_MSG_SET_COLLECTOR) is this follow-up's addition,
+ * inserted between POLL_SET and SET_DATASET/JOINING (see this file's header
+ * comment and docs/power-base.md): SET_DATASET now requires
+ * CS_STATE_COLLECTOR_SET rather than CS_STATE_POLL_SET, so the Thread join
+ * -- and this module's own periodic sensor measurement/reporting once
+ * joined -- never starts before this module knows where its data should go.
  *
  * UUID_PROPOSED (POGO_MSG_REQUEST_UUID/POGO_MSG_PROPOSE_UUID) is a code
  * review follow-up addition (section 1: "센서 모듈 UUID를 영구 식별자로
@@ -65,6 +74,7 @@ typedef enum {
     CS_STATE_PARENT_INFO_SET, /* has parent_uuid + parent_is_power_base */
     CS_STATE_SENSOR_DONE,     /* SENSOR_INFO_ACK sent */
     CS_STATE_POLL_SET,        /* POLL_CONFIG acked */
+    CS_STATE_COLLECTOR_SET,   /* SET_COLLECTOR stored (durably + in components/collector_endpoint) */
     CS_STATE_JOINING,
     CS_STATE_JOINED,
     CS_STATE_ERROR,
@@ -75,7 +85,7 @@ typedef struct {
     pogo_port_event_data_t data;
 } child_evt_t;
 
-#define DEDUP_COUNT 7
+#define DEDUP_COUNT 8
 typedef struct {
     bool valid;
     uint8_t seq;
@@ -150,6 +160,8 @@ static int dedup_index_for(uint8_t msg_type)
         return 5;
     case POGO_MSG_REQUEST_UUID:
         return 6;
+    case POGO_MSG_SET_COLLECTOR:
+        return 7;
     default:
         return -1;
     }
@@ -198,6 +210,12 @@ static void clear_provisioning_temporaries(void)
      * generation) is the only thing allowed to do so. */
     s_join_result_pending = false;
     s_join_result_retries = 0;
+    /* A new provisioning session (or a detach) immediately invalidates
+     * whatever collector endpoint the OLD session may have set -- see
+     * components/collector_endpoint's header comment and docs/power-base.md.
+     * A brand new SET_COLLECTOR must arrive before this module (or anything
+     * that later docks below it) sends data again. */
+    collector_endpoint_clear();
 }
 
 static void reset_session(void)
@@ -272,6 +290,48 @@ static esp_err_t save_dynamic_record(void)
     if (err != ESP_OK) {
         /* Dataset bytes are never logged, only the fact that storage failed. */
         ESP_LOGE(TAG, "save_dynamic_record failed: %s -- dataset NOT applied, NACKing SET_DATASET", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/*
+ * Persists the collector endpoint into the same runtime "nvs" NVS namespace
+ * save_dynamic_record() uses (never the fixed "cfg" partition -- section 5
+ * of this follow-up: "동적 정보는 cfg 파티션에 넣지 말고 기존 Dataset과 같은
+ * 런타임 NVS 영역에 저장하라"). Diagnostic/forward-compatibility only, same
+ * policy as save_dynamic_record() -- never read back at boot (see
+ * docs/state-machine.md's "No auto-rejoin from stored dynamic NVS on boot"
+ * simplification, which applies here identically: a changed upstream parent
+ * must not be trusted silently, so this module always waits for a fresh,
+ * live SET_COLLECTOR before ever using components/collector_endpoint's
+ * in-RAM copy for a real send). Every NVS call's result is checked, same as
+ * save_dynamic_record().
+ */
+static esp_err_t save_collector_dynamic_record(const pogo_collector_endpoint_t *ep)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(CHILD_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_collector_dynamic_record: nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    do {
+        err = nvs_set_blob(h, "coll_uuid", ep->power_base_uuid, POGO_UUID_LEN);
+        if (err != ESP_OK) break;
+        err = nvs_set_blob(h, "coll_addr", ep->addr, POGO_COLLECTOR_ADDR_LEN);
+        if (err != ESP_OK) break;
+        err = nvs_set_u16(h, "coll_port", ep->port);
+        if (err != ESP_OK) break;
+        err = nvs_set_u32(h, "coll_gen", ep->generation);
+        if (err != ESP_OK) break;
+        err = nvs_commit(h);
+    } while (0);
+
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_collector_dynamic_record failed: %s -- SET_COLLECTOR NOT applied, NACKing",
+                 esp_err_to_name(err));
     }
     return err;
 }
@@ -648,6 +708,70 @@ static void handle_poll_config(const pogo_frame_t *frame)
     dedup_remember(idx, frame->seq, resp_type, resp_payload, resp_len);
 }
 
+/*
+ * SET_COLLECTOR (this follow-up, see child_service.h's header comment):
+ * requires CS_STATE_POLL_SET (i.e. AFTER POLL_CONFIG, BEFORE SET_DATASET).
+ * A structurally-malformed payload (wrong length) is POGO_NACK_BAD_STATE,
+ * the same reason every other malformed-payload case in this file uses;
+ * a well-formed but semantically-invalid endpoint (unspecified/multicast/
+ * link-local address, port 0, all-zero uuid) is the more specific
+ * POGO_NACK_INVALID_COLLECTOR. A storage failure is POGO_NACK_STORAGE_FAILED
+ * and does NOT advance s_state or populate components/collector_endpoint --
+ * mirrors handle_set_dataset()'s own storage-failure policy exactly.
+ */
+static void handle_set_collector(const pogo_frame_t *frame)
+{
+    int idx = dedup_index_for(frame->type);
+    if (dedup_resend_if_repeat(idx, frame->seq)) {
+        return;
+    }
+    uint8_t resp_type, resp_payload[2];
+    size_t resp_len;
+
+    pogo_collector_endpoint_t ep;
+    if (s_state != CS_STATE_POLL_SET) {
+        pogo_nack_t nack = {.acked_type = POGO_MSG_SET_COLLECTOR, .reason = POGO_NACK_BAD_STATE};
+        resp_type = POGO_MSG_NACK;
+        resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
+    } else if (!pogo_unpack_set_collector(frame->payload, frame->len, &ep)) {
+        pogo_nack_t nack = {.acked_type = POGO_MSG_SET_COLLECTOR, .reason = POGO_NACK_BAD_STATE};
+        resp_type = POGO_MSG_NACK;
+        resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
+    } else if (!pogo_collector_endpoint_is_valid(&ep)) {
+        ESP_LOGW(TAG, "SET_COLLECTOR rejected: invalid endpoint (unspecified/multicast/link-local address, "
+                      "port 0, or all-zero power_base_uuid)");
+        pogo_nack_t nack = {.acked_type = POGO_MSG_SET_COLLECTOR, .reason = POGO_NACK_INVALID_COLLECTOR};
+        resp_type = POGO_MSG_NACK;
+        resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
+    } else if (save_collector_dynamic_record(&ep) != ESP_OK) {
+        pogo_nack_t nack = {.acked_type = POGO_MSG_SET_COLLECTOR, .reason = POGO_NACK_STORAGE_FAILED};
+        resp_type = POGO_MSG_NACK;
+        resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
+    } else {
+        /* IPv6 addresses/Network-topology-identifying UUIDs are logged only
+         * as a short suffix, same convention as every other uuid log line in
+         * this codebase. */
+        esp_err_t set_err =
+            collector_endpoint_set(ep.power_base_uuid, ep.addr, ep.port, ep.generation);
+        if (set_err != ESP_OK) {
+            /* Should not happen (already validated above), but never claim
+             * success if the in-RAM cache somehow rejects it. */
+            pogo_nack_t nack = {.acked_type = POGO_MSG_SET_COLLECTOR, .reason = POGO_NACK_INVALID_COLLECTOR};
+            resp_type = POGO_MSG_NACK;
+            resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
+        } else {
+            pogo_ack_t ack = {.acked_type = POGO_MSG_SET_COLLECTOR};
+            resp_type = POGO_MSG_ACK;
+            resp_len = pogo_pack_ack(&ack, resp_payload, sizeof(resp_payload));
+            s_state = CS_STATE_COLLECTOR_SET;
+            ESP_LOGI(TAG, "collector endpoint accepted: power_base_uuid=..%02x%02x port=%u",
+                     ep.power_base_uuid[6], ep.power_base_uuid[7], (unsigned)ep.port);
+        }
+    }
+    pogo_port_send(POGO_PORT_UPSTREAM, resp_type, frame->seq, resp_payload, resp_len);
+    dedup_remember(idx, frame->seq, resp_type, resp_payload, resp_len);
+}
+
 static void handle_set_dataset(const pogo_frame_t *frame)
 {
     int idx = dedup_index_for(frame->type);
@@ -657,7 +781,7 @@ static void handle_set_dataset(const pogo_frame_t *frame)
     uint8_t resp_type, resp_payload[2];
     size_t resp_len;
 
-    if (s_state != CS_STATE_POLL_SET) {
+    if (s_state != CS_STATE_COLLECTOR_SET) {
         pogo_nack_t nack = {.acked_type = POGO_MSG_SET_DATASET, .reason = POGO_NACK_BAD_STATE};
         resp_type = POGO_MSG_NACK;
         resp_len = pogo_pack_nack(&nack, resp_payload, sizeof(resp_payload));
@@ -730,6 +854,9 @@ static void handle_frame(const pogo_frame_t *frame)
         break;
     case POGO_MSG_POLL_CONFIG:
         handle_poll_config(frame);
+        break;
+    case POGO_MSG_SET_COLLECTOR:
+        handle_set_collector(frame);
         break;
     case POGO_MSG_SET_DATASET:
         handle_set_dataset(frame);
@@ -825,6 +952,13 @@ static void child_service_task(void *arg)
             ESP_LOGW(TAG, "UPSTREAM port error=%d -> ERROR", (int)evt.data.error_code);
             s_state = CS_STATE_ERROR;
             sensor_service_set_thread_joined(false);
+            /* upstream ERROR: the collector endpoint (if any) this session
+             * received is no longer trustworthy either -- see
+             * clear_provisioning_temporaries()'s own call for the DETACHED/
+             * new-session cases; POGO_PORT_EVENT_ERROR does not route through
+             * reset_session()/begin_new_provisioning_session() so this is
+             * called explicitly here too. */
+            collector_endpoint_clear();
             break;
         }
     }

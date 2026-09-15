@@ -24,10 +24,10 @@
 
   "dev_mode": "AUTO",
 
-  "_upstream_comment": "UART0. DETECT_IN uses GPIO2, NOT GPIO13 (documented onboard LED pin, see docs/pogo-interface.md) and NOT GPIO6 (an earlier draft of this profile used GPIO6, but GPIO6/7 are not bonded out on the ESP32-H2 SuperMini/SiP package at all -- corrected to GPIO2, which IS exposed and is an ordinary GPIO under this firmware's USB-Serial/JTAG console configuration; see docs/pogo-interface.md's 'Confirmed GPIO profile' section for the full history/evidence).",
+  "_upstream_comment": "UART0. Deep-sleep-ready GPIO profile (this follow-up): UPSTREAM DETECT_IN is GPIO12 and DETECT_OUT is GPIO2 -- swapped from the earlier profile (DETECT_IN=2/DETECT_OUT=12) because GPIO12 is an ESP32-H2 RTC GPIO channel (see components/module_config/deep_sleep_gpio.h) usable as a future terminal-leaf Deep-sleep ext1 wake source, while GPIO2 is not. GPIO2 is NOT GPIO13 (documented onboard LED pin, see docs/pogo-interface.md) and NOT GPIO6 (GPIO6/7 are not bonded out on the ESP32-H2 SuperMini/SiP package at all); see docs/pogo-interface.md's 'Confirmed GPIO profile' section for the full history/evidence. IMPORTANT: the real boards are still wired to the OLD profile (DETECT_IN=2/DETECT_OUT=12) -- swap the two DETECT wires before flashing firmware built from this config, see README.md.",
   "upstream_port": {
     "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
-    "detect_in_gpio": 2, "detect_out_gpio": 12, "base_id_gpio": 14,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
     "detect_out_active_low": true, "debounce_ms": 30
   },
 

@@ -23,10 +23,10 @@
 
   "dev_mode": "AUTO",
 
-  "_port_comment": "The confirmed GPIO profile (docs/pogo-interface.md) -- identical on every real board; only the sensor fields above ever differ per board.",
+  "_port_comment": "The confirmed, deep-sleep-ready GPIO profile (docs/pogo-interface.md) -- identical on every real board; only the sensor fields above ever differ per board. UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2 (swapped from an earlier DETECT_IN=2/DETECT_OUT=12 profile -- GPIO12 is an ESP32-H2 RTC GPIO channel, usable as a future terminal-leaf Deep-sleep wake source).",
   "upstream_port": {
     "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
-    "detect_in_gpio": 2, "detect_out_gpio": 12, "base_id_gpio": 14,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
     "detect_out_active_low": true, "debounce_ms": 30
   },
   "downstream_port": {

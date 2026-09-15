@@ -7,75 +7,153 @@
  * parent_service's small context struct (see parent_service.h) to its own
  * always-power-base identity instead of role_manager/child_service.
  *
- * Boot sequence (section 4 of the power-base follow-up spec -- order matters,
- * every step below is exactly one item in that list):
+ * FIXED application role vs. DYNAMIC Thread role (this follow-up): the
+ * power base's fixed, permanent application role is the physical root of
+ * the POGO chain, the downstream provisioning coordinator, the UUID/slot/
+ * topology registry owner, the sensor-data aggregator, and (in a future
+ * revision) the POGO 5V supplier and the gateway in front of a Linux Matter
+ * Bridge -- see docs/power-base.md. It is NOT described here as Thread's
+ * "ROOT" or "Leader": `otDeviceRole` is entirely Thread's own decision, and
+ * this file never calls thread_manager_start_as_root() (that name/wrapper
+ * exists only for module's DEV_ROOT regression fixture -- see
+ * thread_manager.h) -- it calls the neutral
+ * thread_manager_start_as_always_on_ftd() instead, and logs this device's
+ * own boot/attach progress as "power-base FTD:", never "ROOT:". This device
+ * always runs as an always-on FTD (rx-on-when-idle=true, router-eligible=true
+ * -- same link mode as before) and accepts CHILD, ROUTER, or LEADER alike as
+ * "attached and ready"; only DISABLED/DETACHED are "not ready". Nothing
+ * below waits specifically for LEADER, and a first attach that takes longer
+ * than any fixed budget (e.g. an OTBR/another FTD only becoming reachable
+ * much later) is NOT a fatal error -- see "attach supervisor" below.
+ *
+ * Boot sequence:
  *   1. nvs_flash_init()            -- dynamic "nvs" partition (OpenThread's
  *                                      own Active Dataset, see
- *                                      thread_manager_start_as_root()).
+ *                                      thread_manager_start_as_always_on_ftd()).
  *   2. power_base_config_load()    -- fixed "cfg" partition. CONFIG_ERROR
  *                                      halts here, same policy as module_config_load().
- *   3. thread_manager_init()       -- OpenThread FTD stack up, no network yet.
- *   4/5. thread_manager_start_as_root() -- resumes a commissioned dataset if
- *                                      one exists in NVS, otherwise forms a
- *                                      new one (Dataset/Network Key never
- *                                      logged). Reused VERBATIM from
- *                                      components/thread_manager -- this is
- *                                      the ONLY place in the whole system
- *                                      that ever forms or owns a dataset.
- *   6. Block until LEADER (strictly -- not "Leader or Router"; see
- *                                      pb_provisioning_allowed()'s own
- *                                      comment for why no other role is
- *                                      ever the correct steady state here)
- *                                    -- a bounded 30s wait (same budget as
- *                                      module's root_ready_watcher_task).
- *                                      Failure here halts WITHOUT ever
- *                                      calling pogo_port_enable(), so
- *                                      DETECT_OUT stays released the whole
- *                                      time (pogo_port_init() alone touches
- *                                      no GPIO -- see pogo_port.h).
- *   7. power_base_transport_init() -- CoAP "/s" (sensor data) + "/t"
- *                                      (topology reports) resources.
- *   8. parent_service_init()       -- wired to this power base's own
- *                                      context; starts automatically
- *                                      provisioning whatever docks on the
- *                                      downstream port once its own
- *                                      provisioning_allowed() callback
- *                                      (strictly LEADER) says so.
- *   9. pogo_port_init()            -- registers the downstream port's
+ *   3. Power rail sequencing (power_enable_gpio/...) -- see section 8 of
+ *                                      docs/power-base.md. A no-op today (no
+ *                                      switching hardware decided yet).
+ *   4. esp_efuse_mac_get_default() -- this power base's own stable 8-byte
+ *                                      identity (its EUI-64), used both as
+ *                                      its POGO UUID (for ASSIGN_PARENT_INFO
+ *                                      and SET_COLLECTOR) and its topology-
+ *                                      registry key. Never regenerated,
+ *                                      never logged in full.
+ *   5. thread_manager_init()       -- OpenThread FTD stack up, no network yet.
+ *   6. thread_manager_start_as_always_on_ftd() -- the only place in the whole
+ *                                      system that ever forms or resumes an
+ *                                      Active Dataset. If NVS already holds a
+ *                                      commissioned dataset, it is resumed;
+ *                                      otherwise a new one is formed from
+ *                                      Kconfig defaults. Neither the dataset
+ *                                      bytes nor the Network Key are ever
+ *                                      logged. A failure HERE (a genuine
+ *                                      OpenThread API error, not "not yet
+ *                                      attached") halts immediately -- see
+ *                                      halt_forever()'s callers below.
+ *   7. attach_supervisor_task() started, app_main() returns. This task is
+ *                                      the ONLY thing that ever calls
+ *                                      start_services_once() (step 8-12
+ *                                      below) -- it polls thread_manager_get_role()
+ *                                      (bounded, non-busy: 200ms between
+ *                                      checks) until this device's FIRST
+ *                                      attach (CHILD, ROUTER, or LEADER),
+ *                                      with NO timeout and NO halt_forever()
+ *                                      for simply "not attached yet" -- a
+ *                                      Thread/OTBR network that only becomes
+ *                                      reachable much later must still work.
+ *                                      A rate-limited ESP_LOGW appears once
+ *                                      30s have passed without attaching, and
+ *                                      repeats at most once every 60s after
+ *                                      that (never a flood, never a busy
+ *                                      loop) -- see ATTACH_WARN_*_MS below.
+ *                                      Once attached, start_services_once()
+ *                                      runs EXACTLY ONCE and this task then
+ *                                      deletes itself: no further role
+ *                                      fluctuation (including a LATER drop to
+ *                                      DISABLED/DETACHED and a subsequent
+ *                                      reattach) ever re-enters this task's
+ *                                      logic or re-creates anything -- see
+ *                                      "role fluctuation" below.
+ *   8. power_base_transport_init() -- registers the CoAP "/s" (sensor data)
+ *                                      and "/t" (topology report) resources.
+ *   9. parent_service_init()       -- wired to the power base's own context:
+ *                                      pb_provisioning_allowed() re-checks
+ *                                      "is otDeviceRole currently CHILD,
+ *                                      ROUTER, or LEADER" on every call
+ *                                      (parent_service's own loop already
+ *                                      polls this continuously -- no
+ *                                      separate watcher task is needed
+ *                                      here), get_own_depth()==0,
+ *                                      pb_get_collector() supplies this
+ *                                      power base's own Mesh-Local EID +
+ *                                      CoAP port whenever attached.
+ *  10. pogo_port_init()            -- registers the downstream port's
  *                                      config; touches no GPIO yet.
- *  10. Stale-sweep task creation CONFIRMED (xTaskCreate() checked) --
- *                                      code review follow-up (2nd pass):
- *                                      this must succeed BEFORE
- *                                      pogo_port_enable() below, or a
- *                                      sensor module could start docking
- *                                      while this power base can never
- *                                      mark a stale node offline again.
- *                                      Failure here halts -- exactly like
- *                                      every step above -- WITHOUT ever
- *                                      calling pogo_port_enable().
- *  11. pogo_port_enable()          -- the ONE downstream POGO port. This is
+ *  11. Stale-sweep task creation CONFIRMED (xTaskCreate() checked) -- must
+ *                                      succeed BEFORE pogo_port_enable()
+ *                                      below, or a sensor module could start
+ *                                      docking while this power base can
+ *                                      never mark a stale node offline
+ *                                      again. Failure here halts -- a
+ *                                      genuine resource-creation failure,
+ *                                      not "not attached yet".
+ *  12. pogo_port_enable()          -- the ONE downstream POGO port. This is
  *                                      also what drives DETECT_OUT active
  *                                      (Low) -- see pogo_port.c's
  *                                      pogo_port_enable(): there is no
- *                                      separate step to sequence, the
- *                                      ordering above already guarantees
+ *                                      separate step to sequence.
+ *                                      DISABLED/DETACHED never reaches this
+ *                                      line at all (it only runs inside
+ *                                      start_services_once(), only called
+ *                                      after a confirmed attach), so
  *                                      DETECT_OUT never activates before
- *                                      Thread is LEADER-ready AND the
+ *                                      this device is attached AND the
  *                                      stale-sweep task is confirmed running.
- *  12. "power base ready" logged   -- only reachable if every step above
- *                                      succeeded.
+ *  13. "power base ready" logged   -- only reachable once every step above
+ *                                      inside start_services_once() succeeded.
+ *
+ * Role fluctuation AFTER services start: none of the CoAP resources, the
+ * parent_service task, the pogo_port task/GPIOs, or the stale-sweep task are
+ * ever torn down or re-created because `otDeviceRole` later changes among
+ * CHILD/ROUTER/LEADER, or even drops to DETACHED/DISABLED. Instead:
+ *   - pb_provisioning_allowed() (re-checked by parent_service on every idle
+ *     loop iteration, never cached) simply starts returning false the moment
+ *     role becomes DISABLED/DETACHED -- no NEW downstream provisioning
+ *     session is started, but an already-connected/JOINED child is left
+ *     alone (parent_service does not tear down an existing session just
+ *     because a NEW one could not start).
+ *   - pb_get_collector() likewise starts returning false while
+ *     DISABLED/DETACHED -- a session that reaches its own SET_COLLECTOR step
+ *     during that window is abandoned by parent_service (same as any other
+ *     failed provisioning step) and naturally retried once this device
+ *     reattaches, without any code here needing to notice the transition
+ *     itself. A peer that is already PEER_READY and waiting
+ *     (`s_peer_ready_pending` in parent_service.c) is automatically
+ *     re-evaluated on parent_service's own next idle-loop iteration once
+ *     pb_provisioning_allowed() starts returning true again -- nothing here
+ *     needs to "wake" it up explicitly.
+ *   - Once this device reattaches (any of CHILD/ROUTER/LEADER again), both
+ *     callbacks resume returning true/valid on their very next call -- no
+ *     explicit "resume" step, no busy-retry loop; it is simply the same
+ *     live otDeviceRole check as always.
  */
 #include <stdint.h>
 #include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "openthread/coap.h" /* OT_DEFAULT_COAP_PORT */
 
 #include "pogo_proto/pogo_crc16.h"
 #include "pogo_port/pogo_port.h"
@@ -86,9 +164,28 @@
 
 static const char *TAG = "power_base_main";
 
+/* First rate-limited "still not attached" warning, and the minimum spacing
+ * between every warning after that -- see attach_supervisor_task(). Neither
+ * of these is a halt condition; they exist purely so a real console shows
+ * SOMETHING if this device is stuck DISABLED/DETACHED for a long time,
+ * without flooding the log while it waits (e.g. for an OTBR to come up). */
+#define ATTACH_WARN_FIRST_MS 30000
+#define ATTACH_WARN_REPEAT_MS 60000
+#define ATTACH_POLL_INTERVAL_MS 200
+
 static power_base_config_t s_cfg;
 static uint8_t s_own_uuid[POGO_UUID_LEN];
 static parent_service_context_t s_parent_ctx;
+/* Informational provisioning epoch handed out in every SET_COLLECTOR this
+ * boot sends (pogo_collector_endpoint_t.generation) -- not read back or
+ * relied on for any wire-level decision today; a random-per-boot value is
+ * enough to let a future revision distinguish "this boot's collector" from
+ * an earlier one if it ever needs to (see pogo_protocol.h's own comment). */
+static uint32_t s_collector_generation;
+/* Set exactly once, by start_services_once(), the first (and only) time it
+ * runs -- guards against it ever being called twice (see
+ * attach_supervisor_task()). */
+static volatile bool s_services_started;
 
 static void halt_forever(const char *why)
 {
@@ -134,27 +231,27 @@ static void apply_power_rail_sequencing(void)
     }
 }
 
+static bool role_is_attached(otDeviceRole role)
+{
+    return role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER;
+}
+
 /* --- parent_service_context_t: this power base's own identity/readiness,
  * reusing parent_service completely unmodified (see parent_service.h). --- */
 
 /*
- * Code review follow-up section 5: strictly LEADER, not "LEADER or ROUTER".
- * The power base is this system's architectural requirement's "one and only
- * Thread ROOT/Leader" -- it is the sole device that ever forms or resumes
- * the network's Active Dataset (thread_manager_start_as_root()), and no
- * sensor module ever forms one of its own (see docs/power-base.md). In a
- * network where this is the only device that can ever legitimately become
- * Leader, a solo-forming/resuming FTD node attaches directly into the
- * Leader role -- there is no other partition to defer Leadership to, so
- * there is no scenario in THIS topology where "merely Router" is the
- * correct, expected steady state for the power base. Tolerating ROUTER here
- * was a leftover hedge, not a deliberate design choice with an OpenThread
- * justification -- removed.
+ * Re-checked live on every call (parent_service's own idle loop already does
+ * this every iteration -- see parent_service.c's parent_service_task()), so
+ * this needs no caching and no separate watcher task: CHILD, ROUTER, and
+ * LEADER are all normal, provisioning-ready Thread connectivity states for
+ * this power base (its fixed application role never depended on Thread
+ * Leadership in the first place -- see this file's top comment).
+ * DISABLED/DETACHED are the only "not ready" states.
  */
 static bool pb_provisioning_allowed(void *ctx)
 {
     (void)ctx;
-    return thread_manager_get_role() == OT_DEVICE_ROLE_LEADER;
+    return role_is_attached(thread_manager_get_role());
 }
 
 static uint8_t pb_get_own_depth(void *ctx)
@@ -173,6 +270,34 @@ static const char *pb_role_name(void *ctx)
 {
     (void)ctx;
     return "POWER_BASE";
+}
+
+/*
+ * Fills *out with this power base's own identity as the collector every
+ * sensor module in the chain should send "/s"/"/t" traffic to: its own
+ * permanent UUID + its own Thread Mesh-Local EID (via
+ * thread_manager_get_mesh_local_eid(), confirmed against ESP-IDF v6.1's real
+ * otThreadGetMeshLocalEid() -- see thread_manager.h) + the CoAP port
+ * power_base_transport_init() actually bound. Returns false (collector not
+ * currently valid) while DISABLED/DETACHED -- see this file's top comment on
+ * role fluctuation for what that means for an in-flight provisioning
+ * session.
+ */
+static bool pb_get_collector(pogo_collector_endpoint_t *out, void *ctx)
+{
+    (void)ctx;
+    if (!role_is_attached(thread_manager_get_role())) {
+        return false;
+    }
+    otIp6Address mleid;
+    if (thread_manager_get_mesh_local_eid(&mleid) != ESP_OK) {
+        return false;
+    }
+    memcpy(out->power_base_uuid, s_own_uuid, POGO_UUID_LEN);
+    memcpy(out->addr, mleid.mFields.m8, sizeof(out->addr));
+    out->port = OT_DEFAULT_COAP_PORT;
+    out->generation = s_collector_generation;
+    return pogo_collector_endpoint_is_valid(out);
 }
 
 static void port_event_dispatcher(pogo_port_id_t port_id, pogo_port_event_t event, const pogo_port_event_data_t *data,
@@ -201,8 +326,149 @@ static void stale_sweep_task(void *arg)
     }
 }
 
+/*
+ * Runs the fixed, one-time service-startup steps (boot-sequence steps 8-13
+ * in this file's top comment) -- called EXACTLY ONCE, by
+ * attach_supervisor_task(), the first time this device is ever observed
+ * attached (CHILD, ROUTER, or LEADER). Every failure inside here is a
+ * genuine resource-creation failure (CoAP resource registration, task
+ * creation, GPIO/UART bring-up) -- NOT "not attached yet" -- so halting is
+ * still the correct policy, same as the rest of this file's boot-time
+ * failures.
+ *
+ * Only reads/writes static (file-scope) state -- s_cfg/s_own_uuid/
+ * s_collector_generation/s_parent_ctx are all already-initialized globals
+ * by the time this can ever run, never a stack-local address handed to a
+ * longer-lived task.
+ */
+static void start_services_once(otDeviceRole role)
+{
+    ESP_ERROR_CHECK(power_base_transport_init(s_own_uuid));
+
+    s_parent_ctx = (parent_service_context_t){
+        .provisioning_allowed = pb_provisioning_allowed,
+        .get_own_depth = pb_get_own_depth,
+        .get_own_uuid = pb_get_own_uuid,
+        .role_name = pb_role_name,
+        .is_power_base = true,
+        .get_collector = pb_get_collector,
+        .ack_timeout_ms = s_cfg.ack_timeout_ms,
+        .ctx = NULL,
+    };
+    ESP_ERROR_CHECK(parent_service_init(&s_parent_ctx));
+
+    pogo_port_config_t down_cfg = {
+        .enabled = true,
+        .uart_num = s_cfg.downstream_port.uart_num,
+        .tx_gpio = s_cfg.downstream_port.tx_gpio,
+        .rx_gpio = s_cfg.downstream_port.rx_gpio,
+        .detect_in_gpio = s_cfg.downstream_port.detect_in_gpio,
+        .detect_out_gpio = s_cfg.downstream_port.detect_out_gpio,
+        .base_id_gpio = -1, /* BASE_ID is read on a MODULE's UPSTREAM side only -- meaningless here */
+        .detect_out_active_low = s_cfg.downstream_port.detect_out_active_low,
+        .debounce_ms = (s_cfg.downstream_port.debounce_ms != 0) ? s_cfg.downstream_port.debounce_ms : 30,
+        .baud_rate = CONFIG_POGO_UART_BAUD_RATE,
+    };
+    ESP_ERROR_CHECK(pogo_port_init(POGO_PORT_DOWNSTREAM, &down_cfg, port_event_dispatcher, NULL));
+
+    /*
+     * The stale-sweep task must be CONFIRMED running BEFORE pogo_port_enable()
+     * -- otherwise a sensor module could already be docking (DETECT_OUT
+     * active, provisioning under way) while this power base's own ability to
+     * ever mark a stale node offline again was silently broken. If this task
+     * cannot be created, halt here -- exactly like every other resource
+     * failure -- WITHOUT ever calling pogo_port_enable(): DETECT_OUT stays
+     * released, "power base ready" is never logged, and no sensor module is
+     * ever invited to dock against a power base that cannot maintain its own
+     * topology registry.
+     */
+    BaseType_t sweep_task_ok = xTaskCreate(stale_sweep_task, "topology_stale_sweep", 3072, NULL, 3, NULL);
+    if (sweep_task_ok != pdPASS) {
+        halt_forever("STALE_SWEEP_TASK_FAILED: xTaskCreate failed -- refusing to enable downstream POGO "
+                     "provisioning with no way to ever mark a stale node offline again");
+    }
+
+    /* pogo_port_enable() itself drives DETECT_OUT active (Low) as part of
+     * bringing the port up -- simply never having called it before this
+     * device was first attached AND the stale-sweep task was confirmed
+     * running (just above) IS this system's "DETECT_OUT only once fully
+     * ready" guarantee; there is no separate GPIO write to sequence. This
+     * call happens exactly once per boot -- start_services_once() itself is
+     * only ever invoked once, see attach_supervisor_task(). */
+    ESP_ERROR_CHECK(pogo_port_enable(POGO_PORT_DOWNSTREAM, POGO_PEER_TYPE_POWER_BASE));
+    ESP_LOGI(TAG, "pogo_port DOWNSTREAM: task created and enabled");
+
+    s_services_started = true;
+    ESP_LOGI(TAG, "power base ready: uuid=..%02x%02x otDeviceRole=%u(%s) stale_sweep=running -- awaiting the "
+                  "first sensor module",
+             s_own_uuid[6], s_own_uuid[7], (unsigned)role, thread_manager_role_to_str(role));
+}
+
+/*
+ * Owns this device's FIRST attach wait, with NO fixed timeout and NO
+ * halt_forever() for simply "not attached yet" -- a Thread/OTBR network
+ * that only becomes reachable much later (or a bench setup with no OTBR at
+ * all, forming its own standalone network, which may itself take a moment)
+ * must still work correctly, not permanently wedge this power base. See
+ * this file's top comment for the full policy.
+ *
+ * Polls thread_manager_get_role() every ATTACH_POLL_INTERVAL_MS (200ms) --
+ * bounded, non-busy, same cadence the pre-existing boot-time wait already
+ * used. thread_manager_get_role() itself is a cheap, non-blocking read (an
+ * OpenThread API-lock-guarded field read), so this loop never risks
+ * starving anything else.
+ *
+ * Once attached, calls start_services_once() EXACTLY ONCE and then deletes
+ * itself -- there is nothing further for this task to do afterward:
+ * pb_provisioning_allowed()/pb_get_collector() both read
+ * thread_manager_get_role() live, on every call, directly from
+ * parent_service's own code, so no supervisor involvement is needed for
+ * any LATER role fluctuation (including a drop back to DISABLED/DETACHED
+ * and a subsequent reattach) -- see "role fluctuation" in this file's top
+ * comment.
+ */
+static void attach_supervisor_task(void *arg)
+{
+    (void)arg;
+    TickType_t boot_tick = xTaskGetTickCount();
+    bool warned_once = false;
+    TickType_t last_warn_tick = 0;
+
+    while (1) {
+        otDeviceRole role = thread_manager_get_role();
+        if (role_is_attached(role)) {
+            ESP_LOGI(TAG, "power-base FTD: attached, otDeviceRole=%u(%s) -- starting services (this runs exactly "
+                          "once; a later role change never re-triggers it)",
+                     (unsigned)role, thread_manager_role_to_str(role));
+            start_services_once(role);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        TickType_t elapsed_ms = (now - boot_tick) * portTICK_PERIOD_MS;
+        if (elapsed_ms >= ATTACH_WARN_FIRST_MS &&
+            (!warned_once || (now - last_warn_tick) * portTICK_PERIOD_MS >= ATTACH_WARN_REPEAT_MS)) {
+            ESP_LOGW(TAG, "power-base FTD: still not attached after %ums (otDeviceRole=%u(%s)) -- OpenThread attach "
+                          "attempt continues; services will start automatically once attached (e.g. once an OTBR "
+                          "or another Thread device becomes reachable) -- not halting",
+                     (unsigned)elapsed_ms, (unsigned)role, thread_manager_role_to_str(role));
+            warned_once = true;
+            last_warn_tick = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ATTACH_POLL_INTERVAL_MS));
+    }
+}
+
 void app_main(void)
 {
+    /* Minimal, unconditional boot-diagnostic trail -- see module/main/
+     * app_main.c's identical note: this does not by itself fix "no serial
+     * output until reset"; if these lines never appear at all on a real
+     * board, that points at USB re-enumeration / power / monitor-connection,
+     * not firmware logic. */
+    ESP_LOGI(TAG, "app_main: entry (reset_reason=%d)", (int)esp_reset_reason());
+
     if (!pogo_crc16_selftest()) {
         ESP_LOGE(TAG, "CRC16 self-test failed -- refusing to start");
         abort();
@@ -219,6 +485,7 @@ void app_main(void)
         /* power_base_config_load() already logged a specific CONFIG_ERROR line. */
         halt_forever("CONFIG_ERROR loading power_base_config");
     }
+    ESP_LOGI(TAG, "power_base_config_load: OK");
 
     apply_power_rail_sequencing();
 
@@ -243,83 +510,36 @@ void app_main(void)
                      "base's identity");
     }
     memcpy(s_own_uuid, mac8, POGO_UUID_LEN);
+    s_collector_generation = esp_random();
+    if (s_collector_generation == 0) {
+        s_collector_generation = 1; /* purely informational field -- 0 is never handed out, no semantic meaning either way */
+    }
 
     ESP_ERROR_CHECK(thread_manager_init());
 
-    if (thread_manager_start_as_root() != ESP_OK) {
-        halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_root failed");
+    /* A failure HERE is a genuine OpenThread API error (bad return from the
+     * underlying otThreadSetEnabled/otThreadSetLinkMode/... calls, or
+     * esp_openthread_auto_start() itself failing) -- fundamentally different
+     * from "has not attached yet", which is NOT a halt condition (see
+     * attach_supervisor_task() below). */
+    if (thread_manager_start_as_always_on_ftd() != ESP_OK) {
+        halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd failed");
     }
-
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
-    otDeviceRole role;
-    while (1) {
-        role = thread_manager_get_role();
-        if (role == OT_DEVICE_ROLE_LEADER) {
-            break;
-        }
-        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
-            ESP_LOGE(TAG, "ROLE_TRANSITION_ERROR: last observed otDeviceRole=%u(%s) -- never reached LEADER within 30s",
-                     role, thread_manager_role_to_str(role));
-            halt_forever("ROLE_TRANSITION_ERROR: Thread never reached LEADER within 30s");
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    ESP_LOGI(TAG, "Thread ready: otDeviceRole=%u(%s) -- starting CoAP services and downstream provisioning",
-             (unsigned)role, thread_manager_role_to_str(role));
-
-    ESP_ERROR_CHECK(power_base_transport_init(s_own_uuid));
-
-    s_parent_ctx = (parent_service_context_t){
-        .provisioning_allowed = pb_provisioning_allowed,
-        .get_own_depth = pb_get_own_depth,
-        .get_own_uuid = pb_get_own_uuid,
-        .role_name = pb_role_name,
-        .is_power_base = true,
-        .ack_timeout_ms = s_cfg.ack_timeout_ms,
-        .ctx = NULL,
-    };
-    ESP_ERROR_CHECK(parent_service_init(&s_parent_ctx));
-
-    pogo_port_config_t down_cfg = {
-        .enabled = true,
-        .uart_num = s_cfg.downstream_port.uart_num,
-        .tx_gpio = s_cfg.downstream_port.tx_gpio,
-        .rx_gpio = s_cfg.downstream_port.rx_gpio,
-        .detect_in_gpio = s_cfg.downstream_port.detect_in_gpio,
-        .detect_out_gpio = s_cfg.downstream_port.detect_out_gpio,
-        .base_id_gpio = -1, /* BASE_ID is read on a MODULE's UPSTREAM side only -- meaningless here */
-        .detect_out_active_low = s_cfg.downstream_port.detect_out_active_low,
-        .debounce_ms = (s_cfg.downstream_port.debounce_ms != 0) ? s_cfg.downstream_port.debounce_ms : 30,
-        .baud_rate = CONFIG_POGO_UART_BAUD_RATE,
-    };
-    ESP_ERROR_CHECK(pogo_port_init(POGO_PORT_DOWNSTREAM, &down_cfg, port_event_dispatcher, NULL));
 
     /*
-     * Code review follow-up (2nd pass): the stale-sweep task must be
-     * CONFIRMED running BEFORE pogo_port_enable() -- previously it was
-     * created after enable(), so a sensor module could already be docking
-     * (DETECT_OUT active, provisioning under way) while this power base's
-     * own ability to ever mark a stale node offline again was silently
-     * broken. If this task cannot be created, halt here -- exactly like
-     * every other boot-time failure above -- WITHOUT ever calling
-     * pogo_port_enable(): DETECT_OUT stays released, "power base ready" is
-     * never logged, and no sensor module is ever invited to dock against a
-     * power base that cannot maintain its own topology registry.
+     * The attach wait (and everything that depends on it -- CoAP resources,
+     * parent_service, the downstream POGO port, the stale-sweep task) now
+     * runs entirely inside attach_supervisor_task(), which owns only
+     * file-scope static state (never a pointer to one of THIS function's
+     * own locals) so it remains valid for as long as the task itself runs,
+     * independent of app_main() returning. app_main() itself has nothing
+     * further to do once this task is launched -- see this file's top
+     * comment for the full policy (no fixed timeout, no halt_forever() for
+     * "not attached yet", exactly-once service startup).
      */
-    BaseType_t sweep_task_ok = xTaskCreate(stale_sweep_task, "topology_stale_sweep", 3072, NULL, 3, NULL);
-    if (sweep_task_ok != pdPASS) {
-        halt_forever("STALE_SWEEP_TASK_FAILED: xTaskCreate failed -- refusing to enable downstream POGO "
-                     "provisioning with no way to ever mark a stale node offline again");
+    BaseType_t supervisor_ok = xTaskCreate(attach_supervisor_task, "attach_supervisor", 3584, NULL, 4, NULL);
+    if (supervisor_ok != pdPASS) {
+        halt_forever("ATTACH_SUPERVISOR_TASK_FAILED: xTaskCreate failed -- refusing to continue with no way to ever "
+                     "notice this device attaching to Thread");
     }
-
-    /* pogo_port_enable() itself drives DETECT_OUT active (Low) as part of
-     * bringing the port up -- simply never having called it before Thread
-     * was confirmed LEADER (above) AND the stale-sweep task was confirmed
-     * running (just above) IS this system's "DETECT_OUT only once fully
-     * ready" guarantee; there is no separate GPIO write to sequence. */
-    ESP_ERROR_CHECK(pogo_port_enable(POGO_PORT_DOWNSTREAM, POGO_PEER_TYPE_POWER_BASE));
-
-    ESP_LOGI(TAG, "power base ready: uuid=..%02x%02x otDeviceRole=%u(%s) stale_sweep=running -- awaiting the "
-                  "first sensor module",
-             s_own_uuid[6], s_own_uuid[7], (unsigned)role, thread_manager_role_to_str(role));
 }

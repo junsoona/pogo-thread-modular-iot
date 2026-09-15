@@ -5,6 +5,19 @@ static uint16_t rd_u16(const uint8_t *p)
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
+void pms5003_build_command(pms5003_command_t command, uint8_t data_low,
+                           uint8_t out[PMS5003_COMMAND_LEN])
+{
+    out[0] = 0x42;
+    out[1] = 0x4D;
+    out[2] = (uint8_t)command;
+    out[3] = 0;
+    out[4] = data_low;
+    uint16_t checksum = (uint16_t)(out[0] + out[1] + out[2] + out[3] + out[4]);
+    out[5] = (uint8_t)(checksum >> 8);
+    out[6] = (uint8_t)checksum;
+}
+
 void pms5003_parser_init(pms5003_parser_t *parser)
 {
     parser->state = PMS5003_PARSE_WAIT_START1;

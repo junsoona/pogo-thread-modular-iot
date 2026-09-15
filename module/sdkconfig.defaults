@@ -24,10 +24,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 
 #
 # Console: USB-Serial/JTAG ONLY (section 1 of the follow-up hardware
-# bring-up spec). ESP32-H2 has exactly two UART controllers, and both are
-# now committed to the two POGO ports (UPSTREAM=UART0, DOWNSTREAM=UART1 --
-# see module_config/configs/*.json and docs/pogo-interface.md) -- there is no
-# UART left over for a log console. The chip's native USB-Serial/JTAG
+# bring-up spec). ESP32-H2 has exactly two UART controllers: UART0 is the
+# UPSTREAM POGO link and UART1 is either DOWNSTREAM POGO or, on a terminal
+# PMS5003 module only, the sensor link. The chip's native USB-Serial/JTAG
 # peripheral (GPIO26/27, untouched by any POGO/sensor config -- see
 # module_config's ESP32-H2 GPIO profile) is flash/monitor's actual transport
 # either way, so redirecting ESP_LOG/printf there too costs nothing and

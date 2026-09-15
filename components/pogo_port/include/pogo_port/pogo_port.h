@@ -54,15 +54,21 @@ typedef enum {
     POGO_PORT_EVENT_DETACHED,       /* DETECT_IN debounced High. Any in-flight session/handshake is cancelled and invalid. */
     POGO_PORT_EVENT_PEER_READY,     /* HELLO_REQ/RESP (or a silent-POWER_BASE BASE_ID read) resolved; data->peer_type is authoritative from here on. */
     POGO_PORT_EVENT_FRAME_RECEIVED, /* one post-handshake protocol frame (HELLO_REQ/RESP frames are consumed internally and never reach here). */
-    POGO_PORT_EVENT_ERROR,          /* data->error_code names which. In AUTO (real DETECT hardware) the port stays in ERROR until the next DETACHED; in dev compat mode (no DETECT_IN) it auto-retries the handshake cycle -- see pogo_port.c. */
+    POGO_PORT_EVENT_ERROR,          /* data->error_code names which. DOCK_TIMEOUT and LIVENESS_LOST are transient: in AUTO mode (real DETECT hardware) the port auto-retries a fresh handshake after CONFIG_POGO_HOTSWAP_COOLDOWN_MS as long as DETECT_IN still reads attached (no edge required); in dev compat mode (no DETECT_IN) it retries immediately. PEER_TYPE_CONFLICT/PROTOCOL_VERSION/CAPABILITY_MISMATCH are configuration/compatibility errors and always stay in ERROR until the next physical DETACHED -- see pogo_port.c. */
 } pogo_port_event_t;
 
 typedef enum {
     POGO_PORT_ERR_NONE = 0,
-    POGO_PORT_ERR_DOCK_TIMEOUT,        /* attached, but the peer never answered HELLO_REQ and BASE_ID doesn't explain why */
-    POGO_PORT_ERR_PEER_TYPE_CONFLICT,  /* BASE_ID hardware contradicts the peer's declared peer_type, OR the peer declared a peer_type that is neither MODULE nor POWER_BASE */
-    POGO_PORT_ERR_PROTOCOL_VERSION,    /* peer's HELLO_REQ/RESP protocol_version does not match ours */
-    POGO_PORT_ERR_LIVENESS_LOST,       /* PEER_READY, but idle PING/PONG failed too many times in a row while DETECT_IN still reads attached (section 9) */
+    POGO_PORT_ERR_DOCK_TIMEOUT,        /* attached, but the peer never answered HELLO_REQ and BASE_ID doesn't explain why -- transient, auto-retried (see POGO_PORT_EVENT_ERROR's own comment) */
+    POGO_PORT_ERR_PEER_TYPE_CONFLICT,  /* BASE_ID hardware contradicts the peer's declared peer_type, OR the peer declared a peer_type that is neither MODULE nor POWER_BASE -- permanent until physical detach/reattach */
+    POGO_PORT_ERR_PROTOCOL_VERSION,    /* peer's HELLO_REQ/RESP protocol_version does not match ours -- permanent until physical detach/reattach */
+    POGO_PORT_ERR_LIVENESS_LOST,       /* PEER_READY, but idle PING/PONG failed too many times in a row while DETECT_IN still reads attached (section 9) -- transient, auto-retried */
+    POGO_PORT_ERR_CAPABILITY_MISMATCH, /* peer's HELLO_REQ/RESP is missing POGO_CAP_COLLECTOR_PROVISIONING (or
+                                           predates the capabilities field entirely, a legacy 2-byte HELLO payload) --
+                                           this firmware's collector-provisioning sequence is mandatory on both
+                                           sides, so an old/incompatible peer is rejected cleanly here, at the
+                                           handshake, rather than failing confusingly mid-provisioning at
+                                           SET_COLLECTOR. Permanent until physical detach/reattach. */
 } pogo_port_error_t;
 
 typedef struct {

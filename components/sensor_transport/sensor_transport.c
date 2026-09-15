@@ -1,6 +1,7 @@
 #include "sensor_transport/sensor_transport.h"
 
 #include <stdint.h>
+#include <string.h>
 #include "esp_log.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
@@ -11,7 +12,7 @@
 #include "openthread/error.h"
 
 #include "sensor_service/sensor_service.h"
-#include "thread_manager/thread_manager.h"
+#include "collector_endpoint/collector_endpoint.h"
 #include "node_calc/node_calc.h"
 #include "topology_gate/topology_gate.h"
 
@@ -159,11 +160,13 @@ esp_err_t sensor_transport_init(bool require_topology_registration)
  * while detached). */
 static bool send_one_attempt(const uint8_t *payload, size_t len)
 {
-    otIp6Address leader_addr;
-    if (thread_manager_get_leader_address(&leader_addr) != ESP_OK) {
-        ESP_LOGD(TAG, "no Leader/ROOT address available (not joined?) -- skipping this attempt");
+    collector_endpoint_snapshot_t collector;
+    if (!collector_endpoint_get(&collector) || !collector.valid) {
+        ESP_LOGD(TAG, "no collector endpoint available yet -- skipping this attempt");
         return false;
     }
+    otIp6Address dest_addr;
+    memcpy(dest_addr.mFields.m8, collector.addr, sizeof(dest_addr.mFields.m8));
 
     uint32_t my_token;
     taskENTER_CRITICAL(&s_send_lock);
@@ -189,8 +192,8 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
             }
             if (err == OT_ERROR_NONE) {
                 otMessageInfo info = {0};
-                info.mPeerAddr = leader_addr;
-                info.mPeerPort = OT_DEFAULT_COAP_PORT;
+                info.mPeerAddr = dest_addr;
+                info.mPeerPort = collector.port;
                 /* mMaxRetransmit=0: exactly one CoAP-layer transmission per
                  * attempt -- the application-level retry loop in
                  * sensor_transport_send_sample() owns the retry/backoff

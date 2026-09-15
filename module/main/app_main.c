@@ -23,6 +23,19 @@
  *                                    components/topology_gate); must exist
  *                                    before sensor_transport_init() or
  *                                    topology_reporter_init() run.
+ *   7a. collector_endpoint_init() -- creates the cross-task-safe collector
+ *                                    (power base) endpoint cache (see
+ *                                    components/collector_endpoint); must
+ *                                    exist before sensor_transport_init()/
+ *                                    topology_reporter_init() (readers) or
+ *                                    child_service_init()/parent_service_init()
+ *                                    (writer/forwarder) run. sensor_transport
+ *                                    and topology_reporter both target this
+ *                                    endpoint -- never "the current Thread
+ *                                    Leader" -- so this module's data
+ *                                    destination never changes while its own
+ *                                    Thread role fluctuates between CHILD/
+ *                                    ROUTER/LEADER (see docs/power-base.md).
  *   7b. sensor_transport_init()  -- starts the CoAP sample-receiving
  *                                    resource (section 8); the sample-ready
  *                                    callback then wires sensor_service's
@@ -56,8 +69,10 @@
  *                                    "missing" port is simply not enabled).
  */
 #include <stdint.h>
+#include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -81,6 +96,9 @@
 #include "parent_service/parent_service.h"
 #include "topology_reporter/topology_reporter.h"
 #include "topology_gate/topology_gate.h"
+#include "collector_endpoint/collector_endpoint.h"
+#include "openthread/coap.h" /* OT_DEFAULT_COAP_PORT -- this module's own CoAP port when it is itself the
+                                 collector (MODULE_DEV_MODE_DEV_ROOT fixture only, see module_parent_get_collector()) */
 
 static const char *TAG = "module_main";
 
@@ -135,12 +153,65 @@ static const char *module_parent_role_name(void *ctx)
     return role_manager_role_to_str(role_manager_get_role());
 }
 
+/*
+ * Fills *out with the collector endpoint this module hands to a docking
+ * child via SET_COLLECTOR (see parent_service_context_t.get_collector's doc
+ * comment).
+ *
+ * MODULE_ROLE_ROOT (the MODULE_DEV_MODE_DEV_ROOT module-to-module regression
+ * fixture ONLY -- see docs/pogo-interface.md's "development compat mode";
+ * role_manager_get_role() never returns ROOT via the AUTO path, so this
+ * branch is unreachable there): there is no power base in this topology at
+ * all -- this module's OWN Thread Mesh-Local EID + CoAP port IS the
+ * collector, exactly mirroring power_base/main/app_main.c's own
+ * pb_get_collector(). This is what lets DEV_LEAF's sensor_transport keep
+ * sending its "/s" samples to DEV_ROOT, same destination as before this
+ * follow-up (which used to be "the current Leader", always DEV_ROOT itself
+ * in that topology) -- see docs/power-base.md.
+ *
+ * Otherwise (INTERMEDIATE): forwards the ORIGINAL collector endpoint this
+ * module itself received from ITS OWN upstream via SET_COLLECTOR
+ * (components/collector_endpoint's snapshot), completely unmodified --
+ * never substituting this module's own address (section 5 of the follow-up
+ * spec: "자신의 IPv6 주소로 바꾸면 안 된다"). Guaranteed already populated by
+ * the time this is ever called: module_parent_provisioning_allowed() only
+ * returns true once role_manager_is_upstream_ready(), which requires this
+ * module's OWN child_service to have already completed SET_COLLECTOR (see
+ * child_service.c's state ordering).
+ */
+static bool module_parent_get_collector(pogo_collector_endpoint_t *out, void *ctx)
+{
+    (void)ctx;
+    if (role_manager_get_role() == MODULE_ROLE_ROOT) {
+        otIp6Address mleid;
+        if (thread_manager_get_mesh_local_eid(&mleid) != ESP_OK) {
+            return false;
+        }
+        sensor_service_get_module_uuid(out->power_base_uuid);
+        memcpy(out->addr, mleid.mFields.m8, sizeof(out->addr));
+        out->port = OT_DEFAULT_COAP_PORT;
+        out->generation = 1;
+        return pogo_collector_endpoint_is_valid(out);
+    }
+
+    collector_endpoint_snapshot_t snap;
+    if (!collector_endpoint_get(&snap) || !snap.valid) {
+        return false;
+    }
+    memcpy(out->power_base_uuid, snap.power_base_uuid, POGO_UUID_LEN);
+    memcpy(out->addr, snap.addr, sizeof(out->addr));
+    out->port = snap.port;
+    out->generation = snap.generation;
+    return true;
+}
+
 static const parent_service_context_t s_module_parent_ctx = {
     .provisioning_allowed = module_parent_provisioning_allowed,
     .get_own_depth = module_parent_get_own_depth,
     .get_own_uuid = module_parent_get_own_uuid,
     .role_name = module_parent_role_name,
     .is_power_base = false,
+    .get_collector = module_parent_get_collector,
     .ack_timeout_ms = 0, /* use CONFIG_POGO_ACK_TIMEOUT_MS, unchanged from before this refactor */
     .ctx = NULL,
 };
@@ -259,6 +330,16 @@ static pogo_port_config_t to_port_cfg(const module_port_config_t *mp)
 
 void app_main(void)
 {
+    /*
+     * Minimal, unconditional boot-diagnostic trail (does not by itself fix
+     * "no serial output until reset" -- if these lines never appear on a
+     * real board, that is a USB re-enumeration / power / monitor-connection
+     * problem, not something the following log lines can paper over; see
+     * this file's own note further down and the final report that added
+     * these). esp_reset_reason() first, before anything else can fail.
+     */
+    ESP_LOGI(TAG, "app_main: entry (reset_reason=%d)", (int)esp_reset_reason());
+
     if (!pogo_crc16_selftest()) {
         ESP_LOGE(TAG, "CRC16 self-test failed -- refusing to start");
         abort();
@@ -281,9 +362,8 @@ void app_main(void)
     sensor_provider_register(SENSOR_DRIVER_ID_SHT45, &g_sht45_provider_ops);
     sensor_provider_register(SENSOR_DRIVER_ID_SGP40, &g_sgp40_provider_ops);
     sensor_provider_register(SENSOR_DRIVER_ID_SGP41, &g_sgp41_provider_ops);
-    /* Registered for a clear, actionable CONFIG_ERROR-style log if ever
-     * selected -- its init() always fails honestly (no working transport
-     * exists yet). See components/pms5003/pms5003.h. */
+    /* PMS5003 is a real terminal-only UART driver; module_config rejects it
+     * unless the downstream POGO face is fully disabled. */
     sensor_provider_register(SENSOR_DRIVER_ID_PMS5003, &g_pms5003_provider_ops);
 
     module_config_t cfg;
@@ -295,6 +375,9 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(10000));
         }
     }
+
+    ESP_LOGI(TAG, "module_config_load: OK (driver_id=%u schema_version=%u)", (unsigned)cfg.driver_id,
+             (unsigned)cfg.schema_version);
 
     module_dev_mode_t dev_mode = module_config_load_dev_mode();
     if (dev_mode != MODULE_DEV_MODE_AUTO) {
@@ -322,7 +405,9 @@ void app_main(void)
      * callback wiring (sensor_service -> sensor_transport, see that
      * callback's own doc comment for why it's a function pointer and not a
      * direct component dependency) happens right after both exist. */
+    ESP_LOGI(TAG, "sensor_service_init: starting");
     ESP_ERROR_CHECK(sensor_service_init(&cfg));
+    ESP_LOGI(TAG, "sensor_service_init: complete");
     /*
      * topology_gate must exist before sensor_transport_init() (reads it on
      * every send) or topology_reporter_init() (the only thing that ever
@@ -336,6 +421,12 @@ void app_main(void)
      * follow-up spec).
      */
     ESP_ERROR_CHECK(topology_gate_init());
+    /* collector_endpoint must exist before sensor_transport_init()/
+     * topology_reporter_init() (both read its snapshot on every send) or
+     * child_service_init()/parent_service_init() (child_service is the sole
+     * writer; parent_service's context reads it via module_parent_get_collector()
+     * to forward it downstream) run. */
+    ESP_ERROR_CHECK(collector_endpoint_init());
     ESP_ERROR_CHECK(sensor_transport_init(dev_mode == MODULE_DEV_MODE_AUTO));
     sensor_service_set_sample_ready_cb(sensor_transport_send_sample);
 
@@ -352,11 +443,13 @@ void app_main(void)
 
     if (up_cfg.enabled) {
         ESP_ERROR_CHECK(pogo_port_enable(POGO_PORT_UPSTREAM, POGO_PEER_TYPE_MODULE));
+        ESP_LOGI(TAG, "pogo_port UPSTREAM: task created and enabled");
     } else {
         ESP_LOGI(TAG, "UPSTREAM port disabled by config (dev compat mode or not wired on this board)");
     }
     if (down_cfg.enabled) {
         ESP_ERROR_CHECK(pogo_port_enable(POGO_PORT_DOWNSTREAM, POGO_PEER_TYPE_MODULE));
+        ESP_LOGI(TAG, "pogo_port DOWNSTREAM: task created and enabled");
     } else {
         ESP_LOGI(TAG, "DOWNSTREAM port disabled by config (dev compat mode or not wired on this board)");
     }

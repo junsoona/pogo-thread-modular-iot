@@ -5,20 +5,41 @@
 [`docs/architecture.md`](docs/architecture.md), POGO 포트/확정 GPIO 프로필은
 [`docs/pogo-interface.md`](docs/pogo-interface.md), 고정 설정 스키마는
 [`docs/module-config.md`](docs/module-config.md), 상태 머신/오류 처리는
-[`docs/state-machine.md`](docs/state-machine.md), **전원 모듈(전용 ESP32-H2 보드,
-시스템의 유일한 Thread ROOT/Leader) 아키텍처·배선·토폴로지 프로토콜은
-[`docs/power-base.md`](docs/power-base.md)** 참고.
+[`docs/state-machine.md`](docs/state-machine.md), **전원 모듈(전용 ESP32-H2 보드)
+아키텍처·배선·토폴로지 프로토콜은 [`docs/power-base.md`](docs/power-base.md)** 참고.
 
-**중요 (전원 모듈 도입 이후 역할 규칙 변경):** 센서 모듈(`module/`)은 AUTO 모드에서
-더 이상 ROOT가 되지 않는다. 시스템의 유일한 ROOT/Leader는 별도 프로젝트
-`power_base/`로 구현된 전용 전원 모듈이다. 이 절 아래의 "실물 배선"/"ROOT용 passive
-power-base 시험 지그" 관련 옛 서술은 이 변경으로 대체되었다 -- 자세한 내용과 근거는
-[`docs/power-base.md`](docs/power-base.md) 참고. **전원 모듈<->센서 모듈 간 배선은
-이후 세션에서 실제로 연결되었고, POGO 프로비저닝부터 Thread 가입, topology 보고,
-SHT45 sample 수집까지 실물에서 성공했다** -- 자세한 내용은 아래 "실물 검증 결과 및
-데이터플레인 registration gate 수정" 절 참고. 이 절에서 설명하는 첫 sample/topology
-경쟁 수정 자체는 이 문서를 쓰는 시점 기준 아직 실물 flash/monitor로 재검증되지
-않았다 (아래 "네 프로젝트 빌드 결과"와 `docs/power-base.md`의 "아직 실물 하드웨어에서
+**중요 (이번 세션: 전원 모듈의 고정 애플리케이션 역할과 Thread 역할 분리):**
+전원 모듈은 POGO 계층의 물리적 루트·downstream provisioning coordinator·
+UUID/slot/topology registry 관리자·센서 데이터 aggregator라는 **고정된
+애플리케이션 역할**을 갖지만, 더 이상 "시스템의 유일한 Thread ROOT/Leader"로
+서술되지 않는다 -- 실제 `otDeviceRole`은 전적으로 Thread가 결정하며, 전원 모듈은
+항상 켜진 FTD(rx-on-when-idle=true, router-eligible=true)로 CHILD/ROUTER/LEADER
+어느 상태에서도 정상 동작한다 (DISABLED/DETACHED만 "준비되지 않은 상태"). 자세한
+내용은 [`docs/power-base.md`](docs/power-base.md)의 "module/Thread role decoupling
+and collector provisioning" 절 참고. 센서 모듈(`module/`)은 여전히 AUTO 모드에서
+ROOT가 되지 않는다 (이 부분은 이번 세션에서 변경하지 않았다 -- role_manager의
+LEAF/INTERMEDIATE 판정은 POGO 계층 개념으로 `otDeviceRole`과 무관).
+
+**이번 세션에서 추가로 변경한 것:** 센서 데이터(`"/s"`)와 topology 보고(`"/t"`)의
+전송 목적지를 "현재 Thread Leader"(`thread_manager_get_leader_address()`)가 아닌,
+POGO `SET_COLLECTOR` 메시지로 전달되는 **collector endpoint**(전원 모듈의 영구
+UUID + Mesh-Local EID + CoAP port, `components/collector_endpoint`)로 완전히
+교체했다 -- 이제 전원 모듈 자신의 Thread 역할이 바뀌어도 데이터 목적지는 바뀌지
+않는다. 또한 UPSTREAM DETECT_IN/DETECT_OUT GPIO를 교환했다 (GPIO12/GPIO2, 이전은
+GPIO2/GPIO12) -- 미래의 terminal-leaf Deep-sleep wake용 GPIO12(ESP32-H2 RTC GPIO
+채널) 확보가 목적이며, **Deep-sleep 자체는 이번 세션에서 구현하지 않았다**. 실물은
+아직 이전 GPIO 배선 상태이므로, **이 세션에서 빌드한 firmware를 flash하기 전에
+반드시 아래 "새 GPIO 프로필 flash 전 재배선" 절의 배선을 먼저 교체할 것.**
+
+이 절 아래의 "실물 배선"/"ROOT용 passive power-base 시험 지그" 관련 옛 서술 중
+"전원 모듈이 유일한 Leader"라는 표현은 위 변경으로 대체되었다 -- 자세한 내용과
+근거는 [`docs/power-base.md`](docs/power-base.md) 참고. **전원 모듈<->센서 모듈 간
+배선(이전 GPIO 프로필 기준)은 이전 세션에서 실제로 연결되었고, POGO 프로비저닝부터
+Thread 가입, topology 보고, SHT45 sample 수집까지 실물에서 성공했다** -- 자세한
+내용은 아래 "실물 검증 결과 및 데이터플레인 registration gate 수정" 절 참고.
+그 성공은 이번 세션의 GPIO 재배선 전 구성 기준이며, 이번 세션의 변경(모듈/Thread
+역할 분리, collector provisioning, GPIO 교환)은 아직 실물로 재검증되지 않았다
+(아래 "네 프로젝트 빌드 결과"와 `docs/power-base.md`의 "아직 실물 하드웨어에서
 확인되지 않은 항목" 참고).
 
 **최종 졸업작품 프로토타입은 ESP32-H2 SuperMini 기반 전원 모듈 1대(`power_base/`)와
@@ -87,23 +108,36 @@ DEV_ROOT/DEV_LEAF(module-to-module 회귀, `"/t"` 리소스가 아예 없는 피
 ```
 module/                   센서 모듈 공통 ESP-IDF 프로젝트 -- 모든 센서 모듈이 이 하나의
                           바이너리를 사용. AUTO 모드에서 절대 ROOT가 되지 않는다.
-power_base/                전원 모듈 전용 ESP-IDF 프로젝트 (신규) -- 시스템의 유일한
-                          Thread ROOT/Leader. module/과 별도 보드/바이너리.
-                          자세한 내용은 docs/power-base.md.
+power_base/                전원 모듈 전용 ESP-IDF 프로젝트 (신규) -- POGO 계층의 고정
+                          물리적 루트(현재는 otDeviceRole과 분리됨 -- CHILD/ROUTER/LEADER
+                          어느 상태에서도 서비스 시작, docs/power-base.md 참고).
+                          module/과 별도 보드/바이너리. 자세한 내용은 docs/power-base.md.
 upper/, lower/             기존 검증용 참조 프로젝트 (회귀 기준, 변경하지 않음)
 components/
-  pogo_proto/               공용 프레임/CRC16/프로토콜 payload codec (ASSIGN_PARENT_INFO
-                            추가 -- 기존 wire format은 그대로)
+  pogo_proto/               공용 프레임/CRC16/프로토콜 payload codec (ASSIGN_PARENT_INFO,
+                            SET_COLLECTOR, PEER_HELLO capability negotiation 추가 -- 기존
+                            wire format은 그대로)
+  collector_endpoint/       (신규, 이번 세션) 센서 모듈이 자신의 collector(전원 모듈)
+                            endpoint를 보관하는 FreeRTOS-task-safe 캐시 -- POGO
+                            SET_COLLECTOR로 전달받고, sensor_transport/topology_reporter가
+                            전송 목적지로 사용, parent_service context를 통해 downstream으로
+                            그대로 전달(INTERMEDIATE)
   pogo_port/                양방향 POGO 포트 (UPSTREAM/DOWNSTREAM), 접촉 감지, PEER_HELLO,
                             idle PING/PONG liveness
   role_manager/             LEAF/INTERMEDIATE/UNASSIGNED/ROLE_ERROR 런타임 판정
                             (AUTO 모드에서는 ROOT를 절대 산출하지 않음 -- 전원 모듈이
                             시스템의 유일한 ROOT)
   thread_manager/           공통 OpenThread FTD 어댑터 (역할별 link mode 적용,
-                            Leader/ROOT 주소 조회) -- module/과 power_base/ 양쪽이 그대로 사용
+                            Leader/ROOT 주소 조회, Mesh-Local EID 조회 -- 이번 세션 추가,
+                            collector endpoint 계산에 사용) -- module/과 power_base/
+                            양쪽이 그대로 사용. thread_manager_get_leader_address()는
+                            sensor_transport/topology_reporter의 전송 목적지 결정에는
+                            더 이상 쓰이지 않는다 (다른 진단 코드를 위해 API 자체는 유지)
   child_service/            UPSTREAM 포트 전담 -- 부모에게 응답, JOIN_RESULT 재시도,
-                            parent UUID 수신(ASSIGN_PARENT_INFO)
-  parent_service/           DOWNSTREAM 포트 전담 -- 자식을 프로비저닝, JOIN_RESULT ACK.
+                            parent UUID 수신(ASSIGN_PARENT_INFO), collector endpoint
+                            수신(SET_COLLECTOR, 이번 세션 -- POLL_SET과 SET_DATASET 사이)
+  parent_service/           DOWNSTREAM 포트 전담 -- 자식을 프로비저닝, JOIN_RESULT ACK,
+                            collector endpoint 전달(SET_COLLECTOR, 이번 세션).
                             module/과 power_base/ 양쪽에서 수정 없이 재사용 (작은 context
                             구조체로 역할별 동작을 주입 -- docs/power-base.md 참고)
   module_config/            고정 센서/보드 설정 ("cfg" NVS 파티션), ESP32-H2 GPIO 검증
@@ -128,8 +162,7 @@ components/
   sensirion_gas_index_algorithm/  Sensirion 공식 알고리즘 벤더링 (BSD-3-Clause, 출처는
                             THIRD_PARTY_NOTICE.md)
   sensirion_crc8/           SGP4x용 공용 Sensirion CRC-8
-  pms5003/                  PMS5003 프레임 파서 (완성) + 등록 가능한 driver 인터페이스
-                            (실물 UART transport는 미확보 -- docs/pogo-interface.md 참고)
+  pms5003/                  PMS5003 terminal UART driver + 프레임 파서
 configs/                    설정 이미지 원본 (사람이 수정하는 JSON, power_base.json 포함)
 tools/                      설정 이미지 생성 스크립트 + 순수 계산 로직 검증 + host test
 docs/                       아키텍처/인터페이스/설정/상태머신/전원모듈 문서
@@ -204,6 +237,42 @@ bash tools/gen_power_base_config.sh build/cfg_images
 ```
 
 자세한 스키마는 [`docs/power-base.md`](docs/power-base.md) 14절.
+
+## 새 GPIO 프로필 flash 전 재배선 (이번 세션, 필수)
+
+**실물은 현재 이전 GPIO 배선(UPSTREAM DETECT_IN=GPIO2, DETECT_OUT=GPIO12)으로
+연결되어 있다. 이번 세션에서 빌드한 firmware(UPSTREAM DETECT_IN=GPIO12,
+DETECT_OUT=GPIO2로 교환됨)를 flash하기 전에 반드시 아래 DETECT 두 선을 먼저
+바꿔 연결할 것.** 배선을 바꾸지 않고 새 firmware만 flash하면 DETECT_IN/DETECT_OUT이
+서로 뒤바뀐 채로 동작해 도킹 감지 자체가 실패한다 (또는 완전히 우연히 동작하는 것처럼
+보일 수도 있으나 절대 신뢰하지 말 것).
+
+**전원 모듈 <-> 첫 센서 모듈** (`docs/power-base.md` 4절 참고, 전원 모듈 쪽 GPIO는
+변경 없음):
+
+| 이전 배선 | 새 배선 |
+|---|---|
+| 전원 모듈 GPIO22(DETECT_OUT) -- 모듈 GPIO2(DETECT_IN) | 전원 모듈 GPIO22(DETECT_OUT) -- 모듈 GPIO12(DETECT_IN) |
+| 전원 모듈 GPIO23(DETECT_IN) -- 모듈 GPIO12(DETECT_OUT) | 전원 모듈 GPIO23(DETECT_IN) -- 모듈 GPIO2(DETECT_OUT) |
+
+**모듈 A(DOWNSTREAM) <-> 모듈 B(UPSTREAM)** (module-to-module 체인, 아래 "실물 배선"
+절도 참고):
+
+| 이전 배선 | 새 배선 |
+|---|---|
+| A GPIO22(DETECT_OUT) -- B GPIO2(DETECT_IN) | A GPIO22(DETECT_OUT) -- B GPIO12(DETECT_IN) |
+| A GPIO23(DETECT_IN) -- B GPIO12(DETECT_OUT) | A GPIO23(DETECT_IN) -- B GPIO2(DETECT_OUT) |
+
+다른 모든 신호(UART TX/RX, BASE_ID, I2C, GND)는 변경되지 않는다. POGO 5V 공급은
+이번 세션에서도 구현하지 않았다 -- 두 보드 모두 계속 각자 USB 전원을 쓰고, 신호선과
+GND만 연결한다.
+
+재배선 후 사용할 flash/monitor 명령은 이 문서 바로 아래 "플래시" 절과 동일하다 --
+`bash tools/gen_config.sh build/cfg_images`/`bash tools/gen_power_base_config.sh
+build/cfg_images`로 새 GPIO 값이 반영된 설정 이미지를 다시 생성한 뒤 (이 세션에서
+이미 재생성해 커밋된 `build/cfg_images/*.bin`이 최신이면 다시 만들 필요는 없다),
+아래 "전원 모듈 + 센서 모듈 배치" 또는 "실물 AUTO 배치" 절의 명령을 그대로 실행한다.
+**배선을 바꾸기 전에는 아래 명령들을 실행해 실물 검증을 했다고 보고하지 않는다.**
 
 ## 플래시 (사용자가 실행)
 
@@ -312,23 +381,31 @@ idf.py -C upper -B ~/esp-builds/pogo_upper -p /dev/tty.usbmodemBBBB flash monito
 ## 실물 배선
 
 확정 GPIO 프로필과 그 근거는 [`docs/pogo-interface.md`](docs/pogo-interface.md)의
-"확정 GPIO 프로필" 절 참고. **UPSTREAM DETECT_IN은 GPIO2다** (GPIO13은 보드 내장 LED와
-충돌하고, 그 다음 시도했던 GPIO6/7은 ESP32-H2 SuperMini/SiP 패키지에서 아예 외부로
-나오지 않아 사용할 수 없다는 것이 뒤늦게 확인되어 GPIO2로 재수정했다 -- 근거와 이력은
-docs/pogo-interface.md 참고). 아래는 두 센서 모듈을 module-to-module로 직접 연결해
-시험하는 (전원 모듈 없이) 배선이며, **전원 모듈<->첫 센서 모듈 배선표는
+"확정 GPIO 프로필" 절 참고. **현재 UPSTREAM DETECT_IN은 GPIO12, DETECT_OUT은
+GPIO2다** (GPIO13은 보드 내장 LED와 충돌하고, 그 다음 시도했던 GPIO6/7은 ESP32-H2
+SuperMini/SiP 패키지에서 아예 외부로 나오지 않아 사용할 수 없다는 것이 뒤늦게
+확인되어 한때 DETECT_IN=GPIO2로 재수정했었다. **이번 세션에 미래 Deep-sleep wake
+용도로 DETECT_IN/DETECT_OUT을 다시 GPIO12/GPIO2로 교환했다** -- 근거와 전체 이력은
+docs/pogo-interface.md 참고. 실물은 아직 구배선(DETECT_IN=GPIO2/DETECT_OUT=GPIO12)
+상태이므로 새 firmware flash 전 재배선 필수, 위 "새 GPIO 프로필 flash 전 재배선"
+절 참고). 아래는 두 센서 모듈을 module-to-module로 직접 연결해 시험하는 (전원 모듈
+없이) 배선이며, **전원 모듈<->첫 센서 모듈 배선표는
 [`docs/power-base.md`](docs/power-base.md) 4절**을 참고할 것 (BASE_ID가 전원 모듈
-커넥터의 GND 접점이지 GPIO가 아니라는 점, GPIO2/GPIO14가 서로 다른 신호라는 점 등
+커넥터의 GND 접점이지 GPIO가 아니라는 점, GPIO12/GPIO14가 서로 다른 신호라는 점 등
 핵심 주의사항 포함).
 
 ### 모듈 간 연결 (A의 DOWNSTREAM -> B의 UPSTREAM)
+
+**이번 세션에서 B의 UPSTREAM DETECT_IN/DETECT_OUT이 교환되었다 (GPIO12/GPIO2, 이전은
+GPIO2/GPIO12) -- 아래 표는 새 프로필 기준. 실물이 이전 배선 상태라면 flash 전에
+반드시 재배선할 것 (아래 "새 GPIO 프로필 flash 전 재배선" 절 참고).**
 
 | A (DOWNSTREAM) | B (UPSTREAM) |
 |---|---|
 | GPIO10 (TX) | GPIO5 (RX) |
 | GPIO11 (RX) | GPIO4 (TX) |
-| GPIO22 (DETECT_OUT) | GPIO2 (DETECT_IN) |
-| GPIO23 (DETECT_IN) | GPIO12 (DETECT_OUT) |
+| GPIO22 (DETECT_OUT) | GPIO12 (DETECT_IN) |
+| GPIO23 (DETECT_IN) | GPIO2 (DETECT_OUT) |
 | GND | GND |
 
 두 보드의 3.3V/5V 전원선은 서로 연결하지 않는다 (각자 USB로 독립 전원). 모듈-모듈 연결에서는
@@ -347,7 +424,7 @@ UPSTREAM=MODULE과 동일하게 LEAF/INTERMEDIATE로 취급하도록 수정되�
 
 | 신호 | 연결 |
 |---|---|
-| A UPSTREAM DETECT_IN (GPIO2) | GND |
+| A UPSTREAM DETECT_IN (GPIO12, 이번 세션 교환 전 기록 당시에는 GPIO2였음) | GND |
 | A UPSTREAM BASE_ID (GPIO14) | GND |
 | A UPSTREAM UART (GPIO4/5) | 연결하지 않음 |
 
@@ -436,10 +513,22 @@ I (..) child_service: JOIN_RESULT_ACK received (seq=1) -- provisioning session f
 로그에서 확인된다. Network Key가 포함된 Dataset 원문, 전체 UUID(짧은 suffix만 표시)는
 어떤 로그에도 출력되지 않는다.
 
-### 전원 모듈 + 센서 모듈 배치 -- 기대 로그
+### 전원 모듈 + 센서 모듈 배치 -- 기대 로그 (과거 정책, SUPERSEDED -- 당시 firmware 기준)
 
-**아래 로그는 실물로 확인되었다** (전원 모듈 1대 + SHT45 센서 모듈 1대, depth=1 단일
-홉 -- 위 "실물 검증 결과 및 데이터플레인 registration gate 수정" 절 참고). 다만 그
+**이 절 전체(바로 아래 두 로그 블록과 "합격 기준" 단락)는 이번 세션(GPIO 재배선,
+`thread_manager_start_as_always_on_ftd()`로의 전환, collector provisioning, 30초
+halt 제거) 이전의 firmware로 실물 검증된 기록이다.** 당시 GPIO 배선은 UPSTREAM
+DETECT_IN=GPIO2/DETECT_OUT=GPIO12(현재는 GPIO12/GPIO2로 교환됨)였고, 전원 모듈은
+`thread_manager_start_as_root()`를 호출해 `ROOT:` 로그를 남겼으며 `otDeviceRole=4
+(LEADER)`만 합격으로 인정하고 30초 안에 LEADER가 되지 못하면 `halt_forever()`로
+영구 정지했다. **이 정책들은 이번 세션에서 모두 대체되었다 -- 현재 정책과 기대 로그는
+바로 아래 "전원 모듈 + 센서 모듈 배치 -- 현재 firmware 기대 로그 (이번 세션, 아직
+실물 미검증)" 절을 참고할 것.** 이 절은 GPIO2/12 구배선 + 구 정책 조합이 실제로
+동작했다는 과거 기록으로만 보존한다.
+
+**아래 로그는 (당시 firmware 기준으로) 실물로 확인되었다** (전원 모듈 1대 + SHT45
+센서 모듈 1대, depth=1 단일 홉 -- 위 "실물 검증 결과 및 데이터플레인 registration
+gate 수정" 절 참고). 다만 그
 실물 시험에서는 시작 직후 첫 sensor sample이 topology 등록보다 먼저 도착해 CoAP
 4.04로 한 번 거부되는 순서 경쟁도 함께 관측되었다 -- 아래 로그는 그 경쟁이 없는
 정상 경로를 보여준다 (실제로 경쟁이 발생하면 `power_base_transport: sensor sample
@@ -475,20 +564,76 @@ I (..) power_base_transport: topology report applied: uuid=..xxyy depth=1 role=3
 `ROOT`=1, `INTERMEDIATE`=2, `LEAF`=3, `ERROR`=4)이며 **`otDeviceRole`과는 서로 다른
 숫자 체계**이므로 혼동하지 않는다.
 
-**합격 기준**: `ROLE_TRANSITION_ERROR`/`CONFIG_ERROR` 로그가 없을 것, `power_base_main`이
-로그에 `otDeviceRole=4(LEADER)`를 남길 것 (전원 모듈은 **엄격히 LEADER만** 허용 --
-`ROUTER`에서 멈추면 30초 뒤 `halt_forever`로 정지하고 downstream 포트를 절대 활성화하지
-않는다), `stale_sweep=running`일 것 (`FAILED`면 회귀), `pogo_port: port 1: PEER_READY
-(peer_type=2)`가 첫 센서 모듈 도킹 직후 나타날 것, `power_base_transport: topology report
-applied: ... depth=1 role=3`(LEAF, 절대 role=1(ROOT) 아님)이 나타날 것.
+**합격 기준 (당시 firmware, 과거 정책 -- 현재는 아래 "현재 firmware 기대 로그" 절의
+기준을 사용할 것)**: `ROLE_TRANSITION_ERROR`/`CONFIG_ERROR` 로그가 없을 것,
+`power_base_main`이 로그에 `otDeviceRole=4(LEADER)`를 남길 것 (당시 전원 모듈은
+**엄격히 LEADER만** 허용 -- `ROUTER`에서 멈추면 30초 뒤 `halt_forever`로 정지하고
+downstream 포트를 절대 활성화하지 않았다 -- **이 halt 정책은 이번 세션에서
+제거되었다**, 아래 참고), `stale_sweep=running`일 것 (`FAILED`면 회귀), `pogo_port:
+port 1: PEER_READY (peer_type=2)`가 첫 센서 모듈 도킹 직후 나타날 것,
+`power_base_transport: topology report applied: ... depth=1 role=3`(LEAF, 절대
+role=1(ROOT) 아님)이 나타날 것.
 
-#### 첫 센서 모듈 (`module`, 예: SHT45, depth=1)
+### 전원 모듈 + 센서 모듈 배치 -- 현재 firmware 기대 로그 (이번 세션, 아직 실물 미검증)
+
+**이 절이 현재 코드 기준이다.** 아래는 이번 세션의 변경(GPIO 재배선, Thread/역할
+분리, collector provisioning, 30초 halt 제거)이 반영된 firmware를 실제로 flash한
+뒤 기대되는 로그이며, **아직 실물 flash/monitor로 검증되지 않았다** (재배선 자체가
+아직 안 되어 있음 -- 위 "새 GPIO 프로필 flash 전 재배선" 절 참고).
+
+핵심 차이:
+
+- `thread_manager`가 `ROOT:`가 아닌 `always-on FTD:` 로 로그를 남긴다 (전원 모듈은
+  `thread_manager_start_as_always_on_ftd()`를 호출 -- `thread_manager_start_as_root()`는
+  이제 module의 DEV_ROOT 회귀 전용).
+- `power_base_main`은 `attach_supervisor_task`가 별도 task에서 attach를 기다리며,
+  attach가 CHILD/ROUTER/LEADER 중 무엇이든 되는 즉시(엄격히 LEADER를 기다리지 않음)
+  `power-base FTD: attached, otDeviceRole=..(...) -- starting services`를 남기고
+  서비스를 시작한다. **30초 안에 attach하지 못해도 halt하지 않는다** -- 대신
+  `power-base FTD: still not attached after 30000ms (...) -- ... not halting` 경고가
+  한 번 나타나고(이후 60초 간격으로만 반복), OpenThread는 계속 attach를 시도한다.
+- `parent_service`가 `SET_COLLECTOR`를 `SET_DATASET`보다 먼저 보내고, 모듈 쪽에서
+  `child_service: collector endpoint accepted: power_base_uuid=..` 로그가
+  `dataset stored ...` 로그보다 먼저 나타난다.
+
+```
+I (..) power_base_config: loaded: schema=1 rev=1 uart=1 tx=10 rx=11 detect_in=23 detect_out=22 ...
+I (..) power_base_main: power_enable_gpio not configured -- 5V rail assumed always-on (no switching hardware yet)
+I (..) thread_manager: always-on FTD: no dataset in NVS -- forming a new Thread network from Kconfig defaults
+I (..) power_base_main: power-base FTD: attached, otDeviceRole=2(CHILD) -- starting services (this runs exactly once; a later role change never re-triggers it)
+I (..) power_base_transport: CoAP power-base transport ready: resources='/s','/t' port=5683
+I (..) pogo_port: port 1: PEER_READY (peer_type=2)
+I (..) parent_service: starting downstream provisioning as POWER_BASE
+I (..) parent_service: child identified: mac=... fw=1 sensor_bitmap=0x06
+I (..) parent_service: child sensor: bitmap=0x0006 response_time=..ms status=0
+I (..) parent_service: polling_period_ms=.. sent (from response_time_ms=..)
+I (..) parent_service: dataset accepted (.. bytes) -- waiting for join result (timeout 20000ms)
+I (..) parent_service: JOIN OK -- child otDeviceRole=2(CHILD) uuid_backoff=..ms depth=1 polling=..ms
+I (..) power_base_main: power base ready: uuid=..xxyy otDeviceRole=2(CHILD) stale_sweep=running -- awaiting the first sensor module
+I (..) power_base_transport: topology report applied: uuid=..xxyy depth=1 role=3 type=0
+```
+
+`otDeviceRole=2(CHILD)`는 예시일 뿐이다 -- 실제 라디오 환경에 따라 이 전원 모듈이
+CHILD/ROUTER/LEADER 어느 것으로 먼저 attach하든(단독 standalone 시험에서는 대개
+LEADER로 바로 attach) 서비스가 즉시 시작되어야 하며, 어느 쪽이든 "합격"이다.
+
+**합격 기준 (현재)**: `CONFIG_ERROR`/`ROLE_TRANSITION_ERROR`(진짜 API 오류일 때만)
+로그가 없을 것, `power_base_main`이 `power-base FTD: attached, otDeviceRole=..(CHILD
+또는 ROUTER 또는 LEADER)`를 남길 것 (셋 중 **무엇이든** 합격 -- LEADER만 요구하지
+않음), attach가 30초를 넘겨도 `halt`/재부팅 로그 없이 계속 시도할 것(대신 rate-limited
+경고), `stale_sweep=running`일 것, `pogo_port: port 1: PEER_READY (peer_type=2)`가
+첫 센서 모듈 도킹 직후 나타날 것, 모듈 쪽에서 `SET_COLLECTOR` 성공 로그가
+`SET_DATASET`/`dataset stored` 로그보다 먼저 나타날 것, `power_base_transport:
+topology report applied: ... depth=1 role=3`(LEAF)이 나타날 것.
+
+#### 첫 센서 모듈 (`module`, 예: SHT45, depth=1) -- 현재 firmware 기준, 아직 실물 미검증
 
 ```
 I (..) module_config: loaded: schema=1 rev=1 driver_id=1397240885 sensor_bitmap=0x0006 ...
 I (..) sht45: SHT45 initialized: addr=0x44 ...
 I (..) pogo_port: port 0: PEER_READY (peer_type=1)
 I (..) child_service: sensor measurement OK: bitmap=0x0006 response_time=..ms
+I (..) child_service: collector endpoint accepted: power_base_uuid=..xxyy port=5683
 I (..) child_service: dataset stored (.. bytes) -- starting Thread join as LEAF
 I (..) thread_manager: LEAF link mode: router_eligible=false rx-on-when-idle=false poll_period=..ms
 I (..) child_service: Thread join succeeded, otDeviceRole=2(CHILD)
@@ -496,10 +641,15 @@ I (..) child_service: JOIN_RESULT_ACK received (seq=1) -- provisioning session f
 I (..) topology_reporter: topology report sent OK (type=0 seq=1 attempt=1/4)
 ```
 
+`collector endpoint accepted: ...` (SET_COLLECTOR ACK, 이번 세션 추가)는 반드시
+`dataset stored ...` 보다 먼저 나타나야 한다 -- `child_service`가 `SET_DATASET`을
+`CS_STATE_COLLECTOR_SET` 이전 상태에서는 `POGO_NACK_BAD_STATE`로 거부하기 때문이다.
+
 **합격 기준**: `module_main: role -> ROOT`가 **절대 나타나지 않을 것** (나타나면 회귀 --
 `role_manager.c`의 AUTO 판정 수정이 깨진 것). `peer_type=1`(POWER_BASE)로 PEER_READY될
-것. `otDeviceRole=2`(CHILD)로 join 성공할 것. `topology_reporter`가 최소 한 번은 성공
-전송(`sent OK`, `type=0`=ATTACHED)할 것.
+것. `collector endpoint accepted`가 `dataset stored`보다 먼저 나타날 것(이번 세션
+추가). `otDeviceRole=2`(CHILD)로 join 성공할 것. `topology_reporter`가 최소 한 번은
+성공 전송(`sent OK`, `type=0`=ATTACHED)할 것.
 
 #### `topology_gate` 수정 적용 후 기대되는 추가 로그 (아직 실물 미검증)
 
@@ -568,10 +718,9 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   하지 않았다**. `sensor_provider_register()`로 등록만 되어 있고, `configs/prototype_*.json`
   어느 쪽 보드에도 아직 SGP40/SGP41을 `driver_id`로 지정하지 않았다 (필요하면 세 번째/네 번째
   보드용 config를 SHT45/BH1750 config와 동일한 POGO 포트 블록으로 복사해 만들면 된다).
-- **PMS5003**: 사용자가 실물을 보유하고 있으나, ESP32-H2에 UART 컨트롤러가 2개뿐이고 둘 다
-  POGO 포트에 이미 배정되어 세 번째 하드웨어 UART가 없다. 프레임 파서와 등록 가능한 driver
-  인터페이스는 완성했지만 transport(실제 통신 경로)는 미구현이다 -- 아래 "아직 실물 보드에서
-  확인되지 않은 항목" 및 `docs/pogo-interface.md`의 PMS5003 절 참고.
+- **PMS5003**: terminal 모듈에서는 downstream POGO를 완전히 비활성화하고 UART1/GPIO10/11을
+  센서에 전용한다. 9600 8N1, ACTIVE/PASSIVE 명령, checksum parser, 30초 warm-up 상태,
+  PM1.0/PM2.5/PM10 채널 전송이 구현되어 있다. 실물 배선/측정 검증은 남아 있다.
 
 ## 아직 실물 보드에서 확인되지 않은 항목
 
@@ -613,22 +762,27 @@ clean build까지만 확인했다 -- 다음이 아직 실물로 재검증되지 
   아님)에서도 동일하게 동작하는지 -- 아직 미확인 (전원 모듈 재부팅에 의한 등록 소실
   자체는 이번 세션 `topology_gate` 수정이 다루지만, 그 수정 자체도 아직 실물 미검증 --
   위 절 참고).
-- DETECT_OUT이 실물에서도 Leader 준비 전에는 절대 활성화되지 않는지 (이번 세션은
-  `power_base/main/app_main.c`의 순서 자체와 그 순서를 그대로 mirror한 host test로만
-  확인 -- 실제 GPIO 레벨은 미측정).
+- DETECT_OUT이 실물에서도 이 전원 모듈이 attach(CHILD/ROUTER/LEADER 중 하나)되기
+  전에는 절대 활성화되지 않는지 (더 이상 Leader 전제가 아니다 -- 위
+  `docs/power-base.md` 19.8절 참고). 이번 세션은 `power_base/main/app_main.c`의
+  순서 자체와 그 순서를 그대로 mirror한 host test로만 확인 -- 실제 GPIO 레벨은 미측정.
+- (이번 세션 신규) `attach_supervisor_task`가 30초를 넘겨도 halt하지 않고 계속
+  재시도하는지, rate-limited 경고가 실물 콘솔에 정상 출력되는지 -- 아직 실물 미검증
+  (host test만 통과, 위 `docs/power-base.md` 19.8절 참고).
 
 **기존(module-to-module) 항목**:
 
-- 확정 GPIO 프로필(POGO UART, DETECT_IN/OUT, BASE_ID -- **UPSTREAM DETECT_IN=GPIO2**)로
-  배선된 실물 두 보드에서의 attach/detach 디바운스, PEER_HELLO/BASE_ID 교차검증.
-  (passive power-base 지그를 이용한 ROOT 판정은 위 "실물 배선" 절에서 설명한 대로
-  이제 유효하지 않은 시나리오다 -- 대신 전원 모듈 관련 항목 참고.)
+- 확정 GPIO 프로필(POGO UART, DETECT_IN/OUT, BASE_ID -- **현재 UPSTREAM
+  DETECT_IN=GPIO12, DETECT_OUT=GPIO2**, 이번 세션에 GPIO2/GPIO12에서 교환됨 --
+  실물은 아직 구배선 상태이므로 재배선 필요, 위 "새 GPIO 프로필 flash 전 재배선"
+  절 참고)로 배선된 실물 두 보드에서의 attach/detach 디바운스, PEER_HELLO/BASE_ID
+  교차검증. (passive power-base 지그를 이용한 ROOT 판정은 위 "실물 배선" 절에서
+  설명한 대로 이제 유효하지 않은 시나리오다 -- 대신 전원 모듈 관련 항목 참고.)
 - SHT45 실물 I2C 통신·변환값: 전원 모듈과의 조합에서 **실물로 확인됨** (위 절 참고).
   BH1750은 아직 미확인.
 - SGP40/SGP41: 코드/알고리즘/host test는 완료했으나 실물 배선·실행은 미검증 (위 "보유 센서
   현황" 참고).
-- PMS5003: 파서는 완성했으나 실물 UART transport가 없어 센서 자체의 실물 동작은 애초에
-  시험할 수 없다 (하드웨어 결정이 먼저 필요 -- docs/pogo-interface.md 참고).
+- PMS5003 terminal UART driver: 실물 배선, PASSIVE 응답, 30초 warm-up 이후 PM 채널값 검증.
 - JOIN_RESULT/ACK: SHT45 1대와의 정상 경로는 **실물로 확인됨** (`JOIN_RESULT_ACK
   received` 로그). 유실·중복 재시도 경로 자체(ACK가 실제로 유실되는 경우)는 host test
   시나리오만 통과, 아직 실물 미확인.

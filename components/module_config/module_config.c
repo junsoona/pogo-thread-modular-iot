@@ -34,9 +34,18 @@ static bool s_partition_ready = false;
  *   30      4     spi_clock_hz (u32)
  *   34      16    calibration[4] (i32 each)
  *   50      4     measurement_timeout_ms (u32)
- *   54      18    upstream_port   (module_port_config_t blob, see PORT_BLOB_LEN below)
- *   72      18    downstream_port (module_port_config_t blob)
- *   = 90 bytes total (CFG_BLOB_LEN)
+ * Schema v1 then stores upstream_port at 54 and downstream_port at 72
+ * (= 90 bytes total). Schema v2 inserts this 14-byte UART extension:
+ *   54      2     uart_tx_gpio (i16)
+ *   56      2     uart_rx_gpio (i16)
+ *   58      4     uart_baud_rate (u32)
+ *   62      1     uart_mode (u8: 0 active, 1 passive)
+ *   63      1     reserved (u8, must be 0)
+ *   64      4     uart_warmup_ms (u32)
+ *   68      18    upstream_port
+ *   86      18    downstream_port
+ *   = 104 bytes total. The loader accepts both layouts so installing new
+ * firmware does not force existing I2C modules to re-flash their cfg image.
  *
  * Per-port blob (18 bytes):
  *   0  2  uart_num (i16, -1 = port not wired on this board)
@@ -50,8 +59,10 @@ static bool s_partition_ready = false;
  *   14 4  debounce_ms (u32)
  */
 #define PORT_BLOB_LEN 18
-#define CFG_HEADER_LEN 54
-#define CFG_BLOB_LEN (CFG_HEADER_LEN + 2 * PORT_BLOB_LEN)
+#define CFG_V1_HEADER_LEN 54
+#define CFG_V1_BLOB_LEN (CFG_V1_HEADER_LEN + 2 * PORT_BLOB_LEN)
+#define CFG_V2_HEADER_LEN 68
+#define CFG_V2_BLOB_LEN (CFG_V2_HEADER_LEN + 2 * PORT_BLOB_LEN)
 
 static uint16_t rd_u16(const uint8_t *p)
 {
@@ -85,7 +96,7 @@ static void unpack_port(const uint8_t *p, module_port_config_t *out)
     out->debounce_ms = rd_u32(p + 14);
 }
 
-static void unpack_blob(const uint8_t *blob, module_config_t *out)
+static void unpack_blob(const uint8_t *blob, size_t blob_len, module_config_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->schema_version = rd_u32(blob + 0);
@@ -106,8 +117,19 @@ static void unpack_blob(const uint8_t *blob, module_config_t *out)
         out->calibration[i] = rd_i32(blob + 34 + i * 4);
     }
     out->measurement_timeout_ms = rd_u32(blob + 50);
-    unpack_port(blob + CFG_HEADER_LEN, &out->upstream_port);
-    unpack_port(blob + CFG_HEADER_LEN + PORT_BLOB_LEN, &out->downstream_port);
+    size_t port_offset = CFG_V1_HEADER_LEN;
+    out->uart_tx_gpio = -1;
+    out->uart_rx_gpio = -1;
+    if (blob_len == CFG_V2_BLOB_LEN) {
+        out->uart_tx_gpio = rd_i16(blob + 54);
+        out->uart_rx_gpio = rd_i16(blob + 56);
+        out->uart_baud_rate = rd_u32(blob + 58);
+        out->uart_mode = (module_uart_mode_t)blob[62];
+        out->uart_warmup_ms = rd_u32(blob + 64);
+        port_offset = CFG_V2_HEADER_LEN;
+    }
+    unpack_port(blob + port_offset, &out->upstream_port);
+    unpack_port(blob + port_offset + PORT_BLOB_LEN, &out->downstream_port);
 }
 
 /*
@@ -150,7 +172,8 @@ static esp_err_t check_gpio_field(const char *field_name, int32_t gpio)
  */
 static esp_err_t validate_config(const module_config_t *cfg, module_dev_mode_t dev_mode)
 {
-    if (cfg->bus_type != MODULE_BUS_I2C && cfg->bus_type != MODULE_BUS_SPI) {
+    if (cfg->bus_type != MODULE_BUS_I2C && cfg->bus_type != MODULE_BUS_SPI &&
+        cfg->bus_type != MODULE_BUS_UART) {
         ESP_LOGE(TAG, "CONFIG_ERROR: unsupported bus_type=%d", (int)cfg->bus_type);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -162,8 +185,8 @@ static esp_err_t validate_config(const module_config_t *cfg, module_dev_mode_t d
     /* Every GPIO actually in use, to catch one number assigned to more than
      * one function. -1 ("not present") entries are skipped. Sized for 2
      * ports x 5 GPIOs each, plus up to 4 bus GPIOs (SPI's worst case). */
-    int32_t used_gpios[2 * 5 + 4];
-    const char *used_field_names[2 * 5 + 4];
+    int32_t used_gpios[2 * 5 + 4 + 2];
+    const char *used_field_names[2 * 5 + 4 + 2];
     int used_count = 0;
 
     const module_port_config_t *ports[2] = {&cfg->upstream_port, &cfg->downstream_port};
@@ -271,7 +294,7 @@ static esp_err_t validate_config(const module_config_t *cfg, module_dev_mode_t d
             used_gpios[used_count] = cfg->i2c_scl_gpio;
             used_field_names[used_count++] = "i2c_scl_gpio";
         }
-    } else {
+    } else if (cfg->bus_type == MODULE_BUS_SPI) {
         const char *spi_names[4] = {"spi_mosi_gpio", "spi_miso_gpio", "spi_sclk_gpio", "spi_cs_gpio"};
         int32_t spi_gpios[4] = {cfg->spi_mosi_gpio, cfg->spi_miso_gpio, cfg->spi_sclk_gpio, cfg->spi_cs_gpio};
         for (int i = 0; i < 4; i++) {
@@ -284,6 +307,60 @@ static esp_err_t validate_config(const module_config_t *cfg, module_dev_mode_t d
                 used_field_names[used_count++] = spi_names[i];
             }
         }
+    } else {
+        if (cfg->schema_version < 2) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: UART sensor bus requires module config schema v2");
+            return ESP_ERR_INVALID_VERSION;
+        }
+        if (cfg->bus_number > 1) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: UART bus_number=%u is not a valid ESP32-H2 UART controller (0 or 1)",
+                     (unsigned)cfg->bus_number);
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (cfg->uart_baud_rate == 0) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: uart_baud_rate must not be 0");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (cfg->uart_mode != MODULE_UART_MODE_ACTIVE && cfg->uart_mode != MODULE_UART_MODE_PASSIVE) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: unsupported uart_mode=%d", (int)cfg->uart_mode);
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t gerr = check_gpio_field("uart_tx_gpio", cfg->uart_tx_gpio);
+        if (gerr == ESP_OK) {
+            gerr = check_gpio_field("uart_rx_gpio", cfg->uart_rx_gpio);
+        }
+        if (gerr != ESP_OK || cfg->uart_tx_gpio < 0 || cfg->uart_rx_gpio < 0) {
+            if (gerr == ESP_OK) {
+                ESP_LOGE(TAG, "CONFIG_ERROR: UART sensor bus requires uart_tx_gpio and uart_rx_gpio");
+            }
+            return ESP_ERR_INVALID_ARG;
+        }
+        used_gpios[used_count] = cfg->uart_tx_gpio;
+        used_field_names[used_count++] = "uart_tx_gpio";
+        used_gpios[used_count] = cfg->uart_rx_gpio;
+        used_field_names[used_count++] = "uart_rx_gpio";
+
+        const module_port_config_t *down = &cfg->downstream_port;
+        if (down->uart_num != -1 || down->tx_gpio != -1 || down->rx_gpio != -1 ||
+            down->detect_in_gpio != -1 || down->detect_out_gpio != -1 || down->base_id_gpio != -1) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: UART sensor modules are terminal-only; downstream_port must be fully disabled");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (cfg->upstream_port.uart_num == (int32_t)cfg->bus_number) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: sensor UART%u conflicts with enabled upstream POGO UART",
+                     (unsigned)cfg->bus_number);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (cfg->driver_id == 0x504D3530u) { /* SENSOR_DRIVER_ID_PMS5003 without a module_config -> sensor_provider cycle */
+        if (cfg->bus_type != MODULE_BUS_UART || cfg->uart_baud_rate != 9600) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: PMS5003 requires a 9600-baud UART sensor bus");
+            return ESP_ERR_INVALID_ARG;
+        }
+    } else if (cfg->bus_type == MODULE_BUS_UART) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: UART sensor bus is currently supported only for PMS5003");
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     for (int i = 0; i < used_count; i++) {
@@ -334,7 +411,7 @@ esp_err_t module_config_load(module_config_t *out)
         return err;
     }
 
-    uint8_t blob[CFG_BLOB_LEN];
+    uint8_t blob[CFG_V2_BLOB_LEN];
     size_t blob_len = sizeof(blob);
     uint16_t stored_crc = 0;
     esp_err_t result = ESP_OK;
@@ -346,9 +423,9 @@ esp_err_t module_config_load(module_config_t *out)
             result = ESP_ERR_NOT_FOUND;
             break;
         }
-        if (blob_len != CFG_BLOB_LEN) {
-            ESP_LOGE(TAG, "CONFIG_ERROR: config blob is %u bytes, firmware expects %u (schema mismatch?)",
-                     (unsigned)blob_len, (unsigned)CFG_BLOB_LEN);
+        if (blob_len != CFG_V1_BLOB_LEN && blob_len != CFG_V2_BLOB_LEN) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: config blob is %u bytes, firmware expects schema-v1 %u or schema-v2 %u",
+                     (unsigned)blob_len, (unsigned)CFG_V1_BLOB_LEN, (unsigned)CFG_V2_BLOB_LEN);
             result = ESP_ERR_INVALID_SIZE;
             break;
         }
@@ -365,10 +442,13 @@ esp_err_t module_config_load(module_config_t *out)
             result = ESP_ERR_INVALID_CRC;
             break;
         }
-        unpack_blob(blob, out);
-        if (out->schema_version != MODULE_CONFIG_SCHEMA_VERSION) {
-            ESP_LOGE(TAG, "CONFIG_ERROR: unsupported schema_version=%u (firmware expects %u)",
-                     (unsigned)out->schema_version, (unsigned)MODULE_CONFIG_SCHEMA_VERSION);
+        unpack_blob(blob, blob_len, out);
+        bool schema_matches_layout =
+            (out->schema_version == 1 && blob_len == CFG_V1_BLOB_LEN) ||
+            (out->schema_version == MODULE_CONFIG_SCHEMA_VERSION && blob_len == CFG_V2_BLOB_LEN);
+        if (!schema_matches_layout) {
+            ESP_LOGE(TAG, "CONFIG_ERROR: unsupported schema/layout combination: schema_version=%u blob_len=%u",
+                     (unsigned)out->schema_version, (unsigned)blob_len);
             result = ESP_ERR_INVALID_VERSION;
             break;
         }
@@ -392,9 +472,11 @@ esp_err_t module_config_load(module_config_t *out)
         return result;
     }
 
+    const char *bus_name = out->bus_type == MODULE_BUS_I2C ? "i2c" :
+                           out->bus_type == MODULE_BUS_SPI ? "spi" : "uart";
     ESP_LOGI(TAG, "loaded: schema=%u rev=%u driver_id=%u sensor_bitmap=0x%04x bus=%s#%u timeout=%ums",
              (unsigned)out->schema_version, (unsigned)out->config_revision, (unsigned)out->driver_id,
-             out->sensor_type_bitmap, out->bus_type == MODULE_BUS_I2C ? "i2c" : "spi", out->bus_number,
+             out->sensor_type_bitmap, bus_name, out->bus_number,
              (unsigned)out->measurement_timeout_ms);
     return ESP_OK;
 }

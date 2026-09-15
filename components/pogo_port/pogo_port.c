@@ -17,13 +17,23 @@ static const char *TAG = "pogo_port";
 #define PORT_TASK_PRIO   5
 #define DETECT_QUEUE_LEN 8
 #define GPIO_ISR_FLAGS   0
+/* WAIT_ATTACH/ERROR are intentionally quiet steady states. Emit a sparse
+ * heartbeat so a monitor attached after boot can distinguish a live port
+ * task from a stalled one without flooding the console. */
+#define PORT_STATUS_LOG_INTERVAL_MS 15000
 
 typedef enum {
     PORT_STATE_DISABLED = 0,
     PORT_STATE_WAIT_ATTACH,
+    PORT_STATE_ATTACH_SETTLE,   /* DETECT_IN just debounced attached; short settle before the first handshake */
     PORT_STATE_HANDSHAKE,
     PORT_STATE_PEER_READY,
-    PORT_STATE_ERROR,
+    PORT_STATE_RECOVER_COOLDOWN, /* AUTO mode only: a transient error (DOCK_TIMEOUT/LIVENESS_LOST) while DETECT_IN
+                                     still reads attached -- waiting out CONFIG_POGO_HOTSWAP_COOLDOWN_MS before a
+                                     fresh handshake cycle, without requiring a new DETECT_IN edge */
+    PORT_STATE_ERROR,           /* permanent until the next DETACHED: PEER_TYPE_CONFLICT/PROTOCOL_VERSION/
+                                    CAPABILITY_MISMATCH, or (dev compat mode only) a transient error already
+                                    handled by that mode's own inline retry below */
 } port_internal_state_t;
 
 typedef struct {
@@ -46,9 +56,11 @@ typedef struct {
     bool      pending_valid;
     int       pending_level;
     TickType_t pending_since;
+    TickType_t last_reconcile;   /* last time process_debounce() direct-read DETECT_IN as a missed-ISR backstop */
 
     /* Handshake bookkeeping. */
     port_internal_state_t state;
+    TickType_t state_deadline;   /* PORT_STATE_ATTACH_SETTLE / PORT_STATE_RECOVER_COOLDOWN only */
     pogo_frame_parser_t   parser;
     uint8_t   hello_seq;
     int       hello_retries;
@@ -71,6 +83,9 @@ typedef struct {
     uint8_t    ping_seq;
     TickType_t ping_deadline;
     int        liveness_fail_count;
+
+    /* Rate-limited task-alive/status diagnostic. */
+    TickType_t last_status_log;
 
     bool inited;
     bool enabled; /* true from a successful pogo_port_enable() until pogo_port_disable() -- see that function's doc comment on idempotency */
@@ -203,24 +218,116 @@ static void enter_wait_attach(pogo_port_ctx_t *p)
     p->peer_type = POGO_PEER_TYPE_UNKNOWN;
     pogo_frame_parser_init(&p->parser);
     reset_liveness(p);
+    p->last_status_log = xTaskGetTickCount();
+    ESP_LOGI(TAG, "port %d: WAIT_ATTACH (DETECT_IN=%d)", p->id,
+             p->cfg.detect_in_gpio >= 0 ? gpio_get_level((gpio_num_t)p->cfg.detect_in_gpio) : -1);
+}
+
+/* Real-DETECT_IN attach path only (dev compat mode's port_task() startup
+ * calls begin_handshake() directly -- there is no physical contact to
+ * settle). A short, bounded, explicit wait (CONFIG_POGO_ATTACH_SETTLE_MS,
+ * not a busy loop -- see process_attach_settle()) before the first HELLO_REQ,
+ * so a dock motion where DETECT_IN closes slightly before UART/GND fully
+ * seat does not race the handshake against still-settling contacts. A detach
+ * during this window is handled the same way as during HANDSHAKE/
+ * RECOVER_COOLDOWN: process_debounce() (called every port_task loop
+ * iteration, unconditionally, before the state switch) already transitions
+ * straight to WAIT_ATTACH on its own, which simply pre-empts whatever this
+ * state was about to do next. */
+static void enter_attach_settle(pogo_port_ctx_t *p)
+{
+    p->state = PORT_STATE_ATTACH_SETTLE;
+    p->state_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_POGO_ATTACH_SETTLE_MS);
+}
+
+static const char *port_state_to_str(port_internal_state_t state)
+{
+    switch (state) {
+    case PORT_STATE_WAIT_ATTACH:
+        return "WAIT_ATTACH";
+    case PORT_STATE_ATTACH_SETTLE:
+        return "ATTACH_SETTLE";
+    case PORT_STATE_HANDSHAKE:
+        return "HANDSHAKE";
+    case PORT_STATE_PEER_READY:
+        return "PEER_READY";
+    case PORT_STATE_RECOVER_COOLDOWN:
+        return "RECOVER_COOLDOWN";
+    case PORT_STATE_ERROR:
+        return "ERROR";
+    case PORT_STATE_DISABLED:
+    default:
+        return "DISABLED";
+    }
+}
+
+static void maybe_log_idle_status(pogo_port_ctx_t *p)
+{
+    if (p->state != PORT_STATE_WAIT_ATTACH && p->state != PORT_STATE_ERROR &&
+        p->state != PORT_STATE_RECOVER_COOLDOWN) {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if ((now - p->last_status_log) < pdMS_TO_TICKS(PORT_STATUS_LOG_INTERVAL_MS)) {
+        return;
+    }
+    p->last_status_log = now;
+
+    int detect_level =
+        p->cfg.detect_in_gpio >= 0 ? gpio_get_level((gpio_num_t)p->cfg.detect_in_gpio) : -1;
+    uint32_t uptime_ms = (uint32_t)(now * portTICK_PERIOD_MS);
+    ESP_LOGI(TAG,
+             "port %d: alive state=%s DETECT_IN=%d own_peer_type=%d uptime=%lums detect_isr_drops=%lu",
+             p->id, port_state_to_str(p->state), detect_level, (int)p->own_peer_type,
+             (unsigned long)uptime_ms, (unsigned long)p->detect_isr_drops);
 }
 
 static void send_hello_req(pogo_port_ctx_t *p, uint8_t seq)
 {
-    pogo_peer_hello_t hello = {.protocol_version = POGO_FRAME_VERSION, .peer_type = (uint8_t)p->own_peer_type};
-    uint8_t payload[2];
+    pogo_peer_hello_t hello = {.protocol_version = POGO_FRAME_VERSION,
+                                .peer_type = (uint8_t)p->own_peer_type,
+                                .capabilities = POGO_HELLO_SUPPORTED_CAPABILITIES};
+    uint8_t payload[3];
     size_t len = pogo_pack_peer_hello(&hello, payload, sizeof(payload));
     pogo_transport_send_on(p, POGO_MSG_PEER_HELLO_REQ, seq, payload, len);
 }
 
 static void begin_handshake(pogo_port_ctx_t *p)
 {
+    /* Clears any bytes/partial frame left over from a previous failed
+     * session (stale PING/PONG, a truncated frame) before this new
+     * handshake's parser starts listening -- otherwise a leftover byte
+     * could desync the very first HELLO_REQ/RESP exchange of the new
+     * cycle. Safe to call unconditionally: uart_flush_input() is a no-op
+     * on an already-empty RX buffer, and the UART driver is always
+     * installed by the time begin_handshake() can ever run (from
+     * pogo_port_enable() onward). */
+    uart_flush_input((uart_port_t)p->cfg.uart_num);
     p->state = PORT_STATE_HANDSHAKE;
     pogo_frame_parser_init(&p->parser);
     p->hello_seq = 1;
     p->hello_retries = 0;
     send_hello_req(p, p->hello_seq);
     p->hello_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_POGO_ACK_TIMEOUT_MS);
+}
+
+/* AUTO mode only (detect_in_gpio >= 0): DOCK_TIMEOUT/LIVENESS_LOST are
+ * transient -- if DETECT_IN still reads attached, retry a fresh handshake
+ * cycle automatically after a bounded cooldown instead of requiring a new
+ * DETECT_IN edge (a real dock where DETECT closes before UART/GND would
+ * otherwise wedge in ERROR forever, since no further edge is coming). See
+ * this file's own docs/pogo-interface.md section and CONFIG_POGO_HOTSWAP_COOLDOWN_MS's
+ * Kconfig help text. Configuration/compatibility errors (PEER_TYPE_CONFLICT,
+ * PROTOCOL_VERSION_ERROR, CAPABILITY_MISMATCH) never call this -- they stay
+ * in PORT_STATE_ERROR until the next physical detach, unchanged. */
+static void enter_recover_cooldown(pogo_port_ctx_t *p)
+{
+    p->state = PORT_STATE_RECOVER_COOLDOWN;
+    p->state_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_POGO_HOTSWAP_COOLDOWN_MS);
+    p->last_status_log = xTaskGetTickCount();
+    ESP_LOGI(TAG, "port %d: transient error, DETECT_IN still attached -- cooldown %dms before retrying handshake",
+             p->id, CONFIG_POGO_HOTSWAP_COOLDOWN_MS);
 }
 
 static void handle_dock_timeout_or_silent_power_base(pogo_port_ctx_t *p)
@@ -248,22 +355,27 @@ static void handle_dock_timeout_or_silent_power_base(pogo_port_ctx_t *p)
          * first time a retry cycle fails (e.g. the peer board hasn't
          * finished booting yet). Recover automatically: wait one PING
          * interval (bounded, not a hot loop) and start a fresh handshake
-         * cycle, still capped at CONFIG_POGO_MAX_RETRY per cycle. AUTO mode
-         * (real DETECT_IN) keeps the original policy of waiting for a
-         * physical detach/attach before trying again. */
+         * cycle, still capped at CONFIG_POGO_MAX_RETRY per cycle. */
         vTaskDelay(pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS));
         ESP_LOGI(TAG, "port %d: dev compat mode -- retrying handshake cycle", p->id);
         begin_handshake(p);
+    } else {
+        /* AUTO mode (real DETECT_IN): DOCK_TIMEOUT is transient -- retry
+         * automatically after a cooldown as long as DETECT_IN still reads
+         * attached (see enter_recover_cooldown()'s doc comment). */
+        enter_recover_cooldown(p);
     }
 }
 
-/* Mirrors handle_dock_timeout_or_silent_power_base()'s dev-compat recovery
- * policy, for the idle-liveness-lost case instead of the initial-handshake
- * one (section 9): fire the ERROR event either way, and only auto-retry a
- * fresh handshake when there is no DETECT_IN to wait on. AUTO mode (real
- * DETECT_IN) stays in ERROR until the next physical detach/attach -- a
- * liveness loss while the wire still reads "attached" is exactly the kind of
- * "something is actually wrong" case that policy exists for. */
+/* Mirrors handle_dock_timeout_or_silent_power_base()'s recovery policy, for
+ * the idle-liveness-lost case instead of the initial-handshake one (section
+ * 9): fire the ERROR event either way, then auto-retry a fresh handshake --
+ * immediately (dev compat mode, no DETECT_IN) or after a cooldown as long as
+ * DETECT_IN still reads attached (AUTO mode -- see enter_recover_cooldown()).
+ * LIVENESS_LOST is transient by definition: PING/PONG failing while the wire
+ * still reads "attached" means the peer stopped answering, which a fresh
+ * handshake (possibly after the peer itself reboots/recovers) can resolve
+ * without requiring a physical detach/reattach. */
 static void handle_liveness_lost(pogo_port_ctx_t *p)
 {
     p->state = PORT_STATE_ERROR;
@@ -276,6 +388,8 @@ static void handle_liveness_lost(pogo_port_ctx_t *p)
         vTaskDelay(pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS));
         ESP_LOGI(TAG, "port %d: dev compat mode -- retrying handshake cycle after liveness loss", p->id);
         begin_handshake(p);
+    } else {
+        enter_recover_cooldown(p);
     }
 }
 
@@ -287,7 +401,23 @@ static bool validate_incoming_hello(pogo_port_ctx_t *p, const pogo_frame_t *fram
 {
     pogo_peer_hello_t hello;
     if (!pogo_unpack_peer_hello(frame->payload, frame->len, &hello)) {
-        return false; /* malformed payload: ignore, let retry/timeout logic proceed */
+        if (frame->len == 2) {
+            /* Exactly the OLD (pre-capability-negotiation) HELLO payload
+             * shape -- a peer running firmware from before this follow-up,
+             * which never knows POGO_MSG_SET_COLLECTOR or the provisioning
+             * ordering that requires it. Reject this explicitly and loudly
+             * here, at the handshake, instead of silently ignoring it (the
+             * generic "malformed, let retry/timeout proceed" path below)
+             * and letting it fail confusingly partway through provisioning
+             * once SET_COLLECTOR is reached. */
+            p->state = PORT_STATE_ERROR;
+            pogo_port_event_data_t data = {.error_code = POGO_PORT_ERR_CAPABILITY_MISMATCH};
+            ESP_LOGE(TAG, "port %d: peer sent a legacy 2-byte HELLO (no capabilities field) -- this firmware "
+                          "requires POGO_CAP_COLLECTOR_PROVISIONING on both sides; refusing handshake",
+                     p->id);
+            notify(p, POGO_PORT_EVENT_ERROR, &data);
+        }
+        return false; /* otherwise: malformed payload, ignore, let retry/timeout logic proceed */
     }
     if (hello.protocol_version != POGO_FRAME_VERSION) {
         p->state = PORT_STATE_ERROR;
@@ -317,6 +447,16 @@ static bool validate_incoming_hello(pogo_port_ctx_t *p, const pogo_frame_t *fram
         return false;
     }
 
+    if ((hello.capabilities & POGO_CAP_COLLECTOR_PROVISIONING) == 0) {
+        p->state = PORT_STATE_ERROR;
+        pogo_port_event_data_t data = {.error_code = POGO_PORT_ERR_CAPABILITY_MISMATCH};
+        ESP_LOGE(TAG, "port %d: peer's HELLO capabilities=0x%02x is missing POGO_CAP_COLLECTOR_PROVISIONING -- "
+                      "refusing handshake (both sides must be built from this firmware revision)",
+                 p->id, hello.capabilities);
+        notify(p, POGO_PORT_EVENT_ERROR, &data);
+        return false;
+    }
+
     *out_peer_type = (pogo_peer_type_t)hello.peer_type;
     return true;
 }
@@ -332,8 +472,10 @@ static void handle_incoming_hello_req(pogo_port_ctx_t *p, const pogo_frame_t *fr
     }
     p->peer_type = peer_type; /* opportunistic refresh; does not by itself change PORT_STATE_PEER_READY */
 
-    pogo_peer_hello_t resp = {.protocol_version = POGO_FRAME_VERSION, .peer_type = (uint8_t)p->own_peer_type};
-    uint8_t payload[2];
+    pogo_peer_hello_t resp = {.protocol_version = POGO_FRAME_VERSION,
+                               .peer_type = (uint8_t)p->own_peer_type,
+                               .capabilities = POGO_HELLO_SUPPORTED_CAPABILITIES};
+    uint8_t payload[3];
     size_t len = pogo_pack_peer_hello(&resp, payload, sizeof(payload));
     pogo_transport_send_on(p, POGO_MSG_PEER_HELLO_RESP, frame->seq, payload, len);
 }
@@ -354,6 +496,37 @@ static void handle_incoming_hello_resp(pogo_port_ctx_t *p, const pogo_frame_t *f
     notify(p, POGO_PORT_EVENT_PEER_READY, &data);
 }
 
+/* AUTO mode only, called from process_debounce() below: a backstop against a
+ * missed GPIO ISR firing or the detect_queue overflowing (both would
+ * otherwise leave committed_level stale until some unrelated later edge
+ * happens to correct it). At most once every CONFIG_POGO_DETECT_RECONCILE_MS,
+ * directly re-reads DETECT_IN's raw level and, if it disagrees with whatever
+ * this port currently believes (a pending-but-not-yet-committed level, or the
+ * last committed one), injects a synthetic edge with the CURRENT tick --
+ * i.e. it still has to survive a full debounce window before being
+ * committed, exactly like a real ISR-sourced edge, so a momentary read glitch
+ * cannot itself cause a spurious transition. */
+static void reconcile_detect_level(pogo_port_ctx_t *p)
+{
+    TickType_t now = xTaskGetTickCount();
+    if ((now - p->last_reconcile) < pdMS_TO_TICKS(CONFIG_POGO_DETECT_RECONCILE_MS)) {
+        return;
+    }
+    p->last_reconcile = now;
+    int real_level = gpio_get_level((gpio_num_t)p->cfg.detect_in_gpio);
+    int believed_level = p->pending_valid ? p->pending_level : p->committed_level;
+    if (real_level == believed_level) {
+        return;
+    }
+    ESP_LOGW(TAG,
+             "port %d: DETECT_IN reconciliation mismatch (raw=%d believed=%d, detect_isr_drops=%lu) -- injecting "
+             "synthetic edge (missed ISR?)",
+             p->id, real_level, believed_level, (unsigned long)p->detect_isr_drops);
+    p->pending_level = real_level;
+    p->pending_since = now;
+    p->pending_valid = true;
+}
+
 static void process_debounce(pogo_port_ctx_t *p)
 {
     if (p->detect_queue == NULL) {
@@ -371,6 +544,8 @@ static void process_debounce(pogo_port_ctx_t *p)
     }
     (void)got_one;
 
+    reconcile_detect_level(p);
+
     if (!p->pending_valid) {
         return;
     }
@@ -387,12 +562,43 @@ static void process_debounce(pogo_port_ctx_t *p)
     if (p->committed_level == 0) {
         ESP_LOGI(TAG, "port %d: ATTACHED (DETECT_IN debounced Low)", p->id);
         notify(p, POGO_PORT_EVENT_ATTACHED, NULL);
-        begin_handshake(p);
+        enter_attach_settle(p);
     } else {
         ESP_LOGI(TAG, "port %d: DETACHED (DETECT_IN debounced High)", p->id);
         notify(p, POGO_PORT_EVENT_DETACHED, NULL);
         enter_wait_attach(p);
     }
+}
+
+/* PORT_STATE_ATTACH_SETTLE: bounded poll (not a busy loop) for
+ * state_deadline, then starts the first handshake. If DETECT_IN debounces
+ * back to detached during this wait, process_debounce() (called every loop
+ * iteration before the state switch in port_task()) has already moved
+ * p->state to PORT_STATE_WAIT_ATTACH by the time this would otherwise run --
+ * so this function is simply never reached for that iteration. */
+static void process_attach_settle(pogo_port_ctx_t *p)
+{
+    if ((int32_t)(xTaskGetTickCount() - p->state_deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+    begin_handshake(p);
+}
+
+/* PORT_STATE_RECOVER_COOLDOWN: same bounded-poll shape as
+ * process_attach_settle() above, and the same detach-cancels-it guarantee
+ * (process_debounce() pre-empts p->state before this ever runs). Once
+ * state_deadline elapses, begin_handshake() starts a fresh cycle -- still
+ * capped at CONFIG_POGO_MAX_RETRY retries internally, exactly like the very
+ * first handshake after ATTACHED. */
+static void process_recover_cooldown(pogo_port_ctx_t *p)
+{
+    if ((int32_t)(xTaskGetTickCount() - p->state_deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        return;
+    }
+    ESP_LOGI(TAG, "port %d: cooldown elapsed -- starting a fresh handshake cycle", p->id);
+    begin_handshake(p);
 }
 
 static void process_handshake(pogo_port_ctx_t *p)
@@ -524,6 +730,8 @@ static void port_task(void *arg)
 {
     pogo_port_ctx_t *p = (pogo_port_ctx_t *)arg;
 
+    p->last_reconcile = xTaskGetTickCount();
+
     if (p->cfg.detect_in_gpio < 0) {
         /* Dev compat mode: no DETECT hardware at all -- the port is
          * considered attached the instant it is enabled (see
@@ -538,16 +746,23 @@ static void port_task(void *arg)
 
     while (1) {
         process_debounce(p);
+        maybe_log_idle_status(p);
 
         switch (p->state) {
         case PORT_STATE_WAIT_ATTACH:
             vTaskDelay(pdMS_TO_TICKS(20));
+            break;
+        case PORT_STATE_ATTACH_SETTLE:
+            process_attach_settle(p);
             break;
         case PORT_STATE_HANDSHAKE:
             process_handshake(p);
             break;
         case PORT_STATE_PEER_READY:
             process_peer_ready(p);
+            break;
+        case PORT_STATE_RECOVER_COOLDOWN:
+            process_recover_cooldown(p);
             break;
         case PORT_STATE_ERROR:
         case PORT_STATE_DISABLED:
@@ -811,7 +1026,8 @@ bool pogo_port_is_attached(pogo_port_id_t id)
         return false;
     }
     port_internal_state_t st = s_ports[id].state;
-    return st == PORT_STATE_HANDSHAKE || st == PORT_STATE_PEER_READY || st == PORT_STATE_ERROR;
+    return st == PORT_STATE_ATTACH_SETTLE || st == PORT_STATE_HANDSHAKE || st == PORT_STATE_PEER_READY ||
+           st == PORT_STATE_RECOVER_COOLDOWN || st == PORT_STATE_ERROR;
 }
 
 pogo_peer_type_t pogo_port_get_peer_type(pogo_port_id_t id)

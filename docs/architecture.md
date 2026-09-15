@@ -1,8 +1,13 @@
 # Architecture
 
-**A dedicated power-base project (`power_base/`) now exists and is the
-system's one and only Thread ROOT/Leader -- see [power-base.md](power-base.md)
-for its full architecture, boot sequence, and component reuse table.** This
+**A dedicated power-base project (`power_base/`) now exists -- see
+[power-base.md](power-base.md) for its full architecture, boot sequence, and
+component reuse table.** Its fixed application role (physical POGO root,
+downstream provisioning coordinator, topology registry owner, sensor-data
+aggregator) is decoupled from Thread's own `otDeviceRole` -- it is not
+described as Thread's "ROOT" or "Leader" any more; it runs as an always-on
+FTD and treats CHILD/ROUTER/LEADER alike as ready (see power-base.md's
+"module/Thread role decoupling and collector provisioning" section). This
 document's component map/boot sequence below describe `module/` (the sensor
 module firmware) specifically; `power_base/` is a separate ESP-IDF
 project/binary that reuses `pogo_port`/`pogo_proto`/`thread_manager`/
@@ -211,10 +216,13 @@ components/
                               runs a CoAP resource that unpacks a
                               sensor_channel-encoded POST into
                               sensor_service's aggregator; INTERMEDIATE/LEAF
-                              send via Confirmable POST to
-                              thread_manager_get_leader_address() (never a
-                              hardcoded address), retrying with the
-                              node_calc UUID-hash backoff schedule.
+                              send via Confirmable POST to the collector
+                              endpoint (components/collector_endpoint's
+                              current snapshot -- the power base's own
+                              Mesh-Local EID + CoAP port, delivered via POGO
+                              SET_COLLECTOR, never "the current Thread
+                              Leader" -- see power-base.md), retrying with
+                              the node_calc UUID-hash backoff schedule.
 
   bh1750/, sht45/, sgp40/, sgp41/, pms5003/
                                 Real sensor_provider drivers (sections 4/5/10/11).
@@ -225,13 +233,10 @@ components/
                               unmodified Sensirion Gas Index Algorithm (see
                               components/sensirion_gas_index_algorithm/THIRD_PARTY_NOTICE.md)
                               and share components/sensirion_crc8's word CRC.
-                              pms5003 is a complete, host-tested 32-byte
-                              frame parser plus a registrable
-                              sensor_provider_ops_t whose init() always fails
-                              honestly -- ESP32-H2's two UART controllers are
-                              both committed to the POGO ports, so no
-                              hardware transport exists yet (see
-                              docs/pogo-interface.md's PMS5003 section).
+                              pms5003 is a terminal-only UART1/GPIO10/11
+                              provider with active/passive commands, warm-up
+                              status, and a host-tested 32-byte frame parser;
+                              its downstream POGO port is disabled by config.
 
 upper/, lower/                Preserved reference projects (regression
                               baseline). Unchanged except for the

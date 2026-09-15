@@ -61,7 +61,7 @@ static bool base_id_says_power_base(const module_upstream_port_t *p)
 }
 
 /* Mirrors validate_incoming_hello() in pogo_port.c. */
-static bool validate(module_upstream_port_t *p, uint8_t declared_peer_type)
+static bool validate(module_upstream_port_t *p, uint8_t declared_peer_type, uint8_t capabilities)
 {
     if (!pogo_peer_type_is_valid(declared_peer_type)) {
         p->state = P_ERROR;
@@ -73,6 +73,10 @@ static bool validate(module_upstream_port_t *p, uint8_t declared_peer_type)
         p->state = P_ERROR;
         return false;
     }
+    if ((capabilities & POGO_CAP_COLLECTOR_PROVISIONING) == 0) {
+        p->state = P_ERROR;
+        return false;
+    }
     p->peer_type = declared_peer_type;
     return true;
 }
@@ -81,10 +85,12 @@ static bool validate(module_upstream_port_t *p, uint8_t declared_peer_type)
  * format) and immediately decodes it back through validate() -- this is the
  * exact same round trip pogo_port.c's UART parser + validate_incoming_hello()
  * perform, just without the UART/task plumbing in between. */
-static bool receive_hello(module_upstream_port_t *p, pogo_peer_type_t declared_type)
+static bool receive_hello_ex(module_upstream_port_t *p, pogo_peer_type_t declared_type, uint8_t capabilities)
 {
-    pogo_peer_hello_t h = {.protocol_version = POGO_FRAME_VERSION, .peer_type = (uint8_t)declared_type};
-    uint8_t payload[2];
+    pogo_peer_hello_t h = {.protocol_version = POGO_FRAME_VERSION,
+                            .peer_type = (uint8_t)declared_type,
+                            .capabilities = capabilities};
+    uint8_t payload[3];
     size_t plen = pogo_pack_peer_hello(&h, payload, sizeof(payload));
 
     uint8_t frame_buf[POGO_FRAME_MAX_SIZE];
@@ -106,11 +112,16 @@ static bool receive_hello(module_upstream_port_t *p, pogo_peer_type_t declared_t
     if (!pogo_unpack_peer_hello(decoded.payload, decoded.len, &decoded_hello)) {
         return false;
     }
-    bool valid = validate(p, decoded_hello.peer_type);
+    bool valid = validate(p, decoded_hello.peer_type, decoded_hello.capabilities);
     if (valid) {
         p->state = P_READY;
     }
     return valid;
+}
+
+static bool receive_hello(module_upstream_port_t *p, pogo_peer_type_t declared_type)
+{
+    return receive_hello_ex(p, declared_type, POGO_HELLO_SUPPORTED_CAPABILITIES);
 }
 
 static void scenario_power_base_and_module_hello_match(void)
@@ -212,11 +223,24 @@ static void scenario_silent_power_base_still_reaches_ready(void)
     CHECK(silent_unexplained.state == P_ERROR, "a silent peer that BASE_ID does NOT explain is DOCK_TIMEOUT (ERROR), not PEER_READY");
 }
 
+static void scenario_capability_mismatch_rejected(void)
+{
+    printf("\n-- scenario: a power base's HELLO missing POGO_CAP_COLLECTOR_PROVISIONING is rejected --\n");
+    module_upstream_port_t p;
+    memset(&p, 0, sizeof(p));
+    p.state = P_HANDSHAKE;
+    p.base_id_power_base = 1;
+    bool ok = receive_hello_ex(&p, POGO_PEER_TYPE_POWER_BASE, /*capabilities=*/0);
+    CHECK(!ok, "a POWER_BASE HELLO with capabilities=0 is rejected even though BASE_ID/peer_type agree");
+    CHECK(p.state == P_ERROR, "the port moves to ERROR on a capability mismatch, not PEER_READY");
+}
+
 int main(void)
 {
     scenario_power_base_and_module_hello_match();
     scenario_base_id_peer_type_conflict_rejected();
     scenario_silent_power_base_still_reaches_ready();
+    scenario_capability_mismatch_rejected();
 
     printf("\n");
     if (g_failures == 0) {

@@ -35,10 +35,36 @@ typedef enum {
 esp_err_t thread_manager_init(void);
 
 /*
- * ROOT: resumes a previously-commissioned dataset if one exists in
- * OpenThread's own storage, otherwise forms a new network from this
- * component's Kconfig (OPENTHREAD_NETWORK_*) defaults. Router-eligible,
- * full network data -- a Leader/Router candidate.
+ * Applies the same fixed link-mode configuration as
+ * thread_manager_start_as_root() below (rx-on-when-idle=true, FTD,
+ * full network data=true, router-eligible=true) and either resumes a
+ * previously-commissioned dataset from OpenThread's own storage, or forms a
+ * new network from this component's Kconfig (OPENTHREAD_NETWORK_*) defaults
+ * if none exists yet.
+ *
+ * This is the NEUTRAL name for that behavior: it says nothing about Thread
+ * roles (CHILD/ROUTER/LEADER) at all -- `otDeviceRole` is decided by Thread
+ * itself once this device actually attaches, which can take an unbounded
+ * amount of time (e.g. waiting for an OTBR or another FTD to be reachable)
+ * and is NOT this function's concern. Use this for any device whose FIXED
+ * APPLICATION role does not itself require or claim Thread Leadership --
+ * currently `power_base/main/app_main.c` (see docs/power-base.md's
+ * "module/Thread role decoupling" section: the power base's fixed role is
+ * the physical POGO root/provisioning coordinator, decoupled from whatever
+ * `otDeviceRole` it happens to hold).
+ */
+esp_err_t thread_manager_start_as_always_on_ftd(void);
+
+/*
+ * ROOT: identical underlying behavior to thread_manager_start_as_always_on_ftd()
+ * above (same link mode, same resume-or-form logic) -- kept as a distinctly
+ * named wrapper ONLY for `module`'s `MODULE_DEV_MODE_DEV_ROOT` regression
+ * fixture (see docs/pogo-interface.md's "development compat mode"), which
+ * reproduces the old `upper` project's behavior and whose own logs/tests
+ * still refer to this device's role as "ROOT". New callers -- especially
+ * anything that is not actually claiming to BE a fixed Thread ROOT/Leader --
+ * should call thread_manager_start_as_always_on_ftd() instead; see that
+ * function's own comment for why (e.g. `power_base` no longer calls this).
  */
 esp_err_t thread_manager_start_as_root(void);
 
@@ -82,6 +108,26 @@ otDeviceRole thread_manager_get_role(void);
  * report).
  */
 esp_err_t thread_manager_get_leader_address(otIp6Address *out_addr);
+
+/*
+ * This device's own Thread Mesh-Local EID, via otThreadGetMeshLocalEid()
+ * (ESP-IDF v6.1 / components/openthread/openthread/include/openthread/thread.h:
+ * "const otIp6Address *otThreadGetMeshLocalEid(otInstance *aInstance)" --
+ * confirmed against that exact header, not assumed from memory). That
+ * function returns a pointer into OpenThread's own internal state whose
+ * lifetime is tied to the OpenThread API lock, so this wrapper copies the
+ * 16 bytes out into *out_addr WHILE still holding the lock, before
+ * releasing it -- the caller never touches OpenThread's own pointer.
+ * Returns ESP_ERR_INVALID_STATE if OpenThread has no Mesh-Local EID to
+ * report yet (should not happen once thread_manager_init() has run: unlike
+ * the Leader RLOC, the Mesh-Local EID does not require this device to be
+ * attached to a partition). Used by power_base's own collector-endpoint
+ * identity (its ML-EID is what every sensor module in the chain sends
+ * "/s"/"/t" traffic to, regardless of which Thread role -- CHILD, ROUTER, or
+ * LEADER -- it currently holds or how many hops separate them) -- see
+ * docs/power-base.md.
+ */
+esp_err_t thread_manager_get_mesh_local_eid(otIp6Address *out_addr);
 
 /* Non-blocking: true and fills *out_role if the role changed since the last
  * call (backed by a small queue fed from the OpenThread state-changed

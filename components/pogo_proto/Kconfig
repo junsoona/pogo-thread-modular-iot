@@ -60,4 +60,44 @@ menu "POGO UART Protocol"
         int "Max retries per pairing step"
         default 3
 
+    config POGO_ATTACH_SETTLE_MS
+        int "AUTO mode: settle time after DETECT_IN debounces attached, before the first handshake (ms)"
+        default 150
+        help
+            DETECT_IN can close a few ms before the UART/GND pogo contacts
+            fully seat during a real dock motion. A bounded, explicit delay
+            here (not a busy loop -- see pogo_port.c's PORT_STATE_ATTACH_SETTLE)
+            gives those contacts time to settle before the first HELLO_REQ is
+            sent, instead of racing a handshake against still-bouncing
+            contacts. Cancelled immediately (falls back to WAIT_ATTACH) if
+            DETECT_IN debounces back to detached during this window.
+
+    config POGO_HOTSWAP_COOLDOWN_MS
+        int "AUTO mode: cooldown before auto-retrying a transient handshake failure (ms)"
+        default 3000
+        help
+            DOCK_TIMEOUT and LIVENESS_LOST are transient: if DETECT_IN still
+            reads attached (no physical detach), a fresh handshake cycle
+            starts automatically after this cooldown instead of requiring a
+            new DETECT_IN edge -- covers a real dock where DETECT closes
+            before UART/GND, so the first handshake cycle times out with no
+            edge left to recover on. Cancelled immediately if DETECT_IN
+            debounces to detached during the cooldown. Configuration/
+            compatibility errors (PEER_TYPE_CONFLICT, PROTOCOL_VERSION_ERROR,
+            CAPABILITY_MISMATCH) are NOT covered by this -- those still
+            require a physical detach/reattach before retrying.
+
+    config POGO_DETECT_RECONCILE_MS
+        int "AUTO mode: DETECT_IN direct-read reconciliation interval (ms)"
+        default 500
+        help
+            Backstop against a missed GPIO ISR or a full detect_queue
+            (dropped edges, see pogo_port.c's detect_isr_drops counter): at
+            this interval, the port task directly re-reads DETECT_IN's raw
+            level and, if it disagrees with the level this port's debounce
+            state currently believes, injects a synthetic edge so the normal
+            debounce/commit path resynchronizes -- rather than staying
+            wedged on a stale committed level until some unrelated later
+            edge happens to correct it.
+
 endmenu

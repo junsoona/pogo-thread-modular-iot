@@ -121,21 +121,23 @@ bool pogo_unpack_join_result(const uint8_t *data, uint16_t len, pogo_join_result
 
 size_t pogo_pack_peer_hello(const pogo_peer_hello_t *in, uint8_t *out, size_t out_size)
 {
-    if (out_size < 2) {
+    if (out_size < 3) {
         return 0;
     }
     out[0] = in->protocol_version;
     out[1] = in->peer_type;
-    return 2;
+    out[2] = in->capabilities;
+    return 3;
 }
 
 bool pogo_unpack_peer_hello(const uint8_t *data, uint16_t len, pogo_peer_hello_t *out)
 {
-    if (len != 2) {
+    if (len != 3) {
         return false;
     }
     out->protocol_version = data[0];
     out->peer_type = data[1];
+    out->capabilities = data[2];
     return true;
 }
 
@@ -225,5 +227,41 @@ bool pogo_unpack_propose_uuid(const uint8_t *data, uint16_t len, pogo_propose_uu
         return false;
     }
     memcpy(out->uuid, data, POGO_UUID_LEN);
+    return true;
+}
+
+size_t pogo_pack_set_collector(const pogo_collector_endpoint_t *in, uint8_t *out, size_t out_size)
+{
+    if (out_size < POGO_COLLECTOR_ENDPOINT_WIRE_LEN) {
+        return 0;
+    }
+    size_t i = 0;
+    memcpy(&out[i], in->power_base_uuid, POGO_UUID_LEN);
+    i += POGO_UUID_LEN;
+    memcpy(&out[i], in->addr, POGO_COLLECTOR_ADDR_LEN);
+    i += POGO_COLLECTOR_ADDR_LEN;
+    out[i++] = (uint8_t)((in->port >> 8) & 0xFF);
+    out[i++] = (uint8_t)(in->port & 0xFF);
+    out[i++] = (uint8_t)((in->generation >> 24) & 0xFF);
+    out[i++] = (uint8_t)((in->generation >> 16) & 0xFF);
+    out[i++] = (uint8_t)((in->generation >> 8) & 0xFF);
+    out[i++] = (uint8_t)(in->generation & 0xFF);
+    return i;
+}
+
+bool pogo_unpack_set_collector(const uint8_t *data, uint16_t len, pogo_collector_endpoint_t *out)
+{
+    if (len != POGO_COLLECTOR_ENDPOINT_WIRE_LEN) {
+        return false;
+    }
+    size_t i = 0;
+    memcpy(out->power_base_uuid, &data[i], POGO_UUID_LEN);
+    i += POGO_UUID_LEN;
+    memcpy(out->addr, &data[i], POGO_COLLECTOR_ADDR_LEN);
+    i += POGO_COLLECTOR_ADDR_LEN;
+    out->port = (uint16_t)(((uint16_t)data[i] << 8) | data[i + 1]);
+    i += 2;
+    out->generation = ((uint32_t)data[i] << 24) | ((uint32_t)data[i + 1] << 16) | ((uint32_t)data[i + 2] << 8) |
+                       (uint32_t)data[i + 3];
     return true;
 }

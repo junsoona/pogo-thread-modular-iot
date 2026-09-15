@@ -14,6 +14,26 @@
 
 static const char *TAG = "parent_service";
 
+/*
+ * SENSOR_INFO_ACK.sensor_status is a raw wire byte (see pogo_protocol.h's
+ * own field comment) -- parent_service deliberately does NOT #include
+ * sensor_provider/sensor_provider.h for sensor_status_t itself: this
+ * component is reused verbatim by power_base/main/app_main.c, which has no
+ * sensor_provider/module_config component at all (see this file's own
+ * top-of-file comment). These two values are duplicated from
+ * sensor_provider.h's sensor_status_t on purpose, not #included, for that
+ * same reason.
+ *
+ * SENSOR_STATUS_CONDITIONING (child's PMS5003 driver still warming up, see
+ * components/pms5003/pms5003.c's CONFIG_POGO... warmup_ms handling) is not a
+ * failure: unlike every other non-zero sensor_status, provisioning continues
+ * normally with it -- see run_provisioning_session()'s own sensor_status
+ * check below. Any OTHER non-zero value still abandons the session exactly
+ * as before.
+ */
+#define PS_SENSOR_STATUS_OK          0
+#define PS_SENSOR_STATUS_CONDITIONING 7
+
 typedef enum {
     PS_STATE_IDLE = 0,
     PS_STATE_PROVISIONING,
@@ -293,11 +313,20 @@ static bool run_provisioning_session(void)
         ESP_LOGE(TAG, "malformed SENSOR_INFO_ACK -> abandoning session");
         return false;
     }
-    if (sinfo.sensor_status != 0) {
+    if (sinfo.sensor_status != PS_SENSOR_STATUS_OK && sinfo.sensor_status != PS_SENSOR_STATUS_CONDITIONING) {
         ESP_LOGW(TAG, "SENSOR_ERROR: child reports sensor_status=%u -> abandoning session (no polling calc, no "
                       "dataset handoff)",
                  sinfo.sensor_status);
         return false;
+    }
+    if (sinfo.sensor_status == PS_SENSOR_STATUS_CONDITIONING) {
+        /* Not fatal -- the child's sensor driver (e.g. PMS5003) is still
+         * warming up and will report SENSOR_STATUS_OK on its own once the
+         * warm-up window elapses (no re-provisioning needed). Continue the
+         * sequence normally: polling-period calc, SET_COLLECTOR, SET_DATASET
+         * and the Thread join all proceed exactly as for sensor_status==OK. */
+        ESP_LOGI(TAG, "child sensor still warming up (CONDITIONING) -- continuing provisioning; readings not yet "
+                      "fully trustworthy");
     }
     s_node.sensor_type_bitmap = sinfo.sensor_type_bitmap;
     s_node.response_time_ms = sinfo.response_time_ms;
@@ -324,6 +353,28 @@ static bool run_provisioning_session(void)
     }
     ESP_LOGI(TAG, "polling_period_ms=%u sent (from response_time_ms=%u)", (unsigned)period_ms,
              (unsigned)sinfo.response_time_ms);
+
+    /*
+     * SET_COLLECTOR (this follow-up, see docs/power-base.md): must succeed
+     * BEFORE SET_DATASET -- child_service itself also enforces this
+     * ordering (POGO_NACK_BAD_STATE for a SET_DATASET arriving before
+     * COLLECTOR_SET), but abandoning the session here too avoids even
+     * attempting SET_DATASET against a child that would only reject it.
+     */
+    pogo_collector_endpoint_t collector;
+    if (!s_provider.get_collector(&collector, s_provider.ctx)) {
+        ESP_LOGW(TAG, "collector endpoint not currently available -> abandoning session");
+        return false;
+    }
+    uint8_t collector_payload[POGO_COLLECTOR_ENDPOINT_WIRE_LEN];
+    size_t collector_len = pogo_pack_set_collector(&collector, collector_payload, sizeof(collector_payload));
+    if (!send_and_wait(POGO_MSG_SET_COLLECTOR, collector_payload, collector_len, POGO_MSG_ACK, POGO_MSG_NACK, &frame,
+                        max_retry, ack_timeout) ||
+        frame.type != POGO_MSG_ACK) {
+        log_nack_if_any(&frame);
+        ESP_LOGW(TAG, "SET_COLLECTOR failed -> abandoning session");
+        return false;
+    }
 
     otOperationalDatasetTlvs tlvs;
     if (thread_manager_get_active_dataset_tlvs(&tlvs) != ESP_OK) {
@@ -446,7 +497,7 @@ static void parent_service_task(void *arg)
 esp_err_t parent_service_init(const parent_service_context_t *provider)
 {
     if (provider == NULL || provider->provisioning_allowed == NULL || provider->get_own_depth == NULL ||
-        provider->get_own_uuid == NULL || provider->role_name == NULL) {
+        provider->get_own_uuid == NULL || provider->role_name == NULL || provider->get_collector == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     s_provider = *provider; /* owned copy -- same reasoning as child_service's s_cfg */

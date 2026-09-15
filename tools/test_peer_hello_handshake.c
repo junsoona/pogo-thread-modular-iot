@@ -72,8 +72,19 @@ static void port_init(port_t *p, const char *name, uint8_t own_type, int base_id
 static size_t make_frame(uint8_t type, uint8_t seq, uint8_t proto_version, uint8_t peer_type, uint8_t *buf,
                           size_t bufsize)
 {
-    pogo_peer_hello_t h = {.protocol_version = proto_version, .peer_type = peer_type};
-    uint8_t payload[2];
+    pogo_peer_hello_t h = {.protocol_version = proto_version,
+                            .peer_type = peer_type,
+                            .capabilities = POGO_HELLO_SUPPORTED_CAPABILITIES};
+    uint8_t payload[3];
+    size_t len = pogo_pack_peer_hello(&h, payload, sizeof(payload));
+    return pogo_frame_encode(type, seq, payload, len, buf, bufsize);
+}
+
+static size_t make_frame_with_capabilities(uint8_t type, uint8_t seq, uint8_t proto_version, uint8_t peer_type,
+                                            uint8_t capabilities, uint8_t *buf, size_t bufsize)
+{
+    pogo_peer_hello_t h = {.protocol_version = proto_version, .peer_type = peer_type, .capabilities = capabilities};
+    uint8_t payload[3];
     size_t len = pogo_pack_peer_hello(&h, payload, sizeof(payload));
     return pogo_frame_encode(type, seq, payload, len, buf, bufsize);
 }
@@ -103,6 +114,10 @@ static bool validate(port_t *p, const pogo_frame_t *frame, uint8_t *out_peer_typ
         return false;
     }
     if (base_id_present(p) && (base_id_says_power_base(p) != (h.peer_type == POGO_PEER_TYPE_POWER_BASE))) {
+        p->state = P_ERROR;
+        return false;
+    }
+    if ((h.capabilities & POGO_CAP_COLLECTOR_PROVISIONING) == 0) {
         p->state = P_ERROR;
         return false;
     }
@@ -309,6 +324,64 @@ static void scenario_split_frame(void)
     check(reply3_len > 0, "parser resyncs on the next valid frame after a corrupted one");
 }
 
+/* Capability negotiation (this follow-up, section 4): a peer whose HELLO is
+ * missing POGO_CAP_COLLECTOR_PROVISIONING -- either because it declares
+ * capabilities=0 explicitly, or because it is a legacy 2-byte HELLO payload
+ * that predates the capabilities field entirely -- is rejected cleanly at
+ * the handshake, never reaching PEER_READY. */
+static void scenario_capability_mismatch_rejected(void)
+{
+    printf("\n-- scenario: capability negotiation rejects an incompatible peer at the handshake --\n");
+    port_t p;
+    port_init(&p, "P", POGO_PEER_TYPE_MODULE, -1);
+    p.state = P_HANDSHAKE;
+
+    uint8_t frame_buf[64];
+    size_t len = make_frame_with_capabilities(POGO_MSG_PEER_HELLO_REQ, 1, POGO_FRAME_VERSION, POGO_PEER_TYPE_MODULE,
+                                               /*capabilities=*/0, frame_buf, sizeof(frame_buf));
+    pogo_frame_parser_t parser;
+    pogo_frame_parser_init(&parser);
+    pogo_frame_t decoded = {0};
+    bool got = false;
+    for (size_t i = 0; i < len; i++) {
+        if (pogo_frame_parser_feed(&parser, frame_buf[i], &decoded)) {
+            got = true;
+        }
+    }
+    check(got, "the malformed-capability HELLO frame itself still decodes structurally");
+    uint8_t out_peer_type;
+    bool valid = validate(&p, &decoded, &out_peer_type);
+    check(!valid, "a HELLO declaring capabilities=0 (missing POGO_CAP_COLLECTOR_PROVISIONING) is rejected");
+    check(p.state == P_ERROR, "the port moves to ERROR, not PEER_READY, on a capability mismatch");
+
+    /* A legacy (pre-capability-negotiation) 2-byte HELLO payload: this
+     * firmware's pogo_unpack_peer_hello() requires exactly 3 bytes now, so
+     * this fails to even decode as a well-formed pogo_peer_hello_t --
+     * mirrors pogo_port.c's validate_incoming_hello() treating a
+     * frame->len==2 HELLO as an explicit POGO_PORT_ERR_CAPABILITY_MISMATCH
+     * rather than silently ignoring it as generic malformed input. */
+    uint8_t legacy_payload[2] = {POGO_FRAME_VERSION, POGO_PEER_TYPE_MODULE};
+    uint8_t legacy_frame_buf[64];
+    size_t legacy_len =
+        pogo_frame_encode(POGO_MSG_PEER_HELLO_REQ, 1, legacy_payload, sizeof(legacy_payload), legacy_frame_buf,
+                           sizeof(legacy_frame_buf));
+    pogo_frame_parser_t legacy_parser;
+    pogo_frame_parser_init(&legacy_parser);
+    pogo_frame_t legacy_decoded = {0};
+    bool legacy_got = false;
+    for (size_t i = 0; i < legacy_len; i++) {
+        if (pogo_frame_parser_feed(&legacy_parser, legacy_frame_buf[i], &legacy_decoded)) {
+            legacy_got = true;
+        }
+    }
+    check(legacy_got, "a legacy 2-byte HELLO frame still decodes at the FRAME level (POGO_FRAME_VERSION unchanged)");
+    pogo_peer_hello_t legacy_hello;
+    bool legacy_unpack_ok = pogo_unpack_peer_hello(legacy_decoded.payload, legacy_decoded.len, &legacy_hello);
+    check(!legacy_unpack_ok, "pogo_unpack_peer_hello() rejects a legacy 2-byte payload -- it now requires 3 bytes");
+    check(legacy_decoded.len == 2, "the legacy frame's payload length is exactly 2, the signal pogo_port.c uses to "
+                                    "distinguish this case from other malformed input");
+}
+
 int main(void)
 {
     scenario_simultaneous();
@@ -316,6 +389,7 @@ int main(void)
     scenario_staggered("LEAF", "ROOT");
     scenario_one_side_reboots();
     scenario_split_frame();
+    scenario_capability_mismatch_rejected();
 
     printf("\n%d/%d checks passed\n", g_checks - g_failures, g_checks);
     if (g_failures == 0) {

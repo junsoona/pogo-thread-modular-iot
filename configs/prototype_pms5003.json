@@ -1,0 +1,42 @@
+{
+  "_comment": "Terminal AUTO-mode module for a permanently-paired Plantower PMS5003. UART1/GPIO10/11 are reassigned from the downstream POGO face to the sensor, so downstream_port is deliberately and completely disabled. This module can only be a terminal LEAF.",
+
+  "schema_version": 2,
+  "config_revision": 1,
+
+  "driver_id": "PMS5003",
+  "sensor_type_bitmap": ["PM1_0", "PM2_5", "PM10"],
+
+  "bus_type": "UART",
+  "bus_number": 1,
+  "i2c_sda_gpio": -1,
+  "i2c_scl_gpio": -1,
+  "i2c_address": 0,
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "uart_tx_gpio": 10,
+  "uart_rx_gpio": 11,
+  "uart_baud_rate": 9600,
+  "uart_mode": "PASSIVE",
+  "uart_warmup_ms": 30000,
+  "calibration": [0, 0, 0, 0],
+  "measurement_timeout_ms": 3000,
+
+  "dev_mode": "AUTO",
+
+  "upstream_port": {
+    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "Terminal-only invariant: every downstream hardware field is -1. GPIO10/11 and UART1 belong exclusively to PMS5003 on this board.",
+  "downstream_port": {
+    "uart_num": -1, "tx_gpio": -1, "rx_gpio": -1,
+    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

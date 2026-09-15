@@ -18,7 +18,7 @@
 #include "role_manager/role_manager.h"
 #include "child_service/child_service.h"
 #include "sensor_service/sensor_service.h"
-#include "thread_manager/thread_manager.h"
+#include "collector_endpoint/collector_endpoint.h"
 #include "node_calc/node_calc.h"
 #include "topology_gate/topology_gate.h"
 
@@ -204,17 +204,20 @@ static void coap_response_handler(void *ctx_v, otMessage *message, const otMessa
 }
 
 /* One Confirmable POST attempt to the current Leader (the power base is
- * always Leader in this topology, same reasoning as sensor_transport.c).
- * Fails fast if Thread is not currently joined. Success requires BOTH the
- * OpenThread transport to report OT_ERROR_NONE AND the power base's actual
- * CoAP response code to be 2.xx (code review follow-up section 3) -- a
- * 4.xx/5.xx response means the report was rejected, not merely "arrived". */
+ * sent to the collector endpoint, same reasoning as sensor_transport.c).
+ * Fails fast if no collector endpoint is currently valid. Success requires
+ * BOTH the OpenThread transport to report OT_ERROR_NONE AND the power
+ * base's actual CoAP response code to be 2.xx (code review follow-up
+ * section 3) -- a 4.xx/5.xx response means the report was rejected, not
+ * merely "arrived". */
 static bool send_one_attempt(const uint8_t *payload, size_t len)
 {
-    otIp6Address leader_addr;
-    if (thread_manager_get_leader_address(&leader_addr) != ESP_OK) {
+    collector_endpoint_snapshot_t collector;
+    if (!collector_endpoint_get(&collector) || !collector.valid) {
         return false;
     }
+    otIp6Address dest_addr;
+    memcpy(dest_addr.mFields.m8, collector.addr, sizeof(dest_addr.mFields.m8));
 
     uint32_t my_token;
     taskENTER_CRITICAL(&s_send_lock);
@@ -242,8 +245,8 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
             }
             if (err == OT_ERROR_NONE) {
                 otMessageInfo info = {0};
-                info.mPeerAddr = leader_addr;
-                info.mPeerPort = OT_DEFAULT_COAP_PORT;
+                info.mPeerAddr = dest_addr;
+                info.mPeerPort = collector.port;
                 /* mMaxRetransmit=0: this component's own retry/backoff loop
                  * (below) owns retries, same reasoning as sensor_transport.c. */
                 otCoapTxParameters tx = {
