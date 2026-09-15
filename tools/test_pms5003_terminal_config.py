@@ -23,7 +23,7 @@ def main():
     checks.append((len(blob) == 104, "schema-v2 blob is 104 bytes"))
     checks.append((struct.unpack_from(">I", blob, 0)[0] == 2, "schema_version=2 is encoded"))
     checks.append((blob[14] == packer.BUS_TYPES["UART"], "bus_type=UART is encoded"))
-    checks.append((struct.unpack_from(">hh", blob, 54) == (10, 11), "UART GPIO10/11 are encoded"))
+    checks.append((struct.unpack_from(">hh", blob, 54) == (0, 1), "UART GPIO0/1 are encoded"))
     checks.append((struct.unpack_from(">I", blob, 58)[0] == 9600, "UART baud=9600 is encoded"))
     checks.append((blob[62] == packer.UART_MODES["PASSIVE"], "PASSIVE mode is encoded"))
     checks.append((struct.unpack_from(">I", blob, 64)[0] == 30000, "30-second warm-up is encoded"))

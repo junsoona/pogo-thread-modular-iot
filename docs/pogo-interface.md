@@ -428,8 +428,9 @@ mechanism; the handshake and AUTO-mode recovery policy are unchanged.
 
 PMS5003 is the chain's terminal sensor, so its module never needs a
 DOWNSTREAM POGO face. `configs/prototype_pms5003.json` assigns UART0 and
-GPIO4/5 to UPSTREAM POGO as usual, assigns UART1 and GPIO10/11 to PMS5003 at
-9600 8N1, and fully disables every downstream port field. Config validation
+GPIO4/5 to UPSTREAM POGO as usual, assigns UART1 and GPIO0/1 to PMS5003
+(GPIO0=ESP TX->PMS RX, GPIO1=ESP RX<-PMS TX) at 9600 8N1, and fully disables
+every downstream port field. Config validation
 rejects any UART-sensor image that also enables downstream, or that collides
 with the upstream UART/GPIOs; this module therefore remains a LEAF and can
 never become INTERMEDIATE.

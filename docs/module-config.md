@@ -104,7 +104,7 @@ bash tools/gen_config.sh build/cfg_images
 ```
 
 `prototype_pms5003.json` is the terminal-only exception to the shared
-two-port I2C prototype profile. It uses schema v2, UART1/GPIO10/11 at 9600
+two-port I2C prototype profile. It uses schema v2, UART1/GPIO0/1 at 9600
 baud in PASSIVE mode, a 30-second warm-up marker, and a fully disabled
 downstream port. The packer and runtime loader both reject a PMS5003 config
 that violates any of those ownership rules.

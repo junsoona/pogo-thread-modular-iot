@@ -718,7 +718,7 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   하지 않았다**. `sensor_provider_register()`로 등록만 되어 있고, `configs/prototype_*.json`
   어느 쪽 보드에도 아직 SGP40/SGP41을 `driver_id`로 지정하지 않았다 (필요하면 세 번째/네 번째
   보드용 config를 SHT45/BH1750 config와 동일한 POGO 포트 블록으로 복사해 만들면 된다).
-- **PMS5003**: terminal 모듈에서는 downstream POGO를 완전히 비활성화하고 UART1/GPIO10/11을
+- **PMS5003**: terminal 모듈에서는 downstream POGO를 완전히 비활성화하고 UART1/GPIO0/1을
   센서에 전용한다. 9600 8N1, ACTIVE/PASSIVE 명령, checksum parser, 30초 warm-up 상태,
   PM1.0/PM2.5/PM10 채널 전송이 구현되어 있다. 실물 배선/측정 검증은 남아 있다.
 

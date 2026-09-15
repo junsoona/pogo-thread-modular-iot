@@ -2,10 +2,11 @@
  * PMS5003 sensor_provider interface (section 11 of the follow-up spec).
  *
  * PMS5003 UART sensor_provider. It is intentionally terminal-only: UART1
- * and GPIO10/11 are borrowed from the otherwise-disabled DOWNSTREAM POGO
- * face, while UART0 remains the live UPSTREAM link. module_config validates
- * this exclusivity before the driver starts, so an INTERMEDIATE topology
- * can never silently lose its downstream POGO connection to the sensor.
+ * uses GPIO0/1 (GPIO0=ESP TX->PMS RX, GPIO1=ESP RX<-PMS TX) for the sensor
+ * signal, while UART0 remains the live UPSTREAM link and the downstream
+ * POGO face (UART1/GPIO10-11) stays disabled. module_config validates this
+ * exclusivity before the driver starts, so an INTERMEDIATE topology can
+ * never silently lose its downstream POGO connection to the sensor.
  */
 #pragma once
 

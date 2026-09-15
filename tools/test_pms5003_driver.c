@@ -61,8 +61,8 @@ static module_config_t base_valid_config(void)
     cfg.driver_id = SENSOR_DRIVER_ID_PMS5003;
     cfg.bus_type = MODULE_BUS_UART;
     cfg.bus_number = PMS_UART;
-    cfg.uart_tx_gpio = 10;
-    cfg.uart_rx_gpio = 11;
+    cfg.uart_tx_gpio = 0;
+    cfg.uart_rx_gpio = 1;
     cfg.uart_baud_rate = 9600; /* PMS5003_REQUIRED_BAUD_RATE */
     cfg.uart_mode = MODULE_UART_MODE_PASSIVE;
     cfg.uart_warmup_ms = 0; /* not under test here -- see requirement 2's conditioning test */
@@ -71,7 +71,7 @@ static module_config_t base_valid_config(void)
     return cfg;
 }
 
-/* --- Scenario: config validation (UART1/GPIO10-11/9600 8N1, terminal-only) --- */
+/* --- Scenario: config validation (UART1/GPIO0-1/9600 8N1, terminal-only) --- */
 static void scenario_config_validation(void)
 {
     printf("\n-- scenario: pms5003_init()'s own config validation --\n");
@@ -103,7 +103,7 @@ static void scenario_config_validation(void)
 
     module_config_t good = base_valid_config();
     esp_err_t err = g_pms5003_provider_ops.init(&good, &ctx);
-    CHECK(err == ESP_OK && ctx != NULL, "accepts UART1/GPIO10 TX/GPIO11 RX/9600-8N1/terminal-only");
+    CHECK(err == ESP_OK && ctx != NULL, "accepts UART1/GPIO0 TX/GPIO1 RX/9600-8N1/terminal-only");
     if (err == ESP_OK) {
         g_pms5003_provider_ops.deinit(ctx);
     }

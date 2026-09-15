@@ -233,7 +233,7 @@ components/
                               unmodified Sensirion Gas Index Algorithm (see
                               components/sensirion_gas_index_algorithm/THIRD_PARTY_NOTICE.md)
                               and share components/sensirion_crc8's word CRC.
-                              pms5003 is a terminal-only UART1/GPIO10/11
+                              pms5003 is a terminal-only UART1/GPIO0/1
                               provider with active/passive commands, warm-up
                               status, and a host-tested 32-byte frame parser;
                               its downstream POGO port is disabled by config.
