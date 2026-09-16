@@ -304,8 +304,10 @@ sensor_service_init() -- one self-calibration measurement (doubles as the
                           anyone) still has one.
 child_service: POLL_CONFIG received -> effective = sensor_service_compute_effective_period_ms(received)
                                      -> sensor_service_set_polling_period_ms(effective)
-                                     -> s_polling_period_ms = effective (same value used for
-                                        otLinkSetPollPeriod() once JOINING starts)
+                                     -> s_polling_period_ms = effective (sensor measurement
+                                        period ONLY -- see "SED CoAP response timing
+                                        correction" below for why this is NEVER passed to
+                                        otLinkSetPollPeriod() any more)
 sensor_service's periodic task, every effective_polling_period_ms:
   measure via sensor_service_measure_once() (same mutex as SENSOR_HELLO)
     -> role==ROOT: sensor_service_root_record_sample() (local aggregator, no wireless hop)
@@ -327,6 +329,59 @@ retries (4 attempts total), always resending the same `sample_seq`'s
 already-packed bytes. `otCoapTxParameters.mMaxRetransmit=0` disables
 OpenThread's own CoAP retransmission so it never compounds with this
 application-level schedule.
+
+### SED CoAP response timing correction (real-hardware finding)
+
+**Real-hardware observation** (Power Base + Linux OTBR external Dataset join
++ 3-tier chain, PMS5003 LEAF): `sensor_transport`/`topology_reporter` logged
+repeated `sample delivery unconfirmed after 4 attempts`/topology-report
+timeouts even though the power base's own log showed the exact same
+`sample_seq` already stored -- not data loss, but the SENDING side giving
+up on its own wait before ever hearing back. Root cause: this LEAF's Thread
+SED MAC data-poll period (`otLinkSetPollPeriod()`) was, at the time,
+accidentally coupled to its sensor measurement period (the SAME
+`s_polling_period_ms` fed both) -- observed at 3528ms. A SED only receives
+a queued response from its parent on its own next data poll, so a
+multi-second poll period could easily land AFTER the CoAP client's
+semaphore wait (1000ms ACK timeout * 3 at the time) had already given up,
+even though the response was sitting there the whole time.
+
+Fix: the two periods are now fully decoupled.
+
+- **Sensor measurement period**: unchanged wire format/formula (the table
+  above), still flows through `s_polling_period_ms` ->
+  `sensor_service_set_polling_period_ms()` exactly as before.
+- **Thread SED data-poll period**: now its OWN, independent value
+  (`thread_manager_join_with_dataset()`'s `thread_data_poll_period_ms`
+  parameter -- `child_service.c` always passes `0`, meaning "use
+  `components/thread_manager`'s own Kconfig default,
+  `CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS`, 500ms"). `child_service.c`
+  never derives this from `s_polling_period_ms` any more.
+- **CoAP ACK timeout**: raised from 1000ms to
+  `CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS` (2000ms default,
+  `components/coap_response_timing/Kconfig`), and shared by
+  `sensor_transport.c`/`topology_reporter.c` via ONE Kconfig symbol instead
+  of two independently-copied literals.
+- **Response-wait bound**: both components now derive their
+  `xSemaphoreTake()` wait via `coap_response_timing_wait_ms()`
+  (`components/coap_response_timing`, overflow-safe 64-bit arithmetic,
+  host-tested in isolation) instead of a bare `ACK_TIMEOUT_MS * 3` guess --
+  `ack_timeout_ms * ack_random_factor_num / ack_random_factor_den + margin`,
+  where the margin is `ack_timeout_ms` itself.
+- With the production defaults (data-poll 500ms, ACK timeout 2000ms), a SED
+  polls roughly 4x within one CoAP exchange's own worst-case ACK-wait
+  window (3000ms), making a queued response virtually certain to be picked
+  up well before either side gives up.
+- Log wording: `sample dropped after N attempts` /
+  `topology report dropped after N attempts` -> `sample delivery
+  unconfirmed after N attempts` / `topology report delivery unconfirmed
+  after N attempts` -- an unanswered attempt is NOT a claim that the power
+  base never stored it (its own `sample_seq`/generation dedup is still what
+  actually determines that).
+
+This correction is implemented and host-tested (see the final report for
+the exact test list) but **not yet re-verified on real hardware** -- see
+`docs/validation-status.md`.
 
 ROOT's CoAP resource handler unpacks the sample and calls
 `sensor_service_root_record_sample()`, which dedups by

@@ -7,6 +7,19 @@
  * see parent_service.c's run_provisioning_session() and this test's own
  * PS_SENSOR_STATUS_CONDITIONING comment there.
  *
+ * ALSO covers this follow-up's SED CoAP response timing correction's core
+ * regression test (real-hardware finding: a LEAF's own Thread SED data-poll
+ * period must never be derived from its sensor measurement period -- see
+ * components/coap_response_timing and thread_manager.h's comment on
+ * thread_manager_join_with_dataset()): PART A's real end-to-end run snoops
+ * the real, dynamically-computed polling_period_ms the real parent_service.c
+ * actually sends over the wire in POGO_MSG_POLL_CONFIG, and (via
+ * tools/host_test_stubs/host_thread_manager_sim.c's new call-recording)
+ * confirms the real child_service.c passes thread_data_poll_period_ms=0 to
+ * the (stubbed) thread_manager_join_with_dataset() -- proving the two
+ * periods are genuinely decoupled using a REAL dynamically-measured value,
+ * not a hardcoded literal.
+ *
  * PART A links and runs the REAL, UNMODIFIED components/child_service/
  * child_service.c, components/parent_service/parent_service.c,
  * components/sensor_service/sensor_service.c, components/pms5003/pms5003.c +
@@ -88,6 +101,11 @@
  * and host_role_manager_sim.c -- not part of any real production header. */
 extern void host_thread_manager_test_reset(void);
 extern void host_thread_manager_test_set_join_outcome(bool fail, otDeviceRole success_role, unsigned delay_ms);
+/* This follow-up (SED CoAP response timing correction): what the LAST real
+ * thread_manager_join_with_dataset() call actually received. */
+extern uint32_t host_thread_manager_test_get_last_poll_period_ms(void);
+extern uint16_t host_thread_manager_test_get_last_dataset_len(void);
+extern int host_thread_manager_test_get_join_call_count(void);
 extern void host_role_manager_test_set_role(module_role_t role);
 
 static int g_failures = 0;
@@ -117,6 +135,15 @@ static pthread_mutex_t s_observe_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool s_saw_sensor_info_ack = false;
 static uint8_t s_sensor_info_ack_status = 0xFF;
 static bool s_saw_join_result_ack = false;
+/* This follow-up (SED CoAP response timing correction): the real
+ * polling_period_ms the real parent_service.c actually computed (from a
+ * real measured response_time_ms, node_calc_polling_period_ms()) and sent
+ * over the wire in POGO_MSG_POLL_CONFIG -- captured to prove it is NEVER
+ * the same value handed to thread_manager_join_with_dataset() (see
+ * host_thread_manager_test_get_last_poll_period_ms()). */
+static bool s_saw_poll_config = false;
+static uint32_t s_poll_config_period_ms = 0;
+static uint16_t s_dataset_len_from_set_dataset = 0;
 
 static void *bridge_child_to_parent(void *arg)
 {
@@ -155,10 +182,24 @@ static void *bridge_parent_to_child(void *arg)
         }
         host_uart_test_push_rx(CHILD_UART, &b, 1);
         pogo_frame_t frame;
-        if (pogo_frame_parser_feed(&parser, b, &frame) && frame.type == POGO_MSG_JOIN_RESULT_ACK) {
-            pthread_mutex_lock(&s_observe_mutex);
-            s_saw_join_result_ack = true;
-            pthread_mutex_unlock(&s_observe_mutex);
+        if (pogo_frame_parser_feed(&parser, b, &frame)) {
+            if (frame.type == POGO_MSG_JOIN_RESULT_ACK) {
+                pthread_mutex_lock(&s_observe_mutex);
+                s_saw_join_result_ack = true;
+                pthread_mutex_unlock(&s_observe_mutex);
+            } else if (frame.type == POGO_MSG_POLL_CONFIG) {
+                pogo_poll_config_t poll_msg;
+                if (pogo_unpack_poll_config(frame.payload, frame.len, &poll_msg)) {
+                    pthread_mutex_lock(&s_observe_mutex);
+                    s_saw_poll_config = true;
+                    s_poll_config_period_ms = poll_msg.polling_period_ms;
+                    pthread_mutex_unlock(&s_observe_mutex);
+                }
+            } else if (frame.type == POGO_MSG_SET_DATASET) {
+                pthread_mutex_lock(&s_observe_mutex);
+                s_dataset_len_from_set_dataset = frame.len;
+                pthread_mutex_unlock(&s_observe_mutex);
+            }
         }
     }
     return NULL;
@@ -316,6 +357,45 @@ static void part_a_real_end_to_end(void)
     CHECK(saw_join_ack,
           "the parent accepted CONDITIONING and drove the ENTIRE real sequence through to JOIN_RESULT_ACK "
           "(POLL_CONFIG, SET_COLLECTOR, SET_DATASET, and a real Thread join all happened)");
+
+    /*
+     * This follow-up (SED CoAP response timing correction, real-hardware
+     * finding: a LEAF's own Thread SED data-poll period must never be
+     * derived from its sensor measurement period): the real parent_service.c
+     * computed and sent a real, dynamically-derived polling_period_ms over
+     * the wire (node_calc_polling_period_ms(), from a REAL measured
+     * response_time_ms in this same process -- not a hardcoded literal, so
+     * this proves the general decoupling property rather than one magic
+     * number). The real child_service.c must accept that value for its OWN
+     * sensor measurement period, while passing thread_data_poll_period_ms=0
+     * (this component's Kconfig default -- see
+     * CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS,
+     * components/thread_manager) to the REAL
+     * thread_manager_join_with_dataset() call -- never the sensor period.
+     */
+    pthread_mutex_lock(&s_observe_mutex);
+    bool saw_poll_config = s_saw_poll_config;
+    uint32_t sent_polling_period_ms = s_poll_config_period_ms;
+    uint16_t dataset_len_observed = s_dataset_len_from_set_dataset;
+    pthread_mutex_unlock(&s_observe_mutex);
+
+    CHECK(saw_poll_config, "a real POGO_MSG_POLL_CONFIG crossed the wire during provisioning");
+    CHECK(sent_polling_period_ms > 0,
+          "the real parent_service.c sent a real, dynamically-computed (non-zero) sensor measurement period");
+    CHECK(host_thread_manager_test_get_join_call_count() >= 1,
+          "the real child_service.c actually called thread_manager_join_with_dataset() at least once");
+    CHECK(host_thread_manager_test_get_last_poll_period_ms() == 0,
+          "child_service.c passes thread_data_poll_period_ms=0 (this component's own Kconfig default resolution, "
+          "CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS) to thread_manager_join_with_dataset() -- NEVER the "
+          "sensor's own polling_period_ms, regardless of what value POLL_CONFIG carried");
+    CHECK(sent_polling_period_ms != host_thread_manager_test_get_last_poll_period_ms(),
+          "the sensor measurement period actually used (from the wire) and the Thread data poll period actually "
+          "applied are never the same value -- the two are genuinely decoupled, not just renamed");
+    CHECK(dataset_len_observed > 0, "a real, non-empty SET_DATASET payload crossed the wire");
+    CHECK(host_thread_manager_test_get_last_dataset_len() == dataset_len_observed,
+          "the Dataset TLV length passed to thread_manager_join_with_dataset() still matches the real "
+          "SET_DATASET payload actually received -- decoupling the poll period changed nothing about Dataset "
+          "delivery itself");
 
     /* Bullet: after the warm-up window elapses, the SAME session's driver
      * autonomously reports OK -- no re-provisioning, no reboot. */

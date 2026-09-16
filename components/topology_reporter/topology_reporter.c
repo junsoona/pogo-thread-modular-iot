@@ -21,13 +21,19 @@
 #include "collector_endpoint/collector_endpoint.h"
 #include "node_calc/node_calc.h"
 #include "topology_gate/topology_gate.h"
+#include "coap_response_timing/coap_response_timing.h"
 
 static const char *TAG = "topology_reporter";
 
 #define TOPOLOGY_REPORT_URI_PATH "t"
 #define TOPOLOGY_REPORTER_MAX_RETRIES 3
 #define TOPOLOGY_REPORTER_MAX_ATTEMPTS (1 + TOPOLOGY_REPORTER_MAX_RETRIES)
-#define TOPOLOGY_REPORTER_ACK_TIMEOUT_MS 1000
+/* Shared with sensor_transport.c -- ONE Kconfig source of truth (this
+ * follow-up: SED CoAP response timing correction, see
+ * components/coap_response_timing's own header comment for the
+ * real-hardware finding behind this and why it must stay comfortably
+ * LONGER than a LEAF's own Thread data-poll period). */
+#define TOPOLOGY_REPORTER_ACK_TIMEOUT_MS CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS
 #define TOPOLOGY_REPORTER_POLL_TICK_MS 500
 #define TOPOLOGY_REPORTER_NVS_NAMESPACE "topo_rep"
 #define TOPOLOGY_REPORTER_NVS_KEY "boot_gen"
@@ -251,8 +257,8 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
                  * (below) owns retries, same reasoning as sensor_transport.c. */
                 otCoapTxParameters tx = {
                     .mAckTimeout = TOPOLOGY_REPORTER_ACK_TIMEOUT_MS,
-                    .mAckRandomFactorNumerator = 3,
-                    .mAckRandomFactorDenominator = 2,
+                    .mAckRandomFactorNumerator = COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
+                    .mAckRandomFactorDenominator = COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN,
                     .mMaxRetransmit = 0,
                 };
                 err = otCoapSendRequestWithParameters(instance, message, &info, coap_response_handler,
@@ -276,7 +282,15 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
     }
 
     bool ok = false;
-    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(TOPOLOGY_REPORTER_ACK_TIMEOUT_MS * 3)) == pdTRUE) {
+    /* Correctly derived (never a bare "ack_timeout * N" guess) from the SAME
+     * tx params just above via components/coap_response_timing's shared
+     * helper -- see sensor_transport.c's identical use of this same
+     * function for the real-hardware finding this replaced. */
+    uint32_t wait_ms = coap_response_timing_wait_ms(TOPOLOGY_REPORTER_ACK_TIMEOUT_MS,
+                                                      COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
+                                                      COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN,
+                                                      TOPOLOGY_REPORTER_ACK_TIMEOUT_MS);
+    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
         if (s_send_result == OT_ERROR_NONE && s_send_got_message) {
             uint8_t code_class = (uint8_t)(s_send_response_code >> 5);
             if (code_class == 2) {
@@ -325,8 +339,13 @@ static bool transmit(const topology_report_t *rep)
             return true;
         }
     }
-    ESP_LOGW(TAG, "topology report dropped after %d attempts (type=%u seq=%u)", TOPOLOGY_REPORTER_MAX_ATTEMPTS,
-             rep->report_type, (unsigned)rep->sequence);
+    /* NOT a claim that the report was actually lost -- only that THIS SENDER
+     * never received a confirmed 2.xx response within
+     * TOPOLOGY_REPORTER_MAX_ATTEMPTS attempts (same reasoning as
+     * sensor_transport.c's identical wording change, this follow-up). The
+     * power base may have already applied it. */
+    ESP_LOGW(TAG, "topology report delivery unconfirmed after %d attempts (type=%u seq=%u)",
+             TOPOLOGY_REPORTER_MAX_ATTEMPTS, rep->report_type, (unsigned)rep->sequence);
     return false;
 }
 

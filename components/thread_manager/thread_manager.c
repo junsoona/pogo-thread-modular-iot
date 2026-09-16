@@ -257,7 +257,7 @@ esp_err_t thread_manager_start_as_always_on_ftd_with_dataset(const uint8_t *data
 }
 
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,
-                                            uint16_t dataset_len, uint32_t poll_period_ms)
+                                            uint16_t dataset_len, uint32_t thread_data_poll_period_ms)
 {
     if (dataset_tlvs == NULL || dataset_len == 0 || dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
         ESP_LOGE(TAG, "thread_manager_join_with_dataset: rejecting dataset (tlvs=%s len=%u)",
@@ -314,13 +314,21 @@ esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uin
             break;
         }
         if (role == THREAD_MANAGER_ROLE_LEAF) {
-            uint32_t period = (poll_period_ms > 0) ? poll_period_ms : CONFIG_THREAD_MANAGER_DEFAULT_LEAF_POLL_PERIOD_MS;
+            /* Thread SED MAC data poll period ONLY -- never a sensor
+             * measurement/sampling period, see this function's own header
+             * comment (thread_manager.h) for why the two must never be
+             * coupled again. */
+            uint32_t period = (thread_data_poll_period_ms > 0) ? thread_data_poll_period_ms
+                                                                 : CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS;
             if (otLinkSetPollPeriod(instance, period) != OT_ERROR_NONE) {
                 ESP_LOGE(TAG, "otLinkSetPollPeriod(%u) failed", (unsigned)period);
                 result = ESP_FAIL;
                 break;
             }
-            ESP_LOGI(TAG, "LEAF link mode: router_eligible=false rx-on-when-idle=false poll_period=%ums", period);
+            ESP_LOGI(TAG, "LEAF link mode: router_eligible=false rx-on-when-idle=false "
+                          "thread_data_poll_period_ms=%u (independent of this module's own sensor measurement "
+                          "period)",
+                     (unsigned)period);
         } else {
             ESP_LOGI(TAG, "INTERMEDIATE link mode: router_eligible=true full FTD");
         }

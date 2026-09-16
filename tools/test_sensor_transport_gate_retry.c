@@ -5,16 +5,28 @@
  * right before each send, abort the CURRENT sample's remaining retries the
  * instant a 4.04/4.12 response closes the gate, never send a further "/s"
  * request while the gate stays closed, and log that abort at DEBUG rather
- * than the "dropped after N attempts" WARN a genuine delivery failure gets).
+ * than the "delivery unconfirmed after N attempts" WARN a genuine
+ * non-gate delivery failure gets).
+ *
+ * ALSO covers (this follow-up: SED CoAP response timing correction, real-
+ * hardware finding -- see components/coap_response_timing's own header
+ * comment) the corrected response-wait timing itself: a delayed-but-within-
+ * window 2.xx response still succeeds on the FIRST attempt (no unnecessary
+ * retry), a genuinely unanswered request becomes a bounded (never hung)
+ * failure after this component's own derived wait, and a late callback for
+ * an attempt this component already gave up on never corrupts a LATER
+ * attempt's own result (token-staleness guard, exercised with REAL
+ * wall-clock delayed callbacks this time, not just synchronous ones).
  *
  * Links against the REAL, unmodified sensor_transport.c,
  * components/collector_endpoint/collector_endpoint.c,
- * components/topology_gate/topology_gate.c, components/node_calc/node_calc.c
- * and components/sensor_channel/sensor_channel.c -- sensor_transport.c's own
- * retry/backoff/gate logic runs completely unmodified. The only things NOT
- * real here are the OpenThread CoAP client + esp_openthread instance/lock
- * themselves (tools/host_test_stubs/host_ot_coap_sim.c, a stand-in for the
- * Thread-radio hardware dependency, same category as
+ * components/topology_gate/topology_gate.c, components/node_calc/node_calc.c,
+ * components/sensor_channel/sensor_channel.c, and (this follow-up)
+ * components/coap_response_timing/coap_response_timing.c -- sensor_transport.c's
+ * own retry/backoff/gate/timing logic runs completely unmodified. The only
+ * things NOT real here are the OpenThread CoAP client + esp_openthread
+ * instance/lock themselves (tools/host_test_stubs/host_ot_coap_sim.c, a
+ * stand-in for the Thread-radio hardware dependency, same category as
  * host_thread_manager_sim.c already uses for thread_manager.c) and the one
  * sensor_service.h symbol sensor_transport.c's UNUSED-by-this-test
  * ROOT-side handler references (tools/host_test_stubs/host_sensor_service_root_stub.c).
@@ -22,20 +34,29 @@
  * why sensor_transport.c itself (real OpenThread/FreeRTOS calls) cannot be
  * host-compiled any more directly than that.
  *
+ * CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS comes from
+ * tools/host_test_stubs/pogo_fast/sdkconfig.h (40ms here vs. production's
+ * real 2000ms default -- same "much smaller so a real-timing host test
+ * finishes fast" convention that file's own header comment already
+ * documents for CONFIG_POGO_*), so this test's derived wait is
+ * coap_response_timing_wait_ms(40, 3, 2, 40) = 100ms; scenario comments
+ * below reference that value directly.
+ *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -pthread \
- *      -I tools/host_test_stubs -I components/sensor_transport/include \
+ *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs \
+ *      -I components/sensor_transport/include \
  *      -I components/sensor_channel/include -I components/sensor_service/include \
  *      -I components/collector_endpoint/include -I components/node_calc/include \
  *      -I components/topology_gate/include -I components/module_config/include \
  *      -I components/sensor_provider/include -I components/role_manager/include \
  *      -I components/pogo_port/include -I components/pogo_proto/include \
- *      -I components/sensor_root_aggregator/include \
+ *      -I components/sensor_root_aggregator/include -I components/coap_response_timing/include \
  *      -o /tmp/test_sensor_transport_gate_retry tools/test_sensor_transport_gate_retry.c \
  *      components/sensor_transport/sensor_transport.c \
  *      components/collector_endpoint/collector_endpoint.c \
  *      components/topology_gate/topology_gate.c components/node_calc/node_calc.c \
- *      components/sensor_channel/sensor_channel.c \
+ *      components/sensor_channel/sensor_channel.c components/coap_response_timing/coap_response_timing.c \
  *      tools/host_test_stubs/host_ot_coap_sim.c tools/host_test_stubs/host_sensor_service_root_stub.c \
  *   && /tmp/test_sensor_transport_gate_retry
  */
@@ -44,6 +65,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "sensor_transport/sensor_transport.h"
 #include "sensor_channel/sensor_channel.h"
@@ -194,8 +216,8 @@ static void scenario_resumes_after_reregistration_succeeds(void)
 
 /*
  * Item 4: the mid-retry gate-close abort must be logged at DEBUG, never the
- * "sample dropped after N attempts" WARN a genuine (non-gate) delivery
- * failure gets. Captures this process's own stderr (esp_log.h's host stub
+ * "sample delivery unconfirmed after N attempts" WARN a genuine (non-gate)
+ * delivery failure gets. Captures this process's own stderr (esp_log.h's host stub
  * writes "<LEVEL> (<tag>) <message>" lines there -- see
  * tools/host_test_stubs/esp_log.h) around one abort and asserts on the
  * captured text directly, rather than trusting a source-level read.
@@ -242,10 +264,181 @@ static void scenario_abort_is_logged_at_debug_not_warn(void)
     buf[n] = '\0';
     unlink(path);
 
-    CHECK(strstr(buf, "sample dropped after") == NULL,
-          "the noisy \"sample dropped after N attempts\" WARN is NOT logged for a gate-close abort");
+    CHECK(strstr(buf, "sample delivery unconfirmed after") == NULL,
+          "the noisy \"sample delivery unconfirmed after N attempts\" WARN is NOT logged for a gate-close abort");
     CHECK(strstr(buf, "D (sensor_transport)") != NULL && strstr(buf, "aborting remaining retries") != NULL,
           "a DEBUG-level line documenting the abort IS logged instead");
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/*
+ * This follow-up (SED CoAP response timing correction): a response that
+ * arrives after a REAL delay (60ms, via a genuine background-thread wakeup,
+ * not the synchronous default) but still comfortably within this test's
+ * derived wait (coap_response_timing_wait_ms(40,3,2,40) = 100ms) still
+ * succeeds on the FIRST attempt -- no unnecessary retry, and the elapsed
+ * time proves this component actually waited for the real callback rather
+ * than returning instantly.
+ */
+static void scenario_delayed_response_within_window_succeeds_first_attempt(void)
+{
+    printf("\n-- scenario (SED timing correction): a delayed-but-within-window 2.xx response still succeeds on "
+           "the FIRST attempt --\n");
+    reset_gate_and_sim();
+    topology_gate_open();
+    host_ot_coap_sim_queue_delayed_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED, /*delay_ms=*/60);
+
+    uint64_t start = now_ms();
+    sensor_sample_t sample = make_sample(6, 1);
+    sensor_transport_send_sample(&sample);
+    uint64_t elapsed = now_ms() - start;
+
+    CHECK(host_ot_coap_sim_send_count() == 1, "exactly one \"/s\" attempt was made -- no retry was needed");
+    CHECK(topology_gate_is_open(), "a successful (if delayed) 2.xx leaves the gate open");
+    CHECK(elapsed >= 60, "the call genuinely waited for the real (delayed) callback, not a synchronous shortcut");
+    CHECK(elapsed < 100, "the call did not itself pay the full ~100ms derived wait budget -- it returned as soon "
+                          "as the real (delayed) callback actually fired");
+}
+
+/*
+ * This follow-up: a request that is genuinely never answered (the send
+ * succeeds, but no callback is ever invoked -- the strongest possible
+ * model of a truly lost response) still becomes a BOUNDED failure -- never
+ * a hang -- once this component's own derived wait for each of the 4
+ * attempts elapses. Captures stderr to also confirm the final log wording
+ * ("delivery unconfirmed", never "dropped" -- see this follow-up's item 4)
+ * and that "sent OK" never appears.
+ */
+static void scenario_no_response_becomes_bounded_failure(void)
+{
+    printf("\n-- scenario (SED timing correction): a genuinely unanswered request becomes a BOUNDED failure "
+           "after all 4 attempts, never a hang --\n");
+    reset_gate_and_sim();
+    topology_gate_open();
+    for (int i = 0; i < 4; i++) {
+        host_ot_coap_sim_queue_no_response();
+    }
+
+    char path[] = "/tmp/host_sensor_transport_no_response_stderr.XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "mkstemp() for stderr capture succeeded");
+    if (fd >= 0) {
+        close(fd);
+    }
+    fflush(stderr);
+    FILE *captured = (fd >= 0) ? freopen(path, "w+", stderr) : NULL;
+
+    uint64_t start = now_ms();
+    sensor_sample_t sample = make_sample(7, 1);
+    sensor_transport_send_sample(&sample);
+    uint64_t elapsed = now_ms() - start;
+
+    fflush(stderr);
+    FILE *restored = freopen("/dev/tty", "w", stderr);
+    if (restored == NULL) {
+        freopen("/dev/stderr", "w", stderr);
+    }
+
+    CHECK(host_ot_coap_sim_send_count() == 4, "all 4 attempts (1 initial + 3 retries) were actually made");
+    /* Lower bound: 4 attempts * ~100ms wait each, minus generous slack for
+     * scheduling jitter -- proves this did not return early/short-circuit.
+     * Upper bound: comfortably above the worst-case backoff sum
+     * (0+255+511+1023=1789ms) + 4*100ms wait, so this can never be confused
+     * with a hang while still catching a real regression. */
+    CHECK(elapsed >= 350, "the full retry sequence took roughly the expected bounded time, not an instant "
+                          "short-circuit");
+    CHECK(elapsed < 3000, "the full retry sequence completed within a generous bound -- never hung");
+
+    if (captured != NULL) {
+        FILE *f = fopen(path, "r");
+        char buf[8192];
+        size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+        if (f) {
+            fclose(f);
+        }
+        buf[n] = '\0';
+        unlink(path);
+        CHECK(strstr(buf, "sample delivery unconfirmed after 4 attempts") != NULL,
+              "the final log uses \"delivery unconfirmed\" wording -- never claims the sample was definitely lost");
+        CHECK(strstr(buf, "sample sent OK") == NULL, "\"sent OK\" never appears -- this attempt genuinely never "
+                                                       "got a confirmed response");
+    }
+}
+
+/*
+ * This follow-up: a callback that fires LATE for an attempt this component
+ * already gave up on (its own wait already elapsed, a NEW token is already
+ * current) must never be mistaken for success on a LATER attempt -- the
+ * token-staleness guard in sensor_transport.c's own coap_response_handler()
+ * is exercised here with a REAL, asynchronously-delayed callback (not the
+ * synchronous default), landing well after this sample's own first attempt
+ * already timed out and while later attempts (all genuinely unanswered) are
+ * still in flight.
+ */
+static void scenario_late_stale_callback_never_corrupts_a_later_attempt(void)
+{
+    printf("\n-- scenario (SED timing correction): a late/stale callback for an abandoned attempt never corrupts "
+           "a later attempt's own result --\n");
+    reset_gate_and_sim();
+    topology_gate_open();
+    /* Attempt 1: a real callback WILL eventually fire (delay=250ms), but
+     * only long after attempt 1's own ~100ms wait already gave up -- by the
+     * time it fires, sensor_transport.c has already moved on to a later
+     * attempt's own token, so this must be ignored as stale. */
+    host_ot_coap_sim_queue_delayed_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED, /*delay_ms=*/250);
+    /* Attempts 2-4: genuinely unanswered -- if the stale callback above ever
+     * incorrectly satisfied one of THESE attempts' own wait, the overall
+     * sample would be wrongly logged as delivered. */
+    host_ot_coap_sim_queue_no_response();
+    host_ot_coap_sim_queue_no_response();
+    host_ot_coap_sim_queue_no_response();
+
+    char path[] = "/tmp/host_sensor_transport_stale_callback_stderr.XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "mkstemp() for stderr capture succeeded");
+    if (fd >= 0) {
+        close(fd);
+    }
+    fflush(stderr);
+    FILE *captured = (fd >= 0) ? freopen(path, "w+", stderr) : NULL;
+
+    sensor_sample_t sample = make_sample(8, 1);
+    sensor_transport_send_sample(&sample);
+
+    fflush(stderr);
+    FILE *restored = freopen("/dev/tty", "w", stderr);
+    if (restored == NULL) {
+        freopen("/dev/stderr", "w", stderr);
+    }
+
+    CHECK(host_ot_coap_sim_send_count() == 4, "all 4 attempts were made (none short-circuited by the stale, "
+                                               "still-pending callback from attempt 1)");
+
+    if (captured != NULL) {
+        FILE *f = fopen(path, "r");
+        char buf[8192];
+        size_t n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+        if (f) {
+            fclose(f);
+        }
+        buf[n] = '\0';
+        unlink(path);
+        CHECK(strstr(buf, "sample sent OK") == NULL,
+              "the late/stale callback from attempt 1 never caused ANY attempt to be logged as a success");
+        CHECK(strstr(buf, "sample delivery unconfirmed after 4 attempts") != NULL,
+              "the sample is correctly logged as unconfirmed despite the stray late callback");
+    }
+
+    /* Drain attempt 1's still-pending delayed thread (fires ~250ms after it
+     * was queued) before this scenario returns, so it can never fire during
+     * a LATER, unrelated scenario and interfere with ITS token bookkeeping. */
+    usleep(300 * 1000);
 }
 
 int main(void)
@@ -267,6 +460,9 @@ int main(void)
     scenario_no_further_samples_while_gate_closed();
     scenario_resumes_after_reregistration_succeeds();
     scenario_abort_is_logged_at_debug_not_warn();
+    scenario_delayed_response_within_window_succeeds_first_attempt();
+    scenario_no_response_becomes_bounded_failure();
+    scenario_late_stale_callback_never_corrupts_a_later_attempt();
 
     printf("\n");
     if (g_failures == 0) {

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
@@ -15,6 +16,7 @@
 #include "collector_endpoint/collector_endpoint.h"
 #include "node_calc/node_calc.h"
 #include "topology_gate/topology_gate.h"
+#include "coap_response_timing/coap_response_timing.h"
 
 static const char *TAG = "sensor_transport";
 
@@ -23,7 +25,12 @@ static const char *TAG = "sensor_transport";
 /* 1 initial send + up to 3 retries (section 8/13: "최대 3회"). */
 #define SENSOR_TRANSPORT_MAX_RETRIES 3
 #define SENSOR_TRANSPORT_MAX_ATTEMPTS (1 + SENSOR_TRANSPORT_MAX_RETRIES)
-#define SENSOR_TRANSPORT_ACK_TIMEOUT_MS 1000
+/* Shared with topology_reporter.c -- ONE Kconfig source of truth (this
+ * follow-up: SED CoAP response timing correction, see
+ * components/coap_response_timing's own header comment for the
+ * real-hardware finding behind this and why it must stay comfortably
+ * LONGER than a LEAF's own Thread data-poll period). */
+#define SENSOR_TRANSPORT_ACK_TIMEOUT_MS CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS
 
 /* true only for the AUTO path against an active power base -- see this
  * component's header comment and sensor_transport_init(). */
@@ -201,8 +208,8 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
                  * retransmission must not also be retrying underneath it. */
                 otCoapTxParameters tx = {
                     .mAckTimeout = SENSOR_TRANSPORT_ACK_TIMEOUT_MS,
-                    .mAckRandomFactorNumerator = 3,
-                    .mAckRandomFactorDenominator = 2,
+                    .mAckRandomFactorNumerator = COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
+                    .mAckRandomFactorDenominator = COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN,
                     .mMaxRetransmit = 0,
                 };
                 err = otCoapSendRequestWithParameters(instance, message, &info, coap_response_handler,
@@ -223,10 +230,19 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
     }
 
     bool ok = false;
-    /* Generous relative to the tx params' own ack timeout above so we
-     * always hear back from OpenThread's response handler one way or
-     * another before giving up on this attempt. */
-    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(SENSOR_TRANSPORT_ACK_TIMEOUT_MS * 3)) == pdTRUE) {
+    /* Correctly derived (never a bare "ack_timeout * N" guess) from the SAME
+     * tx params just above via components/coap_response_timing's shared
+     * helper -- covers OpenThread's own worst-case ACK wait (ack_timeout *
+     * random_factor) plus a margin, so this wait can never expire strictly
+     * before OpenThread's response handler could still validly fire for
+     * this attempt. See that component's header comment for the
+     * real-hardware finding this replaced (a LEAF's own Thread data-poll
+     * period used to race this timeout). */
+    uint32_t wait_ms = coap_response_timing_wait_ms(SENSOR_TRANSPORT_ACK_TIMEOUT_MS,
+                                                      COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
+                                                      COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN,
+                                                      SENSOR_TRANSPORT_ACK_TIMEOUT_MS);
+    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
         if (s_send_result == OT_ERROR_NONE && s_send_got_message) {
             /* code review follow-up section 3: a successful OpenThread
              * transport is not enough -- the power base's own CoAP response
@@ -366,9 +382,9 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
          * remaining retries for THIS sample immediately rather than paying
          * out this iteration's backoff delay only to have the check above
          * catch it on the next loop pass -- this is the expected recovery
-         * path (topology_reporter is about to re-attach), not a real
-         * delivery failure, so it is logged at DEBUG, never the "dropped
-         * after N attempts" WARN below.
+         * path (topology_reporter is about to re-attach), not a genuinely
+         * unconfirmed delivery, so it is logged at DEBUG, never the
+         * "delivery unconfirmed after N attempts" WARN below.
          */
         if (s_require_topology_gate && !topology_gate_is_open()) {
             ESP_LOGD(TAG, "topology gate closed by this attempt's rejection -- aborting remaining retries for "
@@ -378,6 +394,19 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
             return;
         }
     }
-    ESP_LOGW(TAG, "sample dropped after %d attempts (uuid=..%02x%02x seq=%u)", SENSOR_TRANSPORT_MAX_ATTEMPTS,
-             sample->module_uuid[6], sample->module_uuid[7], (unsigned)sample->sample_seq);
+    /*
+     * NOT a claim that the sample was actually lost -- only that THIS
+     * SENDER never received a confirmed 2.xx response within
+     * SENSOR_TRANSPORT_MAX_ATTEMPTS attempts. The power base may have
+     * already stored it (a real-hardware finding: an unconfirmed response
+     * can arrive after this sender already gave up, most commonly because
+     * of a slow/lost CoAP ACK rather than the request itself ever failing
+     * to arrive) -- see components/coap_response_timing's header comment.
+     * Whether it was actually stored is exactly what sample_seq dedup on
+     * the power base's own side (sensor_root_aggregator) resolves; nothing
+     * here can determine that on its own.
+     */
+    ESP_LOGW(TAG, "sample delivery unconfirmed after %d attempts (uuid=..%02x%02x seq=%u)",
+             SENSOR_TRANSPORT_MAX_ATTEMPTS, sample->module_uuid[6], sample->module_uuid[7],
+             (unsigned)sample->sample_seq);
 }

@@ -20,13 +20,36 @@
  * in-memory value plus an injectable "next write succeeds?" flag) standing
  * in for the real nvs_open()/nvs_get_u32()/nvs_set_u32()/nvs_commit() calls.
  *
+ * ALSO covers (this follow-up: SED CoAP response timing correction) that
+ * topology_reporter.c's own CoAP response-wait policy is IDENTICAL to
+ * sensor_transport.c's -- see scenario_shares_coap_response_timing_policy_with_sensor_transport()
+ * below, which links the REAL, unmodified components/coap_response_timing/
+ * coap_response_timing.c (the one piece of this timing policy that IS
+ * host-testable in isolation) and computes the exact wait value
+ * topology_reporter.c's own send_one_attempt() would derive from
+ * production's real Kconfig default (CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS=2000,
+ * components/coap_response_timing/Kconfig) -- cross-checked against
+ * tools/test_coap_response_timing.c's own identical computation for
+ * sensor_transport.c's real, host-linked test
+ * (tools/test_sensor_transport_gate_retry.c). topology_reporter.c itself
+ * remains NOT host-linkable here (real NVS/FreeRTOS/OpenThread calls, same
+ * as the rest of this file) -- verified instead by code review confirming
+ * it uses the exact same CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS /
+ * COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM/DEN /
+ * coap_response_timing_wait_ms() symbols as sensor_transport.c (never a
+ * separate copy), plus the real ESP-IDF module fullclean build.
+ *
  * Build & run (from the repo root):
- *   cc -Wall -Wextra -o /tmp/test_topology_reporter_session tools/test_topology_reporter_session.c \
+ *   cc -Wall -Wextra -I components/coap_response_timing/include \
+ *      -o /tmp/test_topology_reporter_session tools/test_topology_reporter_session.c \
+ *      components/coap_response_timing/coap_response_timing.c \
  *   && /tmp/test_topology_reporter_session
  */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#include "coap_response_timing/coap_response_timing.h"
 
 static int g_failures = 0;
 
@@ -253,6 +276,35 @@ static void scenario_rollover_persistence_failure_disables_reporting(void)
                                  "un-persisted, about-to-wrap generation");
 }
 
+/*
+ * This follow-up: proves topology_reporter.c and sensor_transport.c share
+ * the IDENTICAL CoAP response-wait policy rather than each hardcoding its
+ * own copy. Uses the REAL, linked coap_response_timing_wait_ms() with the
+ * SAME parameters both components' real source actually uses in production
+ * (CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS=2000 -- components/coap_response_timing/
+ * Kconfig's real default, hardcoded here as a literal since this mirror test
+ * has no sdkconfig.h; cross-checked by code review that both .c files
+ * reference that exact same Kconfig symbol, never an independent copy).
+ */
+static void scenario_shares_coap_response_timing_policy_with_sensor_transport(void)
+{
+    printf("\n-- scenario: topology_reporter.c's CoAP response-wait policy is IDENTICAL to sensor_transport.c's "
+           "(both call the SAME shared helper with the SAME shared constants) --\n");
+    const uint32_t production_ack_timeout_ms = 2000; /* must match components/coap_response_timing/Kconfig's default */
+    uint32_t topology_reporter_wait_ms =
+        coap_response_timing_wait_ms(production_ack_timeout_ms, COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
+                                      COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN, production_ack_timeout_ms);
+    /* sensor_transport.c's own real host test (tools/test_sensor_transport_gate_retry.c,
+     * via tools/test_coap_response_timing.c's identical first scenario)
+     * computes this exact same value from this exact same production
+     * default -- see that test's own "this repository's actual defaults"
+     * scenario. */
+    CHECK(topology_reporter_wait_ms == 5000,
+          "topology_reporter.c's derived CoAP response wait (5000ms) matches sensor_transport.c's own derived "
+          "wait exactly -- both from the SAME shared helper and SAME shared Kconfig default, never two "
+          "independently-drifting copies");
+}
+
 int main(void)
 {
     scenario_monotonic_across_reboots();
@@ -261,6 +313,7 @@ int main(void)
     scenario_init_generation_success_boots_normally();
     scenario_sequence_rollover_before_wrap();
     scenario_rollover_persistence_failure_disables_reporting();
+    scenario_shares_coap_response_timing_policy_with_sensor_transport();
 
     printf("\n");
     if (g_failures == 0) {

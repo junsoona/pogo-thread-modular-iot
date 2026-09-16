@@ -3,8 +3,14 @@
  * host tests that link REAL production .c files depending on CONFIG_POGO_*
  * (components/pogo_port, components/pogo_proto, components/child_service,
  * components/parent_service, components/sensor_service, components/pms5003)
- * -- see tools/test_pogo_port_hotswap_recovery.c and
- * tools/test_conditioning_provisioning.c.
+ * or, this follow-up, CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS
+ * (components/sensor_transport, components/topology_reporter, via
+ * components/coap_response_timing/Kconfig) -- see
+ * tools/test_pogo_port_hotswap_recovery.c, tools/test_conditioning_provisioning.c,
+ * and tools/test_sensor_transport_gate_retry.c. The ONE sdkconfig.h stub in
+ * this repository (see its own "put this directory first" convention
+ * below) -- new CONFIG_* values a newly real-linked component needs are
+ * added here rather than creating a second stub.
  *
  * Values are deliberately much SMALLER than components/pogo_proto/Kconfig's
  * real defaults (300ms ACK timeout, 3000ms hotswap cooldown, ...) so a host
@@ -41,3 +47,13 @@
 #define CONFIG_POGO_ATTACH_SETTLE_MS       30
 #define CONFIG_POGO_HOTSWAP_COOLDOWN_MS    150
 #define CONFIG_POGO_DETECT_RECONCILE_MS    40
+
+/*
+ * This follow-up (SED CoAP response timing correction): deliberately much
+ * SMALLER than components/coap_response_timing/Kconfig's real default
+ * (2000ms) for the exact same "fast host test, identical logic/ordering"
+ * reason as the CONFIG_POGO_* values above -- used by
+ * tools/test_sensor_transport_gate_retry.c, which links the REAL
+ * components/sensor_transport/sensor_transport.c.
+ */
+#define CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS 40

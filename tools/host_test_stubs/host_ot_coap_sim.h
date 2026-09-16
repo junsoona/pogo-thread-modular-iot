@@ -48,6 +48,32 @@ void host_ot_coap_sim_queue_response(otError transport_result, otCoapCode respon
  */
 void host_ot_coap_sim_queue_send_failure(otError send_result);
 
+/*
+ * This follow-up (SED CoAP response timing correction): queues a REAL
+ * response for the next otCoapSendRequestWithParameters() call, same as
+ * host_ot_coap_sim_queue_response() above, EXCEPT the response handler
+ * fires from a detached background thread after `delay_ms` of REAL
+ * wall-clock time has elapsed, instead of synchronously before the send
+ * call even returns. This is what lets a test exercise the caller's own
+ * xSemaphoreTake() wait for real (a genuine block-then-wake), including the
+ * token-staleness guard against a callback that fires late (after the
+ * caller already gave up and moved on to a NEXT attempt/token) -- see
+ * sensor_transport.c's coap_response_handler() for that guard's own
+ * comment. The send call itself still returns OT_ERROR_NONE immediately
+ * (real hardware never blocks the caller's own send call on the response).
+ */
+void host_ot_coap_sim_queue_delayed_response(otError transport_result, otCoapCode response_code, uint32_t delay_ms);
+
+/*
+ * This follow-up: queues an attempt whose send() call succeeds (returns
+ * OT_ERROR_NONE, call counted normally) but whose response handler is NEVER
+ * invoked at all -- models a genuinely lost/unanswered response, so a test
+ * can confirm the caller's OWN semaphore-wait timeout is what eventually
+ * bounds this attempt (never a hang), independent of OpenThread ever
+ * calling back with its own timeout error.
+ */
+void host_ot_coap_sim_queue_no_response(void);
+
 /* How many times otCoapSendRequestWithParameters() has actually been called
  * since the last reset -- i.e. how many real "/s" (or "/t") wireless
  * attempts sensor_transport.c/topology_reporter.c actually made. */

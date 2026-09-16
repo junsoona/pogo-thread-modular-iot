@@ -1,0 +1,18 @@
+menu "CoAP Response Timing (sensor_transport /s + topology_reporter /t)"
+
+    config SENSOR_COAP_ACK_TIMEOUT_MS
+        int "CoAP ACK timeout (ms) for sensor_transport and topology_reporter"
+        default 2000
+        help
+            otCoapTxParameters.mAckTimeout used by BOTH sensor_transport's
+            "/s" sends and topology_reporter's "/t" sends -- ONE shared
+            value so the two components can never silently drift apart (see
+            components/coap_response_timing's own header comment for why
+            this must also stay comfortably LONGER than a LEAF's own Thread
+            SED data-poll period, CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS,
+            not shorter -- the two Kconfig defaults, 2000ms and 500ms, are
+            chosen so a SED polls roughly 4x within one ACK-timeout window).
+            Each send still uses mMaxRetransmit=0 (the application-level
+            retry loop in each component owns retries, not OpenThread's).
+
+endmenu

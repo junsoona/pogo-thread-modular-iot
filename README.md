@@ -10,15 +10,38 @@
 **Linux OTBR용 ESP32-H2 USB RCP 펌웨어(`rcp/`)와 전원 모듈의 external OTBR
 Dataset join(EXTERNAL_OTBR 모드)은 [`docs/otbr-rcp.md`](docs/otbr-rcp.md)** 참고.
 
-**중요 (가장 최근 세션: 전원 모듈을 Linux OTBR + 별도 `rcp/` 보드의 기존 Thread
+**중요 (가장 최근 세션: SED CoAP 응답 타이밍 보정):** 이전 세션에서 구현한
+EXTERNAL_OTBR 모드가 **실물로 검증되었다** -- 전원 모듈이 실제 Linux OTBR +
+`rcp/` 보드의 기존 Thread 네트워크에 가입했고(Partition ID `0x7e64ef94`로 일치),
+Power Base → SHT45 INTERMEDIATE → PMS5003 LEAF 3단 체인도 EXTERNAL_OTBR 모드
+아래서 정상 동작해 depth 1/2 등록과 두 센서 데이터 수신까지 확인했다. 다만 같은
+실물 시험에서 PMS5003 LEAF가 `sensor_transport: sample dropped after 4 attempts`와
+topology report timeout을 반복 로그했다 -- Power Base 로그를 대조하면 동일한
+`sample_seq`가 실제로 저장돼 있었으므로 **데이터 유실이 아니라 CoAP 응답 확인
+실패**였다. 원인은 이 LEAF의 Thread SED MAC data poll 주기(`otLinkSetPollPeriod()`)가
+센서 측정 주기(3528ms)와 우연히 결합되어 있었던 것 -- SED는 자신의 다음 data poll
+에서만 parent로부터 큐잉된 응답을 받을 수 있으므로, 수 초 단위의 poll 주기는 CoAP
+클라이언트의 semaphore wait(당시 1000ms ACK timeout * 3 = 3000ms)가 이미 포기한
+"이후"에 도착할 수 있었다. 이번 세션에서 둘을 완전히 분리했다 -- 센서 측정 주기는
+`polling_period_ms`/POGO `POLL_CONFIG` 경로 그대로 유지되고, Thread data poll
+주기는 `thread_manager_join_with_dataset()`의 새 `thread_data_poll_period_ms`
+인자(기본 500ms, `CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS`)로 완전히
+독립적으로 결정된다. CoAP ACK timeout도 1000ms → 2000ms로 올리고,
+`sensor_transport`/`topology_reporter`가 `components/coap_response_timing`이라는
+단일 공용 helper/Kconfig로 응답 대기 시간을 계산하도록 통합했다. 이번 보정은
+소프트웨어 구현과 host test까지만 완료했고, **실물 재시험으로는 아직 검증하지
+않았다.** 자세한 내용은 [`docs/state-machine.md`](docs/state-machine.md)의 "SED
+CoAP response timing correction" 절, 실물 검증 상태는
+[`docs/validation-status.md`](docs/validation-status.md) 참고.
+
+**중요 (이전 세션: 전원 모듈을 Linux OTBR + 별도 `rcp/` 보드의 기존 Thread
 네트워크에 가입시키는 EXTERNAL_OTBR 모드 추가):** 전원 모듈은 이제 두 가지 Thread
 Dataset 출처 모드 중 하나로 부팅한다 -- **STANDALONE**(기존 동작 그대로: 자체
 Dataset을 형성/재개)과 **EXTERNAL_OTBR**(Linux OTBR가 소유한 실제 Dataset으로
 기존 네트워크에 가입, 자체 네트워크는 절대 형성하지 않음). RCP(`rcp/`)는 Dataset을
 전혀 소유하지 않는 Radio Only 장치이고, Dataset은 항상 Linux OTBR가 소유하며,
 센서 모듈은 기존 POGO `SET_DATASET` 경로로 동일하게 Dataset을 전달받는다(코드
-변경 없음). 이번 세션은 소프트웨어 구현과 host test까지만 완료했고, **실물 Linux
-OTBR + `rcp/` + 전원 모듈 연동은 아직 검증하지 않았다.** 자세한 내용은
+변경 없음). **위 문단대로 이후 세션에서 실물 검증까지 완료했다.** 자세한 내용은
 [`docs/otbr-rcp.md`](docs/otbr-rcp.md)와 [`docs/power-base.md`](docs/power-base.md)
 12절("Dataset ownership"/"External OTBR Dataset join"), 실물 검증 상태는
 [`docs/validation-status.md`](docs/validation-status.md) 참고.
@@ -744,7 +767,7 @@ I (..) pogo_port: port 0: PEER_READY (peer_type=2)
 I (..) child_service: sensor measurement OK: bitmap=0x0001 response_time=..ms
 I (..) child_service: polling_period_ms=.. accepted
 I (..) child_service: dataset stored (.. bytes) -- starting Thread join as LEAF
-I (..) thread_manager: LEAF link mode: router_eligible=false rx-on-when-idle=false poll_period=..ms
+I (..) thread_manager: LEAF link mode: router_eligible=false rx-on-when-idle=false thread_data_poll_period_ms=500 (independent of this module's own sensor measurement period)
 I (..) child_service: Thread join succeeded, otDeviceRole=2(CHILD)
 I (..) child_service: JOIN_RESULT_ACK received (seq=1) -- provisioning session fully confirmed
 ```
@@ -875,7 +898,7 @@ I (..) pogo_port: port 0: PEER_READY (peer_type=1)
 I (..) child_service: sensor measurement OK: bitmap=0x0006 response_time=..ms
 I (..) child_service: collector endpoint accepted: power_base_uuid=..xxyy port=5683
 I (..) child_service: dataset stored (.. bytes) -- starting Thread join as LEAF
-I (..) thread_manager: LEAF link mode: router_eligible=false rx-on-when-idle=false poll_period=..ms
+I (..) thread_manager: LEAF link mode: router_eligible=false rx-on-when-idle=false thread_data_poll_period_ms=500 (independent of this module's own sensor measurement period)
 I (..) child_service: Thread join succeeded, otDeviceRole=2(CHILD)
 I (..) child_service: JOIN_RESULT_ACK received (seq=1) -- provisioning session fully confirmed
 I (..) topology_reporter: topology report sent OK (type=0 seq=1 attempt=1/4)
@@ -984,6 +1007,29 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   `-Wparentheses-equality` 경고 7개는 이번 세션 변경과 무관한 이전부터의 vendored
   코드 경고다 (host test 빌드 경고, ESP-IDF 빌드에는 나타나지 않음).
 
+### 빌드 결과 (가장 최근 세션 -- SED CoAP 응답 타이밍 보정)
+
+- `idf.py -C module -B ~/esp-builds/pogo_module set-target esp32h2 && ... build` -> 성공
+  (경고 0개, `coap_response_timing` 신규 컴포넌트 포함).
+- `idf.py -C power_base -B ~/esp-builds/pogo_power_base set-target esp32h2 && ... build` ->
+  성공 (경고 0개).
+- `idf.py -C upper -B ~/esp-builds/pogo_upper set-target esp32h2 && ... build` -> 성공
+  (경고 0개, 회귀 -- upper는 thread_manager/child_service/sensor_transport/
+  topology_reporter를 아예 사용하지 않아 이번 변경의 영향을 받지 않음).
+- `idf.py -C lower -B ~/esp-builds/pogo_lower set-target esp32h2 && ... build` -> 성공
+  (경고 0개, 회귀, 위와 동일한 이유로 영향 없음).
+- `nm pogo_module.elf`로 `coap_response_timing_wait_ms`와
+  `thread_manager_join_with_dataset` 심볼이 실제로 최종 바이너리에 링크되어 있음을 확인.
+- 기존 45개 host test(37 C + 8 Python) 전부 재통과 + 이번 세션 신규
+  `tools/test_coap_response_timing.c` 1개(실제 `components/coap_response_timing/
+  coap_response_timing.c`를 링크) 통과 -- 총 46개(38 C + 8 Python) 전부 통과.
+  `tools/test_conditioning_provisioning.c`(실제 `child_service.c`/`parent_service.c`
+  end-to-end), `tools/test_sensor_transport_gate_retry.c`(실제 `sensor_transport.c`,
+  신규 real-delay/no-response 시뮬레이션 추가), `tools/test_topology_reporter_session.c`
+  (신규 timing-policy 일치 시나리오)를 확장했다. `git diff --check` -> 공백 오류 없음.
+  벤더링된 `components/sensirion_gas_index_algorithm`의 기존 `-Wparentheses-equality`
+  경고 7개는 이번 세션과도 무관하다 (host test 빌드 한정, ESP-IDF 빌드에는 없음).
+
 ## 보유 센서 현황
 
 사용자는 PMS5003, BH1750, SGP40, SGP41, SHT45를 모두 실제로 보유하고 있다.
@@ -1008,22 +1054,29 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
 
 ## 아직 실물 보드에서 확인되지 않은 항목
 
-**이번 세션까지 실물로 확인된 조합은 전원 모듈 1대 + (SHT45 또는 PMS5003) 센서 모듈
-1대, depth=1 단일 홉뿐이다.** 자세한 항목별 상태는
-[`docs/validation-status.md`](docs/validation-status.md)에 정리했다. 아래는 소프트웨어
-구현/host test/빌드는 완료했지만 여전히 실물 검증이 필요한 항목이다:
+**Linux OTBR external Dataset join과 Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF
+3단 체인은 실물로 확인되었다** (Partition ID `0x7e64ef94` 일치, depth 1/2 등록 및 두
+센서 데이터 수신 확인 -- 자세한 내용은
+[`docs/validation-status.md`](docs/validation-status.md)의 "Linux OTBR external Dataset
+join" 절 참고). 아래는 그 실물 시험에서 드러난 이슈의 보정(SED CoAP 응답 타이밍)을
+포함해, 소프트웨어 구현/host test/빌드는 완료했지만 여전히 실물 (재)검증이 필요한
+항목이다:
 
-- **전원 모듈 EXTERNAL_OTBR Dataset join (가장 최근 세션 신규)**: 실물 Linux OTBR 호스트
-  + `rcp/` 보드 + 전원 모듈을 실제로 연결해 전원 모듈이 OTBR의 기존 Thread 네트워크에
-  가입하는지, 그 아래 센서 모듈이 기존 POGO `SET_DATASET` 경로로 같은 Dataset을 정상
-  전달받는지 -- 소프트웨어 구현/host test/ESP-IDF 실빌드까지만 완료, 실물 미검증. 자세한
-  내용은 [`docs/otbr-rcp.md`](docs/otbr-rcp.md)와
-  [`docs/validation-status.md`](docs/validation-status.md) 참고.
-- **3단 센서 체인(Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF, depth=2)**:
-  중간 모듈이 upstream 프로비저닝 완료 후 INTERMEDIATE로 전환되는지, downstream 자식에게
-  UUID/slot/depth+1/polling/collector endpoint/Dataset을 올바르게 전달하는지, 중간
-  모듈이 항상 켜진 router-eligible FTD로 유지되는지, 말단이 SED LEAF로 유지되는지 -- 코드
-  리뷰와 host test까지만 확인, 실물 미검증. 아래 "3단 센서 체인 실물 배선" 절 참고.
+- **SED CoAP 응답 타이밍 보정 (가장 최근 세션 신규)**: 위 실물 3단 체인 시험에서
+  관측된 `sample dropped after 4 attempts`/topology report timeout 오탐(실제 데이터
+  유실 아님, Power Base에는 이미 저장되어 있었음)의 원인이었던 Thread SED data poll
+  주기와 센서 측정 주기의 결합을 분리했다 -- 소프트웨어 구현/host test까지만 완료,
+  **실물 재시험으로는 아직 검증하지 않았다.** 자세한 내용은
+  [`docs/state-machine.md`](docs/state-machine.md)의 "SED CoAP response timing
+  correction" 절과 [`docs/validation-status.md`](docs/validation-status.md) 참고.
+- **3단 센서 체인 -- SHT45가 INTERMEDIATE인 조합은 실물로 확인되었다** (위 참고).
+  **BH1750이 INTERMEDIATE인 조합은 아직 실물 미확인** (BH1750 자체가 아래 항목대로
+  아직 실물 미배선이므로) -- 중간 모듈이 upstream 프로비저닝 완료 후 INTERMEDIATE로
+  전환되는지, downstream 자식에게 UUID/slot/depth+1/polling/collector endpoint/Dataset을
+  올바르게 전달하는지, 중간 모듈이 항상 켜진 router-eligible FTD로 유지되는지, 말단이
+  SED LEAF로 유지되는지의 코드 경로 자체는 SHT45/BH1750 둘 다 동일(`thread_manager.c`가
+  드라이버 종류를 알지 못함)하므로 이 조합 자체의 로직 리스크는 낮다. 아래 "3단 센서
+  체인 실물 배선" 절 참고.
 - BH1750 실물 I2C 통신·변환값 -- SHT45와 동일 경로이나 아직 미확인.
 - SGP40/SGP41 실물 배선·측정 -- 코드/알고리즘/host test는 완료했으나 미확인.
 - 두 번째/세 번째 모듈이 동시에 붙는 경우의 BASE_ID/PEER_HELLO 타이밍 -- 아직 미확인

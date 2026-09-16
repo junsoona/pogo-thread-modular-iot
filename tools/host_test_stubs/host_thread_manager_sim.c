@@ -37,6 +37,18 @@ static bool s_join_fails = false;
 static otDeviceRole s_join_success_role = OT_DEVICE_ROLE_CHILD;
 static unsigned s_join_delay_ms = 5;
 
+/*
+ * Records the arguments of the LAST thread_manager_join_with_dataset() call
+ * -- this follow-up (SED CoAP response timing correction): lets a test
+ * confirm child_service.c passes thread_data_poll_period_ms=0 (Kconfig
+ * default, decoupled from any sensor measurement period) rather than the
+ * pre-fix coupling that reused the sensor's own polling_period_ms here. See
+ * tools/test_conditioning_provisioning.c's part_a_real_end_to_end().
+ */
+static uint16_t s_last_dataset_len;
+static uint32_t s_last_poll_period_ms;
+static int      s_join_call_count;
+
 void host_thread_manager_test_reset(void)
 {
     pthread_mutex_lock(&s_mutex);
@@ -46,7 +58,34 @@ void host_thread_manager_test_reset(void)
     s_join_fails = false;
     s_join_success_role = OT_DEVICE_ROLE_CHILD;
     s_join_delay_ms = 5;
+    s_last_dataset_len = 0;
+    s_last_poll_period_ms = 0xFFFFFFFFu; /* sentinel: "never called" -- 0 is a legitimate real value */
+    s_join_call_count = 0;
     pthread_mutex_unlock(&s_mutex);
+}
+
+uint32_t host_thread_manager_test_get_last_poll_period_ms(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    uint32_t v = s_last_poll_period_ms;
+    pthread_mutex_unlock(&s_mutex);
+    return v;
+}
+
+uint16_t host_thread_manager_test_get_last_dataset_len(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    uint16_t v = s_last_dataset_len;
+    pthread_mutex_unlock(&s_mutex);
+    return v;
+}
+
+int host_thread_manager_test_get_join_call_count(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    int v = s_join_call_count;
+    pthread_mutex_unlock(&s_mutex);
+    return v;
 }
 
 void host_thread_manager_test_set_join_outcome(bool fail, otDeviceRole success_role, unsigned delay_ms)
@@ -81,16 +120,17 @@ bool thread_manager_validate_dataset_tlvs(const uint8_t *dataset_tlvs, uint16_t 
 }
 
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,
-                                            uint16_t dataset_len, uint32_t poll_period_ms)
+                                            uint16_t dataset_len, uint32_t thread_data_poll_period_ms)
 {
     (void)role;
     (void)dataset_tlvs;
-    (void)dataset_len;
-    (void)poll_period_ms;
     pthread_mutex_lock(&s_mutex);
     bool fails = s_join_fails;
     unsigned delay_ms = s_join_delay_ms;
     otDeviceRole success_role = s_join_success_role;
+    s_last_dataset_len = dataset_len;
+    s_last_poll_period_ms = thread_data_poll_period_ms;
+    s_join_call_count++;
     pthread_mutex_unlock(&s_mutex);
     if (fails) {
         return ESP_OK; /* accepted, but no role-change event ever follows -- the caller's own join_timeout fires */

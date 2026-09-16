@@ -26,6 +26,15 @@
  * on real hardware either way, since the token compare only depends on
  * values already assigned before the send call, never on timing.
  *
+ * This follow-up (SED CoAP response timing correction) adds two more
+ * queueable outcomes, both genuinely asynchronous in real wall-clock time
+ * rather than synchronous: a DELAYED response (the handler fires from a
+ * detached background thread after a real sleep -- exercises the caller's
+ * xSemaphoreTake() wait for real) and NO response at all (the handler is
+ * simply never invoked -- exercises the caller's own timeout as the sole
+ * backstop). See host_ot_coap_sim_queue_delayed_response()/
+ * host_ot_coap_sim_queue_no_response() in host_ot_coap_sim.h.
+ *
  * A test queues exactly one outcome per otCoapSendRequestWithParameters()
  * call it expects the real retry loop to make (host_ot_coap_sim.h). Calling
  * this stub's send function with an empty queue is treated as a test bug
@@ -37,19 +46,30 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 
 #define HOST_OT_COAP_SIM_MAX_QUEUED 32
 
+typedef enum {
+    HOST_OT_COAP_SIM_SEND_FAILURE,
+    HOST_OT_COAP_SIM_IMMEDIATE_RESPONSE,
+    HOST_OT_COAP_SIM_DELAYED_RESPONSE, /* this follow-up: SED CoAP response timing correction */
+    HOST_OT_COAP_SIM_NO_RESPONSE,      /* this follow-up: genuinely never calls the handler */
+} host_ot_coap_sim_kind_t;
+
 typedef struct {
-    bool is_send_failure;
+    host_ot_coap_sim_kind_t kind;
     otError err;         /* send failure: the send call's own return value.
-                             response: the transport result delivered to the
-                             response handler (normally OT_ERROR_NONE). */
-    otCoapCode code;      /* response code, meaningful only when !is_send_failure
-                             && err == OT_ERROR_NONE */
+                             response/delayed: the transport result delivered to the
+                             response handler (normally OT_ERROR_NONE). unused for
+                             no-response. */
+    otCoapCode code;      /* response code, meaningful only for
+                             IMMEDIATE_RESPONSE/DELAYED_RESPONSE with err == OT_ERROR_NONE */
+    uint32_t delay_ms;    /* meaningful only for DELAYED_RESPONSE */
 } host_ot_coap_sim_entry_t;
 
 static host_ot_coap_sim_entry_t s_queue[HOST_OT_COAP_SIM_MAX_QUEUED];
@@ -69,28 +89,47 @@ void host_ot_coap_sim_reset(void)
     s_send_count = 0;
 }
 
-void host_ot_coap_sim_queue_response(otError transport_result, otCoapCode response_code)
+static host_ot_coap_sim_entry_t *push_entry(void)
 {
     if (s_queue_len >= HOST_OT_COAP_SIM_MAX_QUEUED) {
         fprintf(stderr, "host_ot_coap_sim: queue full -- raise HOST_OT_COAP_SIM_MAX_QUEUED\n");
         abort();
     }
-    s_queue[s_queue_len].is_send_failure = false;
-    s_queue[s_queue_len].err = transport_result;
-    s_queue[s_queue_len].code = response_code;
-    s_queue_len++;
+    host_ot_coap_sim_entry_t *e = &s_queue[s_queue_len++];
+    e->err = OT_ERROR_NONE;
+    e->code = 0;
+    e->delay_ms = 0;
+    return e;
+}
+
+void host_ot_coap_sim_queue_response(otError transport_result, otCoapCode response_code)
+{
+    host_ot_coap_sim_entry_t *e = push_entry();
+    e->kind = HOST_OT_COAP_SIM_IMMEDIATE_RESPONSE;
+    e->err = transport_result;
+    e->code = response_code;
 }
 
 void host_ot_coap_sim_queue_send_failure(otError send_result)
 {
-    if (s_queue_len >= HOST_OT_COAP_SIM_MAX_QUEUED) {
-        fprintf(stderr, "host_ot_coap_sim: queue full -- raise HOST_OT_COAP_SIM_MAX_QUEUED\n");
-        abort();
-    }
-    s_queue[s_queue_len].is_send_failure = true;
-    s_queue[s_queue_len].err = send_result;
-    s_queue[s_queue_len].code = 0;
-    s_queue_len++;
+    host_ot_coap_sim_entry_t *e = push_entry();
+    e->kind = HOST_OT_COAP_SIM_SEND_FAILURE;
+    e->err = send_result;
+}
+
+void host_ot_coap_sim_queue_delayed_response(otError transport_result, otCoapCode response_code, uint32_t delay_ms)
+{
+    host_ot_coap_sim_entry_t *e = push_entry();
+    e->kind = HOST_OT_COAP_SIM_DELAYED_RESPONSE;
+    e->err = transport_result;
+    e->code = response_code;
+    e->delay_ms = delay_ms;
+}
+
+void host_ot_coap_sim_queue_no_response(void)
+{
+    host_ot_coap_sim_entry_t *e = push_entry();
+    e->kind = HOST_OT_COAP_SIM_NO_RESPONSE;
 }
 
 int host_ot_coap_sim_send_count(void)
@@ -241,6 +280,39 @@ otError otCoapSendResponse(otInstance *instance, otMessage *message, const otMes
     return OT_ERROR_NONE;
 }
 
+/* Thread-arg for HOST_OT_COAP_SIM_DELAYED_RESPONSE -- see that entry kind's
+ * own doc comment (host_ot_coap_sim.h). message_info is deliberately NOT
+ * carried across (the caller's own stack-allocated otMessageInfo is long
+ * gone by the time this thread wakes); sensor_transport.c's real
+ * coap_response_handler() never dereferences its message_info parameter
+ * anyway (see that function's own `(void)message_info;`). */
+typedef struct {
+    otCoapResponseHandler handler;
+    void *context;
+    otError err;
+    otCoapCode code;
+    uint32_t delay_ms;
+} delayed_response_arg_t;
+
+static void *delayed_response_thread(void *arg_v)
+{
+    delayed_response_arg_t *arg = (delayed_response_arg_t *)arg_v;
+    struct timespec ts = {.tv_sec = arg->delay_ms / 1000, .tv_nsec = (long)(arg->delay_ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+
+    otMessage *response = NULL;
+    if (arg->err == OT_ERROR_NONE) {
+        response = (otMessage *)calloc(1, sizeof(otMessage));
+        response->code = arg->code;
+    }
+    arg->handler(arg->context, response, NULL, arg->err);
+    if (response != NULL) {
+        free(response);
+    }
+    free(arg);
+    return NULL;
+}
+
 otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message, const otMessageInfo *messageInfo,
                                          otCoapResponseHandler handler, void *context,
                                          const otCoapTxParameters *txParameters)
@@ -257,7 +329,7 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
     }
     host_ot_coap_sim_entry_t *e = &s_queue[s_queue_pos++];
 
-    if (e->is_send_failure) {
+    if (e->kind == HOST_OT_COAP_SIM_SEND_FAILURE) {
         /* The real API never hands the message to the network on this path
          * -- sensor_transport.c's own send_one_attempt() frees it itself
          * (`if (err != OT_ERROR_NONE) { otMessageFree(message); }`), so this
@@ -270,6 +342,34 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
      * what it needs from it (nothing, in this simplified client-only sim). */
     otMessageFree(message);
 
+    if (e->kind == HOST_OT_COAP_SIM_NO_RESPONSE) {
+        /* Send succeeds; the handler is deliberately never invoked -- see
+         * this entry kind's own doc comment. */
+        return OT_ERROR_NONE;
+    }
+
+    if (e->kind == HOST_OT_COAP_SIM_DELAYED_RESPONSE) {
+        delayed_response_arg_t *arg = (delayed_response_arg_t *)malloc(sizeof(*arg));
+        if (arg == NULL) {
+            fprintf(stderr, "host_ot_coap_sim: malloc failed for a delayed response -- test infrastructure OOM\n");
+            abort();
+        }
+        arg->handler = handler;
+        arg->context = context;
+        arg->err = e->err;
+        arg->code = e->code;
+        arg->delay_ms = e->delay_ms;
+        pthread_t t;
+        if (pthread_create(&t, NULL, delayed_response_thread, arg) != 0) {
+            fprintf(stderr, "host_ot_coap_sim: pthread_create failed for a delayed response\n");
+            abort();
+        }
+        pthread_detach(t);
+        return OT_ERROR_NONE;
+    }
+
+    /* HOST_OT_COAP_SIM_IMMEDIATE_RESPONSE: unchanged synchronous delivery
+     * (see this file's own top comment for why that is safe/faithful). */
     otMessage *response = NULL;
     if (e->err == OT_ERROR_NONE) {
         response = otCoapNewMessage(instance, NULL);

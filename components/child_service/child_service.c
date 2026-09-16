@@ -684,12 +684,18 @@ static void handle_poll_config(const pogo_frame_t *frame)
     } else {
         /* effective_polling_period_ms = max(parent's dynamic formula result,
          * this module's own driver minimum) -- section 10 of the follow-up
-         * spec. The SAME s_polling_period_ms value feeds otLinkSetPollPeriod()
-         * (below, once JOINING starts) and sensor_service's periodic
-         * measurement task (set here) -- never two different periods
-         * computed two different ways. The ACK itself is unchanged (no new
-         * wire field) to keep POGO_MSG_POLL_CONFIG's existing wire format;
-         * a parent-visible "actual period used" echo is future work if ever
+         * spec. s_polling_period_ms feeds ONLY sensor_service's periodic
+         * measurement task (set here) -- it is NEVER passed to
+         * thread_manager_join_with_dataset() any more (real-hardware
+         * finding, this follow-up: reusing a multi-second sensor period as
+         * this LEAF's own Thread SED data-poll period made its CoAP client
+         * give up waiting for a response before its own next data poll
+         * could even retrieve it -- see thread_manager.h's own comment on
+         * thread_manager_join_with_dataset()'s thread_data_poll_period_ms
+         * parameter, and components/coap_response_timing). The ACK itself
+         * is unchanged (no new wire field) to keep POGO_MSG_POLL_CONFIG's
+         * existing wire format; a parent-visible "actual period used" echo
+         * is future work if ever
          * needed. */
         uint32_t effective_ms = sensor_service_compute_effective_period_ms(cfg_msg.polling_period_ms);
         if (effective_ms != cfg_msg.polling_period_ms) {
@@ -818,7 +824,12 @@ static void handle_set_dataset(const pogo_frame_t *frame)
         /* Dataset TLVs are never logged: they contain the Network Key. */
         ESP_LOGI(TAG, "dataset stored (%u bytes) -- starting Thread join as %s", (unsigned)s_dataset_len,
                  role_manager_role_to_str(role));
-        if (thread_manager_join_with_dataset(tm_role, s_dataset, s_dataset_len, s_polling_period_ms) == ESP_OK) {
+        /* thread_data_poll_period_ms=0: always use thread_manager's own
+         * Kconfig default (CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS)
+         * -- NEVER s_polling_period_ms (the sensor's own measurement
+         * period, logged separately above/in handle_poll_config()). See
+         * thread_manager.h's own comment on this parameter. */
+        if (thread_manager_join_with_dataset(tm_role, s_dataset, s_dataset_len, 0) == ESP_OK) {
             s_join_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_POGO_JOIN_TIMEOUT_MS);
         } else {
             ESP_LOGE(TAG, "failed to apply dataset / start Thread join");
@@ -909,7 +920,9 @@ static void child_service_task(void *arg)
                                                                : THREAD_MANAGER_ROLE_LEAF;
             ESP_LOGI(TAG, "role changed to %s while joined -- re-applying Thread link mode",
                      role_manager_role_to_str(s_role_for_join));
-            thread_manager_join_with_dataset(tm_role, s_dataset, s_dataset_len, s_polling_period_ms);
+            /* thread_data_poll_period_ms=0: same Kconfig-default policy as
+             * the initial join above -- never s_polling_period_ms. */
+            thread_manager_join_with_dataset(tm_role, s_dataset, s_dataset_len, 0);
             s_last_joined_role = s_role_for_join;
         }
 

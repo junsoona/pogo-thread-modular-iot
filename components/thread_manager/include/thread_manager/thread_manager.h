@@ -107,16 +107,34 @@ esp_err_t thread_manager_start_as_root(void);
 /*
  * INTERMEDIATE/LEAF: joins using a dataset obtained from the upstream
  * parent (already validated via thread_manager_validate_dataset_tlvs()).
- * poll_period_ms is applied (via otLinkSetPollPeriod) only for
- * THREAD_MANAGER_ROLE_LEAF; pass 0 to use this component's Kconfig default.
+ *
+ * `thread_data_poll_period_ms` is applied (via otLinkSetPollPeriod) only
+ * for THREAD_MANAGER_ROLE_LEAF; pass 0 to use this component's Kconfig
+ * default (CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS, 500ms by
+ * default). **This is the Thread SED MAC data poll interval -- how often
+ * this device wakes its radio to ask its parent "do you have anything
+ * queued for me" -- and is DELIBERATELY DECOUPLED from any sensor
+ * measurement/sampling period** (real-hardware finding: an earlier
+ * revision passed the sensor's own `polling_period_ms`, e.g. 3528ms,
+ * straight through to this parameter; a SED with a multi-second data-poll
+ * interval only picks up a queued CoAP response from its parent on its
+ * NEXT poll, which can easily arrive after the CoAP client's own
+ * ACK-timeout wait already gave up -- observed on real hardware as
+ * `sensor_transport`/`topology_reporter` timing out even though the power
+ * base had already stored the sample. See
+ * `components/coap_response_timing` and `sensor_service`'s own
+ * measurement-period API, which this parameter has NO relationship to any
+ * more -- the caller must never derive this value from a sensor's sampling
+ * period). Callers that have no reason to override it should simply pass 0.
  *
  * LEAF applies, before enabling Thread: router eligible=false,
  * mRxOnWhenIdle=false, mDeviceType=false, mNetworkData=false (SED).
- * INTERMEDIATE applies: router eligible=true, full FTD link mode -- and,
- * per spec, never forms its own separate network.
+ * INTERMEDIATE applies: router eligible=true, full FTD link mode (always-on,
+ * unaffected by `thread_data_poll_period_ms`, which this branch never
+ * applies at all) -- and, per spec, never forms its own separate network.
  */
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,
-                                            uint16_t dataset_len, uint32_t poll_period_ms);
+                                            uint16_t dataset_len, uint32_t thread_data_poll_period_ms);
 
 /*
  * Safely disables Thread + IP6 (idempotent). Call before switching role, and
