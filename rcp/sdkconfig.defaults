@@ -1,0 +1,95 @@
+#
+# Adapted from ESP-IDF v6.1's official ot_rcp example
+# ($IDF_PATH/examples/openthread/ot_rcp/sdkconfig.defaults), merged with
+# that example's sdkconfig.ci.rcp_usb fragment (CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y)
+# into ONE flat file for this repository's USB Serial/JTAG RCP -- see
+# docs/otbr-rcp.md. Target is set separately via `idf.py -C rcp set-target
+# esp32h2` (not hardcoded here, matching upstream's own multi-target example).
+#
+
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+# end of Partition Table
+
+#
+# Wireless Coexistence
+#
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+#
+# OpenThread
+#
+CONFIG_OPENTHREAD_ENABLED=y
+# "Radio Only Device" -- this firmware forwards 802.15.4 packets to the Linux
+# host over Spinel; the OpenThread FTD/MTD stack itself runs on the host
+# (OTBR), not on this chip.
+CONFIG_OPENTHREAD_RADIO=y
+#
+# RCP transport: USB Serial/JTAG, not UART, not SPI (see docs/otbr-rcp.md for
+# why -- one USB cable for both flashing and the Spinel link, no UART GPIO
+# wiring). This is a `choice` in Kconfig (OPENTHREAD_RCP_TRANSPORT); setting
+# it here means CONFIG_OPENTHREAD_RCP_UART and CONFIG_OPENTHREAD_RCP_SPI are
+# both implicitly "n" and never appear as "=y" in this file.
+CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y
+# CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG's own Kconfig `depends on` requires
+# the ESP-IDF console's SECONDARY output channel to be USB Serial/JTAG.
+# ESP32-H2 already defaults this to "y" (SOC_USB_SERIAL_JTAG_SUPPORTED, and
+# the primary console -- ESP_CONSOLE_UART_DEFAULT, unwired in this project --
+# is not itself USB_SERIAL_JTAG), but it is set explicitly here so this
+# dependency is satisfied by an explicit, checked-in setting rather than by
+# an implicit Kconfig default that could change.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+# No RCP debug console in this initial version (see docs/otbr-rcp.md's scope
+# section) -- this is already Kconfig's own default (n), set explicitly here
+# so it is a visible, checked-in fact rather than an implicit default.
+CONFIG_OPENTHREAD_RCP_SPINEL_CONSOLE=n
+CONFIG_OPENTHREAD_DIAG=n
+CONFIG_OPENTHREAD_COMMISSIONER=n
+CONFIG_OPENTHREAD_JOINER=n
+CONFIG_OPENTHREAD_BORDER_ROUTER=n
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_SRP_CLIENT=n
+CONFIG_OPENTHREAD_DNS_CLIENT=n
+CONFIG_OPENTHREAD_TASK_SIZE=3072
+# Disables the SDK's own dedicated OpenThread console (a further guard on
+# top of OPENTHREAD_CLI=n above -- see the Kconfig help text for
+# OPENTHREAD_CONSOLE_ENABLE).
+CONFIG_OPENTHREAD_CONSOLE_ENABLE=n
+# end of OpenThread
+
+
+#
+# Deprecated options for backward compatibility
+#
+CONFIG_BOOTLOADER_LOG_LEVEL_ERROR=y
+CONFIG_BOOTLOADER_LOG_LEVEL_INFO=n
+# End of deprecated options
+
+#
+# Configurations for optimizing the size of the RCP firmware, AND (just as
+# importantly for this project) keeping ordinary application/log output off
+# entirely -- the USB Serial/JTAG port carries nothing but raw Spinel bytes
+# to the Linux host, and any stray text log line written to that same secondary
+# console channel would corrupt the Spinel byte stream (see docs/otbr-rcp.md).
+# CONFIG_LOG_DEFAULT_LEVEL_NONE / CONFIG_OPENTHREAD_LOG_LEVEL_NONE below are
+# what actually prevent that, not any hardware separation between "logs" and
+# "Spinel" on this one USB endpoint.
+#
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT=y
+CONFIG_COMPILER_SAVE_RESTORE_LIBCALLS=y
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
+CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC=n
+CONFIG_OPENTHREAD_LOG_LEVEL_NONE=y
+CONFIG_OPENTHREAD_TIMING_OPTIMIZATION=y
+CONFIG_FREERTOS_HZ=1000
