@@ -14,6 +14,13 @@ subprocess per scenario sidesteps that entirely and also matches how a real
 user actually runs this tool), and confirms:
 
   - a clean 3-tier log set PASSes (exit code 0)
+  - the SAME clean 3-tier log set, with every line wrapped in ANSI color
+    escape codes the way `idf.py monitor | tee some.log` actually saves them
+    (INTERMEDIATE's and LEAF's own "role changed" lines specifically include
+    a "\x1b[0m" reset, the exact byte sequence a real colorized capture
+    would have right around those role names), STILL PASSes identically --
+    read_lines() strips ANSI escapes before any regex runs, so a colorized
+    log is judged by the exact same criteria as a plain one
   - each of these single defects independently FAILs (exit code 1), with
     the specific expected "FAIL: ..." line present in the tool's stdout:
       1. a missing PEER_READY on the middle module's own upstream link
@@ -76,6 +83,15 @@ GOOD_LEAF = [
 ]
 
 
+def ansi_wrap(line, code="0;32"):
+    """Wraps `line` the way `idf.py monitor`'s own colorizer does: an SGR
+    color-select escape at the front and a reset ("\\x1b[0m") at the end.
+    `idf.py monitor | tee some.log` preserves these bytes verbatim in the
+    saved file -- see validate_three_tier_logs.py's own ANSI_ESCAPE_RE
+    comment for why read_lines() must strip them before any regex runs."""
+    return f"\x1b[{code}m{line}\x1b[0m"
+
+
 def write_log(dir_path, name, lines):
     path = os.path.join(dir_path, name)
     with open(path, "w", encoding="utf-8") as f:
@@ -113,6 +129,22 @@ def main():
     with tempfile.TemporaryDirectory() as tmp_dir:
         # 1. A clean 3-tier chain PASSes.
         scenario(tmp_dir, "clean 3-tier chain", GOOD_BASE, GOOD_MIDDLE, GOOD_LEAF, expect_pass=True)
+
+        # 1b. The same clean chain, captured the way a real
+        # `idf.py monitor | tee some.log` session saves it -- every line
+        # colorized, with a "\x1b[0m" reset specifically inside the
+        # INTERMEDIATE and LEAF "role changed" lines (the two lines
+        # ROLE_CHANGED_RE has to match against) -- must PASS exactly the
+        # same as the plain, colorless fixture above.
+        color_base = [ansi_wrap(line, "0;36") for line in GOOD_BASE]
+        color_middle = [ansi_wrap(line, "0;36") for line in GOOD_MIDDLE]
+        color_leaf = [ansi_wrap(line, "0;36") for line in GOOD_LEAF]
+        assert any("-> INTERMEDIATE" in line and "\x1b[0m" in line for line in color_middle), \
+            "test fixture bug: the colorized INTERMEDIATE role line must contain \\x1b[0m"
+        assert any("-> LEAF" in line and "\x1b[0m" in line for line in color_leaf), \
+            "test fixture bug: the colorized LEAF role line must contain \\x1b[0m"
+        scenario(tmp_dir, "clean 3-tier chain with ANSI color codes (idf.py monitor | tee)",
+                 color_base, color_middle, color_leaf, expect_pass=True)
 
         # 2. A missing PEER_READY (middle module's own upstream link) FAILs.
         bad_middle = without(GOOD_MIDDLE, "port 0: PEER_READY")

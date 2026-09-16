@@ -43,6 +43,7 @@ typedef enum {
     REG_ERR_DEPTH1_BAD_PARENT,
     REG_ERR_UNKNOWN_PARENT,
     REG_ERR_PARENT_DEPTH_MISMATCH,
+    REG_ERR_PARENT_OFFLINE,
     REG_ERR_CYCLE,
     REG_ERR_STALE_SESSION,
     REG_ERR_DUPLICATE_SEQ,
@@ -91,6 +92,8 @@ static void scenario_topology_response_code_mapping(void)
           "stale session -> 4.12 Precondition Failed");
     CHECK(topology_result_to_coap_code(REG_ERR_DUPLICATE_SEQ) == COAP_PRECONDITION_FAILED,
           "reordered/duplicate seq -> 4.12 Precondition Failed");
+    CHECK(topology_result_to_coap_code(REG_ERR_PARENT_OFFLINE) == COAP_PRECONDITION_FAILED,
+          "parent offline (or not downstream_connected) -> 4.12 Precondition Failed");
 
     CHECK(coap_code_is_success(COAP_CHANGED), "2.04 is recognized as success by the client-side check");
     CHECK(coap_code_is_success(COAP_VALID), "2.03 is recognized as success by the client-side check");

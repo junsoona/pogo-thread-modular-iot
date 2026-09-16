@@ -59,9 +59,10 @@ the two would overclaim what a passing 3-tier log judgement actually proves.
 | INTERMEDIATE forwarding UUID/slot/depth+1/polling/collector/Dataset to its own downstream child | Reviewed this pass -- OK, no bug | Not yet | `parent_service.c` is generic (used by both Power Base and any INTERMEDIATE via `s_provider` callbacks): confirms the child's own permanent UUID, `ASSIGN_SLOT` with `depth=get_own_depth()+1`, `ASSIGN_PARENT_INFO`, measured-response-time polling period, `SET_COLLECTOR` before `SET_DATASET` (both sides enforce the ordering). |
 | INTERMEDIATE always an always-on router-eligible FTD (never SED) | Reviewed this pass -- OK, no bug | Not yet | `thread_manager.c`'s non-LEAF branch sets `rx-on-when-idle=true`/FTD/`router_eligible=true`, keyed on `role_manager_get_role()==MODULE_ROLE_INTERMEDIATE` (independent of `otDeviceRole`), and is correctly re-applied if the role flips while already joined. |
 | Terminal LEAF always an SED (never FTD/router-eligible) | Reviewed this pass -- OK, no bug | Not yet | Same `thread_manager.c` function's LEAF branch: `rx-on-when-idle=false`, MTD-like, `router_eligible=false`, plus `otLinkSetPollPeriod()`. |
-| depth=2 POGO chain (Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF) -- POGO docking order, depth propagation, provisioning, CoAP reachability ONLY | Code review this pass: no confirmed bugs in any of the 6 reviewed areas (existing parent/child code is already generic, not hardcoded to depth=1) | Not yet | Target of the next real-hardware pass -- see README "3단 센서 체인 실물 배선" and `tools/validate_three_tier_logs.py` for post-hoc log judging. This item is POGO/application-layer topology only -- it does NOT confirm Thread radio multi-hop (see next row). |
+| depth=2 POGO chain (Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF) -- POGO docking order, depth propagation, provisioning, CoAP reachability ONLY | Yes (`tools/validate_three_tier_logs.py`) | **Verified** | Real run with SHT45 as the INTERMEDIATE and PMS5003 as the LEAF (BH1750 in this role still not yet run). `tools/validate_three_tier_logs.py` judged the captured logs 16/16 PASS: both POGO links reached `PEER_READY` on both ends, SHT45 settled to logical role `INTERMEDIATE` and PMS5003 to `LEAF`, the Power Base's own `topology_registry` registered two distinct, disjoint UUIDs -- one at depth=1 (SHT45) and one at depth=2 (PMS5003), both modules' `JOIN_RESULT_ACK` was confirmed on their own hop, and sensor samples were recorded from both UUIDs. This item is still POGO/application-layer topology only -- it does NOT confirm Thread radio multi-hop (see next section). |
+| Power Base<->INTERMEDIATE POGO detach cascades the whole subtree offline, and a child cannot resurrect itself while its parent stays offline (`TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE`) | Yes (`tools/test_topology_registry.c`, `tools/test_topology_gate.c`, `tools/test_sensor_transport_gate_retry.c`) | **Verified** | On the same depth=2 chain above, physically detaching the Power Base<->SHT45 POGO link took both SHT45 (depth=1) and PMS5003 (depth=2) offline in the Power Base's registry; PMS5003's own topology reports were rejected as `PARENT_OFFLINE` while SHT45 stayed detached, and the Power Base recorded no PMS5003 sensor sample for the entire detached window. Reattaching let SHT45 re-register at depth=1 first, then PMS5003 re-register at depth=2 once SHT45 was online again, and sensor sample delivery resumed automatically with neither board reset. |
 | Power Base topology_registry: two modules' UUIDs/sensor bitmaps never cross-assigned | Reviewed this pass -- OK, no bug | Not yet | `topology_registry_apply_report()` always looks up a node's slot by UUID equality first; a free slot is only allocated for a genuinely new UUID, and every field (including `sensor_bitmap`) is written into a freshly-cleared entry -- no reuse of a stale slot's bitmap under a different UUID. |
-| A reattach on one module never corrupts Power Base session/registry state for other modules | Reviewed this pass -- OK, no bug | Not yet | `topology_registry_cascade_offline_children()`/`mark_offline()` only touch the detaching UUID and its own descendants (no global reset). `power_base_transport_on_direct_downstream_detached()` marks only `depth==1` nodes offline, which is exactly the one physically-detached node given Power Base has exactly one physical DOWNSTREAM POGO port. Each module's own `child_service.c`/`parent_service.c` session state is scoped to that module's one upstream link and one downstream port -- a reattach only resets that module's own session. |
+| A reattach on one module never corrupts Power Base session/registry state for other modules | Reviewed this pass -- OK, no bug | Not yet | `topology_registry_cascade_offline_children()`/`mark_offline()` only touch the detaching UUID and its own descendants (no global reset). `power_base_transport_on_direct_downstream_detached()` marks only `depth==1` nodes offline, which is exactly the one physically-detached node given Power Base has exactly one physical DOWNSTREAM POGO port. Each module's own `child_service.c`/`parent_service.c` session state is scoped to that module's one upstream link and one downstream port -- a reattach only resets that module's own session. The depth=2 detach/reattach row above confirms the detaching module's own two-node subtree recovers correctly; a THIRD, unrelated sibling module's state during that same detach has not yet been exercised on real hardware. |
 
 ## Thread radio multi-hop routing (separate from POGO physical topology depth above)
 
@@ -76,6 +77,21 @@ physical shape.
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
 | A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | None -- this is a real-RF/radio-path property, not something `idf.py monitor` application logs can establish | Not verified | Requires either (a) OpenThread router/neighbor-table and route diagnostics captured separately from the application log (e.g. `ot router table`/`ot neighbor table` CLI output, or `otThreadGetNextHop()`/`otThreadGetRouterInfo()`, showing the actual next-hop router used for the LEAF's destination), or (b) a dedicated RF test that physically prevents a direct LEAF<->Power-Base radio path (shielding/distance/attenuation) so any observed delivery can only have happened via the INTERMEDIATE module's relay. Neither has been done. |
+
+## Thread join timing (open observation, this pass)
+
+The depth=2 real-hardware run above completed with no `THREAD_JOIN_TIMEOUT` on either
+hop -- `CONFIG_POGO_JOIN_TIMEOUT_MS` (20s) was not hit on either the Power Base<->SHT45
+or SHT45<->PMS5003 join. A diagnostic log added this pass
+(`components/thread_manager/thread_manager.c`'s `esp_openthread_auto_start OK --
+otDeviceRole immediately after enable: ...`) confirmed `otDeviceRole` transitioned to
+`DETACHED` immediately every time `thread_manager_join_with_dataset()` was called on this
+run -- so neither `otIp6SetEnabled(true)` nor `otThreadSetEnabled(true)` silently no-op'd.
+
+| Item | Status | Notes |
+|---|---|---|
+| `THREAD_JOIN_TIMEOUT` on either hop | Not observed this run | Still possible under different real-world conditions; no code change was made on the strength of one clean run. |
+| A roughly 16.3s gap between `otThreadSetEnabled(true)` succeeding (role already read back as `DETACHED`) and OpenThread's own first `Attach attempt` log, seen once on this run's FIRST join attempt (a later re-join on the same board attached ~730ms after the equivalent point) | **Unconfirmed root cause -- recorded as an open observation, not fixed** | This firmware's own API calls (`thread_manager.c`/`child_service.c`) all returned success and the role read back correctly immediately, so the delay is not in this firmware's own request path -- it appears to originate inside OpenThread's own MLE attach scheduling. `CONFIG_POGO_JOIN_TIMEOUT_MS` was NOT changed and no warning was suppressed to work around this. The raw capture this observation is drawn from is not checked into this repository. |
 
 ## Explicitly out of scope (not implemented, not planned this pass)
 
@@ -98,3 +114,10 @@ physical shape.
   `topology_gate`, and POGO hotswap recovery as "아직 실물 미검증" (not yet
   verified on real hardware). All three have since been verified -- see the
   tables above. Fixed in this pass.
+- The depth=2 POGO chain (Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF)
+  row was "Not yet" pending the next real-hardware pass -- that pass has
+  since happened (`tools/validate_three_tier_logs.py` 16/16 PASS) and the
+  Power Base<->INTERMEDIATE detach/reattach recovery (`PARENT_OFFLINE`) was
+  also confirmed on the same run. Both rows updated to **Verified** this
+  pass. Thread radio multi-hop routing (a separate, still-unverified claim)
+  is deliberately left unchanged -- see that section's own scope note.

@@ -259,6 +259,30 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
                     topology_gate_close();
                     topology_gate_request_reregister();
                 }
+                /*
+                 * Parent-offline recovery (real-hardware finding: a Power
+                 * Base DOWNSTREAM POGO detach -- or an intermediate node's
+                 * own downstream loss -- cascades this module's registry
+                 * entry offline; see topology_registry.c's new
+                 * TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE). power_base_transport's
+                 * "/s" handler returns this SAME CoAP 4.12 Precondition
+                 * Failed for a known-but-offline module (and, unchanged from
+                 * before, for a bitmap-mismatched sample) -- there is no
+                 * wire-level way to tell those apart, and none is added
+                 * here (item 8: wire format unchanged). Reacting the same
+                 * way as the 4.04 case above -- close the gate immediately
+                 * and ask topology_reporter to re-attach on its very next
+                 * poll tick -- is safe either way: a genuine parent-offline
+                 * condition needs exactly this to recover once the parent
+                 * comes back, and a (rare, config-time) bitmap mismatch just
+                 * re-sends the same idempotent ATTACHED report, bounded by
+                 * this module's own sensor-sampling period -- never a tight
+                 * busy loop (section 9 of the follow-up spec).
+                 */
+                if (s_require_topology_gate && s_send_response_code == OT_COAP_CODE_PRECONDITION_FAILED) {
+                    topology_gate_close();
+                    topology_gate_request_reregister();
+                }
             }
         }
     }
@@ -311,10 +335,47 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
             uint32_t backoff_ms = hash & retry_masks[attempt];
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
         }
+        /*
+         * Re-check the gate right before EVERY attempt, not just once
+         * before this whole loop started: send_one_attempt() itself can
+         * close the gate mid-retry (a 4.04/4.12 rejection -- see its own
+         * "Power base reboot recovery" / "Parent-offline recovery" comments
+         * below), and an unrelated event (topology_reporter noticing
+         * upstream/Thread/role loss) can close it asynchronously during
+         * this loop's own backoff sleep. Either way, once the gate is
+         * closed no further "/s" attempt for this sample is made -- see
+         * this function's header comment and topology_gate.h's own
+         * "a sensor sample must never be sent wirelessly while this is
+         * false" invariant.
+         */
+        if (s_require_topology_gate && !topology_gate_is_open()) {
+            ESP_LOGD(TAG, "topology gate closed before attempt %d/%d -- aborting remaining retries for this "
+                          "sample (uuid=..%02x%02x seq=%u)",
+                     attempt + 1, SENSOR_TRANSPORT_MAX_ATTEMPTS, sample->module_uuid[6], sample->module_uuid[7],
+                     (unsigned)sample->sample_seq);
+            return;
+        }
         if (send_one_attempt(payload, len)) {
             ESP_LOGD(TAG, "sample sent OK (uuid=..%02x%02x seq=%u attempt=%d/%d)", sample->module_uuid[6],
                       sample->module_uuid[7], (unsigned)sample->sample_seq, attempt + 1, SENSOR_TRANSPORT_MAX_ATTEMPTS);
             return; /* success -- no retry state to reset, each call starts fresh */
+        }
+        /*
+         * This very attempt's own rejection may be exactly what just closed
+         * the gate (send_one_attempt()'s 4.04/4.12 handling). Abort the
+         * remaining retries for THIS sample immediately rather than paying
+         * out this iteration's backoff delay only to have the check above
+         * catch it on the next loop pass -- this is the expected recovery
+         * path (topology_reporter is about to re-attach), not a real
+         * delivery failure, so it is logged at DEBUG, never the "dropped
+         * after N attempts" WARN below.
+         */
+        if (s_require_topology_gate && !topology_gate_is_open()) {
+            ESP_LOGD(TAG, "topology gate closed by this attempt's rejection -- aborting remaining retries for "
+                          "this sample (uuid=..%02x%02x seq=%u, %d/%d attempts made)",
+                     sample->module_uuid[6], sample->module_uuid[7], (unsigned)sample->sample_seq, attempt + 1,
+                     SENSOR_TRANSPORT_MAX_ATTEMPTS);
+            return;
         }
     }
     ESP_LOGW(TAG, "sample dropped after %d attempts (uuid=..%02x%02x seq=%u)", SENSOR_TRANSPORT_MAX_ATTEMPTS,

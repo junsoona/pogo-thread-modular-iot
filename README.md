@@ -865,9 +865,15 @@ D (..) sensor_transport: topology registration not yet confirmed -- sample uuid=
 
 ```
 W (..) sensor_transport: sensor sample rejected by receiver: CoAP 4.04
-W (..) topology_reporter: power base no longer recognizes this module (a sensor sample was rejected as unknown-module) -- closing the data-plane gate and re-registering now
+W (..) topology_reporter: power base rejected this module's sample because its topology registration is unknown or no longer valid -- closing the data-plane gate and re-registering now
 I (..) topology_reporter: topology report sent OK (type=0 seq=.. attempt=1/4)
 ```
+
+같은 `topology_reporter` 로그 줄은 부모가 offline인 상태에서 `sensor_transport`가
+CoAP 4.12를 받았을 때도 동일하게 나온다 (`components/topology_registry`의
+`TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE` 참고) -- 둘 중 어느 쪽이었는지는 이 로그 한
+줄만으로 구분되지 않으며, 의도적으로 그렇게 뒀다(두 경우 모두 대응은 동일: gate를
+닫고 즉시 재등록).
 
 `sensor_transport: sensor sample rejected ...: CoAP 4.04` 다음에 (최대 30초가 아니라)
 `topology_reporter`의 다음 poll tick(<=500ms) 안에 새 `topology report sent OK

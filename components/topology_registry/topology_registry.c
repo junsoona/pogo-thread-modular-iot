@@ -93,6 +93,19 @@ topology_registry_result_t topology_registry_apply_report(topology_registry_t *r
         if ((uint8_t)(reg->nodes[parent_idx].depth + 1) != report->topology_depth) {
             return TOPOLOGY_REGISTRY_ERR_PARENT_DEPTH_MISMATCH;
         }
+        /* Real-hardware finding: a parent that is itself offline (a direct
+         * Power Base DOWNSTREAM detach, see
+         * power_base_transport_on_direct_downstream_detached()) or whose own
+         * downstream link just broke (that parent's own UPDATED report with
+         * downstream_connected=false, see the cascade below) must not have
+         * its already-offlined children resurrected by a stale
+         * HEARTBEAT/UPDATED/ATTACHED that the child sends before IT notices
+         * the break. Checked AFTER the depth-mismatch check above so a
+         * structurally-impossible report is still reported as that specific
+         * error, not conflated with liveness. */
+        if (!reg->nodes[parent_idx].online || !reg->nodes[parent_idx].downstream_connected) {
+            return TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE;
+        }
     }
 
     if (creates_cycle(reg, report->module_uuid, report->parent_uuid)) {

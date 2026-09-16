@@ -20,7 +20,11 @@
  *                      has_attached/settled/reregister-request handling
  *                      (topology_reporter.c)
  *   sender_send()      mirrors sensor_transport_send_sample()'s gate check
- *                      + CoAP-4.04 reaction (sensor_transport.c)
+ *                      + CoAP-4.04/4.12 reaction (sensor_transport.c) --
+ *                      4.12 is the power base's response for a known module
+ *                      whose topology_registry entry is offline (the parent-
+ *                      offline follow-up fix, components/topology_registry),
+ *                      reacted to identically to the pre-existing 4.04 case
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -I tools/host_test_stubs -I components/topology_gate/include \
@@ -97,11 +101,12 @@ static void reporter_tick(reporter_model_t *m, bool attached_send_result)
 typedef enum {
     SEND_SKIPPED_GATE_CLOSED, /* no wireless attempt made at all */
     SEND_OK,
-    SEND_REJECTED_UNKNOWN_MODULE, /* CoAP 4.04 -- triggers gate close + reregister request */
+    SEND_REJECTED_UNKNOWN_MODULE,   /* CoAP 4.04 -- triggers gate close + reregister request */
+    SEND_REJECTED_PRECONDITION_FAILED, /* CoAP 4.12 -- ALSO triggers gate close + reregister request */
     SEND_REJECTED_OTHER,
 } send_outcome_t;
 
-typedef enum { COAP_2XX, COAP_4_04_NOT_FOUND, COAP_4XX_OTHER } sim_coap_response_t;
+typedef enum { COAP_2XX, COAP_4_04_NOT_FOUND, COAP_4_12_PRECONDITION_FAILED, COAP_4XX_OTHER } sim_coap_response_t;
 
 /* `sample_seq` is threaded through purely to demonstrate that a skipped (gate
  * closed) send never touches/consumes a sequence number of its own -- the
@@ -123,6 +128,25 @@ static send_outcome_t sender_send(bool require_gate, sim_coap_response_t respons
             topology_gate_request_reregister();
         }
         return SEND_REJECTED_UNKNOWN_MODULE;
+    }
+    if (response == COAP_4_12_PRECONDITION_FAILED) {
+        /*
+         * Parent-offline recovery (real-hardware finding, this follow-up):
+         * power_base_transport's "/s" handler returns this SAME CoAP 4.12
+         * both for a known-but-offline module (the exact scenario a Power
+         * Base DOWNSTREAM detach produces -- see
+         * components/topology_registry's new TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE)
+         * and for a bitmap-mismatched sample; there is no wire-level way to
+         * tell those apart (and none is added). Reacting identically to the
+         * 4.04 branch above -- close the gate right away, ask
+         * topology_reporter to re-attach on its very next poll tick -- is
+         * safe either way, see sensor_transport.c's send_one_attempt().
+         */
+        if (require_gate) {
+            topology_gate_close();
+            topology_gate_request_reregister();
+        }
+        return SEND_REJECTED_PRECONDITION_FAILED;
     }
     return SEND_REJECTED_OTHER;
 }
@@ -232,6 +256,56 @@ static void scenario_power_base_reboot_recovery(void)
     CHECK(out == SEND_OK, "sensor sample sending resumes normally once re-registration is confirmed");
 }
 
+static void scenario_parent_offline_recovery(void)
+{
+    printf("\n-- scenario: parent-offline -- 4.12 Precondition Failed closes the gate and requests "
+           "re-registration; sending stays blocked until the child's own re-ATTACHED succeeds --\n");
+    topology_gate_init();
+    reporter_model_t rep;
+    reporter_reset(&rep);
+    rep.settled = true;
+    reporter_tick(&rep, true);
+    CHECK(rep.has_attached && topology_gate_is_open(), "precondition: this module was already registered "
+                                                        "(and its own parent was online) before the parent detached");
+
+    /* The module's own parent's POGO link (or the Power Base's own direct
+     * DOWNSTREAM link somewhere further up the chain) was detached --
+     * topology_registry cascades this module's OWN entry offline (see
+     * topology_registry.c's TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE). This
+     * module's own Thread membership is completely unaffected (it can
+     * still successfully reach the power base over the mesh) -- only its
+     * SAMPLE gets rejected, since the registry now refuses to accept this
+     * module's reports OR its sensor data while its parent is offline. */
+    send_outcome_t out = sender_send(/*require_gate=*/true, COAP_4_12_PRECONDITION_FAILED);
+    CHECK(out == SEND_REJECTED_PRECONDITION_FAILED, "a 4.12 response is never treated as a successful send");
+    CHECK(!topology_gate_is_open(), "the gate closes immediately on the 4.12, without waiting for topology_reporter's own poll tick");
+
+    /* While the parent stays offline, topology_reporter's own next-tick
+     * re-ATTACH attempt is ALSO rejected by the registry (PARENT_OFFLINE
+     * applies to every report type, not just sensor samples) -- has_attached
+     * stays false, the gate stays closed, and the retry is paced by the
+     * real task's normal poll tick + rate-limited warning log, never a
+     * busy loop (section 9 of the follow-up spec). Modeled here as several
+     * more failed ticks. */
+    for (int i = 0; i < 4; i++) {
+        reporter_tick(&rep, /*attached_send_result=*/false);
+    }
+    CHECK(!rep.has_attached, "re-ATTACH keeps failing while the parent stays offline -- never marked attached");
+    CHECK(!topology_gate_is_open(), "...and the gate stays closed the whole time (never opens on a failed re-ATTACH)");
+
+    out = sender_send(/*require_gate=*/true, COAP_2XX);
+    CHECK(out == SEND_SKIPPED_GATE_CLOSED, "no sensor sample is sent at all while re-registration keeps failing");
+
+    /* The parent genuinely comes back online -- the very next re-ATTACH
+     * attempt now succeeds. */
+    reporter_tick(&rep, /*attached_send_result=*/true);
+    CHECK(rep.has_attached, "re-registration succeeds once the parent is online again");
+    CHECK(topology_gate_is_open(), "the gate reopens once the re-ATTACHED attempt gets a real 2.xx");
+
+    out = sender_send(/*require_gate=*/true, COAP_2XX);
+    CHECK(out == SEND_OK, "sensor sample sending resumes automatically once re-registration is confirmed");
+}
+
 static void scenario_dev_root_dev_leaf_unaffected(void)
 {
     printf("\n-- scenario: DEV_ROOT/DEV_LEAF (require_topology_registration=false) never gate on this at all --\n");
@@ -310,6 +384,7 @@ int main(void)
     scenario_failed_attach_keeps_gate_closed_and_retries();
     scenario_gate_closes_on_detach_error_or_new_session();
     scenario_power_base_reboot_recovery();
+    scenario_parent_offline_recovery();
     scenario_dev_root_dev_leaf_unaffected();
     scenario_duplicate_or_late_callback_never_opens_gate_early();
     scenario_sample_seq_policy_unaffected_by_gate();

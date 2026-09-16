@@ -33,21 +33,31 @@
  * sensor_transport_send_sample() additionally refuses to even attempt a
  * "/s" wireless send while `topology_gate_is_open()` is false -- i.e. before
  * this module's own TOPOLOGY_REPORT_ATTACHED has received a real CoAP 2.xx
- * response from the power base's "/t" resource. This never touches the
- * bounded per-attempt CoAP retry/backoff schedule above; it just skips the
- * whole send attempt entirely (a quiet ESP_LOGD, not a per-cycle warning)
- * until the gate opens. DEV_ROOT/DEV_LEAF (module-to-module regression,
- * whose peer never runs power_base_transport and so never has a "/t"
- * resource at all) pass `require_topology_registration=false` and are
- * completely unaffected -- see docs/power-base.md.
+ * response from the power base's "/t" resource. This is re-checked before
+ * EVERY attempt of the per-sample retry loop below, not just once up front:
+ * a rejection mid-retry (4.04/4.12, see "Power base reboot recovery" /
+ * docs/power-base.md's "parent-offline recovery" below) closes the gate
+ * itself, and the loop notices this immediately and abandons the sample's
+ * remaining retries rather than keep hammering "/s" while re-registration
+ * is in flight -- logged at DEBUG (this is the expected recovery path), not
+ * the "dropped after N attempts" WARN a genuine delivery failure gets.
+ * DEV_ROOT/DEV_LEAF (module-to-module regression, whose peer never runs
+ * power_base_transport and so never has a "/t" resource at all) pass
+ * `require_topology_registration=false` and are completely unaffected --
+ * see docs/power-base.md.
  *
  * Power base reboot recovery: the power base's topology_registry is
  * RAM-only, so a reboot can make it reject an already-registered module's
- * sample as CoAP 4.04 Not Found ("unknown module"). When that happens (and
- * only when `require_topology_registration` is true), sensor_transport
- * closes the gate right away and calls topology_gate_request_reregister()
- * so topology_reporter re-attaches on its very next poll tick instead of
- * waiting for its normal heartbeat schedule.
+ * sample as CoAP 4.04 Not Found ("unknown module"). Parent-offline recovery:
+ * a module whose parent's own registry entry is offline gets CoAP 4.12
+ * Precondition Failed for the exact same "/s" sample (see
+ * components/topology_registry's TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE).
+ * Either way (and only when `require_topology_registration` is true),
+ * sensor_transport closes the gate right away and calls
+ * topology_gate_request_reregister() so topology_reporter re-attaches on
+ * its very next poll tick instead of waiting for its normal heartbeat
+ * schedule; no further "/s" attempt (for this sample or any later one) is
+ * made until a real CoAP 2.xx re-opens the gate.
  */
 #pragma once
 

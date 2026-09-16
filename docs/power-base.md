@@ -354,6 +354,14 @@ mutating anything:
   (`ERR_DEPTH1_BAD_PARENT`);
 - `topology_depth > 1` naming an unknown parent (`ERR_UNKNOWN_PARENT`), or
   one whose own depth+1 doesn't match (`ERR_PARENT_DEPTH_MISMATCH`);
+- `topology_depth > 1` naming a KNOWN parent that is currently
+  `online == false` and/or `downstream_connected == false`
+  (`ERR_PARENT_OFFLINE` -- real-hardware finding: without this check, a
+  child's own stale HEARTBEAT/UPDATED/ATTACHED -- sent before it notices
+  its parent's link broke -- would flip its entry back online ahead of the
+  parent actually reconnecting; see section 11's detach handling below and
+  `tools/test_topology_registry.c`'s
+  `scenario_parent_offline_rejects_children_then_recovers`);
 - a topology cycle -- the claimed parent chain already contains this module
   (`ERR_CYCLE`);
 - a report from an older `boot_session_generation` (`ERR_STALE_SESSION`), or
@@ -389,6 +397,27 @@ the real, unmodified component.
 - **Reconnect**: a later valid report for the SAME uuid revives the SAME
   entry (`online=true` again) -- it is never deleted, only marked offline, so
   its history (depth, parent, sensor bitmap) survives a stale/detach window.
+  For a `topology_depth > 1` node, "valid" now also requires its OWN
+  reported parent to currently be `online == true` AND
+  `downstream_connected == true` (`ERR_PARENT_OFFLINE`, section 10) -- a
+  child cannot revive itself ahead of its parent; only once the parent's own
+  report is accepted first can the child's next report succeed.
+- **A rejected child, while its parent stays offline**: `power_base_transport`'s
+  `"/t"` handler maps `ERR_PARENT_OFFLINE` to the same CoAP `4.12
+  Precondition Failed` every other rejection uses (section 14 below), and
+  its `"/s"` sensor-sample handler ALSO returns `4.12` for that same
+  known-but-offline uuid (unchanged, pre-existing "known+offline" response
+  -- section 13). `sensor_transport` reacts to a `4.12` on a sensor sample
+  exactly like the `4.04` power-base-reboot case just above: it closes
+  `topology_gate` and asks `topology_reporter` to re-attach on its very next
+  poll tick. While the parent stays offline that re-ATTACH itself keeps
+  getting rejected as `ERR_PARENT_OFFLINE` too, so the gate simply stays
+  closed and `topology_reporter` retries at its normal bounded poll-tick +
+  backoff pace (never a busy loop) -- see section 18 and
+  `tools/test_topology_gate.c`'s `scenario_parent_offline_recovery`. Once the
+  parent's own report is accepted again, the very next child re-ATTACH
+  succeeds and the gate reopens automatically, resuming sensor sending with
+  no manual intervention.
 - **Power base reboot**: the registry is RAM-only and starts empty. It is
   repopulated purely by modules' own ordinary `ATTACHED`/`HEARTBEAT` reports
   arriving into what looks like "an unknown uuid" -- no special "recovery

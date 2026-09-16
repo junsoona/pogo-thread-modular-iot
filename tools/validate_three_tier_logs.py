@@ -99,6 +99,19 @@ FATAL_PATTERNS = [
      "parent_service.c run_provisioning_session()"),
 ]
 
+# Strips common ANSI escape sequences (SGR color codes, cursor movement,
+# etc.) -- `idf.py monitor` colorizes its output by log level, and a real
+# 3-board capture is typically taken as `idf.py monitor | tee some.log`,
+# which preserves those escape codes verbatim in the saved file. Every
+# FATAL_PATTERNS/PEER_READY_RE/ROLE_CHANGED_RE/... regex below matches
+# against plain text, so a color code landing mid-line (most commonly a
+# trailing "\x1b[0m" reset right after the log level letter, or wrapping the
+# whole line) must be removed BEFORE any of those patterns ever see the
+# line -- see read_lines(). Matches the general CSI form ESC '[' parameters
+# intermediate final-byte (ECMA-48 5.4), which covers every SGR color code
+# real terminal/monitor tooling emits, not just "\x1b[0m" specifically.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
 REBOOT_BANNER_RE = re.compile(r"app_main: entry \(reset_reason=(\d+)\)")
 REBOOT_LOOP_THRESHOLD = 3  # >=3 fresh boots in one board's own log = a reboot loop, not a single reset
 
@@ -124,7 +137,14 @@ def record(passed, message):
 def read_lines(path, label):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.readlines()
+            # ANSI escape codes are stripped here, once, so every check
+            # downstream (FATAL_PATTERNS, PEER_READY_RE, ROLE_CHANGED_RE,
+            # TOPO_APPLIED_RE, ...) keeps matching plain text exactly as
+            # before -- a plain (already colorless) log line is unaffected
+            # (the substitution is simply a no-op when there is nothing to
+            # strip), and none of those regexes or the PASS/FAIL criteria
+            # they drive are loosened by this.
+            return [ANSI_ESCAPE_RE.sub("", line) for line in f]
     except OSError as e:
         sys.exit(f"cannot read --{label} log at {path}: {e}")
 

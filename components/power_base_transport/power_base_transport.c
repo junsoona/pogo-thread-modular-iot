@@ -130,6 +130,8 @@ static const char *registry_result_str(topology_registry_result_t r)
         return "UNKNOWN_PARENT";
     case TOPOLOGY_REGISTRY_ERR_PARENT_DEPTH_MISMATCH:
         return "PARENT_DEPTH_MISMATCH";
+    case TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE:
+        return "PARENT_OFFLINE";
     case TOPOLOGY_REGISTRY_ERR_CYCLE:
         return "CYCLE";
     case TOPOLOGY_REGISTRY_ERR_STALE_SESSION:
@@ -164,6 +166,7 @@ static otCoapCode topology_result_to_coap_code(topology_registry_result_t r)
     case TOPOLOGY_REGISTRY_ERR_DEPTH1_BAD_PARENT:
     case TOPOLOGY_REGISTRY_ERR_UNKNOWN_PARENT:
     case TOPOLOGY_REGISTRY_ERR_PARENT_DEPTH_MISMATCH:
+    case TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE:
     case TOPOLOGY_REGISTRY_ERR_CYCLE:
     case TOPOLOGY_REGISTRY_ERR_STALE_SESSION:
     case TOPOLOGY_REGISTRY_ERR_DUPLICATE_SEQ:

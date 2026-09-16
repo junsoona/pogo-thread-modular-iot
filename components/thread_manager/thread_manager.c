@@ -251,6 +251,32 @@ esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uin
         }
 
         result = esp_openthread_auto_start(&tlvs);
+        /*
+         * Diagnostic for the still-unresolved THREAD_JOIN_TIMEOUT
+         * investigation (see README.md/docs/state-machine.md): a real
+         * 3-tier chain test once observed the FIRST provisioning attempt's
+         * call reach here with every individual OT API above returning
+         * OT_ERROR_NONE (esp_openthread_auto_start() itself wraps
+         * otDatasetSetActiveTlvs()/otIp6SetEnabled(true)/otThreadSetEnabled(true),
+         * each already ESP_LOGE'd above on its own failure -- see ESP-IDF's
+         * esp_openthread_auto_start()), yet OpenThread's own internal
+         * attach state machine produced no "Attach attempt" log for the
+         * whole CONFIG_POGO_JOIN_TIMEOUT_MS window; a SECOND attempt (a
+         * fresh disable/re-enable cycle through this same function)
+         * attached normally ~240ms later. Logging otDeviceRole here --
+         * synchronously, still under the OT lock, immediately after
+         * otThreadSetEnabled(true) itself returned success -- costs nothing
+         * in the steady state (this function only ever runs once per real
+         * join attempt, never in a polling loop) and lets a future real
+         * test directly compare this snapshot across a failing vs.
+         * succeeding attempt instead of guessing from the attach outcome
+         * alone.
+         */
+        if (result == ESP_OK) {
+            otDeviceRole role_now = otThreadGetDeviceRole(instance);
+            ESP_LOGI(TAG, "esp_openthread_auto_start OK -- otDeviceRole immediately after enable: %d(%s)",
+                     role_now, thread_manager_role_to_str(role_now));
+        }
     } while (0);
 
     esp_openthread_lock_release();

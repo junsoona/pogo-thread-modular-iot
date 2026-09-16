@@ -1,10 +1,19 @@
 /*
- * Host-only, pthread-mutex+condvar-backed stand-in for FreeRTOS's semphr.h --
- * only the plain-mutex subset components/sensor_service/sensor_service.c
- * actually uses (xSemaphoreCreateMutex/xSemaphoreTake/xSemaphoreGive to
- * serialize sensor_service_measure_once() against its own periodic sampling
- * task -- see that file's s_measure_mutex). See freertos/task.h's own header
- * comment for why this directory provides real concurrency.
+ * Host-only, pthread-mutex+condvar-backed stand-in for FreeRTOS's semphr.h.
+ * Originally only the plain-mutex subset components/sensor_service/
+ * sensor_service.c actually uses (xSemaphoreCreateMutex/xSemaphoreTake/
+ * xSemaphoreGive to serialize sensor_service_measure_once() against its own
+ * periodic sampling task -- see that file's s_measure_mutex). See
+ * freertos/task.h's own header comment for why this directory provides real
+ * concurrency.
+ *
+ * xSemaphoreCreateBinary() was added for
+ * components/sensor_transport/sensor_transport.c's s_send_done_sem (see
+ * tools/host_test_stubs/host_ot_coap_sim.c) -- unlike xSemaphoreCreateMutex(),
+ * a binary semaphore starts EMPTY (unavailable: the first take blocks until
+ * a give), matching real FreeRTOS's own distinction between the two. Both
+ * share the same take/give implementation below; only the initial `locked`
+ * value differs.
  */
 #pragma once
 
@@ -37,6 +46,18 @@ static inline SemaphoreHandle_t xSemaphoreCreateMutex(void)
     pthread_mutex_init(&s->mutex, NULL);
     pthread_cond_init(&s->released, NULL);
     s->locked = false;
+    return s;
+}
+
+static inline SemaphoreHandle_t xSemaphoreCreateBinary(void)
+{
+    host_semaphore_record_t *s = (host_semaphore_record_t *)calloc(1, sizeof(*s));
+    if (s == NULL) {
+        return NULL;
+    }
+    pthread_mutex_init(&s->mutex, NULL);
+    pthread_cond_init(&s->released, NULL);
+    s->locked = true; /* starts empty -- see this file's top comment */
     return s;
 }
 

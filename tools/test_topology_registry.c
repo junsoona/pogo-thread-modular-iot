@@ -103,10 +103,17 @@ static void scenario_cycle_and_depth_jump(void)
     fill_uuid(uuid2, 2);
     fill_uuid(uuid3, 3);
 
+    /* node1/node2 both report downstream_connected=true -- realistic for
+     * this scenario, since each one has (or is about to have) a real child
+     * claiming it as parent below. Required since
+     * TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE now also checks the parent's own
+     * downstream_connected, not just online (see topology_registry.c). */
     topology_report_t r1 = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r1.downstream_connected = true;
     CHECK(topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node1 (depth1) accepted");
 
     topology_report_t r2 = make_report(2, 2, uuid1, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r2.downstream_connected = true;
     CHECK(topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node2 (depth2, parent=node1) accepted");
 
     /* A depth jump: node3 claims depth=4 with parent=node2 (whose real depth
@@ -248,12 +255,17 @@ static void scenario_direct_child_detach_offlines_subtree(void)
     fill_uuid(uuid2, 2);
     fill_uuid(uuid3, 3);
 
+    /* node1/node2 report downstream_connected=true -- each has a real child
+     * below it in this chain (node2, node3 respectively), required for
+     * TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE's parent-liveness check. */
     topology_report_t r1 = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
-    topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0);
+    r1.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node1 (depth1) accepted");
     topology_report_t r2 = make_report(2, 2, uuid1, 1, 1, TOPOLOGY_REPORT_ATTACHED);
-    topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0);
+    r2.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node2 (depth2, parent=node1) accepted");
     topology_report_t r3 = make_report(3, 3, uuid2, 1, 1, TOPOLOGY_REPORT_ATTACHED);
-    topology_registry_apply_report(&reg, &r3, POWER_BASE_UUID, 0);
+    CHECK(topology_registry_apply_report(&reg, &r3, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node3 (depth3, parent=node2) accepted");
 
     /* Simulates power_base_transport_on_direct_downstream_detached(): the
      * power base's own physical DOWNSTREAM port lost contact with node1. */
@@ -294,6 +306,154 @@ static void scenario_intermediate_downstream_detach_offlines_below_only(void)
     const topology_registry_entry_t *e2 = topology_registry_find(&reg, uuid2);
     CHECK(e1 != NULL && e1->online, "node1 itself stays ONLINE -- it successfully reported, only its child is gone");
     CHECK(e2 != NULL && !e2->online, "node2 (below the broken downstream link) is marked offline");
+}
+
+/*
+ * Real-hardware regression (the exact bug this follow-up fixes): a depth=1
+ * parent's direct POGO detach offlines it and its whole subtree, but a
+ * depth>1 child's own HEARTBEAT/UPDATED/ATTACHED -- sent before that child
+ * itself notices the break -- must NOT be allowed to flip its registry entry
+ * back online while the parent is still offline. Exercises the exact
+ * required scenario list: depth1 parent + depth2 child register normally,
+ * a direct downstream detach offlines both, every report type from the
+ * child is rejected as PARENT_OFFLINE while the parent stays offline (the
+ * child's entry is never resurrected), and once the parent genuinely
+ * re-attaches, the child's own re-ATTACHED succeeds and brings it back
+ * online. A sibling depth1 node (and ITS child) never registered under the
+ * detached parent is verified completely unaffected throughout.
+ */
+static void scenario_parent_offline_rejects_children_then_recovers(void)
+{
+    printf("\n-- scenario: a child's report is rejected as PARENT_OFFLINE while its parent is offline, and only "
+           "a genuine parent re-attach lets the child re-register --\n");
+    topology_registry_t reg;
+    topology_registry_init(&reg);
+
+    uint8_t parent_uuid[TOPOLOGY_UUID_LEN], child_uuid[TOPOLOGY_UUID_LEN];
+    uint8_t sibling_uuid[TOPOLOGY_UUID_LEN], sibling_child_uuid[TOPOLOGY_UUID_LEN];
+    fill_uuid(parent_uuid, 1);
+    fill_uuid(child_uuid, 2);
+    fill_uuid(sibling_uuid, 3);
+    fill_uuid(sibling_child_uuid, 4);
+
+    /* -- normal registration: depth1 parent, depth2 child -- */
+    topology_report_t parent_attached = make_report(1, 1, POWER_BASE_UUID, 10, 1, TOPOLOGY_REPORT_ATTACHED);
+    parent_attached.downstream_connected = true; /* the child is about to dock below it */
+    CHECK(topology_registry_apply_report(&reg, &parent_attached, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK,
+          "depth1 parent registers normally");
+
+    topology_report_t child_attached = make_report(2, 2, parent_uuid, 20, 1, TOPOLOGY_REPORT_ATTACHED);
+    CHECK(topology_registry_apply_report(&reg, &child_attached, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK,
+          "depth2 child registers normally under its online+downstream_connected parent");
+
+    /* An unrelated sibling depth1 node (with its own depth2 child), never
+     * touched by the parent's detach below -- registered here so every
+     * later CHECK in this scenario can also confirm it stays untouched. */
+    topology_report_t sibling_attached = make_report(3, 1, POWER_BASE_UUID, 30, 1, TOPOLOGY_REPORT_ATTACHED);
+    sibling_attached.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &sibling_attached, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK,
+          "sibling depth1 node registers normally");
+    topology_report_t sibling_child_attached = make_report(4, 2, sibling_uuid, 40, 1, TOPOLOGY_REPORT_ATTACHED);
+    CHECK(topology_registry_apply_report(&reg, &sibling_child_attached, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK,
+          "sibling's depth2 child registers normally");
+
+    /* -- direct downstream detach: power_base_transport_on_direct_downstream_detached()'s
+     * exact behavior for the PARENT's chain only. -- */
+    topology_registry_mark_offline(&reg, parent_uuid);
+    CHECK(!topology_registry_find(&reg, parent_uuid)->online, "parent is offline after the direct detach");
+    CHECK(!topology_registry_find(&reg, child_uuid)->online, "child is cascaded offline too");
+    CHECK(topology_registry_find(&reg, sibling_uuid)->online, "sibling depth1 node is NOT affected by an unrelated detach");
+    CHECK(topology_registry_find(&reg, sibling_child_uuid)->online, "sibling's child is NOT affected either");
+
+    /* -- while the parent is offline, every report type from the child is
+     * rejected as PARENT_OFFLINE, and the registry is left completely
+     * unchanged (never resurrected to online) -- this IS the bug fix. -- */
+    topology_report_t child_heartbeat = make_report(2, 2, parent_uuid, 20, 2, TOPOLOGY_REPORT_HEARTBEAT);
+    topology_registry_result_t r = topology_registry_apply_report(&reg, &child_heartbeat, POWER_BASE_UUID, 1000);
+    CHECK(r == TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE, "child HEARTBEAT while parent is offline is rejected as PARENT_OFFLINE");
+    CHECK(!topology_registry_find(&reg, child_uuid)->online, "the rejected HEARTBEAT never flips the child back online");
+
+    topology_report_t child_updated = make_report(2, 2, parent_uuid, 20, 2, TOPOLOGY_REPORT_UPDATED);
+    r = topology_registry_apply_report(&reg, &child_updated, POWER_BASE_UUID, 1100);
+    CHECK(r == TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE, "child UPDATED while parent is offline is rejected as PARENT_OFFLINE");
+    CHECK(!topology_registry_find(&reg, child_uuid)->online, "the rejected UPDATED never flips the child back online");
+
+    topology_report_t child_reattach_attempt = make_report(2, 2, parent_uuid, 21, 1, TOPOLOGY_REPORT_ATTACHED);
+    r = topology_registry_apply_report(&reg, &child_reattach_attempt, POWER_BASE_UUID, 1200);
+    CHECK(r == TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE, "child ATTACHED (re-registration) while parent is offline is rejected as PARENT_OFFLINE");
+    CHECK(!topology_registry_find(&reg, child_uuid)->online, "the rejected ATTACHED never flips the child back online");
+
+    CHECK(topology_registry_find(&reg, sibling_uuid)->online, "sibling still unaffected after all three rejected child reports");
+    CHECK(topology_registry_find(&reg, sibling_child_uuid)->online, "sibling's child still unaffected too");
+
+    /* -- the parent genuinely re-attaches (a fresh ATTACHED, e.g. after the
+     * physical POGO reconnect) -- online AND downstream_connected are true
+     * again. -- */
+    topology_report_t parent_reattached = make_report(1, 1, POWER_BASE_UUID, 11, 1, TOPOLOGY_REPORT_ATTACHED);
+    parent_reattached.downstream_connected = true;
+    r = topology_registry_apply_report(&reg, &parent_reattached, POWER_BASE_UUID, 2000);
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "parent's own re-ATTACHED (new boot_session_generation) is accepted");
+    CHECK(topology_registry_find(&reg, parent_uuid)->online, "parent is online again");
+
+    /* -- NOW the child's own re-ATTACHED succeeds and brings it back online. -- */
+    topology_report_t child_reattach_ok = make_report(2, 2, parent_uuid, 21, 1, TOPOLOGY_REPORT_ATTACHED);
+    r = topology_registry_apply_report(&reg, &child_reattach_ok, POWER_BASE_UUID, 2100);
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "child's re-ATTACHED succeeds once its parent is online+downstream_connected again");
+    CHECK(topology_registry_find(&reg, child_uuid)->online, "child is back online after its own successful re-ATTACHED");
+
+    CHECK(topology_registry_find(&reg, sibling_uuid)->online, "sibling still unaffected after the full detach/recover cycle");
+    CHECK(topology_registry_find(&reg, sibling_child_uuid)->online, "sibling's child still unaffected after the full cycle");
+}
+
+/*
+ * Symmetric case: an INTERMEDIATE node's own downstream link (not the power
+ * base's direct port) is what breaks. The node itself stays online (it
+ * still successfully reports), but its downstream_connected flips to
+ * false, cascading its own child offline -- already covered by
+ * scenario_intermediate_downstream_detach_offlines_below_only(). This adds
+ * the PARENT_OFFLINE angle: the grandchild's own re-registration attempt
+ * must still be rejected (parent online, but NOT downstream_connected)
+ * until the intermediate node reports downstream_connected=true again.
+ */
+static void scenario_intermediate_downstream_loss_rejects_grandchild_reregistration(void)
+{
+    printf("\n-- scenario: PARENT_OFFLINE also fires when the parent is online but its OWN downstream_connected "
+           "is false (not just when the parent itself is offline) --\n");
+    topology_registry_t reg;
+    topology_registry_init(&reg);
+
+    uint8_t uuid1[TOPOLOGY_UUID_LEN], uuid2[TOPOLOGY_UUID_LEN];
+    fill_uuid(uuid1, 1);
+    fill_uuid(uuid2, 2);
+
+    topology_report_t r1 = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r1.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node1 (depth1) accepted");
+    topology_report_t r2 = make_report(2, 2, uuid1, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    CHECK(topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node2 (depth2, parent=node1) accepted");
+
+    topology_report_t update = make_report(1, 1, POWER_BASE_UUID, 1, 2, TOPOLOGY_REPORT_UPDATED);
+    update.downstream_connected = false;
+    CHECK(topology_registry_apply_report(&reg, &update, POWER_BASE_UUID, 100) == TOPOLOGY_REGISTRY_OK,
+          "node1's downstream-lost UPDATED report is accepted");
+    CHECK(topology_registry_find(&reg, uuid1)->online, "node1 itself stays online");
+    CHECK(!topology_registry_find(&reg, uuid2)->online, "node2 is cascaded offline");
+
+    topology_report_t reregister_attempt = make_report(2, 2, uuid1, 1, 2, TOPOLOGY_REPORT_ATTACHED);
+    topology_registry_result_t r = topology_registry_apply_report(&reg, &reregister_attempt, POWER_BASE_UUID, 200);
+    CHECK(r == TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE,
+          "node2's re-ATTACHED is rejected as PARENT_OFFLINE while node1 is online but NOT downstream_connected");
+    CHECK(!topology_registry_find(&reg, uuid2)->online, "node2 stays offline -- not resurrected by the rejected re-ATTACHED");
+
+    topology_report_t node1_reconnected = make_report(1, 1, POWER_BASE_UUID, 1, 3, TOPOLOGY_REPORT_UPDATED);
+    node1_reconnected.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &node1_reconnected, POWER_BASE_UUID, 300) == TOPOLOGY_REGISTRY_OK,
+          "node1 reports downstream_connected=true again");
+
+    topology_report_t reregister_ok = make_report(2, 2, uuid1, 1, 2, TOPOLOGY_REPORT_ATTACHED);
+    r = topology_registry_apply_report(&reg, &reregister_ok, POWER_BASE_UUID, 400);
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "node2's re-ATTACHED now succeeds once node1 is online AND downstream_connected again");
+    CHECK(topology_registry_find(&reg, uuid2)->online, "node2 is back online");
 }
 
 static void scenario_stale_timeout_and_reconnect(void)
@@ -378,6 +538,8 @@ int main(void)
     scenario_session_transition_is_generation_agnostic();
     scenario_direct_child_detach_offlines_subtree();
     scenario_intermediate_downstream_detach_offlines_below_only();
+    scenario_parent_offline_rejects_children_then_recovers();
+    scenario_intermediate_downstream_loss_rejects_grandchild_reregistration();
     scenario_stale_timeout_and_reconnect();
     scenario_base_reboot_registry_repopulated_by_heartbeat();
     scenario_sensor_data_uuid_linked_to_topology_entry();

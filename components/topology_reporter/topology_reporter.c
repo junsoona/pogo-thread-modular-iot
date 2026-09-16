@@ -459,22 +459,29 @@ static void topology_reporter_task(void *arg)
 
         /*
          * Power base reboot recovery (section 8 of the follow-up spec,
-         * docs/power-base.md section 11): sensor_transport requests an
-         * immediate fresh ATTACHED attempt the moment the power base
-         * rejects a "/s" sample as unknown-module (CoAP 4.04) -- its
-         * RAM-only registry forgot this module across a reboot. Forcing
-         * has_attached back to false here means the `settled && !has_attached`
-         * branch below retries THIS SAME tick, bounded by one poll tick
-         * (<=TOPOLOGY_REPORTER_POLL_TICK_MS) -- never the up-to-
-         * CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS wait a plain
-         * heartbeat schedule would otherwise impose ("30초 heartbeat만
-         * 기다리지 않는다"). Consuming the request when has_attached is
-         * already false is harmless: the retry path below is already
-         * active on its own.
+         * docs/power-base.md section 11) AND parent-offline recovery (this
+         * follow-up, docs/power-base.md's "A rejected child" bullet):
+         * sensor_transport requests an immediate fresh ATTACHED attempt the
+         * moment the power base rejects a "/s" sample either as
+         * unknown-module (CoAP 4.04 -- its RAM-only registry forgot this
+         * module across a reboot) OR as a known-but-currently-offline
+         * module (CoAP 4.12 -- TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE, this
+         * module's own parent is offline). The gate/reregister request
+         * mechanism cannot and does not distinguish which of the two
+         * actually happened (see sensor_transport.c's own comment on this),
+         * so the log line below stays deliberately generic rather than
+         * naming just one. Forcing has_attached back to false here means
+         * the `settled && !has_attached` branch below retries THIS SAME
+         * tick, bounded by one poll tick (<=TOPOLOGY_REPORTER_POLL_TICK_MS)
+         * -- never the up-to-CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS
+         * wait a plain heartbeat schedule would otherwise impose ("30초
+         * heartbeat만 기다리지 않는다"). Consuming the request when
+         * has_attached is already false is harmless: the retry path below
+         * is already active on its own.
          */
         if (topology_gate_take_reregister_request() && has_attached) {
-            ESP_LOGW(TAG, "power base no longer recognizes this module (a sensor sample was rejected as "
-                          "unknown-module) -- closing the data-plane gate and re-registering now");
+            ESP_LOGW(TAG, "power base rejected this module's sample because its topology registration is "
+                          "unknown or no longer valid -- closing the data-plane gate and re-registering now");
             has_attached = false;
             topology_gate_close();
         }

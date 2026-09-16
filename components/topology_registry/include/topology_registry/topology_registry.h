@@ -98,6 +98,19 @@ typedef enum {
     TOPOLOGY_REGISTRY_ERR_DEPTH1_BAD_PARENT,  /* depth==1 but parent_uuid != power_base_uuid */
     TOPOLOGY_REGISTRY_ERR_UNKNOWN_PARENT,     /* depth>1 but parent_uuid names no known node yet */
     TOPOLOGY_REGISTRY_ERR_PARENT_DEPTH_MISMATCH, /* known parent's depth+1 != this report's depth */
+    /* depth>1, parent is known and its depth checks out, but the parent's
+     * OWN registry entry is currently online==false and/or
+     * downstream_connected==false -- i.e. the physical/logical path down to
+     * this reporting node is not currently intact, even though the parent
+     * uuid itself is not unknown. This is the fix for the real-hardware
+     * finding: a Power Base DOWNSTREAM POGO detach (or an intermediate
+     * node's own downstream loss) cascades the whole subtree offline, but
+     * without this check a child's later HEARTBEAT/UPDATED/ATTACHED report
+     * -- sent by a module that has not yet itself noticed the break -- would
+     * silently flip that child back to online, resurrecting stale sensor
+     * data delivery ahead of the parent actually being reconnected. See
+     * topology_registry.c's apply_report() and this header's top comment. */
+    TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE,
     TOPOLOGY_REGISTRY_ERR_CYCLE,              /* module_uuid appears in its own claimed ancestor chain */
     /* A report naming the generation this node just moved away from (see
      * superseded_generation) -- a delayed packet from the PRECEDING
