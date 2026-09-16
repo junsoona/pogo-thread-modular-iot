@@ -1,0 +1,48 @@
+{
+  "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a Sensirion SGP41 (VOC + NOx, see prototype_sgp40.json for the VOC-only sibling). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. This file's upstream_port/downstream_port block is BYTE-FOR-BYTE identical to prototype_sht45.json's/prototype_bh1750.json's/prototype_sgp40.json's -- the only per-board differences across all four common-POGO-port prototypes are driver_id, i2c_address, sensor_type_bitmap, calibration and measurement_timeout_ms, exactly as section 2 of the follow-up spec requires. See tools/test_prototype_port_blocks_match.py, which mechanically checks this for all four.",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_driver_comment": "SENSOR_DRIVER_ID_SGP41 (see components/sensor_provider/include/sensor_provider/sensor_provider.h) and the VOC_RAW/VOC_INDEX/NOX_RAW/NOX_INDEX channel bits (see components/sensor_channel/include/sensor_channel/sensor_channel.h) are resolved by name here -- tools/pack_module_config.py's DRIVER_IDS/CHANNEL_BITS tables mirror those two C headers bit-for-bit, so this file never repeats a magic number by hand. The four channel names listed here exactly match what components/sgp41/sgp41.c's sgp41_get_sensor_bitmap() actually reports at runtime -- note the DRIVER's per-sample channel_count varies (2 during the initial conditioning window, 4 once real NOx data is available, see sgp41.c's sgp41_read_measurement()); sensor_type_bitmap here is the full CAPABILITY set the sensor can ever report, not a per-sample snapshot.",
+  "driver_id": "SGP41",
+  "sensor_type_bitmap": ["VOC_RAW", "VOC_INDEX", "NOX_RAW", "NOX_INDEX"],
+
+  "bus_type": "I2C",
+  "bus_number": 0,
+  "i2c_sda_gpio": 0,
+  "i2c_scl_gpio": 1,
+  "_addr_comment": "SGP41's 7-bit I2C address is fixed at 0x59 by the datasheet, same address family as SGP40 -- a board never pairs both on one bus (see components/sgp41/sgp41.c's own header comment citing Sensirion's reference driver).",
+  "i2c_address": "0x59",
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "_calibration_comment": "SGP41 has no calibration/offset fields of its own (both Gas Index Algorithm instances self-normalize) -- calibration stays all-zero, same convention as every other driver when unused.",
+  "calibration": [0, 0, 0, 0],
+  "_timeout_comment": "components/sgp41/sgp41.c hardcodes SGP41_CONDITIONING_MS_MAX=50ms and SGP41_MEASURE_MS_MAX=50ms (the conditioning/measure-raw-signals commands' own datasheet max) as the point read_measurement() actually stops waiting; measurement_timeout_ms is a SEPARATE, larger ceiling checked in the same polling loop purely to abandon a wedged/non-responding sensor (see sgp41_read_measurement()) -- it must stay comfortably above 50ms or a slow-but-healthy read would be misreported as SENSOR_STATUS_TIMEOUT before the real measurement window even elapses. 200ms (same value as prototype_sht45.json/prototype_sgp40.json) leaves a wide margin for I2C bus contention/retries without ever being reached by a normal reading.",
+  "measurement_timeout_ms": 200,
+
+  "dev_mode": "AUTO",
+
+  "_conditioning_comment": "Unlike SGP40, SGP41 runs a dedicated I2C conditioning command (0x2612, VOC raw only) for the first SGP41_CONDITIONING_WINDOW_MS=10000ms after init (components/sgp41/sgp41.c), before switching to the combined measure-raw-signals command (0x2619, VOC+NOx). Every channel reported during that window is marked SENSOR_CHANNEL_STATUS_CONDITIONING (section 10 of the follow-up spec: 'conditioning/warm-up 상태를 정상 측정과 구분') and NO NOx channel is reported at all during conditioning (sgp41_read_measurement() reports channel_count=2, not 4, in that window) -- parent_service.c's PS_SENSOR_STATUS_CONDITIONING handling (see docs/module-config.md and tools/test_conditioning_provisioning.c) already lets provisioning continue normally through this, exactly as it does for PMS5003's own warm-up.",
+
+  "_polling_comment": "Not a config field (the Gas Index Algorithm's minimum cadence is compiled into components/sgp41/sgp41.c's sgp41_get_min_polling_period_ms()==1000ms, enforced at runtime by sensor_service_compute_effective_period_ms() -- see tools/test_effective_polling_period.c) -- noted here only so this file's reader knows POLL_CONFIG's negotiated period can never go below 1 Hz for this driver regardless of what the parent's response-time-derived formula alone would pick.",
+
+  "_compensation_comment": "IMPORTANT: components/sgp41/sgp41.c always compensates its raw VOC/NOx reading with a FIXED 50%RH/25degC default (SGP41_DEFAULT_RH_TICKS/SGP41_DEFAULT_T_TICKS) -- this board does NOT read another module's live SHT45 temperature/humidity over the wire (section 10 of the follow-up spec: never borrow another module's SHT45 reading and present it as real compensation). Do not mistake VOC_INDEX/NOX_INDEX readings from this config for humidity/temperature-corrected values; they are only as accurate as that fixed assumption. The driver logs this loudly (ESP_LOGW) at every init specifically so this is never silently forgotten.",
+
+  "_upstream_comment": "Identical to prototype_sht45.json's upstream_port -- see that file's _upstream_comment for why DETECT_IN is GPIO12/DETECT_OUT is GPIO2 (deep-sleep-ready profile, swapped from the earlier DETECT_IN=2/DETECT_OUT=12), and for the required rewiring before flashing.",
+  "upstream_port": {
+    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port.",
+  "downstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

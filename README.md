@@ -37,10 +37,16 @@ GPIO2/GPIO12) -- 미래의 terminal-leaf Deep-sleep wake용 GPIO12(ESP32-H2 RTC 
 배선(이전 GPIO 프로필 기준)은 이전 세션에서 실제로 연결되었고, POGO 프로비저닝부터
 Thread 가입, topology 보고, SHT45 sample 수집까지 실물에서 성공했다** -- 자세한
 내용은 아래 "실물 검증 결과 및 데이터플레인 registration gate 수정" 절 참고.
-그 성공은 이번 세션의 GPIO 재배선 전 구성 기준이며, 이번 세션의 변경(모듈/Thread
-역할 분리, collector provisioning, GPIO 교환)은 아직 실물로 재검증되지 않았다
-(아래 "네 프로젝트 빌드 결과"와 `docs/power-base.md`의 "아직 실물 하드웨어에서
-확인되지 않은 항목" 참고).
+
+**(이후 세션에서 갱신) 위 문단의 "아직 실물로 재검증되지 않았다"는 더 이상 최신
+상태를 반영하지 않는다.** 현재 GPIO 프로필(UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2)
+로 재배선한 firmware가 이후 세션에서 전원 모듈 + PMS5003 terminal 모듈 조합으로 실물
+flash/monitor 검증까지 완료했다 -- 센서 측정, Thread 가입, topology 등록, 데이터
+수집, 분리 후 재연결(POGO hotswap)까지 전부 실물로 성공했다. 항목별 최신 host-test/
+실물검증 상태는 [`docs/validation-status.md`](docs/validation-status.md)를 단일
+기준으로 참고할 것 -- 이 preamble을 포함한 문서 곳곳의 "이번 세션"/"아직 미검증"
+표현은 그 문단이 쓰인 시점 기준이며, 서로 모순되면 `docs/validation-status.md`
+쪽이 우선한다.
 
 **최종 졸업작품 프로토타입은 ESP32-H2 SuperMini 기반 전원 모듈 1대(`power_base/`)와
 센서 모듈 N대(`module/`, 현재 보유·검증 대상은 SHT45 1대 + BH1750 1대, 총 2대)로
@@ -98,10 +104,11 @@ DEV_ROOT/DEV_LEAF(module-to-module 회귀, `"/t"` 리소스가 아예 없는 피
 `require_topology_registration=false`로 이 gate의 영향을 받지 않는다. 자세한 설계는
 `components/topology_gate`의 헤더 주석, `docs/power-base.md`의 관련 절 참고.
 
-**이 수정 자체는 host test(`tools/test_topology_gate.c` 포함 30개 전체 통과)와
-`module`/`power_base`/`upper`/`lower` clean build(경고 0건)까지만 검증되었다 -- 실물
-보드에 다시 flash해 위 경쟁이 재현되지 않고 회귀도 없는지는 아직 확인되지 않았다** (아래
-"네 프로젝트 빌드 결과", "아직 실물 보드에서 확인되지 않은 항목" 참고).
+**이 수정은 host test(`tools/test_topology_gate.c` 포함)와 clean build 통과에 이어,
+이후 세션에서 전원 모듈 + PMS5003 terminal 모듈 조합으로 실물 flash/monitor 재검증까지
+완료했다 -- 첫 sample/topology 등록 경쟁이 실제로 사라졌고, 분리 후 재연결(hotswap)에도
+gate가 올바르게 재동작한다.** 자세한 항목별 host-test/실물검증 상태는
+[`docs/validation-status.md`](docs/validation-status.md) 참고.
 
 ## 구조
 
@@ -322,11 +329,13 @@ USB 포트로 동작한다. `0x187000`은 `module/partitions.csv`의 `cfg` 파�
 두 번째 시험부터는 앱/설정이 이미 맞게 들어가 있다면 2~5단계만 반복하면 된다 (앱 코드만
 바뀌었다면 1번 없이 2번부터, `cfg` 이미지만 바뀌었다면 3~4번만).
 
-### 전원 모듈 + 센서 모듈 배치 (신규 -- 새 배선 완료 후에만 실행)
+### 전원 모듈 + 센서 모듈 배치 (depth=1 단일 홉 -- 실물 검증 완료)
 
-**이번 세션에서는 전원 모듈<->센서 모듈 간 새 배선([`docs/power-base.md`](docs/power-base.md)
-4절 참고)을 아직 실제로 연결하지 않았다.** 아래는 배선을 완료한 뒤 실행할 순서이며, 전원
-모듈의 시리얼 포트는 아직 확인되지 않았으므로 값을 추측해 고정하지 않는다:
+전원 모듈<->센서 모듈 간 새 배선([`docs/power-base.md`](docs/power-base.md) 4절 참고)은
+이후 세션에서 실제로 연결되어, 전원 모듈 + PMS5003 조합으로 실물 검증까지 완료했다 (위
+"실물 검증 결과" 절, [`docs/validation-status.md`](docs/validation-status.md) 참고). 전원
+모듈/센서 모듈의 실제 시리얼 포트는 연결할 때마다 `ls /dev/tty.usbmodem*`로 다시 확인해
+아래 변수에 채울 것 -- 특정 경로를 고정값으로 가정하지 않는다:
 
 ```bash
 cd "/Users/junsoona/no-icloud/main project_1"
@@ -362,6 +371,104 @@ idf.py -C module -B ~/esp-builds/pogo_module -p "$MODULE_PORT" monitor
 **기대 로그와 합격 기준**은 아래 "기대 로그" 절과 [`docs/power-base.md`](docs/power-base.md)
 15/16절 참고. 배선이 없는 상태에서 "실물 연동 성공"이라고 보고하지 않는다 -- 이 절차는
 사용자가 새 배선을 마친 뒤 직접 실행해 검증해야 한다.
+
+### 3단 센서 체인 실물 배선 (Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF, 다음 실물 시험)
+
+**목표 구성**: 전원 모듈(`power_base/`) 1대 -> SHT45 또는 BH1750 중간 모듈(INTERMEDIATE,
+depth=1) 1대 -> PMS5003 말단 모듈(LEAF, depth=2) 1대. 세 보드 모두 `module`/`power_base`
+프로젝트의 동일한 앱 바이너리를 그대로 쓰고(전원 모듈만 별도 `power_base` 바이너리),
+**서로 다른 것은 `cfg` 파티션의 설정 이미지뿐**이다 -- 두 센서 모듈에는 완전히 동일한
+`module` 앱을 flash한 뒤 `prototype_sht45_config.bin`(또는 `prototype_bh1750_config.bin`)과
+`prototype_pms5003_config.bin`만 서로 다르게 기록한다. 세 보드 모두 **POGO 5V는 아직
+사용하지 않고 각자 USB로 독립 전원을 공급한다** ([`docs/validation-status.md`](docs/validation-status.md)의
+"명시적으로 범위 밖" 참고 -- POGO 커넥터를 통한 5V 공급은 이번 범위에 포함되지 않는다).
+
+**배선표** (전원 모듈<->중간 모듈은 [`docs/power-base.md`](docs/power-base.md) 4절과
+동일, 중간 모듈<->말단 모듈은 위 "모듈 간 연결 (A의 DOWNSTREAM -> B의 UPSTREAM)"과
+동일 -- 현재 GPIO 프로필 기준, UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2):
+
+| 구간 | 신호 | 연결 |
+|---|---|---|
+| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | UART TX/RX | 전원 모듈 GPIO10(TX) -- 중간 모듈 GPIO5(RX); 전원 모듈 GPIO11(RX) -- 중간 모듈 GPIO4(TX) |
+| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | DETECT | 전원 모듈 GPIO22(DETECT_OUT) -- 중간 모듈 GPIO12(DETECT_IN); 전원 모듈 GPIO23(DETECT_IN) -- 중간 모듈 GPIO2(DETECT_OUT) |
+| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | BASE_ID | 전원 모듈의 BASE_ID 접점(GND) -- 중간 모듈 GPIO14 |
+| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | GND | 공통 GND (전원선은 연결하지 않음 -- 각자 USB 전원) |
+| 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | UART TX/RX | 중간 모듈 GPIO10(TX) -- 말단 모듈 GPIO5(RX); 중간 모듈 GPIO11(RX) -- 말단 모듈 GPIO4(TX) |
+| 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | DETECT | 중간 모듈 GPIO22(DETECT_OUT) -- 말단 모듈 GPIO12(DETECT_IN); 중간 모듈 GPIO23(DETECT_IN) -- 말단 모듈 GPIO2(DETECT_OUT) |
+| 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | GND | 공통 GND (전원선은 연결하지 않음) |
+| 중간 모듈 자체 센서 | SHT45 또는 BH1750 I2C | 중간 모듈 GPIO0(SDA)/GPIO1(SCL) + GND + 3.3V |
+| 말단 모듈 자체 센서 | PMS5003 UART | 말단 모듈 GPIO0(TX->PMS RX)/GPIO1(RX<-PMS TX) + GND + PMS5003 자체 5V |
+
+**중간 모듈은 downstream POGO 포트가 살아 있는 일반 I2C 센서 모듈이므로 말단 모듈을 그
+DOWNSTREAM에 그대로 꽂으면 된다 -- PMS5003의 downstream 비활성화 정책은 PMS5003 자신에게만
+적용되고, PMS5003을 자식으로 받는 중간 모듈에는 영향이 없다.**
+
+```bash
+cd "/Users/junsoona/no-icloud/main project_1"
+source ~/.espressif/v6.1/esp-idf/export.sh
+
+# 0) 설정 이미지 생성 (SGP40/SGP41도 함께 생성됨 -- 이번 시험에는 사용하지 않음)
+bash tools/gen_config.sh build/cfg_images
+bash tools/gen_power_base_config.sh build/cfg_images
+
+# 포트는 연결할 때마다 ls /dev/tty.usbmodem*로 확인해 채울 것 -- 임의로 추정하지 않는다
+BASE_PORT=/dev/cu.usbmodemXXXX       # 전원 모듈
+MIDDLE_PORT=/dev/cu.usbmodemYYYY     # SHT45(또는 BH1750) 중간 모듈
+TERMINAL_PORT=/dev/cu.usbmodemZZZZ   # PMS5003 말단 모듈
+
+# 1) 이전에 다른 이미지를 플래시해 본 보드라면 최초 시험에서 erase-flash부터
+python -m esptool --chip esp32h2 -p "$BASE_PORT" erase-flash
+python -m esptool --chip esp32h2 -p "$MIDDLE_PORT" erase-flash
+python -m esptool --chip esp32h2 -p "$TERMINAL_PORT" erase-flash
+
+# 2) 전원 모듈은 power_base 앱, 두 센서 모듈에는 동일한 module 앱을 flash
+idf.py -C power_base -B ~/esp-builds/pogo_power_base -p "$BASE_PORT" flash
+idf.py -C module -B ~/esp-builds/pogo_module -p "$MIDDLE_PORT" flash
+idf.py -C module -B ~/esp-builds/pogo_module -p "$TERMINAL_PORT" flash
+
+# 3) cfg 파티션만 서로 다르게 기록 (offset은 module/power_base 공통 0x187000)
+python -m esptool --chip esp32h2 -p "$BASE_PORT" \
+    write-flash 0x187000 build/cfg_images/power_base_config.bin
+python -m esptool --chip esp32h2 -p "$MIDDLE_PORT" \
+    write-flash 0x187000 build/cfg_images/prototype_sht45_config.bin   # 또는 prototype_bh1750_config.bin
+python -m esptool --chip esp32h2 -p "$TERMINAL_PORT" \
+    write-flash 0x187000 build/cfg_images/prototype_pms5003_config.bin
+
+# 4) 배선 순서대로 도킹: 먼저 전원 모듈 <-> 중간 모듈, 그 다음 중간 모듈 <-> 말단 모듈
+
+# 5) 세 보드 monitor 로그를 각각 파일로 저장 (타임스탬프 포함 파일명 권장)
+mkdir -p logs
+idf.py -C power_base -B ~/esp-builds/pogo_power_base -p "$BASE_PORT" monitor \
+    | tee "logs/base_$(date +%Y%m%d_%H%M%S).log"
+idf.py -C module -B ~/esp-builds/pogo_module -p "$MIDDLE_PORT" monitor \
+    | tee "logs/middle_$(date +%Y%m%d_%H%M%S).log"
+idf.py -C module -B ~/esp-builds/pogo_module -p "$TERMINAL_PORT" monitor \
+    | tee "logs/terminal_$(date +%Y%m%d_%H%M%S).log"
+```
+
+(`tee`는 화면 출력과 파일 저장을 동시에 한다. 세 monitor는 서로 다른 터미널에서 실행할
+것. 저장한 세 로그 파일은 `tools/validate_multihop_logs.py`로 사후 판정할 수 있다 --
+아래 참고.)
+
+**시험 순서와 합격 조건**:
+
+1. **정상 부팅**: 전원 모듈이 attach(CHILD/ROUTER/LEADER 중 하나) 후 중간 모듈을 도킹,
+   중간 모듈이 자신의 upstream 프로비저닝(POGO PEER_READY, Thread join, topology 등록)을
+   완료한 뒤 말단 모듈을 중간 모듈의 DOWNSTREAM에 도킹. 합격: 두 센서 모듈 모두
+   `JOIN_RESULT_ACK`를 받고, 전원 모듈의 topology registry에 서로 다른 UUID 2개가
+   depth=1(중간)/depth=2(말단)로 등록되며, 두 UUID 모두에서 sensor sample이 수신된다.
+2. **말단 분리/재연결**: 말단 모듈(PMS5003)을 중간 모듈에서 물리적으로 분리했다가 다시
+   연결. 합격: 중간 모듈의 topology/parent_service 세션이 말단 재연결 후 정상적으로
+   재프로비저닝되고, 전원 모듈의 registry에서 중간 모듈의 UUID/등록 상태는 영향받지
+   않는다 (말단 UUID만 재등록되거나 갱신됨).
+3. **중간 분리/재연결**: 중간 모듈(SHT45/BH1750)을 전원 모듈에서 물리적으로 분리했다가
+   다시 연결 (말단 모듈은 중간 모듈에 계속 꽂힌 채). 합격: 중간 모듈이 재도킹 후 다시
+   upstream 프로비저닝을 완료하고, 말단 모듈도 (중간 모듈이 다시 살아나면) 함께
+   재프로비저닝된다. 전원 모듈의 registry는 다른 모듈의 상태를 잃지 않는다.
+4. **전원 모듈 재부팅**: 두 센서 모듈은 그대로 둔 채 전원 모듈만 재부팅. 합격:
+   `topology_gate` 4.04 복구 경로대로 두 모듈 모두 재등록되고, 재등록 후 다시 정상적으로
+   sample이 수신된다 (depth=1 단일 홉에서 이미 확인된 것과 동일한 경로가 depth=2에서도
+   두 모듈 각각에 대해 성립하는지가 이 시험의 핵심 확인 대상).
 
 ### 회귀 확인용 (기존 upper/lower, 그리고 module의 DEV_ROOT/DEV_LEAF 회귀 이미지)
 
@@ -651,9 +758,10 @@ I (..) topology_reporter: topology report sent OK (type=0 seq=1 attempt=1/4)
 추가). `otDeviceRole=2`(CHILD)로 join 성공할 것. `topology_reporter`가 최소 한 번은
 성공 전송(`sent OK`, `type=0`=ATTACHED)할 것.
 
-#### `topology_gate` 수정 적용 후 기대되는 추가 로그 (아직 실물 미검증)
+#### `topology_gate` 수정 적용 후 기대되는 추가 로그 (실물 검증 완료)
 
-이 수정을 반영해 다시 flash한 뒤에는, `topology_reporter`의 `ATTACHED` 성공 로그(위
+이 수정을 반영해 다시 flash한 뒤 실물로 확인됨(전원 모듈 + PMS5003 조합, 위 "실물
+검증 결과" 참고): `topology_reporter`의 `ATTACHED` 성공 로그(위
 `topology report sent OK (type=0 ...)`)가 이 module의 첫 sensor sample 전송보다 먼저
 (또는 늦어도 같은 poll tick 안에) 나타나야 하고, 그 사이 짧은 창에서 `DEBUG` 레벨로만
 아래와 같은 로그가 보일 수 있다 (기본 `INFO` 레벨 모니터에는 나타나지 않는다):
@@ -710,84 +818,57 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
 ## 보유 센서 현황
 
 사용자는 PMS5003, BH1750, SGP40, SGP41, SHT45를 모두 실제로 보유하고 있다.
+항목별 host-test/실물검증 상태를 한곳에 정리한 표는
+[`docs/validation-status.md`](docs/validation-status.md) 참고 (아래는 요약).
 
-- **BH1750 / SHT45**: 최초 두 보드(보드 A=SHT45, 보드 B=BH1750) 실물 검증 대상으로 예정되어
-  있다 -- 위 "실물 배선"/"기대 로그" 절이 이 두 센서 기준이다.
-- **SGP40 / SGP41**: 코드(I2C 명령, CRC, 벤더링된 Sensirion Gas Index Algorithm)와 host test는
-  모두 완료했지만, 사용자가 보유한 실물 SGP40/SGP41은 이번 세션에서 **배선·실행 검증을
-  하지 않았다**. `sensor_provider_register()`로 등록만 되어 있고, `configs/prototype_*.json`
-  어느 쪽 보드에도 아직 SGP40/SGP41을 `driver_id`로 지정하지 않았다 (필요하면 세 번째/네 번째
-  보드용 config를 SHT45/BH1750 config와 동일한 POGO 포트 블록으로 복사해 만들면 된다).
-- **PMS5003**: terminal 모듈에서는 downstream POGO를 완전히 비활성화하고 UART1/GPIO0/1을
-  센서에 전용한다. 9600 8N1, ACTIVE/PASSIVE 명령, checksum parser, 30초 warm-up 상태,
-  PM1.0/PM2.5/PM10 채널 전송이 구현되어 있다. 실물 배선/측정 검증은 남아 있다.
+- **SHT45**: 전원 모듈과의 depth=1 단일 홉 조합에서 **실물로 확인됨** (I2C 통신, 변환값,
+  POGO 프로비저닝, Thread 가입, topology 보고, sample 수집 -- 위 "실물 검증 결과" 절).
+- **PMS5003**: terminal 모듈(downstream POGO 완전 비활성화, UART1/GPIO0/1을 센서에 전용)로
+  전원 모듈과의 조합이 **실물로 확인됨** -- 실제 측정값 수집, Thread 가입, topology 등록,
+  `topology_gate` 데이터플레인 gate, 그리고 분리 후 재연결(POGO hotswap)까지 실물에서
+  성공했다.
+- **BH1750**: 코드/host test는 SHT45와 동일 경로로 완료했으나, 실물 배선·측정은 아직
+  검증하지 않았다.
+- **SGP40 / SGP41**: 코드(I2C 명령, CRC, 벤더링된 Sensirion Gas Index Algorithm)와 host
+  test는 모두 완료했고, `configs/prototype_sgp40.json`/`configs/prototype_sgp41.json`로
+  `driver_id`가 지정되어 있다 (이번 세션 신규 -- 아래 "3단 센서 체인 실물 배선" 절 참고).
+  실물 배선·실행 검증은 아직 하지 않았다.
+- **3단 이상 체인(depth>=2)**: 지금까지 확인된 것은 depth=1 단일 홉(전원 모듈 + PMS5003
+  1대)뿐이다. Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF 3단 체인은 아직
+  실물 미검증 -- 배선/시험 절차는 아래 "3단 센서 체인 실물 배선" 절 참고.
 
 ## 아직 실물 보드에서 확인되지 않은 항목
 
-**이번 세션의 `topology_gate` 데이터플레인 registration gate 수정 (최우선 미검증
-대상)**: 전원 모듈 1대 + SHT45 센서 모듈 1대 조합 자체는 이미 실물로 성공했고, 그
-시험에서 첫 sample/topology 순서 경쟁도 실제로 관측되었다 (위 "실물 검증 결과 및
-데이터플레인 registration gate 수정" 절). 하지만 그 경쟁을 없애기 위해 이번 세션에서
-추가한 `components/topology_gate`/`sensor_transport`/`topology_reporter` 변경 자체는
-host test(`tools/test_topology_gate.c` 포함)와 `module`/`power_base`/`upper`/`lower`
-clean build까지만 확인했다 -- 다음이 아직 실물로 재검증되지 않았다:
+**이번 세션까지 실물로 확인된 조합은 전원 모듈 1대 + (SHT45 또는 PMS5003) 센서 모듈
+1대, depth=1 단일 홉뿐이다.** 자세한 항목별 상태는
+[`docs/validation-status.md`](docs/validation-status.md)에 정리했다. 아래는 소프트웨어
+구현/host test/빌드는 완료했지만 여전히 실물 검증이 필요한 항목이다:
 
-- 정상 경로에서 첫 sensor sample이 topology `ATTACHED` 확인 전에 전송되지 않는지
-  (기존에 관측된 CoAP 4.04 경쟁이 실제로 사라지는지).
-- 전원 모듈을 실물로 재부팅했을 때 4.04 -> 즉시 재등록 -> 2.xx -> sample 재개 흐름이
-  30초 heartbeat를 기다리지 않고 실제로 다음 poll tick 안에 일어나는지.
-- DEV_ROOT/DEV_LEAF 회귀 이미지(`upper`/`lower`, 그리고 `module`의 dev_root/dev_leaf
-  config)가 이 gate의 영향을 받지 않고 기존과 동일하게 동작하는지.
-
-**전원 모듈 관련 나머지 항목 (자세한 목록은 [`docs/power-base.md`](docs/power-base.md)
-16절)**: 위에서 실물로 확인된 것은 전원 모듈 1대 + SHT45 센서 모듈 1대, depth=1 단일
-홉 조합뿐이다. 아래는 소프트웨어 구현/host test/빌드는 완료했지만 여전히 실물 검증이
-필요한 항목이다:
-
-- `docs/power-base.md` 4절의 실제 배선표: 전원 모듈 1대 + SHT45 센서 모듈 1대(depth=1
-  단일 홉) 조합에서는 **실물로 확인됨**. BH1750 보드, 3단 이상 체인은 아직 미확인.
-- 실물 전원 모듈 MCU와의 BASE_ID/PEER_HELLO 교차검증: 이 SHT45 1대 조합에서는 **실물로
-  확인됨** (POGO PEER_READY 성공, 위 절 참고). 두 번째/세 번째 모듈이 동시에 붙는 경우의
-  타이밍은 아직 미확인.
-- `thread_manager_start_as_root()`의 Dataset 재사용 경로를 실물 전원 모듈의 실제
-  전원 재投입(power cycle)으로 확인 -- 아직 미확인.
-- `"/s"`/`"/t"` CoAP 전송: SHT45 1대와의 단일 홉에서는 **실물로 확인됨** (sample이
-  `sensor_root_aggregator`에 저장됨, topology report가 적용됨 -- 다만 첫 sample이
-  4.04로 한 번 거부되는 경쟁도 함께 관측됨, 위 절 참고). 다중 홉 Thread 메시 위에서의
-  동작과 UUID-hash backoff의 실제 타이밍은 아직 미확인.
-- 전원 모듈의 30초 **LEADER(엄격, ROUTER는 더 이상 허용하지 않음)** 부팅 대기 예산:
-  이번 시험에서는 실제로 LEADER에 도달했다 -- 더 열악한 무선 환경에서도 충분한지는
-  아직 미확인.
-- topology registry의 detach/reconnect/stale 처리가 실물 물리적 detach(단순 host-test
-  아님)에서도 동일하게 동작하는지 -- 아직 미확인 (전원 모듈 재부팅에 의한 등록 소실
-  자체는 이번 세션 `topology_gate` 수정이 다루지만, 그 수정 자체도 아직 실물 미검증 --
-  위 절 참고).
-- DETECT_OUT이 실물에서도 이 전원 모듈이 attach(CHILD/ROUTER/LEADER 중 하나)되기
-  전에는 절대 활성화되지 않는지 (더 이상 Leader 전제가 아니다 -- 위
-  `docs/power-base.md` 19.8절 참고). 이번 세션은 `power_base/main/app_main.c`의
-  순서 자체와 그 순서를 그대로 mirror한 host test로만 확인 -- 실제 GPIO 레벨은 미측정.
-- (이번 세션 신규) `attach_supervisor_task`가 30초를 넘겨도 halt하지 않고 계속
-  재시도하는지, rate-limited 경고가 실물 콘솔에 정상 출력되는지 -- 아직 실물 미검증
-  (host test만 통과, 위 `docs/power-base.md` 19.8절 참고).
-
-**기존(module-to-module) 항목**:
-
-- 확정 GPIO 프로필(POGO UART, DETECT_IN/OUT, BASE_ID -- **현재 UPSTREAM
-  DETECT_IN=GPIO12, DETECT_OUT=GPIO2**, 이번 세션에 GPIO2/GPIO12에서 교환됨 --
-  실물은 아직 구배선 상태이므로 재배선 필요, 위 "새 GPIO 프로필 flash 전 재배선"
-  절 참고)로 배선된 실물 두 보드에서의 attach/detach 디바운스, PEER_HELLO/BASE_ID
-  교차검증. (passive power-base 지그를 이용한 ROOT 판정은 위 "실물 배선" 절에서
-  설명한 대로 이제 유효하지 않은 시나리오다 -- 대신 전원 모듈 관련 항목 참고.)
-- SHT45 실물 I2C 통신·변환값: 전원 모듈과의 조합에서 **실물로 확인됨** (위 절 참고).
-  BH1750은 아직 미확인.
-- SGP40/SGP41: 코드/알고리즘/host test는 완료했으나 실물 배선·실행은 미검증 (위 "보유 센서
-  현황" 참고).
-- PMS5003 terminal UART driver: 실물 배선, PASSIVE 응답, 30초 warm-up 이후 PM 채널값 검증.
-- JOIN_RESULT/ACK: SHT45 1대와의 정상 경로는 **실물로 확인됨** (`JOIN_RESULT_ACK
-  received` 로그). 유실·중복 재시도 경로 자체(ACK가 실제로 유실되는 경우)는 host test
+- **3단 센서 체인(Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF, depth=2)**:
+  중간 모듈이 upstream 프로비저닝 완료 후 INTERMEDIATE로 전환되는지, downstream 자식에게
+  UUID/slot/depth+1/polling/collector endpoint/Dataset을 올바르게 전달하는지, 중간
+  모듈이 항상 켜진 router-eligible FTD로 유지되는지, 말단이 SED LEAF로 유지되는지 -- 코드
+  리뷰와 host test까지만 확인, 실물 미검증. 아래 "3단 센서 체인 실물 배선" 절 참고.
+- BH1750 실물 I2C 통신·변환값 -- SHT45와 동일 경로이나 아직 미확인.
+- SGP40/SGP41 실물 배선·측정 -- 코드/알고리즘/host test는 완료했으나 미확인.
+- 두 번째/세 번째 모듈이 동시에 붙는 경우의 BASE_ID/PEER_HELLO 타이밍 -- 아직 미확인
+  (지금까지는 한 번에 한 모듈만 붙는 경로만 확인됨).
+- `thread_manager_start_as_root()`의 Dataset 재사용 경로를 실물 전원 모듈의 실제 전원
+  재投입(power cycle)으로 확인 -- 아직 미확인.
+- 다중 홉 Thread 메시 위에서의 CoAP 전송 동작과 UUID-hash backoff의 실제 타이밍 -- 아직
+  미확인 (지금까지 확인된 것은 depth=1 단일 홉뿐).
+- 전원 모듈의 30초 첫 attach(CHILD/ROUTER/LEADER 중 아무 상태나 충분 -- 더 이상 LEADER
+  전용이 아니다, `docs/power-base.md` 19.1/19.7절 참고) 부팅 대기 예산이 더 열악한 무선
+  환경에서 CHILD/ROUTER로만 attach된 채로도 충분한지 -- 아직 미확인.
+- DETECT_OUT이 실물에서도 전원 모듈이 attach(CHILD/ROUTER/LEADER 중 하나)되기 전에는
+  절대 활성화되지 않는지 (더 이상 Leader 전제가 아니다 -- 위 `docs/power-base.md` 19.8절
+  참고) -- `power_base/main/app_main.c`의 순서 자체와 그 순서를 mirror한 host test로만
+  확인, 실제 GPIO 레벨은 미측정.
+- `attach_supervisor_task`가 30초를 넘겨도 halt하지 않고 계속 재시도하는지, rate-limited
+  경고가 실물 콘솔에 정상 출력되는지 -- host test만 통과, 실물 미검증.
+- JOIN_RESULT/ACK 유실·중복 재시도 경로(ACK가 실제로 유실되는 경우) -- host test
   시나리오만 통과, 아직 실물 미확인.
-- 주기적 CoAP 센서 전송, ROOT aggregator 적재: SHT45 1대에서는 **실물로 확인됨**. Thread
-  재가입 후 세션 재개는 아직 미확인.
+- Thread 재가입 후 세션 재개 -- 아직 미확인.
 - idle PING/PONG liveness 및 `LIVENESS_LOST` 판정의 실물 동작 -- 아직 미확인.
-- 여러 DOWNSTREAM 세대(3단 이상 체인)에서의 topology_depth 전달과 INTERMEDIATE 역할 전환
-  -- 아직 미확인 (지금까지 확인된 것은 depth=1 단일 홉뿐).
+- Deep-sleep, Linux OTBR, Matter Bridge, POGO 5V 공급 -- 이번 세션 범위 밖, 구현 자체가
+  없음 (`docs/validation-status.md` 참고).

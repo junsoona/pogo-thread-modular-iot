@@ -1,0 +1,46 @@
+{
+  "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a Sensirion SGP40 (VOC only -- no NOx, see prototype_sgp41.json for VOC+NOx). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. This file's upstream_port/downstream_port block is BYTE-FOR-BYTE identical to prototype_sht45.json's/prototype_bh1750.json's -- the only per-board differences across all four common-POGO-port prototypes are driver_id, i2c_address, sensor_type_bitmap, calibration and measurement_timeout_ms, exactly as section 2 of the follow-up spec requires. See tools/test_prototype_port_blocks_match.py, which mechanically checks this for all four.",
+
+  "schema_version": 1,
+  "config_revision": 1,
+
+  "_driver_comment": "SENSOR_DRIVER_ID_SGP40 (see components/sensor_provider/include/sensor_provider/sensor_provider.h) and the VOC_RAW/VOC_INDEX channel bits (see components/sensor_channel/include/sensor_channel/sensor_channel.h) are resolved by name here -- tools/pack_module_config.py's DRIVER_IDS/CHANNEL_BITS tables mirror those two C headers bit-for-bit, so this file never repeats a magic number by hand. The two channel names listed here exactly match what components/sgp40/sgp40.c's sgp40_get_sensor_bitmap() actually reports at runtime (VOC_RAW + VOC_INDEX, no NOx channels -- SGP40 has no NOx sensing element at all).",
+  "driver_id": "SGP40",
+  "sensor_type_bitmap": ["VOC_RAW", "VOC_INDEX"],
+
+  "bus_type": "I2C",
+  "bus_number": 0,
+  "i2c_sda_gpio": 0,
+  "i2c_scl_gpio": 1,
+  "_addr_comment": "SGP40's 7-bit I2C address is fixed at 0x59 by the datasheet (not address-pin-selectable, unlike BH1750) -- see components/sgp40/sgp40.c's own header comment citing Sensirion's reference driver.",
+  "i2c_address": "0x59",
+  "spi_mosi_gpio": -1,
+  "spi_miso_gpio": -1,
+  "spi_sclk_gpio": -1,
+  "spi_cs_gpio": -1,
+  "spi_clock_hz": 0,
+  "_calibration_comment": "SGP40 has no calibration/offset fields of its own (the VOC Index Algorithm self-normalizes) -- calibration stays all-zero, same convention as every other driver when unused.",
+  "calibration": [0, 0, 0, 0],
+  "_timeout_comment": "components/sgp40/sgp40.c hardcodes SGP40_MEASURE_MS_MAX=30ms (the measure-raw-signal command's own datasheet max) as the point read_measurement() actually stops waiting; measurement_timeout_ms is a SEPARATE, larger ceiling checked in the same polling loop purely to abandon a wedged/non-responding sensor (see sgp40_read_measurement()) -- it must stay comfortably above 30ms or a slow-but-healthy read would be misreported as SENSOR_STATUS_TIMEOUT before the real 30ms measurement window even elapses. 200ms (same value as prototype_sht45.json) leaves a wide margin for I2C bus contention/retries without ever being reached by a normal reading, and without stalling child_service's SENSOR_HELLO handler for long if the sensor really is unresponsive.",
+  "measurement_timeout_ms": 200,
+
+  "dev_mode": "AUTO",
+
+  "_polling_comment": "Not a config field (the Gas Index Algorithm's minimum cadence is compiled into components/sgp40/sgp40.c's sgp40_get_min_polling_period_ms()==1000ms, enforced at runtime by sensor_service_compute_effective_period_ms() -- see tools/test_effective_polling_period.c) -- noted here only so this file's reader knows POLL_CONFIG's negotiated period can never go below 1 Hz for this driver regardless of what the parent's response-time-derived formula alone would pick.",
+
+  "_compensation_comment": "IMPORTANT: components/sgp40/sgp40.c always compensates its raw VOC reading with a FIXED 50%RH/25degC default (SGP40_DEFAULT_RH_TICKS/SGP40_DEFAULT_T_TICKS) -- this board does NOT read another module's live SHT45 temperature/humidity over the wire (section 10 of the follow-up spec: never borrow another module's SHT45 reading and present it as real compensation). Do not mistake VOC_INDEX readings from this config for humidity/temperature-corrected values; they are only as accurate as that fixed assumption. The driver logs this loudly (ESP_LOGW) at every init specifically so this is never silently forgotten.",
+
+  "_upstream_comment": "Identical to prototype_sht45.json's upstream_port -- see that file's _upstream_comment for why DETECT_IN is GPIO12/DETECT_OUT is GPIO2 (deep-sleep-ready profile, swapped from the earlier DETECT_IN=2/DETECT_OUT=12), and for the required rewiring before flashing.",
+  "upstream_port": {
+    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
+    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
+    "detect_out_active_low": true, "debounce_ms": 30
+  },
+
+  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port.",
+  "downstream_port": {
+    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
+    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_out_active_low": true, "debounce_ms": 30
+  }
+}

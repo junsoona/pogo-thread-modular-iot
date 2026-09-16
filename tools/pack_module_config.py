@@ -240,22 +240,12 @@ def find_nvs_partition_gen() -> str:
     return tool
 
 
-def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
-    """
-    Re-parses the just-generated NVS image and asserts module_cfg's "blob"
-    entry is exactly `expected_len` bytes on the wire -- a regression guard
-    for the CSV-row encoding bug where "blob,data,binary,<path>" (wrong)
-    stored the temp file *path string itself* as the blob's bytes instead of
-    "blob,file,binary,<path>" (correct), which reads the file at that path.
-    Both forms make nvs_partition_gen.py exit 0 -- pack_config()'s own
-    pack_config()'s own length assert never sees this, since it only checks the bytes
-    written to the temp file, not what actually ends up in the NVS image --
-    so this is the only check that would have caught it.
-
-    Reuses ESP-IDF's own nvs_partition_tool parser (same component that
-    ships nvs_partition_gen.py, already required on PATH via IDF_PATH)
-    rather than re-implementing the NVS binary format a second time.
-    """
+def _import_nvs_parser():
+    """Imports ESP-IDF's own nvs_partition_tool parser module (same
+    component that ships nvs_partition_gen.py, already required on PATH via
+    IDF_PATH) rather than re-implementing the NVS binary format a second
+    time. Shared by verify_module_cfg_blob_len() and read_module_cfg_blob()
+    below."""
     idf_path = os.environ.get("IDF_PATH", "")
     tool_dir = os.path.join(idf_path, "components", "nvs_flash", "nvs_partition_tool")
     if not os.path.isdir(tool_dir):
@@ -263,13 +253,25 @@ def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
     if tool_dir not in sys.path:
         sys.path.insert(0, tool_dir)
     import nvs_parser  # noqa: E402 -- IDF_PATH-dependent, must be imported at runtime
+    return nvs_parser
+
+
+def _find_module_cfg_blob_data_entry(image_path: str):
+    """Re-parses `image_path` and returns the module_cfg:blob NVS entry with
+    metadata type 'blob_data' (the chunk head entry whose .children hold the
+    actual bytes-on-the-wire), or None if not found. Both
+    verify_module_cfg_blob_len() (length only) and read_module_cfg_blob()
+    (full content, for host-test re-parsing) build on this single lookup so
+    the "how do you find module_cfg's blob entry in a generated image" logic
+    is written exactly once."""
+    nvs_parser = _import_nvs_parser()
 
     with open(image_path, "rb") as f:
         raw = bytearray(f.read())
     partition = nvs_parser.NVS_Partition(os.path.basename(image_path), raw)
 
     namespace_id = None
-    blob_size = None
+    blob_entry = None
     for page in partition.pages:
         for entry in page.entries:
             if entry.key == "module_cfg" and entry.metadata["namespace"] == 0 and entry.data:
@@ -279,19 +281,51 @@ def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
                 and entry.data
                 and namespace_id is not None
                 and entry.metadata["namespace"] == namespace_id
+                and entry.metadata["type"] == "blob_data"
             ):
-                blob_size = entry.data.get("size")
+                blob_entry = entry
+    return blob_entry
 
-    if namespace_id is None:
-        sys.exit(f"verify_module_cfg_blob_len: 'module_cfg' namespace not found in {image_path}")
-    if blob_size is None:
+
+def verify_module_cfg_blob_len(image_path: str, expected_len: int) -> None:
+    """
+    Re-parses the just-generated NVS image and asserts module_cfg's "blob"
+    entry is exactly `expected_len` bytes on the wire -- a regression guard
+    for the CSV-row encoding bug where "blob,data,binary,<path>" (wrong)
+    stored the temp file *path string itself* as the blob's bytes instead of
+    "blob,file,binary,<path>" (correct), which reads the file at that path.
+    Both forms make nvs_partition_gen.py exit 0 -- pack_config()'s own
+    length assert never sees this, since it only checks the bytes written to
+    the temp file, not what actually ends up in the NVS image -- so this is
+    the only check that would have caught it.
+    """
+    blob_entry = _find_module_cfg_blob_data_entry(image_path)
+    if blob_entry is None:
         sys.exit(f"verify_module_cfg_blob_len: module_cfg:blob entry not found in {image_path}")
+    blob_size = blob_entry.data.get("size")
     if blob_size != expected_len:
         sys.exit(
             f"verify_module_cfg_blob_len: module_cfg:blob is {blob_size} bytes in {image_path}, "
             f"expected {expected_len} -- check the CSV row uses 'blob,file,binary,<path>', "
             f"not 'blob,data,binary,<path>' (see tools/pack_module_config.py)"
         )
+
+
+def read_module_cfg_blob(image_path: str) -> bytes:
+    """Re-parses a generated NVS image (e.g. build/cfg_images/*.bin) and
+    reconstructs the actual module_cfg:blob bytes-on-the-wire, by
+    concatenating the blob_data entry's chunk children and truncating to its
+    recorded size -- the same reconstruction nvs_partition_tool's own
+    `nvs_tool.py blobs` dump performs. Used by host tests that need to
+    confirm the *content* actually written into a flashable image, not just
+    what pack_config() computed in memory before generation."""
+    blob_entry = _find_module_cfg_blob_data_entry(image_path)
+    if blob_entry is None:
+        sys.exit(f"read_module_cfg_blob: module_cfg:blob entry not found in {image_path}")
+    raw = bytearray()
+    for child in blob_entry.children:
+        raw += child.raw
+    return bytes(raw[: blob_entry.data["size"]])
 
 
 def main():

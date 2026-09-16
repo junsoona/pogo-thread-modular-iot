@@ -193,23 +193,60 @@ dev configs needed no change.
 
 ## Prototype configs (real AUTO-mode hardware)
 
-`configs/prototype_sht45.json` and `configs/prototype_bh1750.json` are the
-two real, `dev_mode=AUTO` configs for the confirmed GPIO profile (see
-docs/pogo-interface.md) -- both share the identical `upstream_port`/
-`downstream_port` block; only `driver_id`, `i2c_address`,
-`sensor_type_bitmap`, and `calibration` differ:
+`configs/prototype_sht45.json`, `configs/prototype_bh1750.json`,
+`configs/prototype_sgp40.json`, and `configs/prototype_sgp41.json` are the
+four `dev_mode=AUTO` configs for ordinary I2C sensor boards on the confirmed
+GPIO profile (see docs/pogo-interface.md) -- all four share the identical
+`upstream_port`/`downstream_port` block; only `driver_id`, `i2c_address`,
+`sensor_type_bitmap`, `measurement_timeout_ms`, and `calibration` differ.
+`tools/test_prototype_port_blocks_match.py` checks this mechanically for all
+four (byte-for-byte port comparison, plus driver_id/bitmap/address decoded
+back out of the actual packed NVS blob, plus a parity check that this
+document's driver_id/channel tables below never drift from
+`tools/pack_module_config.py`'s `DRIVER_IDS`/`CHANNEL_BITS` dicts or the C
+headers they mirror).
 
-| | SHT45 | BH1750 |
-|---|---|---|
-| `driver_id` | `SHT45` (`0x53483435`) | `BH1750` (`0x42483137`) |
-| `i2c_address` | `0x44` | `0x23` (ADDR low/floating -- confirm the actual breakout's strap) |
-| `sensor_type_bitmap` | `["TEMPERATURE", "HUMIDITY"]` | `["ILLUMINANCE"]` |
-| `measurement_timeout_ms` | 200 | 300 |
+| | SHT45 | BH1750 | SGP40 | SGP41 |
+|---|---|---|---|---|
+| `driver_id` | `SHT45` (`0x53483435`) | `BH1750` (`0x42483137`) | `SGP40` (`0x53473430`) | `SGP41` (`0x53473431`) |
+| `i2c_address` | `0x44` | `0x23` (ADDR low/floating -- confirm the actual breakout's strap) | `0x59` (fixed, no ADDR strap) | `0x59` (fixed, same address family as SGP40 -- a board never pairs both) |
+| `sensor_type_bitmap` | `["TEMPERATURE", "HUMIDITY"]` | `["ILLUMINANCE"]` | `["VOC_RAW", "VOC_INDEX"]` | `["VOC_RAW", "VOC_INDEX", "NOX_RAW", "NOX_INDEX"]` |
+| `measurement_timeout_ms` | 200 | 300 | 200 | 200 |
+
+SGP40/SGP41 notes (real hardware for these two boards is still **not**
+wired/tested -- see docs/validation-status.md):
+
+- `measurement_timeout_ms=200` is chosen the same way as SHT45's: it must
+  stay comfortably above the driver's own hardware measurement ceiling
+  (`components/sgp40/sgp40.c`'s `SGP40_MEASURE_MS_MAX`=30ms;
+  `components/sgp41/sgp41.c`'s `SGP41_CONDITIONING_MS_MAX`/
+  `SGP41_MEASURE_MS_MAX`=50ms each) so a normal reading never gets
+  misreported as `SENSOR_STATUS_TIMEOUT`, while still being short enough to
+  abandon a genuinely wedged sensor without stalling `child_service`'s
+  `SENSOR_HELLO` handler for long. Both drivers separately floor the
+  *sampling* period (not this per-read timeout) at 1000ms via
+  `get_min_polling_period_ms()`, since the Sensirion Gas Index Algorithm is
+  defined for ~1 Hz sampling -- see `tools/test_effective_polling_period.c`.
+- SGP41's first ~10s (`SGP41_CONDITIONING_WINDOW_MS`) after init report only
+  the two VOC channels, tagged `SENSOR_CHANNEL_STATUS_CONDITIONING` --
+  `sensor_type_bitmap` still lists all four channels (the driver's steady-
+  state capability set), matching the same convention PMS5003's 30s warm-up
+  already uses. `tools/test_conditioning_provisioning.c` already covers
+  `parent_service.c` accepting a `CONDITIONING` sensor_status during
+  provisioning; this is unchanged for SGP40/SGP41.
+- Both drivers always compensate against Sensirion's own fixed documented
+  default (50%RH / 25degC) -- neither reads this board's real ambient
+  humidity/temperature, and neither borrows another module's SHT45 reading
+  over the wire. **Do not mistake VOC_INDEX/NOX_INDEX values from these
+  boards for humidity/temperature-corrected readings** -- both drivers log
+  this loudly (`ESP_LOGW`) at every init.
 
 ```bash
 python3 tools/pack_module_config.py configs/prototype_sht45.json build/cfg_images/prototype_sht45_config.bin
 python3 tools/pack_module_config.py configs/prototype_bh1750.json build/cfg_images/prototype_bh1750_config.bin
-# or, along with dev_root/dev_leaf, all at once:
+python3 tools/pack_module_config.py configs/prototype_sgp40.json build/cfg_images/prototype_sgp40_config.bin
+python3 tools/pack_module_config.py configs/prototype_sgp41.json build/cfg_images/prototype_sgp41_config.bin
+# or, along with dev_root/dev_leaf/prototype_pms5003, all at once:
 bash tools/gen_config.sh build/cfg_images
 ```
 
