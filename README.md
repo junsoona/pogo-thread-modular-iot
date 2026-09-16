@@ -447,8 +447,21 @@ idf.py -C module -B ~/esp-builds/pogo_module -p "$TERMINAL_PORT" monitor \
 ```
 
 (`tee`는 화면 출력과 파일 저장을 동시에 한다. 세 monitor는 서로 다른 터미널에서 실행할
-것. 저장한 세 로그 파일은 `tools/validate_multihop_logs.py`로 사후 판정할 수 있다 --
+것. 저장한 세 로그 파일은 `tools/validate_three_tier_logs.py`로 사후 판정할 수 있다 --
 아래 참고.)
+
+**이 시험이 증명하는 것과 증명하지 못하는 것**: 아래 시험과 `tools/validate_three_tier_logs.py`는
+POGO **물리** 토폴로지(양쪽 POGO 링크 PEER_READY, depth 전달, INTERMEDIATE/LEAF 논리 역할,
+프로비저닝, 전원 모듈에서의 CoAP 도달성)를 검증한다. **센서 sample 패킷이 실제로 중간
+모듈을 Thread 무선 라우터로 경유해서(radio multi-hop) 전원 모듈에 도달했다는 것은 이
+시험만으로 증명되지 않는다** -- OpenThread 메시 라우팅이 중간 모듈을 거치지 않고 말단
+모듈에서 전원 모듈로 직접 무선 도달했더라도 depth=2 로그와 CoAP 성공 로그는 동일하게
+남는다. 실제 Thread 무선 multi-hop(중간 모듈의 라우터 역할을 실제로 경유)을 확인하려면
+별도로 OpenThread router/neighbor table과 next-hop 경로 정보(`ot router table`/
+`ot neighbor table` 또는 `otThreadGetNextHop()` 등)를 캡처하거나, 말단<->전원 모듈 간
+직접 무선 도달을 물리적으로 차단하는 RF 시험(차폐/거리/감쇠)이 필요하다 -- 둘 다 이번
+범위에는 포함되지 않았다. 자세한 내용은 `docs/validation-status.md`의 "POGO physical
+topology depth" 및 "Thread radio multi-hop routing" 항목 참고.
 
 **시험 순서와 합격 조건**:
 

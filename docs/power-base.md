@@ -518,9 +518,15 @@ In particular, still needing real hardware:
   correction pass's name for what was `thread_manager_start_as_root()` when
   this bullet was first written) across a REAL power cycle of the power-base
   board.
-- CoAP delivery of both `"/s"` and `"/t"` over a real MULTI-HOP Thread mesh
+- CoAP delivery of both `"/s"` and `"/t"` over a real depth>=2 POGO chain
   (only a single depth=1 hop has been tried), including the UUID-hash backoff
-  schedule's real timing.
+  schedule's real timing. Note: even a passing depth=2 POGO chain test only
+  confirms POGO physical/application-layer topology (docking order, depth
+  propagation, provisioning, CoAP reachability) -- it does NOT by itself
+  prove the CoAP packet actually radio-hopped through the INTERMEDIATE
+  module's Thread router role (genuine Thread-mesh multi-hop is a distinct,
+  separately-unverified property; see docs/validation-status.md's "POGO
+  physical topology depth" vs. "Thread radio multi-hop routing" sections).
 - The unbounded, no-halt first-attach wait (`attach_supervisor_task()`,
   section 19.8) under adverse real radio conditions or a genuinely absent
   Thread network for an extended period (the one run so far reached LEADER

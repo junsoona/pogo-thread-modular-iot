@@ -1,12 +1,50 @@
 #!/usr/bin/env python3
 """
-Post-hoc PASS/FAIL judge for a real 3-board 3-tier POGO/Thread chain
-(Power Base -> INTERMEDIATE sensor module -> LEAF sensor module), reading
-ONLY three already-captured `idf.py monitor` log files -- one per board.
-This tool never opens a serial port, never flashes, and never controls
-firmware; it is a pure log-file auditor, run after the fact against
-whatever a real test session already saved to disk (see README's "3단
-실물 시험" section for how to capture those three files).
+Post-hoc PASS/FAIL judge for a real 3-board POGO physical chain (Power Base
+-> INTERMEDIATE sensor module -> LEAF sensor module), reading ONLY three
+already-captured `idf.py monitor` log files -- one per board. This tool
+never opens a serial port, never flashes, and never controls firmware; it
+is a pure log-file auditor, run after the fact against whatever a real test
+session already saved to disk (see README's "3단 실물 시험" section for how
+to capture those three files).
+
+IMPORTANT -- what this tool proves vs. what it does NOT prove:
+
+  This tool (and the 3-board test procedure it judges) confirms the POGO
+  PHYSICAL topology: POGO PEER_READY on both physical links, the
+  INTERMEDIATE/LEAF logical role each module settles into, topology_depth
+  propagation (depth=1 for the INTERMEDIATE module, depth=2 for the LEAF)
+  as reported to the Power Base, successful provisioning (JOIN_RESULT_ACK),
+  and CoAP reachability of both modules' sensor samples at the Power Base.
+
+  topology_depth=2 is a POGO/application-layer concept (see
+  components/topology_registry, components/topology_proto) -- it is
+  reported by the LEAF module itself once ITS OWN parent (the INTERMEDIATE
+  module) has provisioned it, and says nothing on its own about which
+  physical/radio path a CoAP packet actually took through the Thread mesh.
+  In particular, **this tool does NOT prove that a sensor sample's CoAP
+  packet actually radio-hopped through the INTERMEDIATE module's Thread
+  router role to reach the Power Base** -- OpenThread's own mesh routing
+  could equally have delivered that packet over a direct radio link between
+  the LEAF and the Power Base (or some other router already in range),
+  independent of the POGO physical chain's shape. depth=2 is proof of POGO
+  docking order and provisioning ancestry, not proof of the Thread radio
+  hop count a packet actually took.
+
+  Verifying genuine Thread-radio multi-hop routing (i.e. that a packet was
+  actually relayed by the INTERMEDIATE module's router role rather than
+  reaching the Power Base directly) requires evidence this tool cannot
+  extract from `idf.py monitor` application logs alone -- either real
+  OpenThread router/neighbor-table and route-price diagnostics (e.g.
+  `otThreadGetNextHop`/`otThreadGetRouterInfo` output, or `ot router table`/
+  `ot neighbor table` CLI output showing the actual next-hop router
+  used for a given destination) captured separately, or a dedicated RF
+  test that physically prevents a direct LEAF<->Power-Base radio path
+  (e.g. shielding/distance/attenuation) so any observed delivery can only
+  have happened via the INTERMEDIATE module's relay. Neither is implemented
+  by this tool -- see docs/validation-status.md's "Thread radio multi-hop
+  routing" row, which stays a separate, explicitly unverified item even
+  after every check in this tool PASSes.
 
 Why UUID/event correlation, not line order: log lines from three
 independent boards are captured independently and are NOT clock-synchronized
@@ -28,7 +66,7 @@ Log line patterns this tool understands (see the cited source for each):
     FATAL_PATTERNS below for the exact source of each.
 
 Usage:
-    python3 tools/validate_multihop_logs.py \\
+    python3 tools/validate_three_tier_logs.py \\
         --base   base_monitor.log \\
         --middle middle_monitor.log \\
         --leaf   leaf_monitor.log

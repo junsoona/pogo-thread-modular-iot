@@ -42,7 +42,15 @@ code exists for this yet.
 | SGP40 | `configs/prototype_sgp40.json` (this pass) | Yes (I2C commands, CRC, vendored Gas Index Algorithm) | Not yet | Config added this pass; real board still unwired. |
 | SGP41 | `configs/prototype_sgp41.json` (this pass) | Yes (I2C commands, CRC, vendored Gas Index Algorithm, conditioning-vs-measure command switch) | Not yet | Config added this pass; real board still unwired. |
 
-## Multi-hop / topology depth
+## POGO physical topology depth
+
+**This section is about the POGO/application-layer topology** -- physical docking order,
+`topology_depth` propagation, logical role assignment, and provisioning -- as tracked by
+`components/topology_registry`/`topology_proto` and confirmed by
+`tools/validate_three_tier_logs.py`. It is a distinct concept from actual Thread **radio**
+multi-hop routing (which physical/radio path a CoAP packet took through the mesh); see
+"Thread radio multi-hop routing" below for that separate, still-unverified item. Conflating
+the two would overclaim what a passing 3-tier log judgement actually proves.
 
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
@@ -51,9 +59,23 @@ code exists for this yet.
 | INTERMEDIATE forwarding UUID/slot/depth+1/polling/collector/Dataset to its own downstream child | Reviewed this pass -- OK, no bug | Not yet | `parent_service.c` is generic (used by both Power Base and any INTERMEDIATE via `s_provider` callbacks): confirms the child's own permanent UUID, `ASSIGN_SLOT` with `depth=get_own_depth()+1`, `ASSIGN_PARENT_INFO`, measured-response-time polling period, `SET_COLLECTOR` before `SET_DATASET` (both sides enforce the ordering). |
 | INTERMEDIATE always an always-on router-eligible FTD (never SED) | Reviewed this pass -- OK, no bug | Not yet | `thread_manager.c`'s non-LEAF branch sets `rx-on-when-idle=true`/FTD/`router_eligible=true`, keyed on `role_manager_get_role()==MODULE_ROLE_INTERMEDIATE` (independent of `otDeviceRole`), and is correctly re-applied if the role flips while already joined. |
 | Terminal LEAF always an SED (never FTD/router-eligible) | Reviewed this pass -- OK, no bug | Not yet | Same `thread_manager.c` function's LEAF branch: `rx-on-when-idle=false`, MTD-like, `router_eligible=false`, plus `otLinkSetPollPeriod()`. |
-| depth=2+ chain (Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF) | Code review this pass: no confirmed bugs in any of the 6 reviewed areas (existing parent/child code is already generic, not hardcoded to depth=1) | Not yet | Target of the next real-hardware pass -- see README "3단 센서 체인 실물 배선" and `tools/validate_multihop_logs.py` for post-hoc log judging. |
+| depth=2 POGO chain (Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF) -- POGO docking order, depth propagation, provisioning, CoAP reachability ONLY | Code review this pass: no confirmed bugs in any of the 6 reviewed areas (existing parent/child code is already generic, not hardcoded to depth=1) | Not yet | Target of the next real-hardware pass -- see README "3단 센서 체인 실물 배선" and `tools/validate_three_tier_logs.py` for post-hoc log judging. This item is POGO/application-layer topology only -- it does NOT confirm Thread radio multi-hop (see next row). |
 | Power Base topology_registry: two modules' UUIDs/sensor bitmaps never cross-assigned | Reviewed this pass -- OK, no bug | Not yet | `topology_registry_apply_report()` always looks up a node's slot by UUID equality first; a free slot is only allocated for a genuinely new UUID, and every field (including `sensor_bitmap`) is written into a freshly-cleared entry -- no reuse of a stale slot's bitmap under a different UUID. |
 | A reattach on one module never corrupts Power Base session/registry state for other modules | Reviewed this pass -- OK, no bug | Not yet | `topology_registry_cascade_offline_children()`/`mark_offline()` only touch the detaching UUID and its own descendants (no global reset). `power_base_transport_on_direct_downstream_detached()` marks only `depth==1` nodes offline, which is exactly the one physically-detached node given Power Base has exactly one physical DOWNSTREAM POGO port. Each module's own `child_service.c`/`parent_service.c` session state is scoped to that module's one upstream link and one downstream port -- a reattach only resets that module's own session. |
+
+## Thread radio multi-hop routing (separate from POGO physical topology depth above)
+
+**Not verified, and not verifiable by the 3-tier POGO test or `tools/validate_three_tier_logs.py`.**
+A passing `topology_depth=2` result (POGO docking order + application-layer provisioning
+ancestry) does NOT by itself prove that a sensor sample's CoAP packet was actually radio-relayed
+through the INTERMEDIATE module's Thread router role to reach the Power Base -- OpenThread's own
+mesh routing could equally have delivered that packet over a direct radio link between the LEAF
+and the Power Base (or via some other router already in range), independent of the POGO chain's
+physical shape.
+
+| Feature | Host test / code review | Real hardware | Notes |
+|---|---|---|---|
+| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | None -- this is a real-RF/radio-path property, not something `idf.py monitor` application logs can establish | Not verified | Requires either (a) OpenThread router/neighbor-table and route diagnostics captured separately from the application log (e.g. `ot router table`/`ot neighbor table` CLI output, or `otThreadGetNextHop()`/`otThreadGetRouterInfo()`, showing the actual next-hop router used for the LEAF's destination), or (b) a dedicated RF test that physically prevents a direct LEAF<->Power-Base radio path (shielding/distance/attenuation) so any observed delivery can only have happened via the INTERMEDIATE module's relay. Neither has been done. |
 
 ## Explicitly out of scope (not implemented, not planned this pass)
 
