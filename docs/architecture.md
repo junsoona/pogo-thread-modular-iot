@@ -14,6 +14,17 @@ project/binary that reuses `pogo_port`/`pogo_proto`/`thread_manager`/
 `parent_service`/`sensor_channel` unmodified and never runs
 `role_manager`/`child_service`/`sensor_provider`/`sensor_service` at all.
 
+**The power base can now join an existing Linux OTBR's Thread network**
+instead of always forming/resuming its own (EXTERNAL_OTBR mode, alongside
+`rcp/` -- a third, fully independent ESP-IDF project that is a Radio Only
+ESP32-H2 RCP for that Linux OTBR host, owning no Dataset of its own). This
+does not change `module/`'s own architecture or role model at all -- a
+sensor module still receives its Dataset via the pre-existing POGO
+`SET_DATASET` step regardless of which mode its power base is in. See
+[power-base.md](power-base.md) section 12 and [otbr-rcp.md](otbr-rcp.md)
+for the full design; not yet verified on real hardware, see
+[validation-status.md](validation-status.md).
+
 ## Why this refactor exists
 
 The original two-project MVP (`upper/`, `lower/`) proved the vertical slice

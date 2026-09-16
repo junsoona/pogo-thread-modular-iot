@@ -11,4 +11,10 @@
 *.bin
 *.elf
 *.map
+
+# Real Thread Active Dataset material (contains the Network Key) -- see
+# docs/otbr-rcp.md / docs/power-base.md's EXTERNAL_OTBR section. Never
+# commit a real dataset hex file or a generated *_otbr_config.bin image.
+/secrets/
+**/otbr-active-dataset.hex
 EOF

@@ -23,15 +23,32 @@
  *   10.    The "still not attached" warning is rate-limited (first at 30s,
  *          then at most once every 60s after that -- never every poll tick).
  *
+ * (This follow-up: external OTBR Dataset join, docs/otbr-rcp.md/
+ * docs/power-base.md) Also covers the STANDALONE vs. EXTERNAL_OTBR boot
+ * branch added to power_base/main/app_main.c:
+ *   11.    power_base_thread_config_load() failing halts BEFORE either
+ *          Thread-start branch is attempted.
+ *   12.    EXTERNAL_OTBR mode calls ONLY thread_manager_start_as_always_on_ftd_with_dataset()
+ *          (never the STANDALONE API), and a successful join starts every
+ *          service exactly once for CHILD/ROUTER/LEADER alike, same as
+ *          STANDALONE.
+ *   13.    An EXTERNAL_OTBR join FAILURE halts immediately and NEVER calls
+ *          the STANDALONE API as a fallback (no standalone network is ever
+ *          formed in that case).
+ *
  * app_main.c itself is not host-compilable (it is nothing but ESP-IDF/
  * OpenThread calls) -- this mirrors its actual control flow: the ONE-TIME
- * fixed init (config/efuse/thread_manager_start_as_always_on_ftd()) AND
- * attach_supervisor_task()'s own poll loop (identical logic to the real
+ * fixed init (config/efuse/power_base_thread_config_load()/
+ * thread_manager_start_as_always_on_ftd() OR
+ * thread_manager_start_as_always_on_ftd_with_dataset(), mutually exclusive)
+ * AND attach_supervisor_task()'s own poll loop (identical logic to the real
  * one: ATTACH_POLL_INTERVAL_MS-equivalent ticks, ATTACH_WARN_FIRST_MS/
  * ATTACH_WARN_REPEAT_MS-equivalent thresholds, NO timeout/halt for "not
  * attached yet", start_services_once() called EXACTLY ONCE the first time
  * this device is observed attached) AND the live, stateless post-attach
- * query functions (pb_provisioning_allowed()/pb_get_collector()).
+ * query functions (pb_provisioning_allowed()/pb_get_collector()) -- neither
+ * of which cares which of the two Thread-start branches got this device
+ * attached.
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -o /tmp/test_power_base_boot_sequencing tools/test_power_base_boot_sequencing.c \
@@ -85,10 +102,24 @@ static bool pb_get_collector(sim_role_t role, bool *out_mesh_eid_available)
 #define WARN_FIRST_TICKS 150 /* 30000ms / 200ms */
 #define WARN_REPEAT_TICKS 300 /* 60000ms / 200ms */
 
+/* Mirrors power_base_thread_config_t.mode (components/power_base_thread_config)
+ * -- STANDALONE == 0, matching that enum, so every PRE-EXISTING
+ * scenario_input_t literal below (which never sets .thread_mode at all)
+ * still models STANDALONE without any change. */
+typedef enum { THREAD_MODE_STANDALONE = 0, THREAD_MODE_EXTERNAL_OTBR } thread_mode_t;
+
 typedef struct {
     bool config_ok;
     bool efuse_ok;
-    bool thread_start_ok;
+    /* Mirrors power_base_thread_config_load() failing (CONFIG_ERROR) --
+     * false (the default, so no PRE-EXISTING literal needs to change) means
+     * it succeeds, same "unset == success" convention as thread_start_ok
+     * would want but can't have (that one still defaults every existing
+     * literal to true explicitly, kept as-is). */
+    bool thread_config_load_fails;
+    thread_mode_t thread_mode; /* which of the two boot branches this scenario takes */
+    bool thread_start_ok;      /* STANDALONE branch: thread_manager_start_as_always_on_ftd() */
+    bool external_join_ok;     /* EXTERNAL_OTBR branch: thread_manager_start_as_always_on_ftd_with_dataset() */
     int  max_ticks; /* how many poll ticks this scenario simulates */
     /* role observed at tick i (0-based); ticks beyond the array length
      * repeat the last entry. */
@@ -110,6 +141,11 @@ typedef struct {
     int  ticks_done;
     bool attached_before_budget_exhausted;
     sim_role_t first_attached_role;
+    /* Exactly one of these two is ever incremented per scenario, and never
+     * more than once (see run_boot_sequence()): the two Thread-start
+     * branches are mutually exclusive AND each runs at most once per boot. */
+    int standalone_start_calls; /* thread_manager_start_as_always_on_ftd() */
+    int external_start_calls;   /* thread_manager_start_as_always_on_ftd_with_dataset() */
 } boot_result_t;
 
 static sim_role_t role_at_tick(const scenario_input_t *in, int tick)
@@ -142,9 +178,26 @@ static boot_result_t run_boot_sequence(const scenario_input_t *in)
         r.halted = true;
         return r; /* halt_forever("... all-zero EUI-64 ...") */
     }
-    if (!in->thread_start_ok) {
+    if (in->thread_config_load_fails) {
         r.halted = true;
-        return r; /* halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd failed") */
+        return r; /* halt_forever("CONFIG_ERROR loading power_base_thread_config (EXTERNAL_OTBR mode -- no standalone fallback)") */
+    }
+
+    /* Exactly one of these two branches ever runs, matching s_thread_cfg.mode
+     * -- see power_base/main/app_main.c's own comment. Neither ever falls
+     * back to the other on failure. */
+    if (in->thread_mode == THREAD_MODE_EXTERNAL_OTBR) {
+        r.external_start_calls++;
+        if (!in->external_join_ok) {
+            r.halted = true;
+            return r; /* halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd_with_dataset failed (EXTERNAL_OTBR mode -- no standalone fallback)") */
+        }
+    } else {
+        r.standalone_start_calls++;
+        if (!in->thread_start_ok) {
+            r.halted = true;
+            return r; /* halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd failed") */
+        }
     }
 
     bool attached = false;
@@ -224,6 +277,92 @@ static void scenario_thread_start_failure_never_activates(void)
                             .role_sequence = roles, .role_sequence_len = 1, .stale_sweep_task_create_ok = true, .efuse_ok = true};
     boot_result_t r = run_boot_sequence(&in);
     CHECK(r.halted, "a Thread start API failure halts the boot sequence");
+    CHECK(r.enable_downstream_calls == 0, "the downstream port is never enabled");
+    CHECK(!r.detect_out_active, "DETECT_OUT is never activated");
+    CHECK(r.standalone_start_calls == 1, "thread_manager_start_as_always_on_ftd() was attempted exactly once");
+    CHECK(r.external_start_calls == 0, "the EXTERNAL_OTBR API is never called in a STANDALONE scenario");
+}
+
+/*
+ * This follow-up (external OTBR Dataset join): power_base_thread_config_load()
+ * itself failing (a bad/missing/oversized EXTERNAL_OTBR active_tlvs, or a
+ * genuine NVS error) halts BEFORE either Thread-start branch is ever
+ * attempted -- see power_base/main/app_main.c's own halt_forever() call
+ * right after that load.
+ */
+static void scenario_thread_config_load_error_never_activates(void)
+{
+    printf("\n-- scenario (external OTBR Dataset): power_base_thread_config_load() failure halts before EITHER "
+           "Thread-start branch is attempted --\n");
+    static const sim_role_t roles[] = {ROLE_LEADER};
+    scenario_input_t in = {.config_ok = true, .efuse_ok = true, .thread_config_load_fails = true,
+                            .thread_mode = THREAD_MODE_EXTERNAL_OTBR, .external_join_ok = true, .max_ticks = 10,
+                            .role_sequence = roles, .role_sequence_len = 1, .stale_sweep_task_create_ok = true};
+    boot_result_t r = run_boot_sequence(&in);
+    CHECK(r.halted, "a power_base_thread_config_load() failure halts the boot sequence");
+    CHECK(r.standalone_start_calls == 0, "neither Thread-start branch runs");
+    CHECK(r.external_start_calls == 0, "neither Thread-start branch runs (external)");
+    CHECK(r.enable_downstream_calls == 0, "the downstream port is never enabled");
+    CHECK(!r.detect_out_active, "DETECT_OUT is never activated");
+}
+
+/*
+ * EXTERNAL_OTBR mode, successful join: exercises the SAME attach/exactly-once
+ * service-start machinery as STANDALONE (CHILD/ROUTER/LEADER all count as
+ * attached), but via thread_manager_start_as_always_on_ftd_with_dataset()
+ * instead -- see power_base/main/app_main.c's boot-sequence comment.
+ */
+static void scenario_external_otbr_join_success_starts_services_exactly_once(void)
+{
+    static const struct {
+        const char *name;
+        sim_role_t  role;
+    } cases[] = {
+        {"CHILD", ROLE_CHILD},
+        {"ROUTER", ROLE_ROUTER},
+        {"LEADER", ROLE_LEADER},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        printf("\n-- scenario (EXTERNAL_OTBR): a successful join, then attaching as %s, starts every service "
+               "exactly once via the EXTERNAL_OTBR API (never the STANDALONE one) --\n",
+               cases[i].name);
+        sim_role_t roles[] = {ROLE_DETACHED, cases[i].role};
+        scenario_input_t in = {.config_ok = true, .efuse_ok = true, .thread_mode = THREAD_MODE_EXTERNAL_OTBR,
+                                .external_join_ok = true, .max_ticks = 10, .role_sequence = roles,
+                                .role_sequence_len = 2, .stale_sweep_task_create_ok = true};
+        boot_result_t r = run_boot_sequence(&in);
+        CHECK(!r.halted, "the boot sequence completes successfully once attached (EXTERNAL_OTBR)");
+        CHECK(r.first_attached_role == cases[i].role, "the role that satisfied attachment is recorded correctly");
+        CHECK(r.external_start_calls == 1, "thread_manager_start_as_always_on_ftd_with_dataset() runs exactly once");
+        CHECK(r.standalone_start_calls == 0, "the STANDALONE API is never called in an EXTERNAL_OTBR scenario");
+        CHECK(r.power_base_transport_init_calls == 1, "power_base_transport_init() runs exactly once");
+        CHECK(r.parent_service_init_calls == 1, "parent_service_init() runs exactly once");
+        CHECK(r.pogo_port_init_calls == 1, "pogo_port_init() runs exactly once");
+        CHECK(r.stale_sweep_task_create_calls == 1, "the stale-sweep task is created exactly once");
+        CHECK(r.enable_downstream_calls == 1, "the downstream port is enabled exactly once");
+        CHECK(r.detect_out_active, "DETECT_OUT is active once attached via EXTERNAL_OTBR, same as STANDALONE");
+    }
+}
+
+/*
+ * EXTERNAL_OTBR mode, join failure: this follow-up's core fail-closed
+ * requirement -- a failed thread_manager_start_as_always_on_ftd_with_dataset()
+ * call halts immediately and NEVER falls back to calling the STANDALONE API
+ * (thread_manager_start_as_always_on_ftd()) to form a network of its own.
+ */
+static void scenario_external_otbr_join_failure_halts_with_no_standalone_fallback(void)
+{
+    printf("\n-- scenario (EXTERNAL_OTBR): a failed join halts immediately -- the STANDALONE API is NEVER called "
+           "as a fallback --\n");
+    static const sim_role_t roles[] = {ROLE_LEADER};
+    scenario_input_t in = {.config_ok = true, .efuse_ok = true, .thread_mode = THREAD_MODE_EXTERNAL_OTBR,
+                            .external_join_ok = false, .max_ticks = 10, .role_sequence = roles,
+                            .role_sequence_len = 1, .stale_sweep_task_create_ok = true};
+    boot_result_t r = run_boot_sequence(&in);
+    CHECK(r.halted, "a failed EXTERNAL_OTBR join halts the boot sequence");
+    CHECK(r.external_start_calls == 1, "the EXTERNAL_OTBR API was attempted exactly once");
+    CHECK(r.standalone_start_calls == 0,
+          "the STANDALONE API is NEVER called as a fallback after an EXTERNAL_OTBR join failure");
     CHECK(r.enable_downstream_calls == 0, "the downstream port is never enabled");
     CHECK(!r.detect_out_active, "DETECT_OUT is never activated");
 }
@@ -424,6 +563,9 @@ int main(void)
     scenario_config_error_never_activates();
     scenario_all_zero_efuse_never_activates();
     scenario_thread_start_failure_never_activates();
+    scenario_thread_config_load_error_never_activates();
+    scenario_external_otbr_join_success_starts_services_exactly_once();
+    scenario_external_otbr_join_failure_halts_with_no_standalone_fallback();
     scenario_each_attached_role_starts_services_exactly_once();
     scenario_detached_never_starts_services();
     scenario_stale_sweep_task_failure_still_halts();

@@ -3,20 +3,37 @@
 #
 # "nvs" holds only DYNAMIC state: OpenThread's own Active Dataset (see
 # thread_manager_start_as_root() -- resumed here across every reboot, never
-# regenerated while a commissioned dataset already exists in this partition).
-# The power base has no role_manager/child_service dynamic state of its own
-# (it never runs either) -- this partition is smaller than module's for that
-# reason, but otherwise the exact same idea.
+# regenerated while a commissioned dataset already exists in this partition,
+# in STANDALONE mode only). The power base has no role_manager/child_service
+# dynamic state of its own (it never runs either) -- this partition is
+# smaller than module's for that reason, but otherwise the exact same idea.
+# In EXTERNAL_OTBR mode (see "cfg" below), this partition's own commissioned
+# dataset -- if any is left over from a previous STANDALONE boot -- is
+# ALWAYS overwritten by the "cfg" partition's active_tlvs at every boot; see
+# docs/power-base.md section 7 and docs/otbr-rcp.md for the one-time
+# `erase-region 0x9000 0x6000` command used when first converting a board
+# that was previously STANDALONE.
 nvs,        data, nvs,      0x9000,  0x6000,
 phy_init,   data, phy,      0xf000,  0x1000,
 factory,    app,  factory,  0x10000, 1500K,
 #
-# "cfg" holds the FIXED power-base board configuration (power_base_config,
-# namespace "power_base_cfg" -- see docs/power-base.md,
-# components/power_base_config). Generated offline by
-# tools/pack_power_base_config.py from configs/power_base.json, and is
-# treated as read-only by the application at runtime. This is a physically
-# separate flash image from module/partitions.csv's own "cfg" partition (a
-# different board, a different binary) -- reusing the partition NAME is not
-# a collision.
+# "cfg" holds the FIXED power-base board configuration -- TWO independent
+# NVS namespaces in the SAME partition/image:
+#   - "power_base_cfg" (components/power_base_config): POGO GPIOs, timeouts,
+#     ... -- unchanged by this follow-up.
+#   - "pb_thread" (components/power_base_thread_config, this follow-up):
+#     mode=STANDALONE(0)/EXTERNAL_OTBR(1) and, only for EXTERNAL_OTBR, the
+#     Linux OTBR's real Active Dataset TLVs (a SECRET -- contains the
+#     Network Key; the generated image is written mode 0600 and must never
+#     be committed, see .gitignore). A legacy image with no "pb_thread"
+#     namespace at all is STANDALONE -- this partition is NOT
+#     "standalone-only" any more, but every pre-existing image still works
+#     unchanged. See docs/power-base.md and docs/otbr-rcp.md.
+# Generated offline by tools/pack_power_base_config.py (plain
+# tools/gen_power_base_config.sh for STANDALONE, or
+# tools/gen_power_base_otbr_config.sh for EXTERNAL_OTBR) and treated as
+# read-only by the application at runtime. This is a physically separate
+# flash image from module/partitions.csv's own "cfg" partition (a different
+# board, a different binary) -- reusing the partition NAME is not a
+# collision.
 cfg,        data, nvs,      0x187000, 0x3000,

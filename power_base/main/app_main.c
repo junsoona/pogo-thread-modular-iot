@@ -26,12 +26,46 @@
  * than any fixed budget (e.g. an OTBR/another FTD only becoming reachable
  * much later) is NOT a fatal error -- see "attach supervisor" below.
  *
+ * STANDALONE vs. EXTERNAL_OTBR (this follow-up, see docs/otbr-rcp.md and
+ * docs/power-base.md): power_base_thread_config_load() (components/
+ * power_base_thread_config, a small config component separate from
+ * power_base_config -- see its own header) decides which of the two this
+ * boot uses. STANDALONE is the pre-existing behavior, completely unchanged:
+ * thread_manager_start_as_always_on_ftd() forms/resumes this device's OWN
+ * network. EXTERNAL_OTBR instead joins a Linux OTBR + separate ESP32-H2 RCP
+ * project's (rcp/, see docs/otbr-rcp.md) EXISTING Thread network, using its
+ * real Active Dataset TLVs (read from the "cfg" partition's "pb_thread"
+ * namespace, provisioned offline by tools/gen_power_base_otbr_config.sh --
+ * NEVER generated/invented by this firmware) via
+ * thread_manager_start_as_always_on_ftd_with_dataset(). Both paths apply the
+ * IDENTICAL always-on-FTD link mode and both feed the SAME
+ * attach_supervisor_task()/start_services_once() below -- CHILD/ROUTER/
+ * LEADER are all "attached and ready" either way, and every downstream
+ * service (parent_service, power_base_transport, topology registry) is
+ * completely unaware of which mode got it there. EXTERNAL_OTBR NEVER falls
+ * back to forming a standalone network on any failure (a bad/missing
+ * dataset, a real OpenThread rejection, ...) -- see halt_forever()'s
+ * callers below for both the config-load and the Thread-join failure paths.
+ *
  * Boot sequence:
  *   1. nvs_flash_init()            -- dynamic "nvs" partition (OpenThread's
  *                                      own Active Dataset, see
- *                                      thread_manager_start_as_always_on_ftd()).
+ *                                      thread_manager_start_as_always_on_ftd()
+ *                                      -- STANDALONE mode only; EXTERNAL_OTBR
+ *                                      always overwrites whatever commissioned
+ *                                      dataset this partition holds with the
+ *                                      "cfg" partition's own, see section 7 of
+ *                                      docs/power-base.md).
  *   2. power_base_config_load()    -- fixed "cfg" partition. CONFIG_ERROR
  *                                      halts here, same policy as module_config_load().
+ *   2b. power_base_thread_config_load() -- SAME "cfg" partition, separate
+ *                                      "pb_thread" namespace (see above).
+ *                                      Decides STANDALONE vs. EXTERNAL_OTBR.
+ *                                      A legacy image with no "pb_thread"
+ *                                      namespace/key loads as STANDALONE,
+ *                                      not an error. An EXTERNAL_OTBR image
+ *                                      with a missing/empty/oversized
+ *                                      active_tlvs halts here (fail closed).
  *   3. Power rail sequencing (power_enable_gpio/...) -- see section 8 of
  *                                      docs/power-base.md. A no-op today (no
  *                                      switching hardware decided yet).
@@ -42,7 +76,9 @@
  *                                      registry key. Never regenerated,
  *                                      never logged in full.
  *   5. thread_manager_init()       -- OpenThread FTD stack up, no network yet.
- *   6. thread_manager_start_as_always_on_ftd() -- the only place in the whole
+ *   6. thread_manager_start_as_always_on_ftd() (STANDALONE) or
+ *      thread_manager_start_as_always_on_ftd_with_dataset() (EXTERNAL_OTBR)
+ *                                   -- STANDALONE: the only place in the whole
  *                                      system that ever forms or resumes an
  *                                      Active Dataset. If NVS already holds a
  *                                      commissioned dataset, it is resumed;
@@ -159,6 +195,7 @@
 #include "pogo_port/pogo_port.h"
 #include "parent_service/parent_service.h"
 #include "power_base_config/power_base_config.h"
+#include "power_base_thread_config/power_base_thread_config.h"
 #include "power_base_transport/power_base_transport.h"
 #include "thread_manager/thread_manager.h"
 
@@ -174,6 +211,7 @@ static const char *TAG = "power_base_main";
 #define ATTACH_POLL_INTERVAL_MS 200
 
 static power_base_config_t s_cfg;
+static power_base_thread_config_t s_thread_cfg;
 static uint8_t s_own_uuid[POGO_UUID_LEN];
 static parent_service_context_t s_parent_ctx;
 /* Informational provisioning epoch handed out in every SET_COLLECTOR this
@@ -487,6 +525,30 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "power_base_config_load: OK");
 
+    /*
+     * Thread dataset provenance (this follow-up): STANDALONE (this power
+     * base forms/resumes its own network, exactly as before) or
+     * EXTERNAL_OTBR (join a Linux OTBR + separate ESP32-H2 RCP's EXISTING
+     * network using its real Active Dataset -- see docs/otbr-rcp.md,
+     * docs/power-base.md). power_base_thread_config_load() already fails
+     * closed and logs its own CONFIG_ERROR for any EXTERNAL_OTBR storage
+     * problem (missing/empty/oversized active_tlvs, unsupported mode) --
+     * halting here, same policy as power_base_config_load() above, is the
+     * ONLY thing this call site does: it never falls back to STANDALONE on
+     * its own. A legacy image with no "pb_thread" namespace/key at all
+     * loads as STANDALONE without any error (see that function's own
+     * comment) -- this is what keeps every pre-existing power_base_config.bin
+     * working unchanged. */
+    if (power_base_thread_config_load(&s_thread_cfg) != ESP_OK) {
+        halt_forever("CONFIG_ERROR loading power_base_thread_config (EXTERNAL_OTBR mode -- no standalone fallback)");
+    }
+    if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_EXTERNAL_OTBR) {
+        ESP_LOGI(TAG, "Thread dataset mode: EXTERNAL_OTBR (%u bytes; contents hidden)",
+                 (unsigned)s_thread_cfg.active_tlvs_len);
+    } else {
+        ESP_LOGI(TAG, "Thread dataset mode: STANDALONE");
+    }
+
     apply_power_rail_sequencing();
 
     /* Stable identity (section 6): the ESP32-H2's own efuse-provisioned
@@ -521,9 +583,27 @@ void app_main(void)
      * underlying otThreadSetEnabled/otThreadSetLinkMode/... calls, or
      * esp_openthread_auto_start() itself failing) -- fundamentally different
      * from "has not attached yet", which is NOT a halt condition (see
-     * attach_supervisor_task() below). */
-    if (thread_manager_start_as_always_on_ftd() != ESP_OK) {
-        halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd failed");
+     * attach_supervisor_task() below). Exactly one of the two branches below
+     * ever runs, matching s_thread_cfg.mode determined above -- neither
+     * ever falls back to the other on failure (EXTERNAL_OTBR failing here
+     * never falls back to forming a standalone network of its own). */
+    if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_EXTERNAL_OTBR) {
+        esp_err_t join_err =
+            thread_manager_start_as_always_on_ftd_with_dataset(s_thread_cfg.active_tlvs, s_thread_cfg.active_tlvs_len);
+        /* The in-RAM copy of the dataset is no longer needed once handed to
+         * OpenThread (which keeps its OWN internal copy/storage, untouched
+         * by this) -- zeroize this application-level buffer now, regardless
+         * of outcome. Never logged before or after. */
+        memset(s_thread_cfg.active_tlvs, 0, sizeof(s_thread_cfg.active_tlvs));
+        s_thread_cfg.active_tlvs_len = 0;
+        if (join_err != ESP_OK) {
+            halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd_with_dataset failed "
+                         "(EXTERNAL_OTBR mode -- no standalone fallback)");
+        }
+    } else {
+        if (thread_manager_start_as_always_on_ftd() != ESP_OK) {
+            halt_forever("ROLE_TRANSITION_ERROR: thread_manager_start_as_always_on_ftd failed");
+        }
     }
 
     /*

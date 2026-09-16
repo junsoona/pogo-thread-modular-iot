@@ -6,9 +6,24 @@
 [`docs/pogo-interface.md`](docs/pogo-interface.md), 고정 설정 스키마는
 [`docs/module-config.md`](docs/module-config.md), 상태 머신/오류 처리는
 [`docs/state-machine.md`](docs/state-machine.md), **전원 모듈(전용 ESP32-H2 보드)
-아키텍처·배선·토폴로지 프로토콜은 [`docs/power-base.md`](docs/power-base.md)** 참고.
+아키텍처·배선·토폴로지 프로토콜은 [`docs/power-base.md`](docs/power-base.md)**,
+**Linux OTBR용 ESP32-H2 USB RCP 펌웨어(`rcp/`)와 전원 모듈의 external OTBR
+Dataset join(EXTERNAL_OTBR 모드)은 [`docs/otbr-rcp.md`](docs/otbr-rcp.md)** 참고.
 
-**중요 (이번 세션: 전원 모듈의 고정 애플리케이션 역할과 Thread 역할 분리):**
+**중요 (가장 최근 세션: 전원 모듈을 Linux OTBR + 별도 `rcp/` 보드의 기존 Thread
+네트워크에 가입시키는 EXTERNAL_OTBR 모드 추가):** 전원 모듈은 이제 두 가지 Thread
+Dataset 출처 모드 중 하나로 부팅한다 -- **STANDALONE**(기존 동작 그대로: 자체
+Dataset을 형성/재개)과 **EXTERNAL_OTBR**(Linux OTBR가 소유한 실제 Dataset으로
+기존 네트워크에 가입, 자체 네트워크는 절대 형성하지 않음). RCP(`rcp/`)는 Dataset을
+전혀 소유하지 않는 Radio Only 장치이고, Dataset은 항상 Linux OTBR가 소유하며,
+센서 모듈은 기존 POGO `SET_DATASET` 경로로 동일하게 Dataset을 전달받는다(코드
+변경 없음). 이번 세션은 소프트웨어 구현과 host test까지만 완료했고, **실물 Linux
+OTBR + `rcp/` + 전원 모듈 연동은 아직 검증하지 않았다.** 자세한 내용은
+[`docs/otbr-rcp.md`](docs/otbr-rcp.md)와 [`docs/power-base.md`](docs/power-base.md)
+12절("Dataset ownership"/"External OTBR Dataset join"), 실물 검증 상태는
+[`docs/validation-status.md`](docs/validation-status.md) 참고.
+
+**중요 (전원 모듈의 고정 애플리케이션 역할과 Thread 역할 분리, 이전 세션):**
 전원 모듈은 POGO 계층의 물리적 루트·downstream provisioning coordinator·
 UUID/slot/topology registry 관리자·센서 데이터 aggregator라는 **고정된
 애플리케이션 역할**을 갖지만, 더 이상 "시스템의 유일한 Thread ROOT/Leader"로
@@ -120,6 +135,10 @@ power_base/                전원 모듈 전용 ESP-IDF 프로젝트 (신규) --
                           어느 상태에서도 서비스 시작, docs/power-base.md 참고).
                           module/과 별도 보드/바이너리. 자세한 내용은 docs/power-base.md.
 upper/, lower/             기존 검증용 참조 프로젝트 (회귀 기준, 변경하지 않음)
+rcp/                       Linux OTBR용 ESP32-H2 USB RCP(Radio Co-Processor) 펌웨어 --
+                          별도/독립 ESP-IDF 프로젝트, components/를 전혀 공유하지 않음,
+                          Dataset을 소유하지 않는 Radio Only 장치. 자세한 내용은
+                          docs/otbr-rcp.md.
 components/
   pogo_proto/               공용 프레임/CRC16/프로토콜 payload codec (ASSIGN_PARENT_INFO,
                             SET_COLLECTOR, PEER_HELLO capability negotiation 추가 -- 기존
@@ -150,6 +169,11 @@ components/
   module_config/            고정 센서/보드 설정 ("cfg" NVS 파티션), ESP32-H2 GPIO 검증
                             (gpio_profile.h는 power_base_config도 재사용)
   power_base_config/        전원 모듈 전용 고정 보드 설정 (신규, 센서 필드 없음)
+  power_base_thread_config/ 전원 모듈의 Thread Dataset 출처(STANDALONE/EXTERNAL_OTBR) 설정
+                            (신규 -- Linux OTBR external Dataset join 세션). 같은 "cfg"
+                            파티션의 별도 namespace("pb_thread") -- power_base_config의
+                            44바이트 blob/schema_version은 변경하지 않음. 자세한 내용은
+                            docs/power-base.md 12절/14절, docs/otbr-rcp.md 8절.
   sensor_provider/          센서 드라이버 인터페이스 + registry + mock
   sensor_channel/           공통 센서 샘플 wire format (pack/unpack)
   sensor_root_aggregator/   (module_uuid, sample_seq) 중복 제거 sample 저장소 (신규,
@@ -244,6 +268,24 @@ bash tools/gen_power_base_config.sh build/cfg_images
 ```
 
 자세한 스키마는 [`docs/power-base.md`](docs/power-base.md) 14절.
+
+`power_base`가 자체 Thread 네트워크를 형성하는 대신 Linux OTBR(+ 별도 `rcp/` 보드)의
+기존 Thread 네트워크에 가입하게 하려면(EXTERNAL_OTBR 모드), 같은 `configs/power_base.json`에
+OTBR의 실제 Active Dataset hex 파일을 추가로 넘긴다:
+
+```bash
+tools/gen_power_base_otbr_config.sh /absolute/path/to/otbr-active-dataset.hex build/cfg_images
+# -> build/cfg_images/power_base_otbr_config.bin (권한 0600 -- 실제 비밀 자료)
+```
+
+Dataset hex 파일은 이 저장소 밖에 보관할 것 (`.gitignore`가 `/secrets/`와
+`**/otbr-active-dataset.hex`를 거부하지만, 가장 안전한 것은 애초에 저장소 트리 밖에 두는
+것이다). 자세한 내용(NVS namespace, 검증 규칙, 실물 검증 상태)은
+[`docs/power-base.md`](docs/power-base.md) 12절/14절과
+[`docs/otbr-rcp.md`](docs/otbr-rcp.md) 8절 참고. **이 모드는 이번 세션에 소프트웨어
+구현/host test까지만 완료했고, 실물 Linux OTBR + `rcp/` + 전원 모듈 연동은 아직 검증하지
+않았다** -- [`docs/validation-status.md`](docs/validation-status.md)의 "Linux OTBR
+external Dataset join" 표 참고.
 
 ## 새 GPIO 프로필 flash 전 재배선 (이번 세션, 필수)
 
@@ -912,6 +954,36 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
   (28 C + 2 Python) 전부 통과 (정확한 항목별 통과 수는 최종 보고 참고). `git diff --check`
   -> 공백 오류 없음.
 
+### 빌드 결과 (가장 최근 세션 -- RCP + external OTBR Dataset join)
+
+- `idf.py -C module -B ~/esp-builds/pogo_module set-target esp32h2 && ... build` -> 성공 (경고 0개)
+- `idf.py -C power_base -B ~/esp-builds/pogo_power_base set-target esp32h2 && ... build` ->
+  성공 (경고 0개, `power_base_thread_config` 신규 컴포넌트 포함)
+- `idf.py -C rcp -B ~/esp-builds/pogo_rcp set-target esp32h2 && ... build` -> 성공 (경고 0개, 신규 프로젝트)
+- `idf.py -C upper -B ~/esp-builds/pogo_upper set-target esp32h2 && ... build` -> 성공 (경고 0개)
+- `idf.py -C lower -B ~/esp-builds/pogo_lower set-target esp32h2 && ... build` -> 성공 (경고 0개)
+- 다섯 프로젝트 모두 ESP-IDF v6.1 / esp32h2 타겟, 실제 riscv32-esp-elf 툴체인으로 컴파일
+  확인 (`set-target`이 매번 `fullclean`을 먼저 실행하므로 각 빌드는 clean build).
+- `nm power_base.elf`로 `power_base_thread_config_load`와
+  `thread_manager_start_as_always_on_ftd_with_dataset` 심볼이 실제로 최종 바이너리에
+  링크되어 있음을 확인.
+- `bash tools/gen_power_base_config.sh build/cfg_images` -> `power_base_config.bin`
+  변경 없이 44바이트 blob 유지 + `pb_thread:mode=STANDALONE` 확인.
+- `tools/gen_power_base_otbr_config.sh <가짜 테스트 전용 dataset hex> build/cfg_images` ->
+  `power_base_otbr_config.bin` 생성, `power_base_cfg:blob` 44바이트 동일,
+  `pb_thread:mode=EXTERNAL_OTBR`, `pb_thread:active_tlvs`가 입력 파일과 바이트 단위로
+  동일함을 `nvs_parser.py` 재파싱으로 확인, 출력 파일 권한 0600, stdout/stderr에 hex
+  원문 없음.
+- 기존 44개 host test(36 C + 8 Python, `rcp/`의 `tools/test_rcp_config.py` 포함) 전부
+  재통과 + 이번 세션 신규 `tools/test_power_base_thread_config.c` 1개(실제
+  `components/power_base_thread_config/power_base_thread_config.c`를 링크, NVS는
+  `tools/host_test_stubs/nvs_sim/`의 동작하는 fake로 대체) 통과 -- 총 45개(37 C +
+  8 Python) 전부 통과. `tools/test_power_base_boot_sequencing.c`에는 STANDALONE/
+  EXTERNAL_OTBR 분기·fail-closed·no-fallback 시나리오를 추가했다. `git diff --check`
+  -> 공백 오류 없음. 벤더링된 `components/sensirion_gas_index_algorithm`의 기존
+  `-Wparentheses-equality` 경고 7개는 이번 세션 변경과 무관한 이전부터의 vendored
+  코드 경고다 (host test 빌드 경고, ESP-IDF 빌드에는 나타나지 않음).
+
 ## 보유 센서 현황
 
 사용자는 PMS5003, BH1750, SGP40, SGP41, SHT45를 모두 실제로 보유하고 있다.
@@ -941,6 +1013,12 @@ join succeeded`를 로그에 남긴다. 펌웨어와 `cfg` 파티션은 그대�
 [`docs/validation-status.md`](docs/validation-status.md)에 정리했다. 아래는 소프트웨어
 구현/host test/빌드는 완료했지만 여전히 실물 검증이 필요한 항목이다:
 
+- **전원 모듈 EXTERNAL_OTBR Dataset join (가장 최근 세션 신규)**: 실물 Linux OTBR 호스트
+  + `rcp/` 보드 + 전원 모듈을 실제로 연결해 전원 모듈이 OTBR의 기존 Thread 네트워크에
+  가입하는지, 그 아래 센서 모듈이 기존 POGO `SET_DATASET` 경로로 같은 Dataset을 정상
+  전달받는지 -- 소프트웨어 구현/host test/ESP-IDF 실빌드까지만 완료, 실물 미검증. 자세한
+  내용은 [`docs/otbr-rcp.md`](docs/otbr-rcp.md)와
+  [`docs/validation-status.md`](docs/validation-status.md) 참고.
 - **3단 센서 체인(Power Base -> SHT45/BH1750 INTERMEDIATE -> PMS5003 LEAF, depth=2)**:
   중간 모듈이 upstream 프로비저닝 완료 후 INTERMEDIATE로 전환되는지, downstream 자식에게
   UUID/slot/depth+1/polling/collector endpoint/Dataset을 올바르게 전달하는지, 중간

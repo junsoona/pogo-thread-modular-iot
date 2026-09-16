@@ -1,10 +1,17 @@
 # State machines
 
 **See [power-base.md](power-base.md) for the dedicated power-base project's
-own boot sequence and its (unmodified) reuse of `parent_service`.** The
+own boot sequence and its (unmodified) reuse of `parent_service`,
+including its STANDALONE/EXTERNAL_OTBR Thread-dataset-provenance boot
+branch (section 12/section 5) -- that branch decides how the power base
+itself joins/forms Thread, entirely before any of the sequences below ever
+run, and is invisible to every state machine described in this file.** The
 sequences below describe `module/`'s state machines; `role_manager`'s
 determination has been updated so a sensor module never reaches ROOT in AUTO
-mode any more (see that section below).
+mode any more (see that section below). None of `module/`'s own state
+machines changed for the EXTERNAL_OTBR follow-up -- a sensor module still
+receives its Dataset via the unchanged `SET_DATASET`/`handle_set_dataset`
+step below regardless of which mode its power base used to obtain it.
 
 ## pogo_port (per instance -- UPSTREAM and DOWNSTREAM are fully independent)
 

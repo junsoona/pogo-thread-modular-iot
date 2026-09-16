@@ -104,6 +104,40 @@ esp_err_t thread_manager_stop(void)
 }
 
 /*
+ * Shared by thread_manager_start_as_always_on_ftd(),
+ * thread_manager_start_as_root(), and (this follow-up)
+ * thread_manager_start_as_always_on_ftd_with_dataset(): disables Thread/IP6
+ * (a precondition for changing link mode / router eligibility) and then
+ * applies the ONE fixed always-on-FTD link mode every caller in this file
+ * uses (rx-on-when-idle=true, full FTD, router-eligible=true). Must be
+ * called while already holding the OpenThread lock. `log_tag` is used only
+ * for these two steps' own error logs -- each caller still logs its own
+ * higher-level outcome afterward.
+ */
+static esp_err_t disable_thread_and_apply_always_on_ftd_link_mode(otInstance *instance, const char *log_tag)
+{
+    if (otThreadSetEnabled(instance, false) != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "%s: otThreadSetEnabled(false) failed", log_tag);
+        return ESP_FAIL;
+    }
+    if (otIp6SetEnabled(instance, false) != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "%s: otIp6SetEnabled(false) failed", log_tag);
+        return ESP_FAIL;
+    }
+
+    otLinkModeConfig link_mode = {.mRxOnWhenIdle = true, .mDeviceType = true, .mNetworkData = true};
+    if (otThreadSetLinkMode(instance, link_mode) != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "%s: otThreadSetLinkMode failed", log_tag);
+        return ESP_FAIL;
+    }
+    if (otThreadSetRouterEligible(instance, true) != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "%s: otThreadSetRouterEligible(true) failed", log_tag);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/*
  * Shared implementation behind both thread_manager_start_as_always_on_ftd()
  * and thread_manager_start_as_root() -- the two public names apply the
  * IDENTICAL link-mode/resume-or-form behavior and differ only in the log
@@ -121,27 +155,8 @@ static esp_err_t start_always_on_ftd_impl(const char *log_tag, const char *resum
 
     esp_err_t result = ESP_OK;
     do {
-        /* Thread must be disabled before link mode / router eligibility change. */
-        if (otThreadSetEnabled(instance, false) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "%s: otThreadSetEnabled(false) failed", log_tag);
-            result = ESP_FAIL;
-            break;
-        }
-        if (otIp6SetEnabled(instance, false) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "%s: otIp6SetEnabled(false) failed", log_tag);
-            result = ESP_FAIL;
-            break;
-        }
-
-        otLinkModeConfig link_mode = {.mRxOnWhenIdle = true, .mDeviceType = true, .mNetworkData = true};
-        if (otThreadSetLinkMode(instance, link_mode) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "%s: otThreadSetLinkMode failed", log_tag);
-            result = ESP_FAIL;
-            break;
-        }
-        if (otThreadSetRouterEligible(instance, true) != OT_ERROR_NONE) {
-            ESP_LOGE(TAG, "%s: otThreadSetRouterEligible(true) failed", log_tag);
-            result = ESP_FAIL;
+        result = disable_thread_and_apply_always_on_ftd_link_mode(instance, log_tag);
+        if (result != ESP_OK) {
             break;
         }
 
@@ -184,13 +199,73 @@ esp_err_t thread_manager_start_as_root(void)
     return start_always_on_ftd_impl("ROOT", " as Leader/Router");
 }
 
+/*
+ * EXTERNAL_OTBR: see thread_manager.h's own comment for the full contract.
+ * Never falls back to forming/resuming a standalone network on any failure
+ * path -- every `break` below simply returns the error to the caller.
+ */
+esp_err_t thread_manager_start_as_always_on_ftd_with_dataset(const uint8_t *dataset_tlvs, uint16_t dataset_len)
+{
+    if (dataset_tlvs == NULL || dataset_len == 0 || dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+        ESP_LOGE(TAG, "external OTBR: rejecting dataset (tlvs=%s len=%u) -- refusing to start",
+                 (dataset_tlvs == NULL) ? "NULL" : "non-NULL", (unsigned)dataset_len);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otOperationalDatasetTlvs tlvs;
+    memset(&tlvs, 0, sizeof(tlvs));
+    memcpy(tlvs.mTlvs, dataset_tlvs, dataset_len);
+    tlvs.mLength = (uint8_t)dataset_len;
+
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_OK;
+    do {
+        /* Real OpenThread semantic validation -- malformed TLVs or missing
+         * mandatory fields are caught here, not just re-checked for length
+         * (the loader that produced dataset_tlvs, components/
+         * power_base_thread_config, only ever checks storage-level size). */
+        if (!otDatasetIsValid(&tlvs, /*aActive=*/true)) {
+            ESP_LOGE(TAG, "external OTBR: dataset failed otDatasetIsValid() -- refusing to join (no standalone "
+                          "fallback)");
+            result = ESP_ERR_INVALID_ARG;
+            break;
+        }
+
+        result = disable_thread_and_apply_always_on_ftd_link_mode(instance, "external OTBR");
+        if (result != ESP_OK) {
+            break;
+        }
+
+        result = esp_openthread_auto_start(&tlvs);
+    } while (0);
+
+    esp_openthread_lock_release();
+
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "external OTBR: failed to join existing Thread network -- halting is the caller's "
+                      "responsibility (no standalone fallback here)");
+    } else {
+        /* Dataset TLVs are never logged: they contain the Network Key. */
+        ESP_LOGI(TAG, "external OTBR: Active Dataset accepted (%u bytes) -- joining existing Thread network",
+                 (unsigned)dataset_len);
+    }
+    return result;
+}
+
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,
                                             uint16_t dataset_len, uint32_t poll_period_ms)
 {
-    otOperationalDatasetTlvs tlvs;
-    if (dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+    if (dataset_tlvs == NULL || dataset_len == 0 || dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+        ESP_LOGE(TAG, "thread_manager_join_with_dataset: rejecting dataset (tlvs=%s len=%u)",
+                 (dataset_tlvs == NULL) ? "NULL" : "non-NULL", (unsigned)dataset_len);
         return ESP_ERR_INVALID_ARG;
     }
+
+    otOperationalDatasetTlvs tlvs;
     memset(&tlvs, 0, sizeof(tlvs));
     memcpy(tlvs.mTlvs, dataset_tlvs, dataset_len);
     tlvs.mLength = (uint8_t)dataset_len;
@@ -303,7 +378,7 @@ esp_err_t thread_manager_get_active_dataset_tlvs(otOperationalDatasetTlvs *out_t
 
 bool thread_manager_validate_dataset_tlvs(const uint8_t *dataset_tlvs, uint16_t dataset_len)
 {
-    if (dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+    if (dataset_tlvs == NULL || dataset_len == 0 || dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
         return false;
     }
     otOperationalDatasetTlvs tlvs;

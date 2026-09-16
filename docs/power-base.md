@@ -179,6 +179,15 @@ reflects the CURRENT control flow.
    dynamic state to persist).
 2. `power_base_config_load()` -- the fixed `"cfg"` partition. `CONFIG_ERROR`
    halts here (loops forever, logs once), same policy as `module_config_load()`.
+2b. **(this follow-up, see section 12's "External OTBR Dataset join")**
+   `power_base_thread_config_load()` -- the SAME `"cfg"` partition, separate
+   `pb_thread` namespace. Decides STANDALONE vs. EXTERNAL_OTBR for step 6
+   below. A legacy image with no `pb_thread` namespace/key loads as
+   STANDALONE, not an error; an EXTERNAL_OTBR image with a missing/empty/
+   oversized `active_tlvs` halts here (`CONFIG_ERROR`, fail closed, no
+   standalone fallback). Logs `Thread dataset mode: STANDALONE` or `Thread
+   dataset mode: EXTERNAL_OTBR (N bytes; contents hidden)` -- never the
+   Dataset bytes themselves.
 3. Power rail sequencing (`power_enable_gpio`/`power_enable_active_high`/
    `power_startup_delay_ms`) -- see section 8 below. A no-op today (no
    switching hardware decided yet).
@@ -187,18 +196,27 @@ reflects the CURRENT control flow.
    `ASSIGN_PARENT_INFO`/`SET_COLLECTOR`) and its topology-registry key.
    Never regenerated, never logged in full.
 5. `thread_manager_init()` -- OpenThread FTD stack up, no network yet.
-6. `thread_manager_start_as_always_on_ftd()` (**this correction pass**;
-   previously `thread_manager_start_as_root()` -- see section 19.8) -- **the
-   only place in the whole system that ever forms or resumes an Active
-   Dataset for this power base.** If NVS already holds a commissioned
-   dataset, it is resumed; otherwise a new one is formed from Kconfig
-   defaults. Neither the dataset bytes nor the Network Key are ever logged.
-   Logs as `always-on FTD:`, never `ROOT:` (that log prefix is reserved for
-   `module`'s DEV_ROOT regression fixture, which still calls
-   `thread_manager_start_as_root()` -- a thin wrapper around the exact same
-   underlying logic, kept only for that fixture's own unchanged logs/tests --
-   see `thread_manager.h`). A failure HERE (a genuine OpenThread API error)
-   halts immediately, `pogo_port_enable()` NEVER having been called.
+6. **STANDALONE** (unchanged): `thread_manager_start_as_always_on_ftd()`
+   (**this correction pass**; previously `thread_manager_start_as_root()` --
+   see section 19.8) -- forms or resumes an Active Dataset for this power
+   base. If NVS already holds a commissioned dataset, it is resumed;
+   otherwise a new one is formed from Kconfig defaults. Neither the dataset
+   bytes nor the Network Key are ever logged. Logs as `always-on FTD:`,
+   never `ROOT:` (that log prefix is reserved for `module`'s DEV_ROOT
+   regression fixture, which still calls `thread_manager_start_as_root()` --
+   a thin wrapper around the exact same underlying logic, kept only for that
+   fixture's own unchanged logs/tests -- see `thread_manager.h`).
+   **EXTERNAL_OTBR** (this follow-up, step 2b above): instead calls
+   `thread_manager_start_as_always_on_ftd_with_dataset()` with the
+   `pb_thread:active_tlvs` bytes -- joins the OTBR's existing network
+   instead of forming/resuming one of its own; NEVER falls back to the
+   STANDALONE path on failure. Either way, a failure HERE (a genuine
+   OpenThread API error, or -- EXTERNAL_OTBR only -- a real `otDatasetIsValid()`
+   rejection) halts immediately, `pogo_port_enable()` NEVER having been
+   called. On the EXTERNAL_OTBR success path, the in-RAM copy of
+   `pb_thread:active_tlvs` is explicitly zeroized right after being handed
+   to OpenThread (which keeps its own internal copy, untouched by this) --
+   never logged before or after.
 7. **(This correction pass -- no fixed timeout, no halt)**
    `attach_supervisor_task()` is started and `app_main()` returns. This task
    polls `thread_manager_get_role()` (200ms interval, non-busy) for this
@@ -432,17 +450,120 @@ the real, unmodified component.
 
 ## 12. Dataset ownership
 
-Only the power base ever calls `thread_manager_start_as_root()` (form-or-resume
-an Active Dataset, become Leader). Every sensor module only ever calls
-`thread_manager_join_with_dataset()` with a dataset it received via
-`SET_DATASET` from its own parent -- it never forms one itself, and a failed
-join never falls back to forming a new network (see
-[`state-machine.md`](state-machine.md)'s error table, unchanged). A power
-base reboot resumes its existing dataset from NVS rather than forming a new
-one, so previously-joined modules can simply re-attach once their own POGO
-chain re-establishes (still requiring a fresh POGO handshake per module, per
-the existing "no auto-rejoin from stored dynamic NVS" simplification --
-unchanged by this follow-up).
+**(Superseded/expanded by a later follow-up -- see "External OTBR Dataset
+join" below for the current, authoritative behavior. This paragraph is kept
+as historical record: it described the ONLY mode that existed at the time,
+now called STANDALONE.)** Historically, the power base was the only device
+that ever formed or resumed its own Active Dataset (via what is now called
+`thread_manager_start_as_always_on_ftd()` -- see section 19's role-decoupling
+work for why this is no longer named/described as "becoming Leader" or
+calling `thread_manager_start_as_root()`, which remains only a differently-
+named wrapper for `module`'s own DEV_ROOT regression fixture). Every sensor
+module only ever calls `thread_manager_join_with_dataset()` with a dataset
+it received via `SET_DATASET` from its own parent -- it never forms one
+itself, and a failed join never falls back to forming a new network (see
+[`state-machine.md`](state-machine.md)'s error table, unchanged, and this
+is still true in both modes below). A power base reboot resumes its
+existing dataset from NVS rather than forming a new one (STANDALONE mode
+only -- see below), so previously-joined modules can simply re-attach once
+their own POGO chain re-establishes (still requiring a fresh POGO handshake
+per module, per the existing "no auto-rejoin from stored dynamic NVS"
+simplification -- unchanged by this follow-up).
+
+### External OTBR Dataset join (this follow-up -- see `docs/otbr-rcp.md`)
+
+The power base can now run in one of two Thread dataset PROVENANCE modes,
+chosen by `components/power_base_thread_config` (a small component separate
+from `power_base_config` above -- see section 14):
+
+- **STANDALONE** (the historical behavior above, unchanged): this power
+  base forms or resumes its OWN Active Dataset via
+  `thread_manager_start_as_always_on_ftd()`.
+- **EXTERNAL_OTBR**: this power base instead joins an EXISTING Thread
+  network formed by a Linux OTBR (+ a separate ESP32-H2 flashed as a Radio
+  Co-Processor, `rcp/` -- see `docs/otbr-rcp.md`), using the OTBR's real
+  Active Dataset TLVs, via `thread_manager_start_as_always_on_ftd_with_dataset()`.
+
+**Roles stay strictly separated, and are unchanged by which mode is
+active:**
+
+- **`rcp/` (the RCP project): Radio Only, owns no Dataset at all.** It is
+  purely a radio relay for the Linux OTBR host's own OpenThread stack --
+  see `docs/otbr-rcp.md` section 1/2.
+- **Linux OTBR: owns the Dataset.** It is the only thing in this whole
+  system that ever GENERATES a Thread Active Dataset when EXTERNAL_OTBR
+  mode is used.
+- **Power base: joins, never generates, in EITHER mode.** Even in
+  STANDALONE mode, "generates" means "forms a network from this firmware's
+  own Kconfig defaults" -- the power base has never had any UI/API for a
+  human to hand-author a Dataset; EXTERNAL_OTBR mode simply adds a second,
+  externally-sourced input for the SAME "join with these TLVs" code path
+  (`thread_manager_join_with_dataset()`/`thread_manager_start_as_always_on_ftd_with_dataset()`
+  share the same underlying OpenThread apply-and-join call,
+  `esp_openthread_auto_start(&tlvs)`).
+- **Sensor modules downstream of the power base: completely unaware of
+  which mode their power base is in.** They still receive the Dataset
+  exactly as before, via the pre-existing POGO `SET_DATASET` step -- the
+  power base hands out whatever `thread_manager_get_active_dataset_tlvs()`
+  reports, which is simply "the Dataset this power base is currently
+  running," regardless of whether it got there by forming/resuming
+  (STANDALONE) or by joining an OTBR's network (EXTERNAL_OTBR). No sensor-
+  module code changed for this follow-up at all.
+
+**Fail-closed policy, no exceptions:** if EXTERNAL_OTBR mode is selected but
+its Dataset is missing, empty, oversized, or fails OpenThread's own
+`otDatasetIsValid()` semantic check, the power base halts (see section 5's
+boot sequence and `power_base/main/app_main.c`'s `halt_forever()` calls) --
+it NEVER falls back to forming a standalone network of its own in that
+case. This is deliberate: silently falling back would put this power base
+(and its whole POGO-chain subtree) onto a DIFFERENT, unintended Thread
+network than the operator configured, with no clear signal that anything
+was wrong beyond a device that mysteriously never talks to the expected
+OTBR.
+
+**Secrecy:** an Active Dataset contains the real Thread Network Key. Neither
+the power base firmware, `components/power_base_thread_config`,
+`components/thread_manager`, nor `tools/pack_power_base_config.py` /
+`tools/gen_power_base_otbr_config.sh` ever log, print, or otherwise surface
+the Dataset's bytes -- only its mode and byte LENGTH ever appear in a log
+line. The dataset hex file and the generated EXTERNAL_OTBR `cfg` image are
+both real secrets and must never be committed (`.gitignore` refuses
+`/secrets/` and any `**/otbr-active-dataset.hex`; the generated image is
+written with file mode `0600`).
+
+**Not yet verified on real hardware** -- see `docs/validation-status.md`'s
+"Linux OTBR external Dataset join" table for the current, authoritative
+per-item status.
+
+### First conversion of a real board from STANDALONE to EXTERNAL_OTBR
+
+In EXTERNAL_OTBR mode, the `cfg` partition's `active_tlvs` ALWAYS takes
+priority at boot -- `power_base/main/app_main.c` applies it via
+`thread_manager_start_as_always_on_ftd_with_dataset()` unconditionally,
+overwriting whatever dataset the dynamic `"nvs"` partition (see
+`power_base/partitions.csv`) may already hold from an earlier STANDALONE
+boot. A board that was previously run in STANDALONE mode may still have a
+self-formed dataset commissioned in that `"nvs"` partition; this does not
+need to be erased for EXTERNAL_OTBR mode to work correctly, since the
+`cfg` partition's Dataset always wins regardless.
+
+For a clean first real-hardware conversion (so a real test unambiguously
+confirms the join came from the EXTERNAL_OTBR Dataset and not a leftover
+STANDALONE-formed one still somehow in play), erase ONLY the dynamic
+`"nvs"` partition before flashing the EXTERNAL_OTBR `cfg` image:
+
+```bash
+python -m esptool --chip esp32h2 -p "$BASE_PORT" \
+    erase-region 0x9000 0x6000
+```
+
+`0x9000`/`0x6000` are this project's `"nvs"` partition's own offset/size
+(see `power_base/partitions.csv`) -- **this command must never be pointed
+at the `"cfg"` partition (`0x187000`) or run as a bare `erase-flash`**,
+either of which would also destroy the fixed board config / EXTERNAL_OTBR
+Dataset image (`cfg`) or the application/bootloader themselves. This
+erases ONLY OpenThread's own dynamic dataset storage and this power base's
+topology-registry-adjacent dynamic state -- nothing else.
 
 ## 13. Sensor data reception
 
@@ -481,6 +602,51 @@ bash tools/gen_power_base_config.sh build/cfg_images
 `tools/pack_power_base_config.py` reuses `tools/pack_module_config.py`'s GPIO
 reserved-pin classification and CRC16 implementation directly (no duplicated
 table) -- see that script's own docstring.
+
+### `pb_thread` namespace: Thread dataset provenance (this follow-up)
+
+The SAME `"cfg"` NVS partition/image ALSO holds a second, independent
+namespace, `pb_thread` (`components/power_base_thread_config`), owning
+exactly the STANDALONE/EXTERNAL_OTBR mode decision from section 12 above --
+`power_base_config`'s own 44-byte blob format and `schema_version` are
+completely unchanged by this.
+
+```
+namespace: pb_thread
+  key "mode"          u8:   0 = STANDALONE, 1 = EXTERNAL_OTBR
+  key "active_tlvs"   blob: OTBR Active Dataset TLVs -- present ONLY when mode=1
+```
+
+**Compatibility**: an image with no `pb_thread` namespace at all, or the
+namespace present but no `mode` key, loads as STANDALONE -- NOT an error.
+Every pre-existing `power_base_config.bin` (generated before this follow-up
+existed) keeps working completely unchanged. A freshly-generated STANDALONE
+image may also write `mode=0` explicitly (`tools/gen_power_base_config.sh`
+does this).
+
+**Fail-closed for EXTERNAL_OTBR**: `mode=1` with `active_tlvs` missing,
+empty, or larger than `OT_OPERATIONAL_DATASET_MAX_LENGTH` (254 bytes) is a
+`CONFIG_ERROR` that halts the power base at boot -- never a silent
+fallback to STANDALONE (see section 12).
+
+Generate an EXTERNAL_OTBR image with:
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+tools/gen_power_base_otbr_config.sh /absolute/path/to/otbr-active-dataset.hex build/cfg_images
+# -> build/cfg_images/power_base_otbr_config.bin (mode 0600 -- a real secret)
+```
+
+`tools/pack_power_base_config.py`'s new `--external-dataset-file <path>`
+flag (a FILE PATH, never a literal Dataset value on the command line) is
+what `gen_power_base_otbr_config.sh` wraps -- see that script's own
+docstring for the exact input validation (rejects empty/non-hex/odd-
+length/oversized/`Done`-or-`Error`-contaminated input) and for how the
+generated image is re-parsed with `nvs_parser.py` to confirm
+`power_base_cfg:blob` is still exactly 44 bytes, `pb_thread:mode=1`, and
+`pb_thread:active_tlvs` matches the input file byte-for-byte -- all without
+ever printing the Dataset's content. See `docs/otbr-rcp.md` section 8 for
+how to obtain the hex file from a real Linux OTBR host in the first place.
 
 ## 15. Host tests added by this follow-up
 
@@ -524,6 +690,35 @@ exact run.
 All pre-existing 27 host tests (25 C + 2 Python) were re-run and still pass
 alongside this new one -- 30 total (28 C + 2 Python). See the final report for
 the exact run.
+
+**Added by the external OTBR Dataset join follow-up (this pass, see section
+12's "External OTBR Dataset join"):**
+
+| File | Links against | Covers |
+|---|---|---|
+| `tools/test_power_base_thread_config.c` | real `components/power_base_thread_config/power_base_thread_config.c`, linked against a functional in-memory NVS fake (`tools/host_test_stubs/nvs_sim/`) instead of a re-implementation of its decision logic | legacy namespace missing -> STANDALONE, namespace-present-but-no-mode -> STANDALONE, explicit STANDALONE (a stray `active_tlvs` key is ignored), valid EXTERNAL_OTBR (exact byte match, boundary length), EXTERNAL_OTBR with missing/empty/oversized `active_tlvs` -> fail closed, invalid mode value -> fail closed, a genuine NVS/partition init error -> fail closed, `*out` always zeroed on failure (even if poisoned beforehand) |
+| `tools/test_power_base_boot_sequencing.c` (extended again) | mirrors `power_base/main/app_main.c`'s control flow | added: `power_base_thread_config_load()` failure halts before either Thread-start branch runs; EXTERNAL_OTBR success starts every service exactly once for CHILD/ROUTER/LEADER alike; EXTERNAL_OTBR join failure halts and NEVER calls the STANDALONE API as a fallback |
+| `tools/pack_power_base_config.py --external-dataset-file` / `tools/gen_power_base_otbr_config.sh` (manual + scripted verification, not a `tools/test_*` file) | real production generator, re-parsed with `nvs_parser.py` | normal image unchanged (44-byte blob, `pb_thread:mode=STANDALONE`, no `active_tlvs`); external image (`pb_thread:mode=EXTERNAL_OTBR`, `active_tlvs` byte-identical to input); empty/non-hex/odd-length/oversized/`Done`-or-`Error`-contaminated input all rejected; generated image file mode `0600`; stdout/stderr never contain the Dataset's hex/byte content |
+
+`components/thread_manager/thread_manager.c`'s new
+`thread_manager_start_as_always_on_ftd_with_dataset()` is NOT
+host-compilable (same pre-existing limitation as the rest of this file --
+real OpenThread/FreeRTOS calls from its very first include) -- verified
+instead by ESP-IDF real build (ESP-IDF v6.1, `power_base` fullclean build,
+zero warnings) plus `nm power_base.elf` confirming it is actually linked
+into the final binary, plus code review confirming it shares the exact
+same `disable_thread_and_apply_always_on_ftd_link_mode()` helper as the
+pre-existing, already-reviewed `thread_manager_start_as_always_on_ftd()`
+(so the always-on-FTD link mode cannot drift between the two) and calls
+only `esp_openthread_auto_start(&tlvs)` (the join path), never
+`esp_openthread_auto_start(NULL)` (the network-FORMATION path, only
+reachable from the STANDALONE-only code).
+
+All pre-existing 44 host tests (36 C + 8 Python, counting `rcp/`'s own
+`tools/test_rcp_config.py` and every other pre-existing `tools/test_*.py`)
+were re-run and still pass alongside the new
+`tools/test_power_base_thread_config.c` -- 45 total (37 C + 8 Python). See
+the final report for the exact run.
 
 ## 16. What is still unverified on real hardware
 

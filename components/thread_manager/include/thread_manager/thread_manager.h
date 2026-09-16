@@ -56,6 +56,42 @@ esp_err_t thread_manager_init(void);
 esp_err_t thread_manager_start_as_always_on_ftd(void);
 
 /*
+ * EXTERNAL_OTBR: joins an EXISTING Thread network formed by a Linux OTBR
+ * (+ a separate ESP32-H2 RCP -- see docs/otbr-rcp.md), using its real
+ * Active Dataset TLVs (read from components/power_base_thread_config, NEVER
+ * hardcoded/invented here) instead of forming or resuming a dataset of this
+ * device's own. This is the power base's counterpart to
+ * thread_manager_start_as_always_on_ftd() for that case -- same fixed link
+ * mode (rx-on-when-idle=true, full FTD, router-eligible=true), but the
+ * dataset always comes from the caller, never from this component's own
+ * Kconfig defaults or NVS-resume logic.
+ *
+ * Rejects (ESP_ERR_INVALID_ARG, no OpenThread call made at all):
+ *   - dataset_tlvs == NULL
+ *   - dataset_len == 0
+ *   - dataset_len > OT_OPERATIONAL_DATASET_MAX_LENGTH
+ *
+ * Otherwise: acquires the OpenThread lock, validates the TLVs with
+ * otDatasetIsValid(&tlvs, /aActive=/true) (REAL semantic validation --
+ * malformed TLVs, missing mandatory fields, etc. are all caught here, not
+ * just re-checked for length), disables Thread/IP6, applies the SAME
+ * always-on-FTD link mode as thread_manager_start_as_always_on_ftd(), then
+ * calls esp_openthread_auto_start(&tlvs) to apply this exact dataset and
+ * bring Thread up.
+ *
+ * On ANY failure (invalid TLVs, a lock timeout, any OpenThread API
+ * returning an error) this function returns a non-ESP_OK code and NEVER
+ * falls back to forming or resuming a standalone network of its own --
+ * the caller (power_base/main/app_main.c) must halt rather than silently
+ * degrade to STANDALONE behavior (see docs/power-base.md's EXTERNAL_OTBR
+ * fail-closed policy). On success, logs only the dataset LENGTH and a
+ * neutral "... Active Dataset accepted (N bytes) -- joining existing Thread
+ * network" message -- the dataset bytes (Network Key etc.) are never
+ * logged, same policy as thread_manager_join_with_dataset() below.
+ */
+esp_err_t thread_manager_start_as_always_on_ftd_with_dataset(const uint8_t *dataset_tlvs, uint16_t dataset_len);
+
+/*
  * ROOT: identical underlying behavior to thread_manager_start_as_always_on_ftd()
  * above (same link mode, same resume-or-form logic) -- kept as a distinctly
  * named wrapper ONLY for `module`'s `MODULE_DEV_MODE_DEV_ROOT` regression
