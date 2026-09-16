@@ -98,16 +98,22 @@ int main(int argc, char **argv)
      * is a separate, documented decision in the configs/ JSON files, not enforced here). */
     CHECK(allowed(13), "GPIO13 is NOT rejected by the chip-level profile (board-level LED avoidance is separate)");
 
-    /* GPIO0/1 (I2C) and GPIO10/11/12/14/22/23 (the rest of the confirmed
-     * profile) must all be plain, allowed GPIOs. */
-    int32_t profile_gpios[] = {0, 1, 10, 11, 12, 14, 22, 23};
+    /* GPIO0/1 (I2C) and GPIO3/10/11/12/14/23 (the rest of the confirmed
+     * profile) must all be plain, allowed GPIOs. DOWNSTREAM DETECT_OUT moved
+     * from GPIO22 to GPIO3 in the header-accessibility follow-up (GPIO22 is
+     * not a convenient header pin on the real ESP32-H2 SuperMini board and
+     * required direct soldering with board-damage risk) -- GPIO22 itself
+     * remains ALLOWED by this chip-level policy (never reserved), it is
+     * simply no longer part of the confirmed profile's active pin set; see
+     * docs/pogo-interface.md's GPIO history section. */
+    int32_t profile_gpios[] = {0, 1, 3, 10, 11, 12, 14, 23};
     bool all_profile_allowed = true;
     for (size_t i = 0; i < sizeof(profile_gpios) / sizeof(profile_gpios[0]); i++) {
         if (!allowed(profile_gpios[i])) {
             all_profile_allowed = false;
         }
     }
-    CHECK(all_profile_allowed, "every GPIO the confirmed profile actually uses (0,1,10,11,12,14,22,23) is allowed");
+    CHECK(all_profile_allowed, "every GPIO the confirmed profile actually uses (0,1,3,10,11,12,14,23) is allowed");
 
     /* Out-of-range values. */
     CHECK(!gpio_profile_in_range(28), "GPIO28 is out of range");

@@ -2,7 +2,7 @@
   "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a Sensirion SGP40 (VOC only -- no NOx, see prototype_sgp41.json for VOC+NOx). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. This file's upstream_port/downstream_port block is BYTE-FOR-BYTE identical to prototype_sht45.json's/prototype_bh1750.json's -- the only per-board differences across all four common-POGO-port prototypes are driver_id, i2c_address, sensor_type_bitmap, calibration and measurement_timeout_ms, exactly as section 2 of the follow-up spec requires. See tools/test_prototype_port_blocks_match.py, which mechanically checks this for all four.",
 
   "schema_version": 1,
-  "config_revision": 1,
+  "config_revision": 2,
 
   "_driver_comment": "SENSOR_DRIVER_ID_SGP40 (see components/sensor_provider/include/sensor_provider/sensor_provider.h) and the VOC_RAW/VOC_INDEX channel bits (see components/sensor_channel/include/sensor_channel/sensor_channel.h) are resolved by name here -- tools/pack_module_config.py's DRIVER_IDS/CHANNEL_BITS tables mirror those two C headers bit-for-bit, so this file never repeats a magic number by hand. The two channel names listed here exactly match what components/sgp40/sgp40.c's sgp40_get_sensor_bitmap() actually reports at runtime (VOC_RAW + VOC_INDEX, no NOx channels -- SGP40 has no NOx sensing element at all).",
   "driver_id": "SGP40",
@@ -37,10 +37,10 @@
     "detect_out_active_low": true, "debounce_ms": 30
   },
 
-  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port.",
+  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port (including its DETECT_OUT=GPIO3 move from GPIO22, this follow-up, config_revision bumped 1->2 -- see that file's _downstream_comment and docs/pogo-interface.md's GPIO history section).",
   "downstream_port": {
     "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
-    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_in_gpio": 23, "detect_out_gpio": 3, "base_id_gpio": -1,
     "detect_out_active_low": true, "debounce_ms": 30
   }
 }

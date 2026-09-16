@@ -2,7 +2,7 @@
   "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a ROHM BH1750 (ambient light / illuminance). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. Both prototype configs (this file and prototype_sht45.json) share the EXACT SAME upstream_port/downstream_port block -- the only per-board differences are driver_id, i2c_address, sensor_type_bitmap and calibration, exactly as section 2 of the follow-up spec requires.",
 
   "schema_version": 1,
-  "config_revision": 1,
+  "config_revision": 2,
 
   "_driver_comment": "SENSOR_DRIVER_ID_BH1750 and the ILLUMINANCE channel bit are resolved by name -- see prototype_sht45.json's _driver_comment for how tools/pack_module_config.py keeps this in sync with the C headers.",
   "driver_id": "BH1750",
@@ -33,10 +33,10 @@
     "detect_out_active_low": true, "debounce_ms": 30
   },
 
-  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port.",
+  "_downstream_comment": "Identical to prototype_sht45.json's downstream_port (including its DETECT_OUT=GPIO3 move from GPIO22, this follow-up, config_revision bumped 1->2 -- see that file's _downstream_comment and docs/pogo-interface.md's GPIO history section).",
   "downstream_port": {
     "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
-    "detect_in_gpio": 23, "detect_out_gpio": 22, "base_id_gpio": -1,
+    "detect_in_gpio": 23, "detect_out_gpio": 3, "base_id_gpio": -1,
     "detect_out_active_low": true, "debounce_ms": 30
   }
 }

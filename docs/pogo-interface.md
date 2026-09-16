@@ -238,7 +238,11 @@ source on its UPSTREAM `DETECT_IN` edge; GPIO2 is not an RTC GPIO channel at
 all. **Deep-sleep itself is NOT implemented in this session** -- this is
 purely a GPIO-assignment change to keep that future option open without
 having to move DETECT again later. DOWNSTREAM `DETECT_IN`/`DETECT_OUT` (23/22)
-and every other pin are unchanged. **IMPORTANT: real boards already wired
+and every other pin are unchanged **as of this particular follow-up** --
+DOWNSTREAM `DETECT_OUT` was itself later moved off GPIO22 (to GPIO3) by a
+subsequent follow-up; see "History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now
+3" below and the confirmed-profile table's current DOWNSTREAM DETECT_OUT
+value, which is no longer 22. **IMPORTANT: real boards already wired
 to the previous profile must have their two UPSTREAM DETECT wires swapped
 before flashing firmware built from this profile** -- see README.md's
 rewiring notice.
@@ -254,7 +258,7 @@ rewiring notice.
 | UPSTREAM BASE_ID       |   14 | active-low input, local pull-up |
 | DOWNSTREAM UART1 TX    |   10 | |
 | DOWNSTREAM UART1 RX    |   11 | |
-| DOWNSTREAM DETECT_OUT  |   22 | open-drain, active-low (unchanged) |
+| DOWNSTREAM DETECT_OUT  |    3 | open-drain, active-low (moved from GPIO22, see "History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3" below) |
 | DOWNSTREAM DETECT_IN   |   23 | pull-up input (unchanged) |
 | DOWNSTREAM BASE_ID     |   -1 | BASE_ID is UPSTREAM-only, enforced by module_config validation |
 
@@ -315,6 +319,57 @@ did not stop being usable, it simply changed which DETECT signal it carries.
 See docs/power-base.md's "Deep-sleep 범위" section for the full reasoning
 and what is/is not implemented this session, and README.md for the required
 rewiring of already-built boards.
+
+### History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3
+
+**Updated by the header-accessibility follow-up (this session):** every
+active DOWNSTREAM port's `DETECT_OUT` moves from **GPIO22** to **GPIO3**
+(`configs/power_base.json`, `configs/module_config.example.json`, and all
+four ordinary I2C prototype configs -- `configs/prototype_sht45.json`,
+`prototype_bh1750.json`, `prototype_sgp40.json`, `prototype_sgp41.json`;
+each file's own `config_revision` was bumped accordingly). GPIO22 was never
+rejected by `gpio_profile.c`'s reserved-pin policy -- it remains an
+ordinary, allowed GPIO -- but on the real ESP32-H2 SuperMini board it is not
+brought out to a convenient header pin, so wiring it required direct
+soldering onto the module, with real risk of board damage. GPIO3 is:
+
+- header-accessible on the real board (no soldering required);
+- an ordinary, non-strapping GPIO, already allowed by `gpio_profile.c`
+  (never added to `STRAPPING_GPIOS`/`NOT_BONDED_OUT_GPIOS`/`FLASH_GPIOS`/
+  `USB_GPIOS` -- see the usability policy table above, which already listed
+  GPIO3 among "Allowed, ordinary GPIOs" before this follow-up; it was simply
+  unused until now);
+- not a boot strapping pin. GPIO3 does carry the chip's separate *external
+  pad* JTAG `MTDO` signal, but this firmware never enables pad JTAG and
+  never touches any JTAG-related eFuse (same caveat already noted for
+  GPIO2/4/5 above) -- this firmware's console/debug transport is the native
+  USB Serial/JTAG peripheral (GPIO26/27), never external pad JTAG, so the
+  `MTDO` alternate function is never active;
+- used here only as an open-drain, active-low `DETECT_OUT` **output** --
+  never a Deep-sleep wake source (that role stays fixed on UPSTREAM
+  `DETECT_IN`=GPIO12, unchanged by this follow-up -- see the previous
+  section). GPIO3 is not an ESP32-H2 RTC GPIO channel
+  (`DEEP_SLEEP_WAKE_GPIO_RTC_MIN..MAX` is 7..14, see
+  `components/module_config/deep_sleep_gpio.h`) and does not need to be one,
+  since it is never a wake input.
+
+**PMS5003's terminal config is unaffected**: its `downstream_port` stays
+fully disabled (`-1` for every field, including `detect_out_gpio`) both
+before and after this follow-up -- GPIO3 is never assigned to it. UPSTREAM
+`DETECT_IN`=GPIO12/`DETECT_OUT`=GPIO2 and DOWNSTREAM `DETECT_IN`=GPIO23 are
+also unchanged by this follow-up -- only DOWNSTREAM `DETECT_OUT` moves.
+`tools/test_prototype_port_blocks_match.py` mechanically confirms GPIO3 is
+now used by every active final-prototype config's `downstream_port.
+detect_out_gpio` (both source JSON and the actual generated NVS image
+content) and that GPIO22 no longer appears in any of their enabled port
+fields.
+
+**Real boards already wired to the GPIO22 profile must have their
+DOWNSTREAM `DETECT_OUT` wire moved to GPIO3 before flashing firmware built
+from this profile** -- see README.md's wiring table and rewiring notice.
+`cfg`-partition-only reflashing (no app rebuild) is sufficient for boards
+already running firmware built from an earlier session, since this is a
+config-only change -- see README.md's exact commands.
 
 ### Console moved off UART0
 

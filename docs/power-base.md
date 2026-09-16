@@ -96,27 +96,40 @@ like every other module receives it from its own parent.
 
 The power base's one physical port is electrically identical to a sensor
 module's DOWNSTREAM port -- same GPIO numbers as `module/`'s confirmed
-profile (UART1, GPIO10/11, DETECT GPIO22/23). It connects to the first
+profile (UART1, GPIO10/11, DETECT GPIO3/23). It connects to the first
 sensor module's UPSTREAM port (UART0, GPIO4/5, DETECT GPIO12/2, BASE_ID
 GPIO14):
 
-**Updated by the Deep-sleep-ready GPIO follow-up (this session): the first
-module's UPSTREAM DETECT_IN/DETECT_OUT are SWAPPED** from the previously
-documented GPIO2/GPIO12 assignment -- DETECT_IN is now GPIO12 (an ESP32-H2
-RTC GPIO channel, a candidate wake source for a future terminal-leaf's
-Deep-sleep ext1 wakeup -- see section 20 below) and DETECT_OUT is now GPIO2.
-The power base's own GPIO22/GPIO23 are UNCHANGED. **A real power base +
-first-module pair already wired to the old profile must have these two
-DETECT wires swapped before flashing firmware built from this profile** --
-see README.md's rewiring notice and section 20 below; POGO 5V supply is
-still not implemented (see section 8), so 5V OUT/5V IN in the table below
-remain aspirational, not yet wired on the bench.
+**Updated by the Deep-sleep-ready GPIO follow-up (an earlier session): the
+first module's UPSTREAM DETECT_IN/DETECT_OUT are SWAPPED** from the
+previously documented GPIO2/GPIO12 assignment -- DETECT_IN is now GPIO12
+(an ESP32-H2 RTC GPIO channel, a candidate wake source for a future
+terminal-leaf's Deep-sleep ext1 wakeup -- see section 20 below) and
+DETECT_OUT is now GPIO2. **A real power base + first-module pair already
+wired to that old profile must have these two DETECT wires swapped before
+flashing firmware built from it** -- see README.md's rewiring notice and
+section 20 below; POGO 5V supply is still not implemented (see section 8),
+so 5V OUT/5V IN in the table below remain aspirational, not yet wired on the
+bench.
+
+**Updated by the header-accessibility follow-up (this session): the power
+base's own DETECT_OUT moved from GPIO22 to GPIO3** -- GPIO22 is not a
+convenient header pin on the real ESP32-H2 SuperMini board and required
+direct soldering with board-damage risk; GPIO3 is header-accessible, an
+ordinary non-strapping GPIO, and used only as an open-drain DETECT_OUT
+output (never a Deep-sleep wake source -- see docs/pogo-interface.md's
+"History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3" for the full
+reasoning). The power base's GPIO23 (DETECT_IN) is UNCHANGED. **A real
+power base already wired to the GPIO22 profile must have that one DETECT
+wire moved to GPIO3 before flashing firmware built from this profile** --
+`cfg`-partition-only reflashing is sufficient (no app rebuild needed), see
+README.md's exact commands.
 
 | Power base pin | Direction | First module pin |
 |---|---|---|
 | GPIO10 (UART TX) | ---> | GPIO5 (UART RX) |
 | GPIO11 (UART RX) | <--- | GPIO4 (UART TX) |
-| GPIO22 (DETECT_OUT) | ---> | GPIO12 (DETECT_IN) |
+| GPIO3 (DETECT_OUT) | ---> | GPIO12 (DETECT_IN) |
 | GPIO23 (DETECT_IN) | <--- | GPIO2 (DETECT_OUT) |
 | BASE_ID contact (GND, **not a GPIO** -- see below) | ---> | GPIO14 (BASE_ID) |
 | GND | --- | GND |

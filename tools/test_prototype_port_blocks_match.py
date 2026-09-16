@@ -34,12 +34,24 @@ plus the still-unwired SGP40/SGP41 prototypes) to additionally cover:
      SGP40/SGP41's driver_id/bitmap/0x59 address/GPIO0-1 encoding -- this is
      the only check that exercises the NVS CSV generation step itself, not
      just pack_config()'s in-memory bytes. Skipped (not failed) otherwise.
+  6. Extended for the DOWNSTREAM DETECT_OUT GPIO22->GPIO3 relocation
+     follow-up: every active final-prototype config (the four I2C boards
+     plus configs/power_base.json) now uses GPIO3 for downstream_port.
+     detect_out_gpio, GPIO22 is confirmed absent from every enabled port
+     field of all five, and configs/power_base.json's own 44-byte
+     power_base_config blob (a SEPARATE schema/packer from module_config's
+     -- see tools/pack_power_base_config.py) is checked the same way as
+     section 2/5 above: in-memory pack_config() bytes, and (same IDF_PATH/
+     build/cfg_images gating, this time also requiring
+     tools/gen_power_base_config.sh to have run) the actual generated
+     power_base_config.bin re-parsed from disk.
 
 Usage:
     python3 tools/test_prototype_port_blocks_match.py
-    # for section 5's NVS-image-content checks too:
+    # for sections 5/6's NVS-image-content checks too:
     source ~/.espressif/v6.1/esp-idf/export.sh
     bash tools/gen_config.sh build/cfg_images
+    bash tools/gen_power_base_config.sh build/cfg_images
     python3 tools/test_prototype_port_blocks_match.py
 """
 import importlib.util
@@ -56,6 +68,11 @@ SPEC = importlib.util.spec_from_file_location("pack_module_config", PACKER_PATH)
 packer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(packer)
 
+POWER_BASE_PACKER_PATH = os.path.join(ROOT_DIR, "tools", "pack_power_base_config.py")
+POWER_BASE_SPEC = importlib.util.spec_from_file_location("pack_power_base_config", POWER_BASE_PACKER_PATH)
+power_base_packer = importlib.util.module_from_spec(POWER_BASE_SPEC)
+POWER_BASE_SPEC.loader.exec_module(power_base_packer)
+
 # Byte offsets into pack_config()'s schema-v1/v2 header (54 bytes, layout
 # ">IIIHBBhhHhhhhI4iI" -- see pack_module_config.py's pack_config()).
 OFF_DRIVER_ID = 8
@@ -65,6 +82,55 @@ OFF_I2C_SDA_GPIO = 16
 OFF_I2C_SCL_GPIO = 18
 OFF_I2C_ADDRESS = 20
 HEADER_LEN = 54
+UPSTREAM_PORT_LEN = 18  # pack_port()'s ">hhhhhhBBI" -- see pack_module_config.py
+# schema-v1 downstream_port.detect_out_gpio: HEADER_LEN + one full upstream_port
+# block + detect_out_gpio's own offset within a port block (uart_num, tx_gpio,
+# rx_gpio, detect_in_gpio, detect_out_gpio -- 4th field, 2 bytes each = offset 8).
+OFF_MODULE_DOWNSTREAM_DETECT_OUT = HEADER_LEN + UPSTREAM_PORT_LEN + 8
+
+# Byte offset into pack_power_base_config.py's pack_config()'s 44-byte blob
+# (">II" 8-byte header + downstream_port's own ">hhhhhBBI" layout: uart_num,
+# tx_gpio, rx_gpio, detect_in_gpio, detect_out_gpio -- 4th field, offset 8
+# within the port block) -- see pack_power_base_config.py's pack_port().
+OFF_POWER_BASE_DOWNSTREAM_DETECT_OUT = 8 + 8
+
+GPIO22 = 22  # the header-inconvenient pin this follow-up removes from every active downstream_port
+GPIO3 = 3    # its header-accessible replacement for DOWNSTREAM DETECT_OUT
+
+
+def read_cfg_blob_from_nvs_image(image_path: str, namespace_key: str):
+    """Re-parses a generated NVS image and reconstructs the blob bytes
+    stored under `namespace_key` ("module_cfg" or "power_base_cfg") --
+    same reconstruction approach as pack_module_config.py's
+    read_module_cfg_blob(), generalized to power_base_config's separate
+    namespace so this test can re-verify power_base_config.bin's actual
+    on-flash content too, without duplicating pack_power_base_config.py's
+    own packer. Returns None if the namespace/blob entry is not found."""
+    nvs_parser = packer._import_nvs_parser()
+    with open(image_path, "rb") as f:
+        raw = bytearray(f.read())
+    partition = nvs_parser.NVS_Partition(os.path.basename(image_path), raw)
+    namespace_id = None
+    blob_entry = None
+    for page in partition.pages:
+        for entry in page.entries:
+            if entry.key == namespace_key and entry.metadata["namespace"] == 0 and entry.data:
+                namespace_id = entry.data.get("value")
+            elif (
+                entry.key == "blob"
+                and entry.data
+                and namespace_id is not None
+                and entry.metadata["namespace"] == namespace_id
+                and entry.metadata["type"] == "blob_data"
+            ):
+                blob_entry = entry
+    if blob_entry is None:
+        return None
+    raw_bytes = bytearray()
+    for child in blob_entry.children:
+        raw_bytes += child.raw
+    return bytes(raw_bytes[: blob_entry.data["size"]])
+
 
 failures = 0
 
@@ -91,6 +157,7 @@ def main():
         "sgp41": load("prototype_sgp41.json"),
     }
     pms5003 = load("prototype_pms5003.json")
+    power_base = load("power_base.json")
 
     # --- 1. All four I2C boards' POGO port blocks are byte-for-byte
     # identical (checked against sht45 as the reference). ---
@@ -252,6 +319,11 @@ def main():
             check(actual_blob == expected_blob,
                   f"{image_name}: on-flash module_cfg:blob content matches pack_config({cfg_name}) exactly "
                   f"({len(actual_blob)} bytes re-parsed from the generated NVS image)")
+            if name != "pms5003":
+                got_downstream_detect_out = struct.unpack_from(">h", actual_blob, OFF_MODULE_DOWNSTREAM_DETECT_OUT)[0]
+                check(got_downstream_detect_out == GPIO3,
+                      f"{image_name}: downstream_port.detect_out_gpio in the generated NVS image is "
+                      f"GPIO{GPIO3} (got GPIO{got_downstream_detect_out})")
             if name in ("sgp40", "sgp41"):
                 got_driver_id = struct.unpack_from(">I", actual_blob, OFF_DRIVER_ID)[0]
                 got_bitmap = struct.unpack_from(">H", actual_blob, OFF_SENSOR_BITMAP)[0]
@@ -267,6 +339,68 @@ def main():
     else:
         print("skip: NVS-image-content re-parse checks (set IDF_PATH and run "
               "`bash tools/gen_config.sh build/cfg_images` first -- see this file's module docstring)")
+
+    # --- 6. DOWNSTREAM DETECT_OUT GPIO22 -> GPIO3 migration (this follow-up):
+    # every ACTIVE final-prototype config (the four I2C boards plus
+    # configs/power_base.json) must now use GPIO3, GPIO22 must not appear
+    # anywhere in any of their enabled port fields, UPSTREAM stays untouched
+    # (DETECT_IN=12/DETECT_OUT=2, already checked in section 1), and
+    # PMS5003's downstream stays fully disabled (-1, already checked in
+    # section 3 -- unaffected by this migration since it was never GPIO22
+    # or GPIO3 in the first place). ---
+    check(power_base["downstream_port"]["detect_out_gpio"] == GPIO3,
+          f"power_base.json: downstream_port.detect_out_gpio is GPIO{GPIO3}")
+    for name, cfg in i2c_boards.items():
+        check(cfg["downstream_port"]["detect_out_gpio"] == GPIO3,
+              f"{name}: downstream_port.detect_out_gpio is GPIO{GPIO3}")
+
+    # GPIO22 must not appear in any enabled port field of any of the five
+    # active final-prototype configs (four I2C boards' upstream+downstream,
+    # power_base's one downstream port). PMS5003's downstream is excluded
+    # (all -1, an intentionally-disabled port, not a live GPIO22/GPIO3
+    # candidate either way -- section 3 already confirms it stays disabled).
+    port_gpio_fields = ("tx_gpio", "rx_gpio", "detect_in_gpio", "detect_out_gpio", "base_id_gpio")
+    for name, cfg in i2c_boards.items():
+        for port_name in ("upstream_port", "downstream_port"):
+            port = cfg[port_name]
+            used_gpio22 = [f for f in port_gpio_fields if f in port and packer.as_int(port[f]) == GPIO22]
+            check(not used_gpio22,
+                  f"{name}.{port_name}: GPIO{GPIO22} is not used by any field (found in: {used_gpio22})")
+    used_gpio22_power_base = [f for f in port_gpio_fields if f in power_base["downstream_port"]
+                               and packer.as_int(power_base["downstream_port"][f]) == GPIO22]
+    check(not used_gpio22_power_base,
+          f"power_base.json.downstream_port: GPIO{GPIO22} is not used by any field "
+          f"(found in: {used_gpio22_power_base})")
+
+    # In-memory packed-blob check (power_base_config uses a separate 44-byte
+    # schema/packer -- components/power_base_config, tools/pack_power_base_config.py
+    # -- not module_config's, so it needs its own pack_config() call and byte
+    # offset rather than reusing `packer`'s).
+    power_base_blob = power_base_packer.pack_config(power_base)
+    check(len(power_base_blob) == 44, "power_base.json: packed blob is the expected 44 bytes")
+    got_power_base_detect_out = struct.unpack_from(">h", power_base_blob, OFF_POWER_BASE_DOWNSTREAM_DETECT_OUT)[0]
+    check(got_power_base_detect_out == GPIO3,
+          f"power_base.json: packed blob downstream_port.detect_out_gpio is GPIO{GPIO3} "
+          f"(got GPIO{got_power_base_detect_out})")
+
+    # NVS-image-content re-parse for power_base_config.bin too (same
+    # IDF_PATH/build/cfg_images gating as section 5 above).
+    if idf_path and os.path.isdir(cfg_images_dir):
+        power_base_image_path = os.path.join(cfg_images_dir, "power_base_config.bin")
+        if os.path.isfile(power_base_image_path):
+            actual_power_base_blob = read_cfg_blob_from_nvs_image(power_base_image_path, "power_base_cfg")
+            check(actual_power_base_blob == power_base_blob,
+                  f"power_base_config.bin: on-flash power_base_cfg:blob content matches "
+                  f"pack_config(power_base.json) exactly ({len(actual_power_base_blob)} bytes re-parsed "
+                  f"from the generated NVS image)")
+            got = struct.unpack_from(">h", actual_power_base_blob, OFF_POWER_BASE_DOWNSTREAM_DETECT_OUT)[0]
+            check(got == GPIO3,
+                  f"power_base_config.bin: downstream_port.detect_out_gpio in the generated NVS image is "
+                  f"GPIO{GPIO3} (got GPIO{got})")
+        else:
+            check(False, "power_base_config.bin exists in build/cfg_images (run tools/gen_power_base_config.sh first)")
+    else:
+        print("skip: power_base_config.bin NVS-image-content re-parse check (same IDF_PATH/build gating as above)")
 
     if failures == 0:
         print("ALL CHECKS PASSED")

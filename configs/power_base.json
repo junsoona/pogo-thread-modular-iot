@@ -1,13 +1,14 @@
 {
-  "_comment": "Fixed config for the dedicated power-base project (power_base/, NOT module/) -- see docs/power-base.md. The power base's one physical POGO port is electrically identical to a sensor module's DOWNSTREAM port (same GPIO numbers as module/'s confirmed profile: UART1, GPIO10/11, DETECT_OUT=22, DETECT_IN=23) -- it connects to the first sensor module's UPSTREAM port. BASE_ID is a GND contact on the power-base connector itself, not a GPIO on this board -- there is no base_id field here at all (see docs/pogo-interface.md's BASE_ID section and docs/power-base.md's wiring table).",
+  "_comment": "Fixed config for the dedicated power-base project (power_base/, NOT module/) -- see docs/power-base.md. The power base's one physical POGO port is electrically identical to a sensor module's DOWNSTREAM port (same GPIO numbers as module/'s confirmed profile: UART1, GPIO10/11, DETECT_OUT=3, DETECT_IN=23) -- it connects to the first sensor module's UPSTREAM port. BASE_ID is a GND contact on the power-base connector itself, not a GPIO on this board -- there is no base_id field here at all (see docs/pogo-interface.md's BASE_ID section and docs/power-base.md's wiring table).",
 
   "schema_version": 1,
-  "config_revision": 1,
+  "config_revision": 2,
 
   "_downstream_comment": "Same UART1/GPIO10-11/DETECT pins as module/'s confirmed DOWNSTREAM profile -- this is what makes the power base electrically a drop-in replacement for 'the module that would otherwise be ROOT'.",
+  "_detect_out_comment": "DETECT_OUT moved from GPIO22 to GPIO3 (config_revision bumped 1->2, this follow-up) -- GPIO22 is not a convenient header pin on the real ESP32-H2 SuperMini board and required direct soldering with board-damage risk; GPIO3 is header-accessible, an ordinary non-strapping GPIO already allowed by gpio_profile.c, and used here only as an open-drain DETECT_OUT output (never a Deep-sleep wake source, unlike UPSTREAM DETECT_IN=GPIO12 which is unchanged). See docs/pogo-interface.md's GPIO history section.",
   "downstream_port": {
     "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
-    "detect_in_gpio": 23, "detect_out_gpio": 22,
+    "detect_in_gpio": 23, "detect_out_gpio": 3,
     "detect_out_active_low": true, "debounce_ms": 30
   },
 

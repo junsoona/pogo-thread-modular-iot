@@ -247,6 +247,13 @@ bash tools/gen_power_base_config.sh build/cfg_images
 
 ## 새 GPIO 프로필 flash 전 재배선 (이번 세션, 필수)
 
+**(이후 세션에서 추가) 아래 두 표의 "전원 모듈 GPIO22(DETECT_OUT)"/"A GPIO22(DETECT_OUT)"는
+이 절이 다루는 UPSTREAM DETECT_IN/OUT 교환(GPIO2<->GPIO12) 시점 기준 값이며, DOWNSTREAM
+DETECT_OUT 자체는 그 시점에는 변경되지 않았다는 뜻으로 정확하다. 이후 별도 세션에서
+DOWNSTREAM DETECT_OUT이 GPIO22에서 GPIO3으로 다시 바뀌었다 -- 최신 배선표는 아래
+"DOWNSTREAM DETECT_OUT GPIO 변경 (GPIO22 -> GPIO3)" 절을 참고할 것. 이 절의 GPIO22
+표기 자체는 과거 시점 기록으로 남겨둔다.**
+
 **실물은 현재 이전 GPIO 배선(UPSTREAM DETECT_IN=GPIO2, DETECT_OUT=GPIO12)으로
 연결되어 있다. 이번 세션에서 빌드한 firmware(UPSTREAM DETECT_IN=GPIO12,
 DETECT_OUT=GPIO2로 교환됨)를 flash하기 전에 반드시 아래 DETECT 두 선을 먼저
@@ -280,6 +287,73 @@ build/cfg_images`로 새 GPIO 값이 반영된 설정 이미지를 다시 생성
 이미 재생성해 커밋된 `build/cfg_images/*.bin`이 최신이면 다시 만들 필요는 없다),
 아래 "전원 모듈 + 센서 모듈 배치" 또는 "실물 AUTO 배치" 절의 명령을 그대로 실행한다.
 **배선을 바꾸기 전에는 아래 명령들을 실행해 실물 검증을 했다고 보고하지 않는다.**
+
+## DOWNSTREAM DETECT_OUT GPIO 변경 (GPIO22 -> GPIO3, 이후 세션, 설정 전용 변경)
+
+**모든 활성 DOWNSTREAM 포트의 DETECT_OUT이 GPIO22에서 GPIO3으로 바뀌었다** --
+`configs/power_base.json`, `configs/module_config.example.json`, 그리고 SHT45/BH1750/
+SGP40/SGP41 4종 prototype config 전부(`config_revision`도 각각 1->2로 증가). PMS5003
+terminal config의 downstream 포트는 원래부터 전부 `-1`(완전 비활성화)이므로 이 변경의
+영향을 받지 않는다. UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2, DOWNSTREAM
+DETECT_IN=GPIO23은 이번 변경에서도 그대로다 -- **설정 기반 GPIO 매핑 변경일 뿐,
+production POGO 프로토콜/state machine 코드는 전혀 수정하지 않았다** (GPIO는 config에서
+읽으므로 코드에 GPIO 번호가 하드코딩되어 있지 않다).
+
+**변경 이유**: 실제 ESP32-H2 SuperMini 보드에서 GPIO22는 편리한 헤더로 나오지 않아
+직접 납땜이 필요하고 보드 손상 위험이 있다. GPIO3은 헤더로 접근 가능하고, boot
+strapping pin이 아니며, `gpio_profile.c`의 예약 목록(strapping/미본딩/플래시/USB)
+어디에도 속하지 않아 이미 허용되어 있던 일반 GPIO다. 외부 pad JTAG의 MTDO 기능이
+GPIO3에 있지만, 이 프로젝트는 native USB Serial/JTAG만 쓰고 GPIO2/4/5도 이미 일반
+GPIO로 쓰고 있으므로 외부 pad JTAG 자체를 켜지 않는다 -- 실질적 제약이 아니다. GPIO3은
+DOWNSTREAM DETECT_OUT이라는 open-drain **출력**으로만 쓰이며, ESP32-H2 RTC GPIO 채널
+범위(7~14)에 속하지 않아 Deep-sleep wake source가 될 수 없고 될 필요도 없다 (그 역할은
+변경 없이 UPSTREAM DETECT_IN=GPIO12가 맡는다). 자세한 근거는
+[`docs/pogo-interface.md`](docs/pogo-interface.md)의 "History: DOWNSTREAM DETECT_OUT's
+GPIO -- 22, now 3" 절 참고.
+
+**최신 배선표** (위 두 표를 대체):
+
+| 전원 모듈 <-> 중간(첫) 센서 모듈 | |
+|---|---|
+| 전원 모듈 GPIO10 (UART TX) | -> 모듈 GPIO5 (UART RX) |
+| 전원 모듈 GPIO11 (UART RX) | <- 모듈 GPIO4 (UART TX) |
+| 전원 모듈 GPIO3 (DETECT_OUT) | -> 모듈 GPIO12 (DETECT_IN) |
+| 전원 모듈 GPIO23 (DETECT_IN) | <- 모듈 GPIO2 (DETECT_OUT) |
+| 전원 모듈 BASE_ID 접점 (GND, GPIO 아님) | -> 모듈 GPIO14 (BASE_ID) |
+| GND | 공통 |
+
+| 모듈 A(DOWNSTREAM) <-> 모듈 B(UPSTREAM) (module-to-module 또는 중간 모듈 <-> 말단 모듈) | |
+|---|---|
+| A GPIO10 (UART TX) | -> B GPIO5 (UART RX) |
+| A GPIO11 (UART RX) | <- B GPIO4 (UART TX) |
+| A GPIO3 (DETECT_OUT) | -> B GPIO12 (DETECT_IN) |
+| A GPIO23 (DETECT_IN) | <- B GPIO2 (DETECT_OUT) |
+| GND | 공통 |
+
+**실물이 GPIO22 프로필로 이미 배선되어 있다면 DETECT_OUT 한 선만 GPIO3으로 옮겨
+재배선한다** (다른 신호는 변경 없음). production C 코드가 변경되지 않았으므로 `cfg`
+파티션만 다시 기록하면 된다 -- 앱 바이너리(`pogo_module.bin`/`power_base.elf`)는
+재flash할 필요가 없다:
+
+```bash
+cd "/Users/junsoona/no-icloud/main project_1"
+source ~/.espressif/v6.1/esp-idf/export.sh
+
+# 설정 이미지 재생성 (GPIO3 반영)
+bash tools/gen_config.sh build/cfg_images
+bash tools/gen_power_base_config.sh build/cfg_images
+
+# 전원 모듈: cfg 파티션만 재기록 (0x187000 = power_base/partitions.csv의 cfg offset)
+python -m esptool --chip esp32h2 -p "$BASE_PORT" \
+    write-flash 0x187000 build/cfg_images/power_base_config.bin
+
+# 일반 I2C 중간/센서 모듈(SHT45/BH1750/SGP40/SGP41): cfg 파티션만 재기록
+python -m esptool --chip esp32h2 -p "$MODULE_PORT" \
+    write-flash 0x187000 build/cfg_images/prototype_sht45_config.bin   # 실제 보드에 맞는 이미지로 교체
+
+# PMS5003 terminal 모듈: downstream이 원래부터 비활성화라 이 변경의 영향이 없다 --
+# cfg 재기록 자체가 필요 없다 (재기록해도 무해하지만, 굳이 다시 flash할 이유가 없다).
+```
 
 ## 플래시 (사용자가 실행)
 
@@ -385,17 +459,19 @@ depth=1) 1대 -> PMS5003 말단 모듈(LEAF, depth=2) 1대. 세 보드 모두 `m
 
 **배선표** (전원 모듈<->중간 모듈은 [`docs/power-base.md`](docs/power-base.md) 4절과
 동일, 중간 모듈<->말단 모듈은 위 "모듈 간 연결 (A의 DOWNSTREAM -> B의 UPSTREAM)"과
-동일 -- 현재 GPIO 프로필 기준, UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2):
+동일 -- 현재 GPIO 프로필 기준, UPSTREAM DETECT_IN=GPIO12/DETECT_OUT=GPIO2, DOWNSTREAM
+DETECT_OUT=GPIO3(GPIO22에서 변경됨, 위 "DOWNSTREAM DETECT_OUT GPIO 변경" 절 참고)):
 
 | 구간 | 신호 | 연결 |
 |---|---|---|
 | 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | UART TX/RX | 전원 모듈 GPIO10(TX) -- 중간 모듈 GPIO5(RX); 전원 모듈 GPIO11(RX) -- 중간 모듈 GPIO4(TX) |
-| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | DETECT | 전원 모듈 GPIO22(DETECT_OUT) -- 중간 모듈 GPIO12(DETECT_IN); 전원 모듈 GPIO23(DETECT_IN) -- 중간 모듈 GPIO2(DETECT_OUT) |
+| 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | DETECT | 전원 모듈 GPIO3(DETECT_OUT) -- 중간 모듈 GPIO12(DETECT_IN); 전원 모듈 GPIO23(DETECT_IN) -- 중간 모듈 GPIO2(DETECT_OUT) |
 | 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | BASE_ID | 전원 모듈의 BASE_ID 접점(GND) -- 중간 모듈 GPIO14 |
 | 전원 모듈 DOWNSTREAM -> 중간 모듈 UPSTREAM | GND | 공통 GND (전원선은 연결하지 않음 -- 각자 USB 전원) |
 | 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | UART TX/RX | 중간 모듈 GPIO10(TX) -- 말단 모듈 GPIO5(RX); 중간 모듈 GPIO11(RX) -- 말단 모듈 GPIO4(TX) |
-| 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | DETECT | 중간 모듈 GPIO22(DETECT_OUT) -- 말단 모듈 GPIO12(DETECT_IN); 중간 모듈 GPIO23(DETECT_IN) -- 말단 모듈 GPIO2(DETECT_OUT) |
+| 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | DETECT | 중간 모듈 GPIO3(DETECT_OUT) -- 말단 모듈 GPIO12(DETECT_IN); 중간 모듈 GPIO23(DETECT_IN) -- 말단 모듈 GPIO2(DETECT_OUT) |
 | 중간 모듈 DOWNSTREAM -> 말단 모듈 UPSTREAM | GND | 공통 GND (전원선은 연결하지 않음) |
+| 말단 모듈 GPIO14 | 연결 없음 | 말단 모듈의 GPIO14(BASE_ID)는 GND에 연결하지 않는다 (BASE_ID는 전원 모듈 직속 UPSTREAM 전용, 아래 참고) |
 | 중간 모듈 자체 센서 | SHT45 또는 BH1750 I2C | 중간 모듈 GPIO0(SDA)/GPIO1(SCL) + GND + 3.3V |
 | 말단 모듈 자체 센서 | PMS5003 UART | 말단 모듈 GPIO0(TX->PMS RX)/GPIO1(RX<-PMS TX) + GND + PMS5003 자체 5V |
 
@@ -516,15 +592,17 @@ docs/pogo-interface.md 참고. 실물은 아직 구배선(DETECT_IN=GPIO2/DETECT
 
 ### 모듈 간 연결 (A의 DOWNSTREAM -> B의 UPSTREAM)
 
-**이번 세션에서 B의 UPSTREAM DETECT_IN/DETECT_OUT이 교환되었다 (GPIO12/GPIO2, 이전은
-GPIO2/GPIO12) -- 아래 표는 새 프로필 기준. 실물이 이전 배선 상태라면 flash 전에
-반드시 재배선할 것 (아래 "새 GPIO 프로필 flash 전 재배선" 절 참고).**
+**B의 UPSTREAM DETECT_IN/DETECT_OUT은 GPIO12/GPIO2(이전은 GPIO2/GPIO12)이고, A의
+DOWNSTREAM DETECT_OUT은 GPIO3(이전은 GPIO22, "DOWNSTREAM DETECT_OUT GPIO 변경" 절
+참고)이다 -- 아래 표는 최신 프로필 기준. 실물이 이전 배선 상태라면 flash/재기록 전에
+반드시 재배선할 것 (위 "새 GPIO 프로필 flash 전 재배선"과 "DOWNSTREAM DETECT_OUT
+GPIO 변경" 절 참고).**
 
 | A (DOWNSTREAM) | B (UPSTREAM) |
 |---|---|
 | GPIO10 (TX) | GPIO5 (RX) |
 | GPIO11 (RX) | GPIO4 (TX) |
-| GPIO22 (DETECT_OUT) | GPIO12 (DETECT_IN) |
+| GPIO3 (DETECT_OUT) | GPIO12 (DETECT_IN) |
 | GPIO23 (DETECT_IN) | GPIO2 (DETECT_OUT) |
 | GND | GND |
 
@@ -717,7 +795,7 @@ role=1(ROOT) 아님)이 나타날 것.
   `dataset stored ...` 로그보다 먼저 나타난다.
 
 ```
-I (..) power_base_config: loaded: schema=1 rev=1 uart=1 tx=10 rx=11 detect_in=23 detect_out=22 ...
+I (..) power_base_config: loaded: schema=1 rev=2 uart=1 tx=10 rx=11 detect_in=23 detect_out=3 ...
 I (..) power_base_main: power_enable_gpio not configured -- 5V rail assumed always-on (no switching hardware yet)
 I (..) thread_manager: always-on FTD: no dataset in NVS -- forming a new Thread network from Kconfig defaults
 I (..) power_base_main: power-base FTD: attached, otDeviceRole=2(CHILD) -- starting services (this runs exactly once; a later role change never re-triggers it)
@@ -749,7 +827,7 @@ topology report applied: ... depth=1 role=3`(LEAF)이 나타날 것.
 #### 첫 센서 모듈 (`module`, 예: SHT45, depth=1) -- 현재 firmware 기준, 아직 실물 미검증
 
 ```
-I (..) module_config: loaded: schema=1 rev=1 driver_id=1397240885 sensor_bitmap=0x0006 ...
+I (..) module_config: loaded: schema=1 rev=2 driver_id=1397240885 sensor_bitmap=0x0006 ...
 I (..) sht45: SHT45 initialized: addr=0x44 ...
 I (..) pogo_port: port 0: PEER_READY (peer_type=1)
 I (..) child_service: sensor measurement OK: bitmap=0x0006 response_time=..ms
