@@ -1,0 +1,15 @@
+# Mirrors examples/bridge-app/linux/.gn exactly. This makes
+# linux/matter_bridge/app/ its own self-contained GN "source root" ("//"),
+# the same convention every connectedhomeip example app uses -- see
+# BUILD.gn's own top comment for how //third_party/connectedhomeip and
+# //third_party/pogo_repo resolve.
+
+import("//build_overrides/build.gni")
+
+buildconfig = "${build_root}/config/BUILDCONFIG.gn"
+
+check_system_includes = true
+
+default_args = {
+  import("//args.gni")
+}

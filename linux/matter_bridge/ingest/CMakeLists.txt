@@ -74,6 +74,10 @@ add_executable(ingest_unit_tests tests/test_registry_and_session.cpp)
 target_link_libraries(ingest_unit_tests PRIVATE ingest_core)
 add_test(NAME ingest_unit_tests COMMAND ingest_unit_tests)
 
+add_executable(ingest_registry_snapshot_test tests/test_registry_snapshot.cpp)
+target_link_libraries(ingest_registry_snapshot_test PRIVATE ingest_core Threads::Threads)
+add_test(NAME ingest_registry_snapshot_test COMMAND ingest_registry_snapshot_test)
+
 add_executable(ingest_loopback_test tests/test_loopback.cpp src/server.cpp)
 target_link_libraries(ingest_loopback_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_loopback_test COMMAND ingest_loopback_test)

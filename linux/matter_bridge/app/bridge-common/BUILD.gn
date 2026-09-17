@@ -1,0 +1,44 @@
+# Data model definition for pogo_matter_bridge -- mirrors
+# examples/bridge-app/bridge-common's own BUILD.gn exactly (same
+# chip_data_model() GN template, same is_server=true), pointed at this
+# application's own pogo-matter-bridge.zap instead.
+#
+# pogo-matter-bridge.zap declares only what ZAP-driven code generation
+# needs to exist ahead of time: endpoint 0 (root), endpoint 1 (aggregator,
+# the parent of every module endpoint this bridge creates dynamically), and
+# endpoint 2 (a disabled-at-runtime placeholder that exists purely so ZAP
+# generates Descriptor cluster support at all -- see
+# examples/bridge-app/linux/README.md's own "Limitations" section for why
+# every real Matter bridge example needs one). Every cluster this bridge
+# actually cares about -- Bridged Device Basic Information, Temperature
+# Measurement, Relative Humidity Measurement, and the three PM Concentration
+# Measurement clusters -- is a modern connectedhomeip v1.6.0.0
+# code-driven ServerCluster (see linux/matter_bridge/app/chip/chip_endpoint.cpp),
+# constructed and registered directly in C++ at runtime, NOT declared here --
+# this mirrors how examples/bridge-app/linux's own Bridged Device Basic
+# Information cluster is never in bridge-app.zap either (see that file).
+#
+# pogo-matter-bridge.zap started from connectedhomeip v1.6.0.0's own
+# examples/bridge-app/bridge-common/bridge-app.zap (Apache-2.0, Project CHIP
+# Authors) -- its root (endpoint 0) and aggregator (endpoint 1) structure is
+# the SDK's own standard bridge template, unmodified; see this directory's
+# own README.md for exactly what was and wasn't changed.
+#
+# pogo-matter-bridge.zap.in is a CHIP_ROOT-independent template -- its two
+# "package" entries (pointing ZAP at the real connectedhomeip zcl.json /
+# app-templates.json) use a literal "__CHIP_ROOT__" placeholder rather than
+# a path, since this application lives outside the connectedhomeip checkout
+# and CHIP_ROOT is only known at build time (see tools/build_matter_bridge.sh,
+# which is the ONLY thing that ever produces the real pogo-matter-bridge.zap
+# from this template -- that generated file is intentionally not checked in,
+# see this repo's top-level .gitignore).
+
+import("//build_overrides/chip.gni")
+
+import("${chip_root}/src/app/chip_data_model.gni")
+
+chip_data_model("bridge-common") {
+  zap_file = "pogo-matter-bridge.zap"
+
+  is_server = true
+}

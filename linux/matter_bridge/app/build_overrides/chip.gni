@@ -1,0 +1,11 @@
+# Mirrors connectedhomeip's own examples/build_overrides/chip.gni exactly --
+# see linux/matter_bridge/app/BUILD.gn's own top comment for why
+# //third_party/connectedhomeip is a build-time-only symlink (created by
+# tools/build_matter_bridge.sh, pointed at $CHIP_ROOT) rather than a
+# checked-in one: CHIP_ROOT varies per machine, unlike
+# //third_party/pogo_repo (this repo's own root), which is a fixed relative
+# path and IS checked in.
+
+declare_args() {
+  chip_root = "//third_party/connectedhomeip"
+}

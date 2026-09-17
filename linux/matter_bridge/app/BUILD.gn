@@ -1,0 +1,89 @@
+# pogo_matter_bridge: runs linux/matter_bridge/ingest's existing CoAP
+# ingest server and a real connectedhomeip v1.6.0.0 Matter bridge in one
+# process -- see chip/main.cpp's own top comment for the threading model,
+# and docs/matter-bridge.md for the endpoint/cluster design this
+# implements.
+#
+# Structurally mirrors examples/bridge-app/linux/BUILD.gn (same
+# executable() shape, same core deps for the Linux platform's own
+# commissioning/networking main loop) -- see this repo's own
+# docs/matter-bridge.md for exactly what's shared with that example and
+# what's this application's own code.
+#
+# //third_party/connectedhomeip and //third_party/pogo_repo (see this
+# directory's own third_party/ -- the latter is a checked-in symlink to
+# this repo's own root, fixed and portable; the former is created fresh by
+# tools/build_matter_bridge.sh, pointed at $CHIP_ROOT, and is NOT checked
+# in since CHIP_ROOT varies per machine) are how this GN project -- which
+# lives OUTSIDE the connectedhomeip checkout, unlike every in-tree example
+# -- reaches both the Matter SDK and this repo's own ingest/wire-format
+# sources without vendoring either one.
+
+import("//build_overrides/chip.gni")
+
+import("${chip_root}/build/chip/tools.gni")
+
+assert(chip_build_tools)
+
+_pogo_repo = "//third_party/pogo_repo"
+_ingest_dir = "${_pogo_repo}/linux/matter_bridge/ingest"
+
+executable("pogo_matter_bridge") {
+  sources = [
+    "chip/chip_endpoint.cpp",
+    "chip/chip_endpoint.hpp",
+    "chip/main.cpp",
+    "core/include/matter_bridge/bridge_manager.hpp",
+    "core/include/matter_bridge/endpoint_store.hpp",
+    "core/include/matter_bridge/uuid_hash.hpp",
+    "core/include/matter_bridge/value_mapping.hpp",
+    "core/src/bridge_manager.cpp",
+    "core/src/endpoint_store.cpp",
+    "core/src/value_mapping.cpp",
+
+    # The REAL, unmodified ingest sources (see linux/matter_bridge/ingest's
+    # own CMakeLists.txt, which already documents this "same sources, more
+    # than one binary" pattern) -- this is a second, independent compile of
+    # the exact same files ingest's own CMake build compiles, never a copy.
+    "${_ingest_dir}/src/minicoap.cpp",
+    "${_ingest_dir}/src/registry.cpp",
+    "${_ingest_dir}/src/server.cpp",
+    "${_ingest_dir}/src/session.cpp",
+
+    # The REAL, unmodified production wire-format C sources (same
+    # reuse pattern as linux/matter_bridge/ingest/CMakeLists.txt).
+    "${_pogo_repo}/components/bridge_export_proto/bridge_export_proto.c",
+    "${_pogo_repo}/components/pogo_proto/pogo_crc16.c",
+    "${_pogo_repo}/components/sensor_channel/sensor_channel.c",
+  ]
+
+  include_dirs = [
+    "core/include",
+    "${_ingest_dir}/include",
+    "${_pogo_repo}/components/bridge_export_proto/include",
+    "${_pogo_repo}/components/pogo_proto/include",
+    "${_pogo_repo}/components/sensor_channel/include",
+  ]
+
+  deps = [
+    "bridge-common",
+    "${chip_root}/examples/platform/linux:app-main",
+    "${chip_root}/src/app/clusters/bridged-device-basic-information-server",
+    "${chip_root}/src/app/clusters/concentration-measurement-server",
+    "${chip_root}/src/app/clusters/relative-humidity-measurement-server",
+    "${chip_root}/src/app/clusters/temperature-measurement-server",
+    "${chip_root}/src/lib",
+  ]
+
+  cflags = [ "-Wall" ]
+
+  output_dir = root_out_dir
+}
+
+group("linux") {
+  deps = [ ":pogo_matter_bridge" ]
+}
+
+group("default") {
+  deps = [ ":pogo_matter_bridge" ]
+}

@@ -17,4 +17,15 @@
 # commit a real dataset hex file or a generated *_otbr_config.bin image.
 /secrets/
 **/otbr-active-dataset.hex
+
+# Matter bridge (docs/matter-bridge.md): build-time-only artifacts.
+# //third_party/connectedhomeip is a symlink tools/build_matter_bridge.sh
+# creates fresh every run, pointed at the CHIP_ROOT of whoever is
+# building -- never checked in (CHIP_ROOT varies per machine, and this
+# repo must never vendor the SDK). pogo-matter-bridge.zap is generated
+# from pogo-matter-bridge.zap.in (which IS checked in) the same way, for
+# the same reason (its package paths must point at that same CHIP_ROOT).
+/linux/matter_bridge/app/third_party/connectedhomeip
+/linux/matter_bridge/app/bridge-common/pogo-matter-bridge.zap
+/linux/matter_bridge/app/out/
 EOF

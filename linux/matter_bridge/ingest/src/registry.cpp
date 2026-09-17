@@ -45,6 +45,7 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
         n->boot_session_generation = boot_session_generation;
         n->last_seq = last_seq;
         n->has_superseded_generation = false;
+        note_applied_locked();
         return ApplyResult::AppliedNew;
     }
 
@@ -68,6 +69,7 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
         n->sensor_bitmap = sensor_bitmap;
         n->downstream_connected = downstream_connected;
         n->last_seq = last_seq;
+        note_applied_locked();
         return ApplyResult::AppliedNew;
     }
 
@@ -96,6 +98,7 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
     n->sensor_bitmap = sensor_bitmap;
     n->downstream_connected = downstream_connected;
     n->last_seq = last_seq;
+    note_applied_locked();
     return ApplyResult::AppliedNew;
 }
 
@@ -145,6 +148,7 @@ ApplyResult Registry::apply_sample(const Uuid &power_base_uuid, const Uuid &modu
     n->last_sample_seq = sample_seq;
     n->last_sample_uptime_ms = uptime_ms;
     n->last_channels = channels;
+    note_applied_locked();
     return ApplyResult::AppliedNew;
 }
 
@@ -173,6 +177,34 @@ bool Registry::get_node(size_t index, NodeState &out) const
     }
     out = nodes_[index];
     return true;
+}
+
+void Registry::note_applied_locked()
+{
+    generation_++;
+    cv_.notify_all();
+}
+
+uint64_t Registry::generation() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generation_;
+}
+
+std::vector<NodeState> Registry::snapshot() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return nodes_;
+}
+
+bool Registry::wait_for_change(uint64_t *last_seen_generation, std::chrono::milliseconds timeout) const
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    bool changed = cv_.wait_for(lock, timeout, [this, last_seen_generation] { return generation_ != *last_seen_generation; });
+    if (changed) {
+        *last_seen_generation = generation_;
+    }
+    return changed;
 }
 
 } // namespace ingest

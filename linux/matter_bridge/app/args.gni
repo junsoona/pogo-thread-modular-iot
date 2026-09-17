@@ -1,0 +1,31 @@
+# Mirrors examples/bridge-app/linux/args.gni; project-config include points
+# at OUR bridge-common/include, not the SDK's own example one.
+
+import("//build_overrides/chip.gni")
+
+import("${chip_root}/config/standalone/args.gni")
+
+chip_device_project_config_include = "<CHIPProjectAppConfig.h>"
+chip_project_config_include = "<CHIPProjectAppConfig.h>"
+chip_system_project_config_include = "<SystemProjectConfig.h>"
+
+chip_project_config_include_dirs = [ "//bridge-common/include" ]
+chip_project_config_include_dirs += [ "${chip_root}/config/standalone" ]
+
+# Gives every dynamic endpoint a stable, application-chosen unique-id string
+# (this bridge uses the module_uuid's own hex encoding, see
+# linux/matter_bridge/app/chip/chip_endpoint.cpp) independent of numeric
+# endpoint id churn -- matches examples/bridge-app/linux's own args.gni.
+chip_enable_endpoint_unique_id = true
+
+# ${chip_root}/src/app:required-privileges (needed by chip_data_model(),
+# see bridge-common/BUILD.gn) is visibility-restricted to
+# "${chip_root}/examples/*" by default (see that target's own BUILD.gn) --
+# a rule every IN-TREE example satisfies for free simply by living under
+# connectedhomeip's own examples/ directory. This application deliberately
+# does NOT live there (see this repo's own docs/matter-bridge.md: CHIP_ROOT
+# is an external checkout, never vendored into this repo), so
+# src/app/BUILD.gn provides exactly this override point for that case --
+# see its own "if (chip_app_data_model_target != \"\")" block. This is the
+# SDK's own sanctioned extension mechanism, not a visibility bypass.
+chip_app_data_model_target = "//bridge-common:bridge-common"

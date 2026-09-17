@@ -1,0 +1,5 @@
+# Mirrors connectedhomeip's own examples/build_overrides/build.gni exactly.
+
+declare_args() {
+  build_root = "//third_party/connectedhomeip/build"
+}
