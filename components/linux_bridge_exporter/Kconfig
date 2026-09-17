@@ -37,4 +37,26 @@ menu "Linux Bridge Exporter (Power Base -> Linux OTBR host)"
             never authoritative -- the periodic full resync above is what
             actually reconciles Linux-side state.
 
+    config LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS
+        int "Minimum interval between two SAMPLE exports for the SAME module_uuid (ms)"
+        default 1000
+        help
+            Transport-load reduction (Power Base -> Linux, this pass): caps
+            how often this component actually SENDS a SAMPLE export for any
+            one module_uuid, regardless of how often that module's sensor
+            measurement/aggregator storage updates -- neither the sensor
+            measurement period nor the aggregator's own storage rate is
+            changed by this setting, only how often the ALREADY-STORED
+            latest value is mirrored to the Linux host. Rapid samples for
+            the same uuid within this window keep coalescing (upsert,
+            latest-wins, see PENDING_SAMPLES_MAX) exactly as before; once
+            the window reopens, the then-current latest value is sent --
+            never a replayed backlog of older values. TOPOLOGY events
+            (ATTACHED/UPDATED/DETACHED/OFFLINE, parent-state changes) are
+            NOT subject to this limit -- they are always sent immediately,
+            see s_topology_pending_*/s_topology_queue. The periodic full
+            resync (LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS, far
+            longer than this by default) is independent of this per-uuid
+            gate and always sends every node's current value.
+
 endmenu

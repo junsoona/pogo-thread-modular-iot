@@ -183,7 +183,7 @@ void ChipEndpointManager::Init()
     aggregator_endpoint_id_ = 1;
 }
 
-void ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &update)
+bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &update)
 {
     auto ep = std::make_unique<ModuleEndpoint>();
     ep->endpoint_id = update.endpoint_id;
@@ -213,7 +213,7 @@ void ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
     if (err != CHIP_NO_ERROR) {
         ChipLogError(NotSpecified, "pogo_matter_bridge: failed to create dynamic endpoint %u for module: %" CHIP_ERROR_FORMAT,
                     (unsigned) ep->endpoint_id, err.Format());
-        return;
+        return false;
     }
 
     BridgedDeviceBasicInformationCluster::MutableData mutable_data;
@@ -261,40 +261,64 @@ void ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
     }
 
     modules_[ep->endpoint_id] = std::move(ep);
+    return true;
 }
 
-void ChipEndpointManager::Apply(const matter_bridge::ModuleUpdate &update)
+matter_bridge::ApplyOutcome ChipEndpointManager::Apply(const matter_bridge::ModuleUpdate &update)
 {
+    matter_bridge::ApplyOutcome outcome;
+
     if (update.is_new_endpoint) {
-        CreateEndpoint(update);
+        outcome.endpoint_created = CreateEndpoint(update);
     }
 
     auto it = modules_.find(update.endpoint_id);
     if (it == modules_.end()) {
-        // CreateEndpoint() above failed (logged there already) -- nothing
-        // more can be applied to an endpoint that doesn't exist.
-        return;
+        // CreateEndpoint() above failed (logged there already), or this
+        // update targets an endpoint that was never successfully created on
+        // an earlier attempt either -- nothing more can be applied. Every
+        // outcome field stays false, so the caller (main.cpp) never commits
+        // any of this update as having succeeded -- see
+        // matter_bridge::BridgeManager::CommitApplied()'s own doc comment.
+        return outcome;
     }
     ModuleEndpoint &ep = *it->second;
 
     if (update.reachable.has_value() && ep.basic_info.IsConstructed()) {
+        // SetReachable() returns void (no LogErrorOnFailure() call site
+        // exists for it anywhere in this SDK's own examples either) --
+        // dispatching it with a constructed cluster is considered
+        // unconditionally successful, same as this function always treated
+        // it before this pass.
         ep.basic_info.Cluster().SetReachable(*update.reachable);
+        outcome.reachable_applied = true;
     }
     if (update.temperature.has_value() && ep.temperature.IsConstructed()) {
-        LogErrorOnFailure(ep.temperature.Cluster().SetMeasuredValue(ToNullable(*update.temperature)));
+        CHIP_ERROR err = ep.temperature.Cluster().SetMeasuredValue(ToNullable(*update.temperature));
+        LogErrorOnFailure(err);
+        outcome.temperature_applied = (err == CHIP_NO_ERROR);
     }
     if (update.humidity.has_value() && ep.humidity.IsConstructed()) {
-        LogErrorOnFailure(ep.humidity.Cluster().SetMeasuredValue(ToNullable(*update.humidity)));
+        CHIP_ERROR err = ep.humidity.Cluster().SetMeasuredValue(ToNullable(*update.humidity));
+        LogErrorOnFailure(err);
+        outcome.humidity_applied = (err == CHIP_NO_ERROR);
     }
     if (update.pm1.has_value() && ep.pm1.IsConstructed()) {
-        LogErrorOnFailure(ep.pm1.Cluster().SetMeasuredValue(ToNullable(*update.pm1)));
+        CHIP_ERROR err = ep.pm1.Cluster().SetMeasuredValue(ToNullable(*update.pm1));
+        LogErrorOnFailure(err);
+        outcome.pm1_applied = (err == CHIP_NO_ERROR);
     }
     if (update.pm25.has_value() && ep.pm25.IsConstructed()) {
-        LogErrorOnFailure(ep.pm25.Cluster().SetMeasuredValue(ToNullable(*update.pm25)));
+        CHIP_ERROR err = ep.pm25.Cluster().SetMeasuredValue(ToNullable(*update.pm25));
+        LogErrorOnFailure(err);
+        outcome.pm25_applied = (err == CHIP_NO_ERROR);
     }
     if (update.pm10.has_value() && ep.pm10.IsConstructed()) {
-        LogErrorOnFailure(ep.pm10.Cluster().SetMeasuredValue(ToNullable(*update.pm10)));
+        CHIP_ERROR err = ep.pm10.Cluster().SetMeasuredValue(ToNullable(*update.pm10));
+        LogErrorOnFailure(err);
+        outcome.pm10_applied = (err == CHIP_NO_ERROR);
     }
+    return outcome;
 }
 
 } // namespace pogo_matter_bridge

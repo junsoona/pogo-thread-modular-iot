@@ -14,21 +14,36 @@
 //      messages and calls ONLY ingest::Registry::apply_*(). Never touches
 //      the Matter SDK, never touches BridgeManager/ChipEndpointManager.
 //   2. The "registry watcher" thread (RegistryWatcherThreadMain, this
-//      file) -- blocks on ingest::Registry::wait_for_change() (a
-//      condition_variable wait, never a busy/polling loop), takes a
-//      snapshot(), and runs matter_bridge::BridgeManager::Reconcile() on
-//      it. Every resulting matter_bridge::ModuleUpdate is handed to
-//      chip::DeviceLayer::PlatformMgr().ScheduleWork() -- this thread
-//      itself NEVER calls into the Matter SDK, per this application's own
-//      explicit design requirement (see chip_endpoint.hpp's own top
-//      comment) and per ingest/registry.hpp's own top comment (never call
-//      the Matter SDK or do file I/O while holding the registry's mutex --
-//      wait_for_change()/snapshot() only ever hold it briefly to copy
-//      data out).
+//      file) -- polls ingest::Registry::wait_for_change() on a bounded
+//      250ms timeout (never a busy loop, but also never SUSPENDED
+//      indefinitely -- see this pass's own note below), takes a snapshot(),
+//      and runs matter_bridge::BridgeManager::Reconcile() on it. For each
+//      resulting matter_bridge::ModuleUpdate, matter_bridge::BridgeManager::
+//      TryBeginSchedule() decides whether to actually call
+//      chip::DeviceLayer::PlatformMgr().ScheduleWork() this round -- see
+//      that method's own doc comment for the coalescing+rate-limit policy
+//      (this pass: transport-load reduction, Linux Registry -> Matter).
+//      This thread itself NEVER calls into the Matter SDK, per this
+//      application's own explicit design requirement (see
+//      chip_endpoint.hpp's own top comment) and per ingest/registry.hpp's
+//      own top comment (never call the Matter SDK or do file I/O while
+//      holding the registry's mutex -- wait_for_change()/snapshot() only
+//      ever hold it briefly to copy data out).
+//
+//      This pass: wait_for_change()'s return value is deliberately no
+//      longer checked to skip re-processing on a timeout -- Reconcile() is
+//      cheap (bounded by ingest::Registry::kMaxNodes) and re-running it
+//      every ~250ms regardless is what lets a module_uuid that
+//      TryBeginSchedule() rate-limited earlier get promptly retried once
+//      its own window reopens, without needing a brand-new registry change
+//      to wake this thread up again.
 //   3. The Matter event-loop thread (connectedhomeip's own
 //      ChipLinuxAppMainLoop()) -- the ONLY thread that ever touches a
 //      Matter cluster object (via ChipEndpointManager::Apply(), called
-//      from the ScheduleWork() callback below).
+//      from the ScheduleWork() callback below, which ALSO re-reads
+//      ingest::Registry::snapshot() itself at that exact moment -- see
+//      ApplyUpdateOnMatterThread()'s own doc comment -- and reports the
+//      real outcome back via matter_bridge::BridgeManager::CommitApplied()).
 //
 // Shutdown: connectedhomeip's own AppMain.cpp owns SIGINT/SIGTERM handling
 // (it blocks those signals in every OTHER thread, including the two this
@@ -43,7 +58,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <thread>
+#include <vector>
 
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
@@ -132,36 +149,83 @@ std::thread gWatcherThread;
 // Runs on the Matter event-loop thread via
 // chip::DeviceLayer::PlatformMgr().ScheduleWork() -- see this file's own
 // top comment for the threading contract this depends on.
+//
+// This pass (transport-load reduction, Linux Registry -> Matter): the
+// ScheduleWork() context now carries only a module_uuid, not a
+// pre-computed matter_bridge::ModuleUpdate -- this function re-derives the
+// update FRESH, from the registry's CURRENT snapshot at the exact moment
+// this work item actually runs (matter_bridge::BridgeManager::ReconcileOne()),
+// never whatever snapshot happened to be current back when
+// RegistryWatcherThreadMain() originally called ScheduleWork(). This is
+// what makes a detach/offline that lands in the registry WHILE this work
+// item was queued (or a temperature that kept changing in the meantime)
+// correctly win over a now-stale intended update -- see
+// ReconcileOne()'s own doc comment.
 void ApplyUpdateOnMatterThread(intptr_t context)
 {
-    auto *update = reinterpret_cast<matter_bridge::ModuleUpdate *>(context);
-    gEndpointManager.Apply(*update);
-    delete update;
+    auto *uuid_ctx = reinterpret_cast<matter_bridge::Uuid *>(context);
+    matter_bridge::Uuid module_uuid = *uuid_ctx;
+    delete uuid_ctx;
+
+    std::vector<ingest::NodeState> snapshot = gRegistry.snapshot();
+    std::optional<matter_bridge::ModuleUpdate> update = gBridgeManager->ReconcileOne(snapshot, module_uuid);
+    if (update.has_value()) {
+        matter_bridge::ApplyOutcome outcome = gEndpointManager.Apply(*update);
+        // Only fields outcome actually reports as applied are committed --
+        // see matter_bridge::BridgeManager::CommitApplied()'s own doc
+        // comment: anything that failed here (a setter error, or the
+        // endpoint itself failing to create) is simply left uncommitted, so
+        // the NEXT Reconcile()/ReconcileOne() pass re-diffs and re-emits it
+        // for another attempt -- no separate retry bookkeeping needed here.
+        gBridgeManager->CommitApplied(module_uuid, *update, outcome);
+    }
+    // Whether or not there was anything left to apply (e.g. a uuid that
+    // went offline again before this work item even ran), this work item
+    // has now finished -- release the in-flight gate so a future update for
+    // this uuid can be scheduled again.
+    gBridgeManager->EndSchedule(module_uuid);
 }
 
 void RegistryWatcherThreadMain()
 {
     uint64_t last_seen_generation = 0;
     while (!gStopWatcher.load(std::memory_order_relaxed)) {
-        bool changed = gRegistry.wait_for_change(&last_seen_generation, std::chrono::milliseconds(500));
-        if (!changed) {
-            continue; // bounded wait timed out -- re-check gStopWatcher, never a busy loop
-        }
+        // See this file's own top comment: the return value is
+        // deliberately ignored -- this loop re-processes on every wakeup
+        // AND on every bounded timeout, so a module_uuid TryBeginSchedule()
+        // rate-limited earlier gets retried promptly once its own window
+        // reopens, without needing a brand-new registry change.
+        gRegistry.wait_for_change(&last_seen_generation, std::chrono::milliseconds(250));
 
         std::vector<ingest::NodeState> snapshot = gRegistry.snapshot();
         std::vector<matter_bridge::ModuleUpdate> updates = gBridgeManager->Reconcile(snapshot);
 
         for (auto &update : updates) {
-            auto *heap_update = new matter_bridge::ModuleUpdate(std::move(update));
+            // Urgent: a brand-new endpoint or a Reachable (online<->offline)
+            // transition -- never held back by the SAMPLE-only rate limit
+            // (see matter_bridge::BridgeManager::TryBeginSchedule()'s own
+            // doc comment).
+            bool urgent = update.is_new_endpoint || update.reachable.has_value();
+            if (!gBridgeManager->TryBeginSchedule(update.module_uuid, urgent)) {
+                // Rate-limited (non-urgent, too soon since this uuid's last
+                // schedule) or a work item for this uuid is already in
+                // flight -- NOT a lost update: Reconcile() re-derives the
+                // same (or by-then-newer) diff from the registry on this
+                // loop's next pass, still well under 1s later.
+                continue;
+            }
+
+            auto *uuid_ctx = new matter_bridge::Uuid(update.module_uuid);
             CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork(ApplyUpdateOnMatterThread,
-                                                                           reinterpret_cast<intptr_t>(heap_update));
+                                                                           reinterpret_cast<intptr_t>(uuid_ctx));
             if (err != CHIP_NO_ERROR) {
                 ChipLogError(NotSpecified,
-                            "pogo_matter_bridge: ScheduleWork failed (%" CHIP_ERROR_FORMAT ") -- dropping one module "
-                            "update; it will be re-derived from the next registry change (Power Base resync is "
-                            "at most 5s, see docs/matter-bridge.md)",
+                            "pogo_matter_bridge: ScheduleWork failed (%" CHIP_ERROR_FORMAT ") -- releasing this "
+                            "module_uuid's schedule gate so it is retried on this thread's own next pass (well "
+                            "under 1s later), never left permanently blocked",
                             err.Format());
-                delete heap_update;
+                delete uuid_ctx;
+                gBridgeManager->AbortSchedule(update.module_uuid);
             }
         }
     }

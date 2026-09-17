@@ -82,7 +82,13 @@ public:
     // matter_bridge::ModuleUpdate's own doc comment -- every field here is
     // already pre-deduplicated by BridgeManager, so this function issues
     // exactly one SDK call per present field, never more.
-    void Apply(const matter_bridge::ModuleUpdate &update);
+    //
+    // Returns which of those calls actually succeeded (this pass -- see
+    // matter_bridge::ApplyOutcome's own doc comment): the caller (main.cpp)
+    // feeds this straight into matter_bridge::BridgeManager::CommitApplied()
+    // so a failed SDK call is never silently treated as if it had taken
+    // effect -- the corresponding field simply stays retryable.
+    matter_bridge::ApplyOutcome Apply(const matter_bridge::ModuleUpdate &update);
 
 private:
     struct ModuleEndpoint {
@@ -105,7 +111,11 @@ private:
             pm10;
     };
 
-    void CreateEndpoint(const matter_bridge::ModuleUpdate &update);
+    // Returns true iff the endpoint itself was actually created
+    // (emberAfSetDynamicEndpointWithEpUniqueId() succeeded and the new
+    // ModuleEndpoint was inserted into modules_) -- see Apply()'s own doc
+    // comment for how this feeds matter_bridge::ApplyOutcome::endpoint_created.
+    bool CreateEndpoint(const matter_bridge::ModuleUpdate &update);
 
     std::unordered_map<uint16_t, std::unique_ptr<ModuleEndpoint>> modules_; // keyed by chip::EndpointId
     uint16_t next_ember_index_ = 0;

@@ -134,12 +134,78 @@ correction" section for the full root-cause analysis and fix.
 | `thread_manager_start_as_always_on_ftd_with_dataset()`'s LEAF Kconfig-default resolution (`CONFIG_THREAD_MANAGER_LEAF_DATA_POLL_PERIOD_MS`, 500ms) actually applied via `otLinkSetPollPeriod()` | Code review only (`thread_manager.c` not host-compilable) | Not yet | Verified: real ESP-IDF `module`/`power_base` fullclean builds, zero warnings; the ternary resolving `thread_data_poll_period_ms==0` to the Kconfig default is unchanged in shape from the pre-existing, already-reviewed logic it replaced. |
 | Log wording change (`dropped` -> `delivery unconfirmed`) for both `sensor_transport.c` and `topology_reporter.c` | Yes (`tools/test_sensor_transport_gate_retry.c` asserts the exact new wording; `topology_reporter.c`'s own change verified by code review + build, same reasoning as its timing policy row above) | Not yet | |
 
+## Linux northbound bridge (Power Base -> Linux OTBR host, `components/linux_bridge_exporter`)
+
+| Feature | Host test | Real hardware | Notes |
+|---|---|---|---|
+| TOPOLOGY export (uuid-coalesced queue, current-state-at-drain-time, periodic full resync) | Yes (`tools/test_linux_bridge_exporter.c`, `tools/test_linux_bridge_exporter_timers.c`, `tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | Links the real, unmodified `linux_bridge_exporter.c`/`power_base_transport.c` against a simulated Linux CoAP host (`tools/host_test_stubs/host_pb_bridge_full_sim.c`); no real Linux OTBR host has actually received this component's own CoAP traffic yet. |
+| SAMPLE export (uuid-coalesced pending table, latest-wins, periodic full resync) | Yes (same three files above) | Not yet | Same caveat as TOPOLOGY export above. |
+| CoAP retry policy (2.xx success; 4.xx final, never retried; timeout/OT-error/5.xx bounded retry, shared by TOPOLOGY and SAMPLE) | Yes (`tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | |
+| **This pass**: per-module_uuid SAMPLE export rate limit (`CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`, default 1000ms) -- coalescing to the latest sample, wrap-safe timing, TOPOLOGY unaffected, periodic resync unaffected | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`, links the real, unmodified `linux_bridge_exporter.c`) | Not yet | See "RCP/OTBR fault recovery and transport-load reduction (this pass)" below for what this pass changed and did not change. |
+
+## Linux Matter Bridge (`pogo_matter_bridge`) MVP (see `docs/matter-bridge.md`)
+
+Added in a prior pass (`feat: add Linux Matter Bridge MVP (pogo_matter_bridge) over
+connectedhomeip v1.6.0.0`); this repository's own "explicitly out of scope" table
+below previously still listed Matter Bridge as "Not implemented" -- a stale leftover
+from before that commit, corrected in this pass.
+
+| Feature | Host test | Real hardware | Notes |
+|---|---|---|---|
+| `linux/matter_bridge/ingest` (CoAP ingest server, `Registry::apply_topology()`/`apply_sample()`/`apply_heartbeat()`, generation/sequence ordering, conflict-safe (power_base_uuid, module_uuid) keying) | Yes (`ingest_unit_tests`, `ingest_registry_snapshot_test`, `ingest_loopback_test`, `ingest_ack_transport_static_test` -- all pass via `cmake`+`ctest`, zero warnings) | Not yet | CHIP-SDK-independent; builds and tests with nothing beyond a C++17 compiler + CMake. |
+| `linux/matter_bridge/app/core` (`value_mapping`, `EndpointStore` persistence, `BridgeManager::Reconcile()`/conflict detection/dedup) | Yes (`matter_bridge_core_unit_tests` via `cmake`+`ctest`, zero warnings) | Not yet | Also CHIP-SDK-independent -- see `core/CMakeLists.txt`'s own top comment. |
+| `linux/matter_bridge/app/chip` (`chip_endpoint.cpp`/`main.cpp`, the only files that touch the real Matter SDK) | Partial -- a real `connectedhomeip v1.6.0.0` checkout compiled 449/476 GN targets with `target_os="linux"` on a macOS development sandbox, including every one of this application's own source files; the remaining 5 failures were all genuinely Linux-only headers (`<linux/netlink.h>`, `<linux/ethtool.h>`, `<netpacket/packet.h>`, glibc `fdatasync`) inside connectedhomeip's own `src/platform/Linux/*`, not this application's code -- see `docs/matter-bridge.md` section 14 for the full detail | Not yet | The final Linux-only **link** step, actually running the binary, and `chip-tool` commissioning all still require a real Ubuntu x86_64 host (or container) and have never been attempted. |
+| **This pass**: `BridgeManager::TryBeginSchedule()`/`AbortSchedule()`/`EndSchedule()` (per-uuid Matter-work-item coalescing + rate limit), `CommitApplied()` (commit-only-on-confirmed-success dedup state, replacing the old eager-commit-inside-`Reconcile()` design), `ReconcileOne()` (re-derive from a fresh snapshot at actual apply time), `EndpointStore` internal locking (newly required now that `get_or_assign()` is called from two threads) | Yes (`core/tests/test_bridge_manager.cpp` and `core/tests/test_endpoint_store.cpp`, both extended this pass -- the latter adds a real multi-threaded `get_or_assign()` contention scenario; links the real, unmodified `bridge_manager.cpp`/`endpoint_store.cpp`) | Not yet | This pass re-cloned and re-bootstrapped a real `connectedhomeip v1.6.0.0` checkout and `gn gen` again resolved the identical 6256-target graph, but no Linux cross-compiler was available in this pass's sandbox (unlike the prior pass above), so `ninja` could not compile anything at all this time -- a host-toolchain difference, not a new code finding. `chip_endpoint.cpp`'s new `ApplyOutcome`-returning `Apply()` and `main.cpp`'s rewritten `RegistryWatcherThreadMain()`/`ApplyUpdateOnMatterThread()` were instead verified by manual review against the exact same API shapes the already-compiled pre-existing code used -- see `docs/matter-bridge.md` section 14's own note on this pass. |
+
+## RCP/OTBR fault recovery and transport-load reduction (this pass)
+
+**Real-hardware verified** (reported by the operator for this pass; not reproduced
+inside this session, which had no physical board access):
+
+- Native systemd `Restart=` policy plus `PartOf=otbr-agent.service` applied to the
+  RCP/OTBR service units. With this in place, two consecutive real RCP/OTBR restarts
+  were observed to fully self-recover: `wpan0` came back up, the Matter Bridge
+  (`pogo_matter_bridge`) process restarted and reattached automatically, and Apple
+  Home and Google Home both recovered live sensor values afterward with no manual
+  intervention.
+- The existing connectedhomeip KVS and Matter pairing/fabric state survived both
+  restarts intact -- no re-commissioning was needed.
+
+**Root cause NOT confirmed:**
+
+- The ESP32-H2 RCP's intermittent `RESET_FAULT` (see `docs/otbr-rcp.md`) still has no
+  identified root cause. The systemd auto-recovery above means a `RESET_FAULT`
+  episode is no longer a hands-on incident, but it does **not** mean the fault itself
+  has been fixed or explained -- this pass makes no such claim.
+
+**This pass's own implementation (SAMPLE/Matter-publish transport-load reduction --
+NOT a `RESET_FAULT` fix, tracked as a separate, unrelated change):**
+
+- Power Base -> Linux: `components/linux_bridge_exporter` now sends at most one
+  SAMPLE export per module_uuid per `CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`
+  (default 1000ms), always coalescing to the single latest (seq, value) -- never a
+  replayed backlog. TOPOLOGY events and the periodic full resync are unaffected.
+- Linux Registry -> Matter: `matter_bridge::BridgeManager` now coalesces and
+  rate-limits how often a module_uuid's changes actually reach
+  `chip::DeviceLayer::PlatformMgr().ScheduleWork()`/the Matter SDK (at most one
+  in-flight work item per uuid, and non-urgent SAMPLE-only changes wait at least
+  `BridgeManager::kDefaultSampleUpdateInterval`, 1000ms, between schedule attempts) --
+  a new-endpoint or Reachable/online-offline transition always bypasses that wait.
+- **Explicitly unchanged by this pass**: sensor measurement period, POGO
+  `POLL_CONFIG`, and the Power Base's own internal `sensor_root_aggregator` storage
+  rate/period are all completely untouched -- every sensor sample is still measured
+  and stored at exactly the same rate as before; only how often an
+  ALREADY-CURRENT value is forwarded/published downstream was reduced.
+- Not yet verified on real hardware -- see the per-component host-test rows above.
+  ESP-IDF v6.1 `power_base` fullclean build (zero warnings) and this repository's
+  full host test suite were run this pass; see this pass's own final report for the
+  complete list.
+
 ## Explicitly out of scope (not implemented, not planned this pass)
 
 | Feature | Status |
 |---|---|
 | Deep-sleep | Not implemented. GPIO12 was reserved as a future deep-sleep wake source (see `docs/pogo-interface.md`), but no deep-sleep code exists. |
-| Matter Bridge | Not implemented. |
 | POGO 5V power supply over the POGO connector | Not implemented -- every board is powered independently over USB; `power_enable_gpio` is unconfigured (`power_base_main: power_enable_gpio not configured -- 5V rail assumed always-on`). |
 
 ## Stale claims corrected by this pass

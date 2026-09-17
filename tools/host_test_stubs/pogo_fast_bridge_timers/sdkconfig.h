@@ -51,3 +51,13 @@
  */
 #define CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS 150
 #define CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS 250
+/*
+ * This pass (SAMPLE transport-load reduction): also SHORT on purpose, same
+ * reasoning as the two values directly above -- a real per-uuid SAMPLE
+ * rate-limit test (tools/test_linux_bridge_exporter_rate_limit.c) needs to
+ * actually observe the window reopening in real wall-clock time without a
+ * multi-second sleep. Deliberately still >= one EXPORTER_POLL_TICK_MS
+ * (200ms) so a test can distinguish "still within the window" from "the
+ * window reopened" with a plain sleep_ms() of a similar order.
+ */
+#define CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS 300

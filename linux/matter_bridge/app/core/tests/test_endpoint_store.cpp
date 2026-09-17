@@ -2,14 +2,24 @@
 // SAME endpoint ID for the same module_uuid; different module_uuids get
 // different endpoint IDs) plus corruption handling, against the production
 // matter_bridge::EndpointStore -- see include/matter_bridge/endpoint_store.hpp.
+//
+// This pass (transport-load reduction, Linux Registry -> Matter) also adds
+// a real multi-threaded scenario: matter_bridge::BridgeManager now calls
+// get_or_assign() from BOTH the registry watcher thread and the Matter
+// event-loop thread (see bridge_manager.hpp's own top comment), so
+// EndpointStore itself must be safe under real concurrent access -- see
+// that scenario below.
 #include "matter_bridge/endpoint_store.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "test_check.hpp"
 
@@ -133,5 +143,83 @@ void RunEndpointStoreTests(int *failures)
         auto overflow = store.get_or_assign(make_uuid(0xFE));
         MB_CHECK(!overflow.has_value(), "a brand-new uuid past capacity is refused, not silently overwriting an "
                                           "existing entry");
+    }
+
+    printf("\n-- scenario (this pass): real concurrent get_or_assign() calls from multiple threads for a MIX of "
+           "brand-new and already-assigned uuids never produce a duplicate endpoint id, a lost assignment, or a "
+           "crash -- this is exactly the pattern matter_bridge::BridgeManager now exercises (registry watcher "
+           "thread + Matter event-loop thread both calling into the SAME EndpointStore) --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+
+        constexpr int kThreads = 6;
+        constexpr int kUuidsPerThread = 16; // half distinct, half the shared uuid -- see below
+        static_assert(kThreads * (kUuidsPerThread / 2) + 1 <= (int)EndpointStore::kMaxEndpoints,
+                      "this scenario's own uuid budget (distinct uuids + 1 shared) must stay under capacity, or "
+                      "the 'every call succeeds' assertion below would be testing capacity-exhaustion behavior "
+                      "instead of concurrency safety");
+        // Every thread also repeatedly re-requests uuid 0x00 (shared across
+        // all threads) to specifically stress the "already assigned"
+        // fast path under real contention, not just first-assignment.
+        std::vector<std::thread> threads;
+        std::vector<std::vector<std::optional<uint16_t>>> results(kThreads);
+        for (int t = 0; t < kThreads; t++) {
+            results[t].resize(kUuidsPerThread);
+            threads.emplace_back([&store, &results, t]() {
+                for (int i = 0; i < kUuidsPerThread; i++) {
+                    Uuid u = make_uuid(0x00);
+                    if (i % 2 == 1) {
+                        // Distinct per (thread, i) -- avoids the shared
+                        // uuid 0x00 for odd indices so this also exercises
+                        // genuinely new concurrent first-assignments.
+                        u = make_uuid((uint8_t)(1 + t * kUuidsPerThread + i));
+                    }
+                    results[t][i] = store.get_or_assign(u);
+                }
+            });
+        }
+        for (auto &th : threads) {
+            th.join();
+        }
+
+        bool all_succeeded = true;
+        std::set<uint16_t> distinct_ids;
+        std::optional<uint16_t> shared_id;
+        bool shared_id_consistent = true;
+        for (int t = 0; t < kThreads; t++) {
+            for (int i = 0; i < kUuidsPerThread; i++) {
+                if (!results[t][i].has_value()) {
+                    all_succeeded = false;
+                    continue;
+                }
+                if (i % 2 == 1) {
+                    distinct_ids.insert(*results[t][i]);
+                } else {
+                    if (!shared_id.has_value()) {
+                        shared_id = results[t][i];
+                    } else if (*shared_id != *results[t][i]) {
+                        shared_id_consistent = false;
+                    }
+                }
+            }
+        }
+        MB_CHECK(all_succeeded, "every concurrent get_or_assign() call succeeded (well under kMaxEndpoints "
+                                  "capacity) -- no call was lost or crashed under real thread contention");
+        MB_CHECK(shared_id_consistent, "every thread's concurrent request for the SAME shared uuid (0x00) "
+                                         "resolved to the exact same endpoint id -- no two threads ever raced "
+                                         "each other into assigning it two different ids");
+        MB_CHECK((int)distinct_ids.size() == kThreads * (kUuidsPerThread / 2),
+                 "every genuinely distinct uuid requested concurrently got its own distinct endpoint id -- no "
+                 "duplicate id was ever handed out to two different uuids under contention");
+
+        // A fresh reload from disk must agree with everything the threads
+        // above actually observed -- proves persist_locked()'s own
+        // durability guarantee held even under concurrent writers.
+        EndpointStore reopened(dir);
+        MB_CHECK(reopened.load() == LoadResult::Ok, "the file persisted under concurrent access reloads cleanly");
+        MB_CHECK(reopened.lookup(make_uuid(0x00)) == shared_id,
+                 "the reloaded store agrees with the shared uuid's endpoint id every thread observed");
     }
 }

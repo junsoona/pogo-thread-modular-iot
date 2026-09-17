@@ -6,11 +6,30 @@
 // include/matter_bridge/bridge_manager.hpp. Builds ingest::NodeState values
 // directly (no sockets, no wire pack/unpack) since BridgeManager only ever
 // consumes an already-decoded ingest::Registry::snapshot().
+//
+// This pass (transport-load reduction, Linux Registry -> Matter):
+// Reconcile() no longer commits what it computes into BridgeManager's own
+// dedup state by itself -- that now only happens via an explicit
+// CommitApplied() call once a caller has ACTUALLY applied the update to the
+// real Matter SDK (see bridge_manager.hpp's own top comment for why). Since
+// this test drives BridgeManager directly, with no real Matter SDK or
+// Matter event-loop thread in the loop at all, every scenario below that
+// depends on a PRIOR update having taken effect calls the commit_all()
+// helper right after Reconcile() to simulate "every field of that update
+// was applied successfully" -- i.e. it reproduces the exact same observable
+// sequence the old eager-commit Reconcile() used to produce, but now via
+// the two real, separate production calls a real ScheduleWork() callback
+// would make. Scenarios that specifically exercise a FAILED/uncommitted
+// apply are new this pass (see "a failed apply leaves the latest state
+// retryable" below) and could not have been expressed against the old
+// single-call design at all.
 #include "matter_bridge/bridge_manager.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -20,6 +39,7 @@ extern "C" {
 
 #include "test_check.hpp"
 
+using matter_bridge::ApplyOutcome;
 using matter_bridge::BridgeManager;
 using matter_bridge::EndpointStore;
 using matter_bridge::Measurement;
@@ -33,6 +53,30 @@ Uuid make_uuid(uint8_t tag)
     Uuid u{};
     u.fill(tag);
     return u;
+}
+
+// Simulates a fully-successful real-Matter-SDK application of `u` (every
+// field it carries actually reached Matter) and commits it -- see this
+// file's own top comment.
+void commit_success(BridgeManager &mgr, const ModuleUpdate &u)
+{
+    ApplyOutcome outcome;
+    outcome.endpoint_created = u.is_new_endpoint;
+    outcome.reachable_applied = u.reachable.has_value();
+    outcome.temperature_applied = u.temperature.has_value();
+    outcome.humidity_applied = u.humidity.has_value();
+    outcome.pm1_applied = u.pm1.has_value();
+    outcome.pm25_applied = u.pm25.has_value();
+    outcome.pm10_applied = u.pm10.has_value();
+    mgr.CommitApplied(u.module_uuid, u, outcome);
+}
+
+// Same as commit_success(), applied to every update in `updates`.
+void commit_all_success(BridgeManager &mgr, const std::vector<ModuleUpdate> &updates)
+{
+    for (const auto &u : updates) {
+        commit_success(mgr, u);
+    }
 }
 
 std::string make_temp_dir()
@@ -111,6 +155,7 @@ void RunBridgeManagerTests(int *failures)
         auto node = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
         auto first = mgr.Reconcile({node});
         MB_CHECK(first.size() == 1, "the first reconcile produces one update");
+        commit_all_success(mgr, first);
 
         auto second = mgr.Reconcile({node});
         MB_CHECK(second.empty(), "reconciling the identical snapshot again produces zero updates -- nothing "
@@ -128,6 +173,7 @@ void RunBridgeManagerTests(int *failures)
         auto node1 = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
         auto first = mgr.Reconcile({node1});
         uint16_t ep = first[0].endpoint_id;
+        commit_all_success(mgr, first);
 
         auto node2 = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(22000)});
         auto second = mgr.Reconcile({node2});
@@ -148,7 +194,7 @@ void RunBridgeManagerTests(int *failures)
         BridgeManager mgr(store);
 
         auto good = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
-        mgr.Reconcile({good});
+        commit_all_success(mgr, mgr.Reconcile({good}));
 
         auto bad = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456, SENSOR_CHANNEL_STATUS_CRC_ERROR)});
         auto updates = mgr.Reconcile({bad});
@@ -168,6 +214,7 @@ void RunBridgeManagerTests(int *failures)
         auto online = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
         auto first = mgr.Reconcile({online});
         uint16_t ep = first[0].endpoint_id;
+        commit_all_success(mgr, first);
 
         auto offline = make_node(0xB0, 0x01, false, sht45_bitmap(), true, {temp_channel(21456)});
         auto detach_update = mgr.Reconcile({offline});
@@ -178,6 +225,7 @@ void RunBridgeManagerTests(int *failures)
                                                               "endpoint's last-known reading is simply left alone, "
                                                               "per docs/matter-bridge.md)");
         MB_CHECK(detach_update[0].endpoint_id == ep, "the endpoint id survives a detach");
+        commit_all_success(mgr, detach_update);
 
         auto reattach = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
         auto reattach_update = mgr.Reconcile({reattach});
@@ -251,5 +299,155 @@ void RunBridgeManagerTests(int *failures)
                                         "Matter while it was conflicted)");
         MB_CHECK(resolved[0].reachable.has_value() && *resolved[0].reachable == true,
                  "the resolved update reflects the surviving online source (pb1)");
+    }
+
+    printf("\n-- scenario (this pass): a failed apply leaves the latest state retryable -- CommitApplied() with "
+           "nothing marked as applied commits NOTHING, so the next Reconcile() still sees (and re-emits) the "
+           "exact same diff --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        auto node = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
+        auto first = mgr.Reconcile({node});
+        MB_CHECK(first.size() == 1 && first[0].is_new_endpoint, "setup: the first update is a new endpoint");
+
+        ApplyOutcome all_failed; // every field defaults to false -- nothing applied
+        mgr.CommitApplied(first[0].module_uuid, first[0], all_failed);
+
+        auto retry = mgr.Reconcile({node});
+        MB_CHECK(retry.size() == 1 && retry[0].is_new_endpoint,
+                 "since endpoint creation was never confirmed to have succeeded, the retry is STILL treated as a "
+                 "new endpoint, with the same full ModuleUpdate as before -- nothing was silently dropped");
+        MB_CHECK(retry[0].endpoint_id == first[0].endpoint_id,
+                 "the endpoint id itself is stable across the retry (EndpointStore's own persistence is "
+                 "independent of whether the Matter apply succeeded)");
+
+        // Now simulate: the endpoint creation + Reachable succeed, but the
+        // temperature setter itself fails.
+        ApplyOutcome partial;
+        partial.endpoint_created = true;
+        partial.reachable_applied = true;
+        partial.temperature_applied = false;
+        mgr.CommitApplied(retry[0].module_uuid, retry[0], partial);
+
+        auto after_partial = mgr.Reconcile({node});
+        MB_CHECK(after_partial.size() == 1, "with temperature still not committed, a further reconcile still "
+                                              "reports a pending change");
+        MB_CHECK(!after_partial[0].is_new_endpoint, "endpoint creation itself WAS committed, so this is correctly "
+                                                      "no longer treated as new");
+        MB_CHECK(!after_partial[0].reachable.has_value(), "Reachable WAS committed -- not re-emitted");
+        MB_CHECK(after_partial[0].temperature.has_value() && after_partial[0].temperature->value == 2146,
+                 "temperature was NOT committed (the setter failed) -- it is re-emitted for retry, still carrying "
+                 "the correct value");
+
+        ApplyOutcome temp_now_ok;
+        temp_now_ok.temperature_applied = true;
+        mgr.CommitApplied(after_partial[0].module_uuid, after_partial[0], temp_now_ok);
+        auto settled = mgr.Reconcile({node});
+        MB_CHECK(settled.empty(), "once temperature is finally committed too, the module has nothing left to "
+                                    "retry");
+    }
+
+    printf("\n-- scenario (this pass): TryBeginSchedule()/EndSchedule() enforce at most one in-flight Matter work "
+           "item per uuid, and gate non-urgent (SAMPLE-only) scheduling to the given min_interval, while an "
+           "urgent (new-endpoint/Reachable) update always bypasses the time gate --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        Uuid u = make_uuid(0x77);
+        auto fast_interval = std::chrono::milliseconds(60);
+
+        MB_CHECK(mgr.TryBeginSchedule(u, /*urgent=*/false, fast_interval),
+                 "a uuid never scheduled before is allowed immediately even when not urgent (this repo's own "
+                 "'first valid snapshot applies without waiting' requirement)");
+        MB_CHECK(!mgr.TryBeginSchedule(u, /*urgent=*/false, fast_interval),
+                 "while that work item is still in flight, a second non-urgent attempt for the SAME uuid is "
+                 "refused -- at most one pending Matter work item per uuid");
+        MB_CHECK(!mgr.TryBeginSchedule(u, /*urgent=*/true, fast_interval),
+                 "even an URGENT attempt is refused while a work item for this uuid is already in flight -- the "
+                 "single-in-flight-per-uuid cap is a concurrency-safety rule, not a rate limit, and applies "
+                 "regardless of urgency");
+
+        mgr.EndSchedule(u); // the in-flight work item "finishes"
+        MB_CHECK(!mgr.TryBeginSchedule(u, /*urgent=*/false, fast_interval),
+                 "immediately after finishing, a NON-URGENT attempt is still refused -- less than min_interval "
+                 "has elapsed since the last successful schedule");
+        MB_CHECK(mgr.TryBeginSchedule(u, /*urgent=*/true, fast_interval),
+                 "but an URGENT attempt (e.g. this uuid just went offline) is allowed right away -- urgent "
+                 "updates are never held back by the SAMPLE rate limit");
+        mgr.EndSchedule(u);
+
+        std::this_thread::sleep_for(fast_interval + std::chrono::milliseconds(20));
+        MB_CHECK(mgr.TryBeginSchedule(u, /*urgent=*/false, fast_interval),
+                 "once min_interval has genuinely elapsed, a non-urgent attempt is allowed again -- a rolling "
+                 "window, never a permanent stall");
+        mgr.EndSchedule(u);
+
+        Uuid other = make_uuid(0x78);
+        MB_CHECK(mgr.TryBeginSchedule(other, /*urgent=*/false, fast_interval),
+                 "a DIFFERENT uuid's own gate is completely independent -- never affected by uuid 0x77's own "
+                 "in-flight/rate-limit state");
+        mgr.EndSchedule(other);
+    }
+
+    printf("\n-- scenario (this pass): AbortSchedule() releases the in-flight gate immediately after a "
+           "synchronous ScheduleWork()-equivalent failure, so the uuid is not left permanently blocked --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        Uuid u = make_uuid(0x79);
+        MB_CHECK(mgr.TryBeginSchedule(u, /*urgent=*/true, std::chrono::milliseconds(1)),
+                 "setup: the first attempt begins scheduling");
+        mgr.AbortSchedule(u); // simulates ScheduleWork() itself returning an error synchronously
+        MB_CHECK(mgr.TryBeginSchedule(u, /*urgent=*/true, std::chrono::milliseconds(1)),
+                 "after AbortSchedule(), the gate is open again immediately -- a failed enqueue never permanently "
+                 "blocks this uuid");
+        mgr.EndSchedule(u);
+    }
+
+    printf("\n-- scenario (this pass): ReconcileOne() re-derives from whatever snapshot it is given at call time "
+           "-- a work item that executes against a FRESHER (now-offline) snapshot than whatever was current when "
+           "it was scheduled correctly reflects the offline state, never a stale 'online' from an earlier sample "
+           "--\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        Uuid u = make_uuid(0x7A);
+        auto online_node = make_node(0xB0, 0x7A, true, sht45_bitmap(), true, {temp_channel(21000)});
+        commit_all_success(mgr, mgr.Reconcile({online_node}));
+
+        // A sample-triggered ModuleUpdate would have been computed against
+        // this (now-stale) online snapshot if the caller had reused it --
+        // but production code (chip/main.cpp's own ApplyUpdateOnMatterThread())
+        // always re-takes registry.snapshot() at execution time instead, so
+        // this test exercises exactly that: ReconcileOne() is given a
+        // DIFFERENT, fresher snapshot (module went offline in the meantime)
+        // at "execution time".
+        auto offline_node = make_node(0xB0, 0x7A, false, sht45_bitmap(), true, {temp_channel(21000)});
+        auto update = mgr.ReconcileOne({offline_node}, u);
+        MB_CHECK(update.has_value(), "ReconcileOne() produces an update against the FRESH (offline) snapshot");
+        MB_CHECK(update->reachable.has_value() && *update->reachable == false,
+                 "the update reflects Reachable=false from the fresh snapshot -- never a stale 'online' state "
+                 "from whenever the work item was originally scheduled");
+        MB_CHECK(!update->temperature.has_value(), "no stale temperature value is pushed while offline either");
+
+        // A uuid no longer present in the given snapshot at all (e.g. it
+        // aged out) simply yields no update -- never a crash or a stale
+        // reapplication.
+        Uuid gone = make_uuid(0x7B);
+        auto none = mgr.ReconcileOne({offline_node}, gone);
+        MB_CHECK(!none.has_value(), "ReconcileOne() for a uuid absent from the given snapshot returns no update");
     }
 }

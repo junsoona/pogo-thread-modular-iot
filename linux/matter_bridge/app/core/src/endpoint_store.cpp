@@ -57,6 +57,7 @@ std::string EndpointStore::path() const
 
 LoadResult EndpointStore::load()
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
     loaded_ = true;
 
@@ -208,6 +209,7 @@ bool EndpointStore::persist_locked() const
 
 std::optional<uint16_t> EndpointStore::get_or_assign(const Uuid &module_uuid)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &e : entries_) {
         if (e.uuid == module_uuid) {
             return e.endpoint_id;
@@ -235,6 +237,7 @@ std::optional<uint16_t> EndpointStore::get_or_assign(const Uuid &module_uuid)
 
 std::optional<uint16_t> EndpointStore::lookup(const Uuid &module_uuid) const
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &e : entries_) {
         if (e.uuid == module_uuid) {
             return e.endpoint_id;
@@ -245,6 +248,7 @@ std::optional<uint16_t> EndpointStore::lookup(const Uuid &module_uuid) const
 
 std::optional<Uuid> EndpointStore::reverse_lookup(uint16_t endpoint_id) const
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &e : entries_) {
         if (e.endpoint_id == endpoint_id) {
             return e.uuid;

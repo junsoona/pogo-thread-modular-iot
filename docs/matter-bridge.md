@@ -256,20 +256,30 @@ detail):
 
 1. **CoAP receive thread** -- `ingest::run_server()`, completely
    unmodified, calls only `ingest::Registry::apply_*()`. Never touches the
-   Matter SDK.
-2. **Registry watcher thread** -- blocks on
-   `ingest::Registry::wait_for_change()` (a `condition_variable` wait,
-   never a busy/polling loop), takes a `snapshot()`, and runs
-   `matter_bridge::BridgeManager::Reconcile()` on it (pure, CHIP-SDK-free
-   logic). Every resulting `ModuleUpdate` is hex-boxed onto the heap and
-   handed to `chip::DeviceLayer::PlatformMgr().ScheduleWork()` -- this
+   Matter SDK. Every valid incoming SAMPLE/TOPOLOGY_SNAPSHOT/HEARTBEAT is
+   still applied to the registry immediately, at whatever rate it arrives
+   -- see section 9.1 below for what changed and what deliberately did not.
+2. **Registry watcher thread** -- polls
+   `ingest::Registry::wait_for_change()` on a bounded 250ms timeout (never
+   a busy loop, but no longer parked indefinitely either -- see 9.1), takes
+   a `snapshot()`, and runs `matter_bridge::BridgeManager::Reconcile()` on
+   it (pure, CHIP-SDK-free logic, and -- this pass -- a pure READ against
+   `BridgeManager`'s own dedup state, never a mutation; see 9.1). For each
+   resulting `ModuleUpdate`, `BridgeManager::TryBeginSchedule()` decides
+   whether to actually schedule work this round; only a module_uuid it
+   admits gets its uuid (not the `ModuleUpdate` itself) boxed onto the heap
+   and handed to `chip::DeviceLayer::PlatformMgr().ScheduleWork()`. This
    thread **never** calls into the Matter SDK directly, and never holds
    the registry's mutex while doing anything other than copying data out
    (see `ingest/registry.hpp`'s own top comment).
 3. **Matter event-loop thread** (`ChipLinuxAppMainLoop()`) -- the only
-   thread that ever touches a real Matter cluster object, via
-   `ChipEndpointManager::Apply()` called from the `ScheduleWork()`
-   callback.
+   thread that ever touches a real Matter cluster object. The
+   `ScheduleWork()` callback (`ApplyUpdateOnMatterThread()`) re-reads
+   `ingest::Registry::snapshot()` itself, right there, and calls
+   `BridgeManager::ReconcileOne()` to re-derive the update fresh -- never
+   reusing whatever `ModuleUpdate` the registry watcher thread originally
+   saw -- before calling `ChipEndpointManager::Apply()` and reporting the
+   real per-field outcome back via `BridgeManager::CommitApplied()`.
 
 Shutdown is cooperative: connectedhomeip's own `AppMain.cpp` owns
 SIGINT/SIGTERM (it blocks those signals in every other thread, including
@@ -278,6 +288,65 @@ teardown; that hook only flips two atomics, and `main()` joins both of
 this program's threads *after* `ChipLinuxAppMainLoop()` returns -- no
 signal handler of this application's own, and no blocking call inside the
 shutdown hook itself.
+
+### 9.1 SAMPLE -> Matter publish rate limit (transport-load reduction pass)
+
+This pass reduces how often this bridge actually calls into the Matter SDK
+per module_uuid, without changing the ingest Registry's own semantics at
+all:
+
+- `ingest::Registry::apply_*()` is **unchanged** -- every valid incoming
+  SAMPLE/TOPOLOGY_SNAPSHOT/HEARTBEAT is still applied immediately, at
+  whatever rate the Power Base -> Linux exporter actually sends it (see
+  `components/linux_bridge_exporter`'s own Kconfig/top-of-file comment for
+  that side's own new per-uuid send-rate limit -- a separate mechanism one
+  hop upstream of this one).
+- What changed is purely how often the registry watcher thread turns a
+  registry change into a `ScheduleWork()` call:
+  `matter_bridge::BridgeManager::TryBeginSchedule(module_uuid, urgent)`
+  allows **at most one in-flight Matter work item per module_uuid**, and,
+  for a **non-urgent** update (a SAMPLE-value-only change -- no new
+  endpoint, no Reachable/online-offline transition), additionally requires
+  at least `BridgeManager::kDefaultSampleUpdateInterval` (1000ms) since
+  that uuid's own last scheduled attempt. A brand-new endpoint or a
+  Reachable transition is always `urgent` and bypasses that 1000ms gate
+  entirely -- it can still see the (much smaller, unavoidable)
+  single-in-flight delay, which exists only to stop two concurrent
+  applications for the same endpoint from racing, never to throttle
+  anything.
+- A module_uuid `TryBeginSchedule()` declines this round is never a lost
+  update: `Reconcile()` simply re-derives the same (or by-then-newer) diff
+  against the registry on the watcher thread's next ~250ms pass, and once
+  the gate opens, whatever is CURRENT at that moment is what gets scheduled
+  -- never a queued backlog of older values (there is nothing to queue:
+  `Reconcile()`/`ReconcileOne()` always re-read the registry fresh).
+- `BridgeManager::CommitApplied()` -- new this pass -- is the only thing
+  that ever advances `BridgeManager`'s own last-applied dedup state, and
+  only for the specific fields `ChipEndpointManager::Apply()`'s returned
+  `ApplyOutcome` reports as having actually succeeded against the real SDK.
+  `Reconcile()` itself no longer mutates that state (it used to, eagerly,
+  before this pass) -- a failed `ScheduleWork()` call (see
+  `BridgeManager::AbortSchedule()`) or a failed `SetMeasuredValue()`/
+  endpoint-creation call simply leaves the corresponding field's
+  last-applied value untouched, so the very next `Reconcile()`/
+  `ReconcileOne()` pass re-emits it for another attempt -- no separate
+  retry bookkeeping was added; the existing diff-against-last-applied
+  mechanism already does this once mutation only happens on confirmed
+  success.
+- A brand-new process's first valid snapshot for a module_uuid is always
+  `is_new_endpoint` (hence `urgent`) and is therefore never delayed by this
+  gate, matching the firmware-side exporter's own "first snapshot after
+  restart applies immediately" policy.
+- No deadband was added: any genuinely different Temperature/Humidity/
+  Pm1/Pm25/Pm10 value is still pushed the next time the gate allows it,
+  exactly as before -- this pass only changes *when* an already-decided
+  change is allowed to reach the SDK, never *whether* it eventually does.
+- Covered by `core/tests/test_bridge_manager.cpp` (`TryBeginSchedule()`/
+  `EndSchedule()`/`AbortSchedule()` gating, `CommitApplied()`'s
+  retry-on-failure behavior, and `ReconcileOne()` re-deriving from a
+  fresher snapshot than whatever was current at schedule time). Not yet
+  re-verified against the real Matter SDK/hardware -- see
+  `docs/validation-status.md`.
 
 ## 10. Matter SDK pin
 
@@ -456,6 +525,29 @@ see `linux/matter_bridge/ingest/CMakeLists.txt`'s own top comment):
   `core/tests/test_endpoint_store.cpp`, but not through a real Matter
   commissioning session).
 - Apple Home compatibility of any kind -- not attempted, not claimed.
+
+**This pass's own attempt (SAMPLE/Matter-publish transport-load reduction --
+`chip_endpoint.cpp`/`main.cpp`/`core/*` changes described in section 9.1):** a
+fresh `connectedhomeip v1.6.0.0` checkout was cloned and bootstrapped again in
+this pass's own sandbox (same macOS development machine as the prior pass
+above), and `gn gen` again resolved the identical 6256-target dependency graph
+with `target_os="linux"` -- but this time, no Linux cross-compiler
+(`aarch64-linux-gnu-g++`/`aarch64-linux-gnu-clang++`) was available in this
+sandbox at all (not even with `is_clang=true`), so `ninja` could not compile
+**any** object in the graph, including files this pass did not touch --
+this is a pure host-toolchain-availability difference from the prior pass
+(which apparently had such a cross-toolchain available), not a regression or
+a new finding about this pass's own code. This pass's `chip_endpoint.cpp`/
+`main.cpp` changes were therefore verified only by careful manual review
+against the exact same connectedhomeip v1.6.0.0 API shapes the
+already-compiled pre-existing code in this file used (same `Cluster()`
+accessor pattern, same `SetMeasuredValue()`/`SetReachable()`/`ScheduleWork()`
+call sites -- only their return values and calling convention changed, no
+new API surface was introduced) plus the exhaustive `core/tests/test_bridge_manager.cpp`
+coverage of the underlying `BridgeManager` logic those two files call into.
+A real cross-toolchain-equipped (or native Linux) re-run of `ninja -k`
+against these exact two files is the top recommended follow-up before
+deploying this pass's Matter-side change.
 
 ## 15. Test coverage summary
 

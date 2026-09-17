@@ -80,3 +80,13 @@
  */
 #define CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS 5000
 #define CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS 10000
+/*
+ * This pass (SAMPLE transport-load reduction): matches the real production
+ * Kconfig default (1000ms) exactly, same reasoning as the resync/heartbeat
+ * values directly above -- tools/test_linux_bridge_exporter.c's exact
+ * send-count-delta assertions run well under 1s per scenario, so this never
+ * perturbs them. tools/test_linux_bridge_exporter_rate_limit.c (this pass)
+ * uses the SHORT pogo_fast_bridge_timers stub instead, same convention as
+ * the resync/heartbeat timer test.
+ */
+#define CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS 1000

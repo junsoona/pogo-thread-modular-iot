@@ -95,6 +95,31 @@
  *      stops a normal 4.xx rejection from being mis-logged as "delivery
  *      unconfirmed" (that phrase is now reserved for an actually-exhausted
  *      transient-failure retry budget).
+ *
+ * Per-uuid SAMPLE export rate limit (this pass -- transport-load reduction,
+ * Power Base -> Linux -> Matter controller data path): drain_pending_samples()
+ * now additionally gates each slot on its own next_send_allowed_tick (default
+ * CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS = 1000ms between two
+ * actual SAMPLE sends for the SAME module_uuid). This is a pure send-frequency
+ * cap layered on top of the pre-existing coalescing table -- sensor
+ * measurement period, POGO POLL_CONFIG, and Power Base aggregator storage
+ * rate are completely unchanged; s_pending_samples already always coalesces
+ * to the single latest (seq, value) per uuid (upsert, never append), so a
+ * rate-limited slot simply waits, still holding only ever the latest sample,
+ * until its window reopens -- never a FIFO replay of older values. TOPOLOGY
+ * events (this file's own s_topology_queue/s_topology_pending_*, ATTACHED/
+ * UPDATED/DETACHED/OFFLINE and parent-state changes) are completely
+ * unaffected by this gate -- they are still sent as soon as
+ * exporter_task()'s own queue drain reaches them, same as before this pass.
+ * The periodic full TOPOLOGY+SAMPLE resync (do_full_topology_resync()/
+ * do_full_sample_resync(), CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
+ * far longer than this gate by default) also bypasses this per-uuid gate
+ * entirely and unconditionally re-sends every node's current state -- it is
+ * a distinct, already-existing recovery mechanism, not something this pass
+ * needed to change. Existing CoAP retry policy (2.xx success, 4.xx never
+ * retried, timeout/OT-error/5.xx bounded retry) is completely unchanged by
+ * this gate -- rate limiting only decides WHEN a send is dispatched, never
+ * how a dispatched send's own outcome is handled.
  */
 #include "linux_bridge_exporter/linux_bridge_exporter.h"
 
@@ -210,6 +235,23 @@ typedef struct {
     bool dirty;  /* has NOT been exported since the last upsert -- needs (re-)sending */
     uint8_t module_uuid[SENSOR_UUID_LEN];
     sensor_sample_t sample;
+    /*
+     * Per-uuid SAMPLE export rate limit (this pass -- transport-load
+     * reduction, Power Base -> Linux): the earliest tick at which the NEXT
+     * SAMPLE export for this uuid may actually be sent. Zero-initialized,
+     * meaning "no prior send -- allowed immediately" (see
+     * drain_pending_samples()'s wrap-safe comparison below; tick 0 is
+     * indistinguishable from "never sent" only at the very first instant
+     * after boot, which is itself still correctly "allowed"). Stamped to
+     * `now + CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS` the moment
+     * a send for this uuid is actually DISPATCHED (not when it completes),
+     * so a slow bounded-retry send cannot itself be immediately followed by
+     * another one. This caps SEND FREQUENCY only -- sensor measurement,
+     * Power Base aggregator storage, and registry/dirty tracking above are
+     * all still driven at their existing rates; only how often the
+     * already-current latest value is mirrored to Linux is limited.
+     */
+    TickType_t next_send_allowed_tick;
 } pending_sample_slot_t;
 
 static uint8_t s_power_base_uuid[TOPOLOGY_UUID_LEN];
@@ -636,19 +678,42 @@ static void upsert_pending_sample(const sensor_sample_t *sample)
     xSemaphoreGive(s_pending_samples_mutex);
 }
 
-/* Sends every currently-dirty pending sample (clearing dirty as it goes)
- * and returns. Called once per exporter_task() loop iteration -- bounded
- * (PENDING_SAMPLES_MAX slots), never blocks on anything but its own short
- * mutex per slot. */
+/*
+ * Sends every currently-dirty pending sample that is ALSO past its own
+ * per-uuid rate-limit window (clearing dirty and re-stamping
+ * next_send_allowed_tick as it goes), and returns. Called once per
+ * exporter_task() loop iteration -- bounded (PENDING_SAMPLES_MAX slots),
+ * never blocks on anything but its own short mutex per slot.
+ *
+ * A dirty slot still inside its rate-limit window is left exactly as-is
+ * (dirty stays true, sample untouched) -- it is neither sent now nor
+ * dropped; the NEXT loop iteration that finds it both dirty and past its
+ * window sends it, always with whatever is the CURRENT (possibly further
+ * updated by upsert_pending_sample() in the meantime) sample content at
+ * that moment. This is the same "latest wins, no FIFO replay" coalescing
+ * behavior this table already had, now also gated on time -- a rate-limited
+ * slot is never a source-of-truth loss (the aggregator already has the
+ * value, and the periodic full sample resync -- itself independent of this
+ * per-uuid gate -- converges Linux regardless).
+ *
+ * Wrap-safe comparison (this pass): `(int32_t)(now - deadline) >= 0`, the
+ * same idiom already used elsewhere in this codebase (e.g.
+ * components/pogo_port/pogo_port.c) for a TickType_t (unsigned, wraps) that
+ * must still compare correctly across a wraparound boundary.
+ */
 static void drain_pending_samples(void)
 {
+    TickType_t now = xTaskGetTickCount();
+    TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS);
     for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
         sensor_sample_t sample;
         bool need_send = false;
         if (xSemaphoreTake(s_pending_samples_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (s_pending_samples[i].valid && s_pending_samples[i].dirty) {
+            if (s_pending_samples[i].valid && s_pending_samples[i].dirty &&
+                (int32_t)(now - s_pending_samples[i].next_send_allowed_tick) >= 0) {
                 sample = s_pending_samples[i].sample;
                 s_pending_samples[i].dirty = false;
+                s_pending_samples[i].next_send_allowed_tick = now + interval_ticks;
                 need_send = true;
             }
             xSemaphoreGive(s_pending_samples_mutex);
@@ -804,10 +869,11 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     power_base_transport_set_bridge_observer(&observer);
 
     ESP_LOGI(TAG, "linux bridge exporter ready: resources='/%s','/%s','/%s' port=%u topology_queue_len=%d "
-                  "pending_samples_max=%d resync_interval_ms=%u heartbeat_interval_ms=%u (host address never "
-                  "logged)",
+                  "pending_samples_max=%d resync_interval_ms=%u heartbeat_interval_ms=%u "
+                  "sample_min_interval_ms=%u (host address never logged)",
              URI_SAMPLE, URI_TOPOLOGY, URI_HEARTBEAT, (unsigned)s_host_port, CONFIG_LINUX_BRIDGE_EXPORTER_QUEUE_LEN,
              PENDING_SAMPLES_MAX, (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
-             (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS);
+             (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS,
+             (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS);
     return ESP_OK;
 }

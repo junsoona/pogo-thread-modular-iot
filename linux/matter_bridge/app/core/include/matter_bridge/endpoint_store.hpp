@@ -10,9 +10,19 @@
 // CHIP-SDK-independent on purpose (see value_mapping.hpp's own top comment
 // for why linux/matter_bridge/app/core/ has zero connectedhomeip
 // dependency) -- linux/matter_bridge/app/chip/ is the only caller.
+//
+// Thread-safe (this pass -- transport-load reduction, Linux Registry ->
+// Matter): matter_bridge::BridgeManager now calls get_or_assign() from BOTH
+// the registry watcher thread (via Reconcile()) and the Matter event-loop
+// thread (via ReconcileOne(), see bridge_manager.hpp's own top comment),
+// so this class guards its own entries_ with mutex_ rather than relying on
+// a caller-side lock -- load() is the only method a caller must still only
+// ever call once, before any concurrent access begins (see its own doc
+// comment).
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -79,7 +89,11 @@ public:
     std::optional<uint16_t> lookup(const Uuid &module_uuid) const;
     std::optional<Uuid> reverse_lookup(uint16_t endpoint_id) const;
 
-    size_t size() const { return entries_.size(); }
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return entries_.size();
+    }
 
 private:
     struct Entry {
@@ -88,6 +102,7 @@ private:
     };
 
     std::string state_dir_;
+    mutable std::mutex mutex_;
     std::vector<Entry> entries_;
     bool loaded_ = false;
 
