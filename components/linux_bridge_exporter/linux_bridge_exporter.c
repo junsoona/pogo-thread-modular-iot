@@ -60,6 +60,41 @@
  * but the same stale-callback guard is kept anyway: a late callback for an
  * attempt this task's own bounded wait already gave up on must still never
  * corrupt a LATER attempt's result).
+ *
+ * Real-hardware finding (this follow-up's correction pass, stale TOPOLOGY
+ * backlog): while Linux ingest was down, real Power Base topology events
+ * kept piling up in s_topology_queue; on restart, the periodic full
+ * TOPOLOGY resync applied the CURRENT (newest) state, but the FIFO then
+ * went on to drain its stale backlog of OLDER snapshots for the same
+ * uuid(s) right after -- each one rejected by Linux ingest's own
+ * generation/sequence check as CoAP 4.12 stale_session, which `transmit()`
+ * used to retry 3 times like any other failure, producing pointless
+ * retries/log noise for a rejection that was never going to succeed no
+ * matter how many times the same stale payload was resent. Fixed two ways:
+ *
+ *   1. The queue itself no longer carries a topology SNAPSHOT at all --
+ *      only a module_uuid (topo_evt_payload_t is now just that). Whatever
+ *      state a uuid was in when its event was enqueued is irrelevant by
+ *      the time exporter_task() actually drains it; handle_topology_event()
+ *      always re-reads that uuid's CURRENT entry via
+ *      power_base_transport_get_node() right before sending, so the wire
+ *      payload is always the current generation/last_seq/online/depth/
+ *      downstream state, never a backlog snapshot. A uuid no longer present
+ *      is simply skipped (ESP_LOGD) -- the periodic resync wouldn't find it
+ *      either. Duplicate-uuid backlog entries are additionally coalesced
+ *      away before ever reaching the queue (see s_topology_pending_* below)
+ *      so a burst of changes for one uuid can't crowd out a different
+ *      uuid's event out of the bounded queue.
+ *   2. transmit()/send_one_attempt() now return an explicit
+ *      export_send_result_t instead of a bare bool: a 4.xx response (Linux
+ *      explicitly parsed and rejected the request) is EXPORT_SEND_REJECTED
+ *      and returned immediately, never retried -- retrying an unchanged
+ *      payload against an explicit rejection can only ever get rejected
+ *      again. Only EXPORT_SEND_TRANSIENT_FAILURE (timeout/no ACK/OT send
+ *      error/5.xx) still gets the existing bounded retry+backoff. This also
+ *      stops a normal 4.xx rejection from being mis-logged as "delivery
+ *      unconfirmed" (that phrase is now reserved for an actually-exhausted
+ *      transient-failure retry budget).
  */
 #include "linux_bridge_exporter/linux_bridge_exporter.h"
 
@@ -99,19 +134,65 @@ static const uint32_t s_retry_backoff_ms[EXPORTER_MAX_ATTEMPTS] = {0, 200, 500};
  * coap_response_timing을 재사용"). */
 #define EXPORTER_ACK_TIMEOUT_MS CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS
 
+/*
+ * Explicit per-attempt outcome (correction pass, replacing a bare bool --
+ * see this file's own top comment): a 4.xx response is semantically
+ * DIFFERENT from a timeout/OT-send-error/5.xx -- Linux ingest received and
+ * explicitly parsed the request and rejected it, so resending the exact
+ * same payload can only ever be rejected again, whereas the other failure
+ * kinds are genuinely worth a bounded retry.
+ */
+typedef enum {
+    EXPORT_SEND_DELIVERED_2XX,      /* 2.xx -- success, stop immediately. */
+    EXPORT_SEND_REJECTED_4XX,       /* 4.xx -- explicit rejection, stop immediately, never retried. */
+    EXPORT_SEND_TRANSIENT_FAILURE,  /* timeout/no ACK/OT send error/5.xx -- bounded retry applies. */
+} export_send_result_t;
+
 #define EXPORTER_POLL_TICK_MS 200
 /* A send failure is logged at most this often, regardless of how many
  * individual sample/topology/heartbeat sends fail in between -- never a
  * per-event flood while the Linux host is simply down for a while. */
 #define SEND_FAIL_WARN_INTERVAL_MS 30000
 
+/*
+ * Correction pass (stale TOPOLOGY backlog -- see this file's own top
+ * comment): carries ONLY a module_uuid, never a topology_registry_entry_t
+ * snapshot -- exporter_task() always resolves the CURRENT entry for this
+ * uuid via power_base_transport_get_node() at drain time (handle_topology_event()),
+ * so a backlog of stale queued events can never cause an outdated
+ * generation/last_seq/online/depth/downstream state to be sent, regardless
+ * of how long it sat in the queue.
+ */
 typedef struct {
-    bool have_full_entry; /* true: `entry` is already the full snapshot (on_topology_applied).
-                              false: only `uuid` is known (on_node_offline) -- exporter_task()
-                              resolves the current entry via power_base_transport_get_node() itself. */
     uint8_t uuid[TOPOLOGY_UUID_LEN];
-    topology_registry_entry_t entry;
 } topo_evt_payload_t;
+
+/*
+ * Bounded set of module_uuids currently enqueued in s_topology_queue, used
+ * only to COALESCE duplicate-uuid TOPOLOGY events before they ever reach
+ * xQueueSend() -- since handle_topology_event() always re-reads the CURRENT
+ * registry entry for a uuid at drain time regardless of which of that
+ * uuid's queued events is being drained, a second event for a uuid already
+ * pending would just cause the same current state to be sent twice; skipping
+ * the duplicate instead saves a queue slot for some OTHER uuid's event
+ * during a burst (e.g. a flapping link) -- see this file's own top comment.
+ * Sized to TOPOLOGY_REGISTRY_MAX_NODES, the true upper bound on how many
+ * distinct module_uuids the registry (and therefore this set) can ever need
+ * to track at once, so this can never need to reject a legitimate new uuid
+ * the registry itself would still have room for (same sizing rationale as
+ * s_pending_samples/PENDING_SAMPLES_MAX above).
+ *
+ * Touched from BOTH the OT task (producer, via observer_on_topology_applied/
+ * observer_on_node_offline) and the exporter task (consumer, draining
+ * s_topology_queue) -- protected by a short critical section
+ * (s_topology_pending_lock), the same cheap-spinlock pattern this file
+ * already uses for s_send_lock, never a blocking wait: the OT-task callback
+ * must never block (see this file's own top comment).
+ */
+#define TOPOLOGY_PENDING_MAX TOPOLOGY_REGISTRY_MAX_NODES
+static portMUX_TYPE s_topology_pending_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_topology_pending_valid[TOPOLOGY_PENDING_MAX];
+static uint8_t s_topology_pending_uuids[TOPOLOGY_PENDING_MAX][TOPOLOGY_UUID_LEN];
 
 /*
  * Bounded, uuid-keyed, always-coalescing table of samples still waiting to
@@ -183,8 +264,11 @@ static void coap_response_handler(void *ctx_v, otMessage *message, const otMessa
 
 /* One Confirmable POST attempt to the configured Linux host/port. Mirrors
  * sensor_transport.c's send_one_attempt() exactly, generalized over
- * uri_path/payload and a fixed (not collector_endpoint-derived) destination. */
-static bool send_one_attempt(const char *uri_path, const uint8_t *payload, size_t len)
+ * uri_path/payload and a fixed (not collector_endpoint-derived) destination,
+ * and (this follow-up's correction pass) returning an explicit
+ * export_send_result_t instead of a bare bool -- see this file's own top
+ * comment and export_send_result_t's own doc comment. */
+static export_send_result_t send_one_attempt(const char *uri_path, const uint8_t *payload, size_t len)
 {
     otIp6Address dest_addr;
     memcpy(dest_addr.mFields.m8, s_host_addr, sizeof(dest_addr.mFields.m8));
@@ -233,38 +317,87 @@ static bool send_one_attempt(const char *uri_path, const uint8_t *payload, size_
 
     if (err != OT_ERROR_NONE) {
         ESP_LOGD(TAG, "failed to send bridge-export CoAP request to '%s': %s", uri_path, otThreadErrorToString(err));
-        return false;
+        return EXPORT_SEND_TRANSIENT_FAILURE;
     }
 
     uint32_t wait_ms = coap_response_timing_wait_ms(EXPORTER_ACK_TIMEOUT_MS, COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
                                                       COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_DEN, EXPORTER_ACK_TIMEOUT_MS);
-    bool ok = false;
-    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-        if (s_send_result == OT_ERROR_NONE && s_send_got_message) {
-            uint8_t code_class = (uint8_t)(s_send_response_code >> 5);
-            ok = (code_class == 2);
-        }
+    if (xSemaphoreTake(s_send_done_sem, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        return EXPORT_SEND_TRANSIENT_FAILURE; /* no ACK within the derived wait -- timeout */
     }
-    return ok;
+    if (s_send_result != OT_ERROR_NONE || !s_send_got_message) {
+        return EXPORT_SEND_TRANSIENT_FAILURE; /* OT-layer send/ack error */
+    }
+    uint8_t code_class = (uint8_t)(s_send_response_code >> 5);
+    if (code_class == 2) {
+        return EXPORT_SEND_DELIVERED_2XX;
+    }
+    if (code_class == 4) {
+        return EXPORT_SEND_REJECTED_4XX;
+    }
+    return EXPORT_SEND_TRANSIENT_FAILURE; /* 5.xx (or any other unexpected class) */
 }
 
 /* Bounded 1+EXPORTER_MAX_RETRIES attempts with a small fixed backoff -- see
  * this file's own top comment for why a per-module hash schedule (the
  * mesh-radio-contention design sensor_transport.c/topology_reporter.c use)
- * is not needed for a single fixed Linux destination. */
-static bool transmit(const char *uri_path, const uint8_t *payload, size_t len)
+ * is not needed for a single fixed Linux destination.
+ *
+ * Retry policy (correction pass -- see this file's own top comment):
+ * EXPORT_SEND_DELIVERED_2XX and EXPORT_SEND_REJECTED_4XX both stop
+ * immediately (a 4.xx is a final, explicit outcome from Linux ingest, never
+ * worth retrying the same payload against); only EXPORT_SEND_TRANSIENT_FAILURE
+ * consumes the bounded retry budget below. */
+static export_send_result_t transmit(const char *uri_path, const uint8_t *payload, size_t len)
 {
+    export_send_result_t result = EXPORT_SEND_TRANSIENT_FAILURE;
     for (int attempt = 0; attempt < EXPORTER_MAX_ATTEMPTS; attempt++) {
         if (attempt > 0) {
             vTaskDelay(pdMS_TO_TICKS(s_retry_backoff_ms[attempt]));
         }
-        if (send_one_attempt(uri_path, payload, len)) {
+        result = send_one_attempt(uri_path, payload, len);
+        if (result == EXPORT_SEND_DELIVERED_2XX) {
             ESP_LOGD(TAG, "bridge export sent OK ('%s', attempt=%d/%d)", uri_path, attempt + 1,
                       EXPORTER_MAX_ATTEMPTS);
-            return true;
+            return result;
         }
+        if (result == EXPORT_SEND_REJECTED_4XX) {
+            /* Final, explicit rejection -- see this function's own doc
+             * comment. Never falls through to the retry backoff below. */
+            return result;
+        }
+        /* EXPORT_SEND_TRANSIENT_FAILURE: fall through and retry (bounded). */
     }
-    return false;
+    return result;
+}
+
+/*
+ * Logs the outcome of a transmit() call appropriately for `what` (e.g.
+ * "topology"/"sample"/"heartbeat") -- shared by send_topology_entry()/
+ * handle_sample_event()/send_heartbeat() so all three follow the identical
+ * policy from this file's own top comment: EXPORT_SEND_DELIVERED_2XX is
+ * silent (routine success, already logged at DEBUG by transmit() itself);
+ * EXPORT_SEND_REJECTED_4XX -- an explicit, FINAL outcome from Linux ingest,
+ * e.g. a 4.12 stale_session rejecting a backlog snapshot -- is logged at
+ * DEBUG, never the same "delivery unconfirmed" WARN a genuine transient
+ * failure gets (this follow-up's own explicit requirement: a normal 4.xx
+ * must never be mis-reported as unconfirmed); only an exhausted
+ * EXPORT_SEND_TRANSIENT_FAILURE retry budget gets the rate-limited WARN.
+ */
+static void report_export_result(export_send_result_t result, const char *what, const char *unconfirmed_msg)
+{
+    switch (result) {
+    case EXPORT_SEND_DELIVERED_2XX:
+        break;
+    case EXPORT_SEND_REJECTED_4XX:
+        ESP_LOGD(TAG, "%s export rejected by Linux host (4.xx) -- not retried (the periodic full resync will "
+                      "re-derive and resend the CURRENT state)", what);
+        break;
+    case EXPORT_SEND_TRANSIENT_FAILURE:
+    default:
+        warn_rate_limited(unconfirmed_msg);
+        break;
+    }
 }
 
 static void send_topology_entry(const topology_registry_entry_t *e)
@@ -287,11 +420,10 @@ static void send_topology_entry(const topology_registry_entry_t *e)
         ESP_LOGW(TAG, "failed to pack a topology export message -- dropped");
         return;
     }
-    if (!transmit(URI_TOPOLOGY, wire, wlen)) {
-        warn_rate_limited("topology export delivery unconfirmed (Linux OTBR host unreachable? -- the topology "
-                           "registry itself is completely unaffected, and the next periodic full resync will "
-                           "retry every node's current state)");
-    }
+    report_export_result(transmit(URI_TOPOLOGY, wire, wlen), "topology",
+                          "topology export delivery unconfirmed (Linux OTBR host unreachable? -- the topology "
+                          "registry itself is completely unaffected, and the next periodic full resync will "
+                          "retry every node's current state)");
 }
 
 static void handle_sample_event(const sensor_sample_t *sample)
@@ -313,32 +445,112 @@ static void handle_sample_event(const sensor_sample_t *sample)
         ESP_LOGW(TAG, "failed to pack a sample export message -- dropped");
         return;
     }
-    if (!transmit(URI_SAMPLE, wire, wlen)) {
-        warn_rate_limited("sample export delivery unconfirmed (Linux OTBR host unreachable? -- the sensor sample "
-                           "itself is already stored in the Power Base aggregator regardless)");
-    }
+    report_export_result(transmit(URI_SAMPLE, wire, wlen), "sample",
+                          "sample export delivery unconfirmed (Linux OTBR host unreachable? -- the sensor sample "
+                          "itself is already stored in the Power Base aggregator regardless)");
 }
 
-static void handle_topology_event(const topo_evt_payload_t *p)
+/* Linear scan over the registry for `uuid`'s CURRENT entry -- the only
+ * lookup power_base_transport.h exposes (index-based get_node()/
+ * get_node_count(), no lookup-by-uuid accessor). Bounded by
+ * TOPOLOGY_REGISTRY_MAX_NODES (32) either way. */
+static bool find_current_topology_entry(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_registry_entry_t *out)
 {
-    if (p->have_full_entry) {
-        send_topology_entry(&p->entry);
-        return;
-    }
-    /* on_node_offline only carries a uuid -- resolve the CURRENT entry here,
-     * in this task's own context (never inside the OT callback). A uuid no
-     * longer found (should not happen -- registry slots are never reused
-     * for a different uuid) is simply skipped; the periodic full resync
-     * would not find it either. */
     size_t count = power_base_transport_get_node_count();
     for (size_t i = 0; i < count; i++) {
         topology_registry_entry_t e;
-        if (power_base_transport_get_node(i, &e) && memcmp(e.module_uuid, p->uuid, TOPOLOGY_UUID_LEN) == 0) {
-            send_topology_entry(&e);
-            return;
+        if (power_base_transport_get_node(i, &e) && memcmp(e.module_uuid, uuid, TOPOLOGY_UUID_LEN) == 0) {
+            *out = e;
+            return true;
         }
     }
-    ESP_LOGD(TAG, "node-offline export event for a uuid no longer present in the registry -- skipped");
+    return false;
+}
+
+/* Returns true (and marks `uuid` pending) iff a fresh xQueueSend() for this
+ * uuid should proceed -- false means `uuid` is already pending (a queued
+ * event for it will still be drained, always against its CURRENT registry
+ * state, so this duplicate is redundant -- see s_topology_pending_* 's own
+ * doc comment). A short, bounded critical section, never a blocking wait --
+ * called only from the OT-task's own observer callbacks below. */
+static bool topology_pending_try_mark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    bool should_enqueue = true;
+    int free_slot = -1;
+    taskENTER_CRITICAL(&s_topology_pending_lock);
+    for (int i = 0; i < TOPOLOGY_PENDING_MAX; i++) {
+        if (s_topology_pending_valid[i] && memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            should_enqueue = false;
+            break;
+        }
+        if (!s_topology_pending_valid[i] && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    /* free_slot < 0 here (the set is full) cannot happen in practice -- see
+     * TOPOLOGY_PENDING_MAX's own sizing comment -- but if it ever did, fail
+     * OPEN (still enqueue) rather than silently and permanently refusing to
+     * ever mark this uuid pending again. */
+    if (should_enqueue && free_slot >= 0) {
+        s_topology_pending_valid[free_slot] = true;
+        memcpy(s_topology_pending_uuids[free_slot], uuid, TOPOLOGY_UUID_LEN);
+    }
+    taskEXIT_CRITICAL(&s_topology_pending_lock);
+    return should_enqueue;
+}
+
+/* Clears `uuid`'s pending mark, if any -- called once a queued event for it
+ * has actually been dequeued (exporter_task()) or once an enqueue attempt
+ * for it failed (enqueue_topology_event() below), either way freeing it to
+ * be marked pending again by a future event. */
+static void topology_pending_unmark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    taskENTER_CRITICAL(&s_topology_pending_lock);
+    for (int i = 0; i < TOPOLOGY_PENDING_MAX; i++) {
+        if (s_topology_pending_valid[i] && memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            s_topology_pending_valid[i] = false;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_topology_pending_lock);
+}
+
+/* Shared by observer_on_topology_applied()/observer_on_node_offline() --
+ * both enqueue nothing but a uuid now (see topo_evt_payload_t's own doc
+ * comment), coalesced via s_topology_pending_* before ever reaching
+ * xQueueSend(). Still strictly non-blocking (xQueueSend(..., 0)) -- never
+ * anything that could block the calling OT task (this file's own top
+ * comment). */
+static void enqueue_topology_event(const uint8_t uuid[TOPOLOGY_UUID_LEN], const char *drop_log_msg)
+{
+    if (!topology_pending_try_mark(uuid)) {
+        return; /* a fresh event for this uuid is already queued -- coalesced away */
+    }
+    topo_evt_payload_t evt;
+    memcpy(evt.uuid, uuid, TOPOLOGY_UUID_LEN);
+    if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
+        topology_pending_unmark(uuid); /* enqueue failed -- let a future event for this uuid try again */
+        warn_rate_limited(drop_log_msg);
+    }
+}
+
+/* Correction pass (stale TOPOLOGY backlog -- see this file's own top
+ * comment): `p` only ever carries a uuid now, regardless of whether it came
+ * from on_topology_applied or on_node_offline -- the CURRENT registry entry
+ * is always re-resolved right here, in this task's own context (never
+ * inside the OT callback), so a queue event that sat behind other work for
+ * a while can never cause a stale generation/last_seq/online/depth/
+ * downstream snapshot to be sent. A uuid no longer found (should not happen
+ * -- registry slots are never reused for a different uuid) is simply
+ * skipped; the periodic full resync would not find it either. */
+static void handle_topology_event(const topo_evt_payload_t *p)
+{
+    topology_registry_entry_t e;
+    if (find_current_topology_entry(p->uuid, &e)) {
+        send_topology_entry(&e);
+        return;
+    }
+    ESP_LOGD(TAG, "topology export event for a uuid no longer present in the registry -- skipped");
 }
 
 static void do_full_topology_resync(void)
@@ -459,14 +671,15 @@ static void send_heartbeat(void)
     if (wlen == 0) {
         return;
     }
-    if (transmit(URI_HEARTBEAT, wire, wlen)) {
+    export_send_result_t result = transmit(URI_HEARTBEAT, wire, wlen);
+    if (result == EXPORT_SEND_DELIVERED_2XX) {
         /* Routine success -- DEBUG only, never floods the log (this
          * follow-up's own requirement: "정상 heartbeat 성공 로그는 DEBUG
          * 이하"). */
         ESP_LOGD(TAG, "heartbeat sent OK (node_count=%u)", (unsigned)hb.node_count);
-    } else {
-        warn_rate_limited("heartbeat export delivery unconfirmed (Linux OTBR host unreachable?)");
+        return;
     }
+    report_export_result(result, "heartbeat", "heartbeat export delivery unconfirmed (Linux OTBR host unreachable?)");
 }
 
 static void exporter_task(void *arg)
@@ -478,6 +691,14 @@ static void exporter_task(void *arg)
     while (1) {
         topo_evt_payload_t evt;
         if (xQueueReceive(s_topology_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE) {
+            /* This event is no longer "pending" from the coalescing set's
+             * point of view as of right now -- a NEW on_topology_applied/
+             * on_node_offline for this same uuid arriving while
+             * handle_topology_event() below is still in flight (e.g.
+             * retrying a transient failure) is correctly treated as a fresh
+             * event to enqueue, not folded into the one already being
+             * processed. */
+            topology_pending_unmark(evt.uuid);
             handle_topology_event(&evt);
         }
         /* Runs every loop iteration regardless of whether a topology event
@@ -510,25 +731,16 @@ static void observer_on_sample_stored(const sensor_sample_t *sample, void *ctx)
 static void observer_on_topology_applied(const topology_registry_entry_t *entry, void *ctx)
 {
     (void)ctx;
-    topo_evt_payload_t evt;
-    evt.have_full_entry = true;
-    evt.entry = *entry;
-    if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
-        warn_rate_limited("topology queue full -- dropped one TOPOLOGY export event (the next periodic full "
-                           "resync recovers it)");
-    }
+    enqueue_topology_event(entry->module_uuid,
+                            "topology queue full -- dropped one TOPOLOGY export event (the next periodic full "
+                            "resync recovers it)");
 }
 
 static void observer_on_node_offline(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
 {
     (void)ctx;
-    topo_evt_payload_t evt;
-    evt.have_full_entry = false;
-    memcpy(evt.uuid, uuid, TOPOLOGY_UUID_LEN);
-    if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
-        warn_rate_limited("topology queue full -- dropped one TOPOLOGY (offline) export event (the next periodic "
-                           "full resync recovers it)");
-    }
+    enqueue_topology_event(uuid, "topology queue full -- dropped one TOPOLOGY (offline) export event (the next "
+                                   "periodic full resync recovers it)");
 }
 
 esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID_LEN],
@@ -550,6 +762,7 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     s_send_token = 0;
     s_last_send_fail_warn_tick = 0;
     memset(s_pending_samples, 0, sizeof(s_pending_samples));
+    memset(s_topology_pending_valid, 0, sizeof(s_topology_pending_valid));
 
     s_send_done_sem = xSemaphoreCreateBinary();
     if (s_send_done_sem == NULL) {
