@@ -38,25 +38,51 @@ menu "Linux Bridge Exporter (Power Base -> Linux OTBR host)"
             actually reconciles Linux-side state.
 
     config LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS
-        int "Minimum interval between two SAMPLE exports for the SAME module_uuid (ms)"
+        int "Minimum interval between two SAMPLE publishes for the SAME module_uuid (ms)"
         default 1000
         help
             Transport-load reduction (Power Base -> Linux, this pass): caps
-            how often this component actually SENDS a SAMPLE export for any
-            one module_uuid, regardless of how often that module's sensor
+            how often this component actually PUBLISHES a SAMPLE for any one
+            module_uuid, regardless of how often that module's sensor
             measurement/aggregator storage updates -- neither the sensor
             measurement period nor the aggregator's own storage rate is
             changed by this setting, only how often the ALREADY-STORED
-            latest value is mirrored to the Linux host. Rapid samples for
-            the same uuid within this window keep coalescing (upsert,
-            latest-wins, see PENDING_SAMPLES_MAX) exactly as before; once
-            the window reopens, the then-current latest value is sent --
-            never a replayed backlog of older values. TOPOLOGY events
-            (ATTACHED/UPDATED/DETACHED/OFFLINE, parent-state changes) are
-            NOT subject to this limit -- they are always sent immediately,
-            see s_topology_pending_*/s_topology_queue. The periodic full
-            resync (LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS, far
-            longer than this by default) is independent of this per-uuid
-            gate and always sends every node's current value.
+            latest value is mirrored to the Linux host.
+
+            Precise unit (correction pass -- see linux_bridge_exporter.c's
+            own top comment): this bounds LOGICAL SAMPLE PUBLISHES, not
+            individual CoAP attempts. One logical publish is the whole
+            bounded transmit_sample() attempt sequence for a uuid (1 initial
+            attempt + up to 2 transient-failure retries, all re-reading the
+            CURRENT sensor_root_aggregator value immediately before each
+            individual attempt) -- that whole sequence counts as ONE publish
+            against this interval, dispatched at most once per interval per
+            uuid, never once per retry.
+
+            ALL SAMPLE publish paths share this SAME per-uuid gate now,
+            including the periodic full resync
+            (LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS): a resync tick
+            only marks each uuid's current aggregator value as pending
+            again, it never dispatches a SAMPLE directly -- so a reactive
+            publish immediately followed by a resync tick can never produce
+            a second SAMPLE publish for the same uuid inside one interval
+            window. Worst-case SAMPLE convergence after a dropped/missed
+            event is therefore bounded by resync_interval + at most one
+            SAMPLE_MIN_INTERVAL_MS window, not exactly resync_interval.
+
+            Rapid samples for the same uuid within this window keep
+            coalescing (mark-pending, latest-wins) exactly as before; once
+            the window reopens, the then-CURRENT aggregator value (never a
+            cached/stale one) is published. If every attempt in a publish
+            sequence hits a transient failure, the uuid is left pending
+            again so the NEXT allowed window retries with whatever is
+            current at that later time -- never a busy loop, never a
+            replayed stale value.
+
+            TOPOLOGY events (ATTACHED/UPDATED/DETACHED/OFFLINE, parent-state
+            changes) are a COMPLETELY SEPARATE path (s_topology_pending_*/
+            s_topology_queue) and are NOT subject to this limit at all --
+            they are always sent immediately, including the periodic full
+            TOPOLOGY resync.
 
 endmenu

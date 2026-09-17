@@ -141,7 +141,8 @@ correction" section for the full root-cause analysis and fix.
 | TOPOLOGY export (uuid-coalesced queue, current-state-at-drain-time, periodic full resync) | Yes (`tools/test_linux_bridge_exporter.c`, `tools/test_linux_bridge_exporter_timers.c`, `tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | Links the real, unmodified `linux_bridge_exporter.c`/`power_base_transport.c` against a simulated Linux CoAP host (`tools/host_test_stubs/host_pb_bridge_full_sim.c`); no real Linux OTBR host has actually received this component's own CoAP traffic yet. |
 | SAMPLE export (uuid-coalesced pending table, latest-wins, periodic full resync) | Yes (same three files above) | Not yet | Same caveat as TOPOLOGY export above. |
 | CoAP retry policy (2.xx success; 4.xx final, never retried; timeout/OT-error/5.xx bounded retry, shared by TOPOLOGY and SAMPLE) | Yes (`tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | |
-| **This pass**: per-module_uuid SAMPLE export rate limit (`CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`, default 1000ms) -- coalescing to the latest sample, wrap-safe timing, TOPOLOGY unaffected, periodic resync unaffected | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`, links the real, unmodified `linux_bridge_exporter.c`) | Not yet | See "RCP/OTBR fault recovery and transport-load reduction (this pass)" below for what this pass changed and did not change. |
+| Per-module_uuid SAMPLE export rate limit (`CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`, default 1000ms) -- coalescing to the latest sample, wrap-safe timing, TOPOLOGY unaffected | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`, `tools/test_linux_bridge_exporter_retry_exhaustion.c`, `tools/test_linux_bridge_exporter_timers.c`, all linking the real, unmodified `linux_bridge_exporter.c`) | Not yet | See "RCP/OTBR fault recovery and transport-load reduction" below. |
+| **Correction pass**: unified SAMPLE scheduler -- the periodic full sample resync no longer bypasses the rate-limit gate (it now only marks a uuid pending, exactly like a reactive callback, via the shared `mark_sample_pending()`); `transmit_sample()` re-reads `sensor_root_aggregator`'s CURRENT value and re-packs the wire payload immediately before EVERY attempt (including retries), fixing a real bug where a stale `sample_seq` could be resent on attempt 2/3 if a newer sample arrived mid-retry; a fully-exhausted transient-failure retry sequence re-marks the uuid pending so the next allowed window republishes automatically | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`'s ordered-attempt-inspection scenario, `tools/test_linux_bridge_exporter_retry_exhaustion.c`, `tools/test_linux_bridge_exporter_timers.c`'s new resync-vs-gate scenario -- all link the real, unmodified `linux_bridge_exporter.c` and inspect every captured CoAP attempt in order, not just the last one) | Not yet | Fixes two bugs found in code review of the rate-limit pass immediately above (stale-payload-on-retry, and periodic resync silently bypassing the per-uuid gate) -- see `linux_bridge_exporter.c`'s own top comment ("Unified SAMPLE scheduler"/"Per-attempt fresh payload" paragraphs) and `CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`'s own Kconfig help text for the precise unit (one LOGICAL PUBLISH, i.e. a whole bounded attempt sequence, never one per individual CoAP attempt). |
 
 ## Linux Matter Bridge (`pogo_matter_bridge`) MVP (see `docs/matter-bridge.md`)
 
@@ -178,28 +179,40 @@ inside this session, which had no physical board access):
   episode is no longer a hands-on incident, but it does **not** mean the fault itself
   has been fixed or explained -- this pass makes no such claim.
 
-**This pass's own implementation (SAMPLE/Matter-publish transport-load reduction --
-NOT a `RESET_FAULT` fix, tracked as a separate, unrelated change):**
+**Implementation (SAMPLE/Matter-publish transport-load reduction -- NOT a
+`RESET_FAULT` fix, tracked as a separate, unrelated change):**
 
-- Power Base -> Linux: `components/linux_bridge_exporter` now sends at most one
-  SAMPLE export per module_uuid per `CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`
-  (default 1000ms), always coalescing to the single latest (seq, value) -- never a
-  replayed backlog. TOPOLOGY events and the periodic full resync are unaffected.
-- Linux Registry -> Matter: `matter_bridge::BridgeManager` now coalesces and
+- Power Base -> Linux: `components/linux_bridge_exporter` sends at most one
+  SAMPLE PUBLISH per module_uuid per `CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`
+  (default 1000ms), always publishing the single latest (seq, value) -- never a
+  replayed backlog. TOPOLOGY events are a completely separate, unaffected path.
+- **Correction pass** (code review found two real bugs in the above): (1) a
+  stale `sample_seq` could be resent on a retry attempt if a newer sample
+  arrived mid-flight -- fixed by re-reading `sensor_root_aggregator` fresh
+  immediately before every individual CoAP attempt, never a cached payload;
+  (2) the periodic full sample resync used to bypass the rate-limit gate
+  entirely, so a reactive publish immediately followed by a resync tick
+  could produce two publishes inside one window -- fixed by routing resync
+  through the exact same `mark_sample_pending()`/gate a reactive publish
+  uses, so it only ever marks a uuid pending, never dispatches directly.
+  TOPOLOGY resync is unaffected (never rate-limited, unchanged both passes).
+- Linux Registry -> Matter: `matter_bridge::BridgeManager` coalesces and
   rate-limits how often a module_uuid's changes actually reach
   `chip::DeviceLayer::PlatformMgr().ScheduleWork()`/the Matter SDK (at most one
   in-flight work item per uuid, and non-urgent SAMPLE-only changes wait at least
   `BridgeManager::kDefaultSampleUpdateInterval`, 1000ms, between schedule attempts) --
   a new-endpoint or Reachable/online-offline transition always bypasses that wait.
-- **Explicitly unchanged by this pass**: sensor measurement period, POGO
+  Not touched by the correction pass (that pass's own code review only found
+  issues on the Power Base -> Linux side).
+- **Explicitly unchanged by both passes**: sensor measurement period, POGO
   `POLL_CONFIG`, and the Power Base's own internal `sensor_root_aggregator` storage
   rate/period are all completely untouched -- every sensor sample is still measured
   and stored at exactly the same rate as before; only how often an
   ALREADY-CURRENT value is forwarded/published downstream was reduced.
 - Not yet verified on real hardware -- see the per-component host-test rows above.
-  ESP-IDF v6.1 `power_base` fullclean build (zero warnings) and this repository's
-  full host test suite were run this pass; see this pass's own final report for the
-  complete list.
+  ESP-IDF v6.1 `power_base`/`module` fullclean builds (zero warnings) and this
+  repository's full host test suite were run for both passes; see each pass's own
+  final report for the complete list.
 
 ## Explicitly out of scope (not implemented, not planned this pass)
 

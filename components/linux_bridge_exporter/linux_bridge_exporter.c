@@ -23,11 +23,12 @@
  * (observer_on_sample_stored/observer_on_topology_applied/
  * observer_on_node_offline below) run from within the OpenThread task's own
  * context (same as every otCoapAddResource handler in this codebase) and do
- * ONLY a strictly non-blocking enqueue/upsert -- never a CoAP send, and
- * every xQueueSend()/xSemaphoreTake() call site they reach uses a 0-tick
- * wait (correction pass: upsert_pending_sample()'s mutex take used to
- * block up to 20 ticks, which this pass removed -- see that function's own
- * comment). A 0-tick miss (the exporter task happens to hold the mutex, or
+ * ONLY a strictly non-blocking enqueue/mark-pending -- never a CoAP send,
+ * and every xQueueSend()/xSemaphoreTake() call site they reach uses a
+ * 0-tick wait when called from the OT task (a prior correction pass's own
+ * fix -- see mark_sample_pending()'s own doc comment for exactly which
+ * callers get a 0-tick wait vs. a small bounded one). A 0-tick miss (the
+ * exporter task happens to hold the mutex, or
  * the topology queue is momentarily full) simply drops that one event with
  * a rate-limited warning; it is never retried in a loop and never handed
  * to a new task/state machine. exporter_task() (this component's own,
@@ -40,17 +41,20 @@
  * resyncs read straight from the REAL sources of truth
  * (power_base_transport_get_node()/sensor_root_aggregator_get_node()), so a
  * Linux OTBR host that was down or just restarted converges to the CURRENT
- * state within one resync interval regardless of anything dropped earlier --
- * this component never waits for "the next sensor measurement" to recover.
+ * state -- TOPOLOGY within one resync interval, SAMPLE within one resync
+ * interval plus at most one more SAMPLE_MIN_INTERVAL_MS window (see the
+ * "Unified SAMPLE scheduler" paragraph further down) -- regardless of
+ * anything dropped earlier. This component never waits for "the next
+ * sensor measurement" to recover.
  *
  * Overflow/drop policy (this follow-up's own explicit requirement: "queue
  * overflow 시 시스템을 멈추지 말고 최신 상태가 이후 snapshot으로 복구되게 할
  * 것"): a dropped/coalesced-away SAMPLE is never a source-of-truth loss --
  * the Power Base's own sensor_root_aggregator already has the latest value
- * regardless, and the periodic full sample resync re-sends it. A dropped
- * TOPOLOGY event is likewise recovered by the periodic full topology
- * resync. Either way, dropping never blocks or crashes anything -- just one
- * rate-limited WARN log line.
+ * regardless, and the periodic full sample resync marks it pending again
+ * (see below). A dropped TOPOLOGY event is likewise recovered by the
+ * periodic full topology resync. Either way, dropping never blocks or
+ * crashes anything -- just one rate-limited WARN log line.
  *
  * CoAP client send state (token/staleness guard): identical pattern to
  * sensor_transport.c's/topology_reporter.c's own s_send_done_sem/
@@ -98,28 +102,63 @@
  *
  * Per-uuid SAMPLE export rate limit (this pass -- transport-load reduction,
  * Power Base -> Linux -> Matter controller data path): drain_pending_samples()
- * now additionally gates each slot on its own next_send_allowed_tick (default
+ * gates each slot on its own next_send_allowed_tick (default
  * CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS = 1000ms between two
- * actual SAMPLE sends for the SAME module_uuid). This is a pure send-frequency
- * cap layered on top of the pre-existing coalescing table -- sensor
- * measurement period, POGO POLL_CONFIG, and Power Base aggregator storage
- * rate are completely unchanged; s_pending_samples already always coalesces
- * to the single latest (seq, value) per uuid (upsert, never append), so a
- * rate-limited slot simply waits, still holding only ever the latest sample,
- * until its window reopens -- never a FIFO replay of older values. TOPOLOGY
- * events (this file's own s_topology_queue/s_topology_pending_*, ATTACHED/
- * UPDATED/DETACHED/OFFLINE and parent-state changes) are completely
- * unaffected by this gate -- they are still sent as soon as
- * exporter_task()'s own queue drain reaches them, same as before this pass.
- * The periodic full TOPOLOGY+SAMPLE resync (do_full_topology_resync()/
- * do_full_sample_resync(), CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
- * far longer than this gate by default) also bypasses this per-uuid gate
- * entirely and unconditionally re-sends every node's current state -- it is
- * a distinct, already-existing recovery mechanism, not something this pass
- * needed to change. Existing CoAP retry policy (2.xx success, 4.xx never
- * retried, timeout/OT-error/5.xx bounded retry) is completely unchanged by
- * this gate -- rate limiting only decides WHEN a send is dispatched, never
- * how a dispatched send's own outcome is handled.
+ * SAMPLE PUBLISHES for the SAME module_uuid -- see that Kconfig option's own
+ * help text for the precise unit: one LOGICAL PUBLISH, i.e. one whole bounded
+ * transmit_sample() attempt sequence, never one individual CoAP attempt).
+ * This is a pure publish-frequency cap -- sensor measurement period, POGO
+ * POLL_CONFIG, and Power Base aggregator storage rate are completely
+ * unchanged. TOPOLOGY events (this file's own s_topology_queue/
+ * s_topology_pending_*, ATTACHED/UPDATED/DETACHED/OFFLINE and parent-state
+ * changes) are a completely separate path and are NOT subject to this gate
+ * at all -- they are still sent as soon as exporter_task()'s own queue drain
+ * reaches them, including the periodic full TOPOLOGY resync.
+ *
+ * Unified SAMPLE scheduler (correction pass, fixing two real-hardware-
+ * relevant bugs found in code review of the rate-limit pass above -- see
+ * the two paragraphs below for each one): EVERY SAMPLE publish path --
+ * the reactive OT-task callback (observer_on_sample_stored()) AND the
+ * periodic full sample resync (do_full_sample_resync()) -- now goes through
+ * the exact SAME s_pending_samples table and the exact same
+ * next_send_allowed_tick gate in drain_pending_samples(). Neither path ever
+ * dispatches a SAMPLE directly anymore; both only ever call
+ * mark_sample_pending() to mark a uuid's slot dirty (do_full_sample_resync()
+ * marks every currently-known aggregator uuid dirty every resync tick,
+ * exactly like the reactive callback does for one uuid on a real sample).
+ * This is what makes "at most one SAMPLE publish per uuid per interval"
+ * actually true end to end: a reactive publish immediately followed by a
+ * resync tick can never itself produce a second publish inside the same
+ * window, because the resync tick only marks pending -- it is
+ * drain_pending_samples() alone that ever decides WHEN a publish actually
+ * goes out, for either origin. s_pending_samples slots no longer cache a
+ * sample VALUE at all (see pending_sample_slot_t's own comment) -- only
+ * "this uuid has a pending change", because the value actually published is
+ * always re-read fresh from sensor_root_aggregator at publish time (see
+ * transmit_sample() below), never a value captured back when it was marked
+ * dirty.
+ *
+ * Per-attempt fresh payload (correction pass, fixes real-hardware-adjacent
+ * bug found in code review: transmit()'s old fixed-payload retry loop could
+ * resend a STALE sample_seq on attempt 2/3 if a newer sample for the same
+ * uuid arrived while attempt 1 was still in flight): transmit_sample() below
+ * re-reads sensor_root_aggregator's CURRENT sample for the target uuid and
+ * re-packs the wire payload immediately before EVERY attempt, including the
+ * very first one -- never a cached/precomputed buffer reused across retries.
+ * If all EXPORTER_MAX_ATTEMPTS attempts hit only transient failures,
+ * handle_sample_event() marks the uuid pending again (mark_sample_pending())
+ * so the NEXT time its rate-limit window allows a publish, whatever is
+ * CURRENT in the aggregator at THAT later moment is sent -- bounded by the
+ * gate, never a busy retry loop, never a replay of the failed attempt's
+ * stale value. A 4.xx rejection is NOT re-marked pending here (unchanged
+ * existing policy -- see EXPORT_SEND_REJECTED_4XX's own doc comment): the
+ * next periodic resync still re-marks it regardless, same as before.
+ *
+ * Existing CoAP retry policy (2.xx success, 4.xx never retried,
+ * timeout/OT-error/5.xx bounded retry) is completely unchanged by any of
+ * this -- rate limiting and the unified scheduler only decide WHEN and WITH
+ * WHAT PAYLOAD a send is dispatched, never how a dispatched send's own
+ * outcome is handled.
  */
 #include "linux_bridge_exporter/linux_bridge_exporter.h"
 
@@ -230,26 +269,37 @@ static uint8_t s_topology_pending_uuids[TOPOLOGY_PENDING_MAX][TOPOLOGY_UUID_LEN]
  */
 #define PENDING_SAMPLES_MAX SENSOR_ROOT_AGGREGATOR_MAX_NODES
 
+/*
+ * Correction pass: no longer caches a sensor_sample_t value at all -- this
+ * slot only ever tracks "this uuid has a pending SAMPLE publish", never a
+ * captured value. The value actually published is always re-read fresh
+ * from sensor_root_aggregator at the moment transmit_sample() dispatches
+ * (and again before every retry) -- see this file's own top comment on why
+ * caching a value here was exactly the bug this pass fixes (a stale
+ * sample_seq could otherwise be resent on a later retry attempt).
+ */
 typedef struct {
-    bool valid;  /* this slot has ever held a (module_uuid, sample) pair */
-    bool dirty;  /* has NOT been exported since the last upsert -- needs (re-)sending */
+    bool valid;  /* this slot has ever been marked pending for this module_uuid */
+    bool dirty;  /* a SAMPLE publish for this uuid has NOT happened since the last mark -- needs (re-)publishing */
     uint8_t module_uuid[SENSOR_UUID_LEN];
-    sensor_sample_t sample;
     /*
-     * Per-uuid SAMPLE export rate limit (this pass -- transport-load
+     * Per-uuid SAMPLE publish rate limit (this pass -- transport-load
      * reduction, Power Base -> Linux): the earliest tick at which the NEXT
-     * SAMPLE export for this uuid may actually be sent. Zero-initialized,
-     * meaning "no prior send -- allowed immediately" (see
+     * SAMPLE publish for this uuid may actually be dispatched. Zero-
+     * initialized, meaning "no prior publish -- allowed immediately" (see
      * drain_pending_samples()'s wrap-safe comparison below; tick 0 is
-     * indistinguishable from "never sent" only at the very first instant
-     * after boot, which is itself still correctly "allowed"). Stamped to
-     * `now + CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS` the moment
-     * a send for this uuid is actually DISPATCHED (not when it completes),
-     * so a slow bounded-retry send cannot itself be immediately followed by
-     * another one. This caps SEND FREQUENCY only -- sensor measurement,
-     * Power Base aggregator storage, and registry/dirty tracking above are
-     * all still driven at their existing rates; only how often the
-     * already-current latest value is mirrored to Linux is limited.
+     * indistinguishable from "never published" only at the very first
+     * instant after boot, which is itself still correctly "allowed").
+     * Stamped to `now + CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`
+     * the moment a publish for this uuid is actually DISPATCHED (not when
+     * it completes), so one whole bounded transmit_sample() attempt
+     * sequence -- 1 initial attempt + up to 2 transient-failure retries --
+     * counts as exactly ONE publish against this gate, never one per
+     * individual CoAP attempt (see the Kconfig option's own help text).
+     * This caps PUBLISH FREQUENCY only -- sensor measurement, Power Base
+     * aggregator storage, and dirty-marking above are all still driven at
+     * their existing rates/immediately; only how often the already-current
+     * latest value is mirrored to Linux is limited.
      */
     TickType_t next_send_allowed_tick;
 } pending_sample_slot_t;
@@ -468,28 +518,131 @@ static void send_topology_entry(const topology_registry_entry_t *e)
                           "retry every node's current state)");
 }
 
-static void handle_sample_event(const sensor_sample_t *sample)
+/* Packs `sample` into a SAMPLE export wire message. Returns 0 (and logs) on
+ * a packing failure -- shared by transmit_sample() below, called fresh
+ * immediately before every single CoAP attempt (see this file's own top
+ * comment on why no packed buffer is ever cached/reused across attempts). */
+static size_t pack_sample_wire(const sensor_sample_t *sample, uint8_t *out_wire, size_t wire_cap)
 {
     bridge_export_sample_t exp = {0};
     memcpy(exp.power_base_uuid, s_power_base_uuid, BRIDGE_EXPORT_UUID_LEN);
     uint8_t sc_buf[SENSOR_CHANNEL_MAX_WIRE_LEN];
     size_t sc_len = sensor_channel_pack(sample, sc_buf, sizeof(sc_buf));
     if (sc_len == 0) {
-        ESP_LOGW(TAG, "failed to re-pack a sample for export (channel_count=%u) -- dropped", sample->channel_count);
-        return;
+        ESP_LOGW(TAG, "failed to re-pack a sample for export (channel_count=%u) -- this attempt skipped",
+                  sample->channel_count);
+        return 0;
     }
     memcpy(exp.sensor_channel_payload, sc_buf, sc_len);
     exp.sensor_channel_len = (uint16_t)sc_len;
 
-    uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
-    size_t wlen = bridge_export_pack_sample(&exp, wire, sizeof(wire));
+    size_t wlen = bridge_export_pack_sample(&exp, out_wire, wire_cap);
     if (wlen == 0) {
-        ESP_LOGW(TAG, "failed to pack a sample export message -- dropped");
-        return;
+        ESP_LOGW(TAG, "failed to pack a sample export message -- this attempt skipped");
     }
-    report_export_result(transmit(URI_SAMPLE, wire, wlen), "sample",
+    return wlen;
+}
+
+/* Linear scan over sensor_root_aggregator for `module_uuid`'s CURRENT
+ * sample -- mirrors find_current_topology_entry()'s own identical pattern
+ * below (sensor_root_aggregator.h exposes no uuid-keyed lookup either).
+ * Bounded by SENSOR_ROOT_AGGREGATOR_MAX_NODES (16) either way. Returns
+ * false if this uuid has never had a sample recorded, or (should not
+ * happen -- sensor_root_aggregator never removes a node once created, see
+ * that component's own header) is not found at all. */
+static bool find_current_aggregator_sample(const uint8_t module_uuid[SENSOR_UUID_LEN], sensor_sample_t *out)
+{
+    size_t count = sensor_root_aggregator_get_node_count();
+    for (size_t i = 0; i < count; i++) {
+        sensor_root_aggregator_node_t node;
+        if (sensor_root_aggregator_get_node(i, &node) && node.has_sample &&
+            memcmp(node.module_uuid, module_uuid, SENSOR_UUID_LEN) == 0) {
+            *out = node.last_sample;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * One bounded SAMPLE publish attempt sequence for `module_uuid` -- this
+ * file's own transmit()'s SAMPLE-specific sibling. Deliberately NOT
+ * implemented in terms of transmit() (which stays exactly as-is for
+ * TOPOLOGY/HEARTBEAT, unaffected by this pass): unlike those two,
+ * transmit_sample() must re-derive its payload EVERY attempt, including
+ * the very first one, straight from sensor_root_aggregator's CURRENT state
+ * (never a value captured earlier) -- see this file's own top comment for
+ * the real-hardware-relevant bug this fixes (a stale sample_seq resent on
+ * a later retry attempt while a newer sample had already arrived).
+ *
+ * Retry policy is otherwise IDENTICAL to transmit(): 2.xx stops
+ * immediately; 4.xx (explicit rejection) stops immediately, never retried;
+ * only a transient failure (timeout/OT-error/5.xx) consumes the bounded
+ * EXPORTER_MAX_ATTEMPTS budget, re-fetching+re-packing before each one.
+ */
+static export_send_result_t transmit_sample(const uint8_t module_uuid[SENSOR_UUID_LEN])
+{
+    export_send_result_t result = EXPORT_SEND_TRANSIENT_FAILURE;
+    for (int attempt = 0; attempt < EXPORTER_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(s_retry_backoff_ms[attempt]));
+        }
+        sensor_sample_t sample;
+        if (!find_current_aggregator_sample(module_uuid, &sample)) {
+            /* Nothing valid left to send for this uuid -- should not
+             * happen (see this function's own doc comment), but stop this
+             * attempt cycle cleanly rather than sending garbage. Leaves
+             * `result` as whatever the previous iteration (if any) saw. */
+            break;
+        }
+        uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+        size_t wlen = pack_sample_wire(&sample, wire, sizeof(wire));
+        if (wlen == 0) {
+            break; /* pack failure already logged inside pack_sample_wire() */
+        }
+        result = send_one_attempt(URI_SAMPLE, wire, wlen);
+        if (result == EXPORT_SEND_DELIVERED_2XX) {
+            ESP_LOGD(TAG, "bridge export sent OK ('%s', attempt=%d/%d)", URI_SAMPLE, attempt + 1,
+                      EXPORTER_MAX_ATTEMPTS);
+            return result;
+        }
+        if (result == EXPORT_SEND_REJECTED_4XX) {
+            return result; /* final, explicit rejection -- never retried, same policy as transmit() */
+        }
+        /* EXPORT_SEND_TRANSIENT_FAILURE: fall through and retry (bounded),
+         * re-reading the aggregator fresh on the next loop iteration. */
+    }
+    return result;
+}
+
+/* Forward declaration -- mark_sample_pending() is defined further down
+ * (alongside the rest of the pending-table machinery it shares with
+ * observer_on_sample_stored()/do_full_sample_resync()), but
+ * handle_sample_event() (called only from drain_pending_samples(), itself
+ * defined after mark_sample_pending()) needs it too, for the
+ * retry-exhausted-leaves-it-pending-again behavior below. */
+static void mark_sample_pending(const uint8_t module_uuid[SENSOR_UUID_LEN], TickType_t wait_ticks, bool from_reactive_callback);
+
+/*
+ * Dispatches one bounded SAMPLE publish sequence for `module_uuid` (see
+ * transmit_sample()'s own doc comment) and reports the outcome. If every
+ * attempt hit only a transient failure, marks this uuid pending again --
+ * see this file's own top comment: the NEXT time drain_pending_samples()
+ * finds its rate-limit window open, whatever is CURRENT in the aggregator
+ * at that later moment is published, bounded by the gate, never a busy
+ * retry loop. A 4.xx rejection is deliberately NOT re-marked pending here
+ * (same policy as before this pass) -- the periodic full resync still
+ * re-marks it regardless.
+ */
+static void handle_sample_event(const uint8_t module_uuid[SENSOR_UUID_LEN])
+{
+    export_send_result_t result = transmit_sample(module_uuid);
+    report_export_result(result, "sample",
                           "sample export delivery unconfirmed (Linux OTBR host unreachable? -- the sensor sample "
                           "itself is already stored in the Power Base aggregator regardless)");
+    if (result == EXPORT_SEND_TRANSIENT_FAILURE) {
+        mark_sample_pending(module_uuid, pdMS_TO_TICKS(20), false);
+    }
 }
 
 /* Linear scan over the registry for `uuid`'s CURRENT entry -- the only
@@ -607,12 +760,15 @@ static void do_full_topology_resync(void)
 }
 
 /*
- * Re-sends every module's CURRENT last-known sample straight from
- * sensor_root_aggregator (the real source of truth), regardless of the
- * pending-sample table's own state -- this is what lets a Linux OTBR host
- * that just (re)started converge on the latest value within one resync
- * interval instead of waiting for that module's next sensor measurement
- * (this follow-up's own explicit requirement).
+ * Marks every currently-known sensor_root_aggregator uuid's slot pending
+ * again (correction pass -- see this file's own top comment: resync no
+ * longer dispatches a SAMPLE directly). This is what lets a Linux OTBR host
+ * that just (re)started converge on the latest value without waiting for
+ * that module's next sensor measurement (this follow-up's own explicit
+ * requirement) -- convergence is now bounded by resync_interval + at most
+ * one SAMPLE_MIN_INTERVAL_MS window (see the Kconfig option's own help
+ * text), since the actual publish still goes through drain_pending_samples()'s
+ * SAME per-uuid gate as every other SAMPLE publish, instead of bypassing it.
  */
 static void do_full_sample_resync(void)
 {
@@ -620,41 +776,57 @@ static void do_full_sample_resync(void)
     for (size_t i = 0; i < count; i++) {
         sensor_root_aggregator_node_t node;
         if (sensor_root_aggregator_get_node(i, &node) && node.has_sample) {
-            handle_sample_event(&node.last_sample);
+            /* Bounded (not 0-tick) wait -- called from exporter_task()'s
+             * own context, not the OT callback, so it can afford to
+             * briefly wait for a lock the reactive callback (0-tick) might
+             * transiently hold -- see mark_sample_pending()'s own doc
+             * comment for why this still never blocks unboundedly. */
+            mark_sample_pending(node.module_uuid, pdMS_TO_TICKS(20), false);
         }
     }
 }
 
 /*
- * Upserts `sample` into s_pending_samples, coalescing by module_uuid: a
- * newer sample for a uuid already pending simply overwrites it (dirty stays
- * true) -- there is never more than one pending export per uuid, so this
- * table can never accumulate or later replay a backlog of stale samples
- * (see this file's own top comment). Called from the OT task's own context
- * (an observer callback), which must NEVER block (correction pass): the
- * mutex take below uses a 0-tick (non-blocking) wait -- if the exporter
- * task happens to be holding s_pending_samples_mutex at that exact instant
- * (drain_pending_samples()/linux_bridge_exporter_init()'s own brief
- * critical sections), this reactive upsert is simply dropped with a
- * rate-limited warning, never retried in a busy loop and never handed off
- * to a new task/state machine -- the periodic full sample resync
- * (do_full_sample_resync(), reading sensor_root_aggregator directly) is the
- * sole recovery path for a dropped upsert, same as every other
- * best-effort drop in this component (see this file's own top comment on
- * the overall overflow/drop policy).
+ * Marks `module_uuid`'s slot in s_pending_samples dirty (creating it if not
+ * already tracked) -- correction pass: no longer stores a sample VALUE at
+ * all (see pending_sample_slot_t's own doc comment: the value actually
+ * published is always re-read fresh from sensor_root_aggregator at publish
+ * time, never cached here). Shared by BOTH SAMPLE publish origins:
+ *
+ *   - observer_on_sample_stored() (the OT task's own reactive callback,
+ *     `from_reactive_callback=true`, `wait_ticks=0`) -- MUST NEVER block
+ *     the OT task (this file's own top comment); a 0-tick miss (the
+ *     exporter task happens to hold the mutex at that exact instant)
+ *     simply drops this one mark-pending attempt with a rate-limited
+ *     warning, never retried in a busy loop -- the periodic full sample
+ *     resync below is the recovery path for a dropped mark, same as every
+ *     other best-effort drop in this component.
+ *   - do_full_sample_resync() (`from_reactive_callback=false`,
+ *     `wait_ticks=pdMS_TO_TICKS(20)`) -- runs from exporter_task()'s own
+ *     context (never the OT callback), so it can afford a brief bounded
+ *     wait for whatever short critical section might transiently hold the
+ *     mutex, making a resync mark far less likely to ever miss; a miss
+ *     here is not logged as urgent -- the NEXT resync interval simply
+ *     tries again.
+ *   - handle_sample_event() (after a fully-exhausted transient-failure
+ *     retry budget, `from_reactive_callback=false`,
+ *     `wait_ticks=pdMS_TO_TICKS(20)`) -- see that function's own doc
+ *     comment.
  */
-static void upsert_pending_sample(const sensor_sample_t *sample)
+static void mark_sample_pending(const uint8_t module_uuid[SENSOR_UUID_LEN], TickType_t wait_ticks,
+                                 bool from_reactive_callback)
 {
-    if (xSemaphoreTake(s_pending_samples_mutex, 0) != pdTRUE) {
-        warn_rate_limited("pending-sample table busy -- dropped one reactive SAMPLE export event (the periodic "
-                           "full sample resync still delivers the current value)");
+    if (xSemaphoreTake(s_pending_samples_mutex, wait_ticks) != pdTRUE) {
+        if (from_reactive_callback) {
+            warn_rate_limited("pending-sample table busy -- dropped one reactive SAMPLE mark-pending event (the "
+                               "periodic full sample resync still converges to the current value)");
+        }
         return;
     }
     int slot = -1;
     int free_slot = -1;
     for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
-        if (s_pending_samples[i].valid &&
-            memcmp(s_pending_samples[i].module_uuid, sample->module_uuid, SENSOR_UUID_LEN) == 0) {
+        if (s_pending_samples[i].valid && memcmp(s_pending_samples[i].module_uuid, module_uuid, SENSOR_UUID_LEN) == 0) {
             slot = i;
             break;
         }
@@ -665,36 +837,40 @@ static void upsert_pending_sample(const sensor_sample_t *sample)
     if (slot < 0) {
         if (free_slot < 0) {
             xSemaphoreGive(s_pending_samples_mutex);
-            warn_rate_limited("pending-sample table full -- dropped one reactive SAMPLE export event for a new "
-                               "uuid (the periodic full sample resync still delivers it)");
+            if (from_reactive_callback) {
+                warn_rate_limited("pending-sample table full -- dropped one reactive SAMPLE mark-pending event for "
+                                   "a new uuid (the periodic full sample resync still delivers it)");
+            }
             return;
         }
         slot = free_slot;
         s_pending_samples[slot].valid = true;
-        memcpy(s_pending_samples[slot].module_uuid, sample->module_uuid, SENSOR_UUID_LEN);
+        memcpy(s_pending_samples[slot].module_uuid, module_uuid, SENSOR_UUID_LEN);
     }
-    s_pending_samples[slot].sample = *sample; /* coalesce: always the latest wins */
-    s_pending_samples[slot].dirty = true;
+    s_pending_samples[slot].dirty = true; /* coalesce: no value stored, just "a publish is owed" */
     xSemaphoreGive(s_pending_samples_mutex);
 }
 
 /*
- * Sends every currently-dirty pending sample that is ALSO past its own
- * per-uuid rate-limit window (clearing dirty and re-stamping
- * next_send_allowed_tick as it goes), and returns. Called once per
- * exporter_task() loop iteration -- bounded (PENDING_SAMPLES_MAX slots),
- * never blocks on anything but its own short mutex per slot.
+ * Dispatches (via handle_sample_event()) every currently-dirty pending
+ * uuid that is ALSO past its own per-uuid rate-limit window (clearing
+ * dirty and re-stamping next_send_allowed_tick as it goes), and returns.
+ * Called once per exporter_task() loop iteration -- bounded
+ * (PENDING_SAMPLES_MAX slots), never blocks on anything but its own short
+ * mutex per slot. This is the ONE place in this file that ever actually
+ * dispatches a SAMPLE publish -- see this file's own top comment.
  *
  * A dirty slot still inside its rate-limit window is left exactly as-is
- * (dirty stays true, sample untouched) -- it is neither sent now nor
- * dropped; the NEXT loop iteration that finds it both dirty and past its
- * window sends it, always with whatever is the CURRENT (possibly further
- * updated by upsert_pending_sample() in the meantime) sample content at
- * that moment. This is the same "latest wins, no FIFO replay" coalescing
- * behavior this table already had, now also gated on time -- a rate-limited
- * slot is never a source-of-truth loss (the aggregator already has the
- * value, and the periodic full sample resync -- itself independent of this
- * per-uuid gate -- converges Linux regardless).
+ * (dirty stays true) -- it is neither published now nor dropped; the NEXT
+ * loop iteration that finds it both dirty and past its window publishes
+ * it, always with whatever is the CURRENT aggregator value at that moment
+ * (handle_sample_event()/transmit_sample() re-read it fresh, never a value
+ * captured here). This is the same "latest wins, no FIFO replay"
+ * coalescing behavior this table already had, now also gated on time -- a
+ * rate-limited slot is never a source-of-truth loss (the aggregator
+ * already has the value, and the periodic full sample resync -- which now
+ * shares this exact same gate, see do_full_sample_resync() -- converges
+ * Linux regardless).
  *
  * Wrap-safe comparison (this pass): `(int32_t)(now - deadline) >= 0`, the
  * same idiom already used elsewhere in this codebase (e.g.
@@ -706,12 +882,12 @@ static void drain_pending_samples(void)
     TickType_t now = xTaskGetTickCount();
     TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS);
     for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
-        sensor_sample_t sample;
+        uint8_t module_uuid[SENSOR_UUID_LEN];
         bool need_send = false;
         if (xSemaphoreTake(s_pending_samples_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (s_pending_samples[i].valid && s_pending_samples[i].dirty &&
                 (int32_t)(now - s_pending_samples[i].next_send_allowed_tick) >= 0) {
-                sample = s_pending_samples[i].sample;
+                memcpy(module_uuid, s_pending_samples[i].module_uuid, SENSOR_UUID_LEN);
                 s_pending_samples[i].dirty = false;
                 s_pending_samples[i].next_send_allowed_tick = now + interval_ticks;
                 need_send = true;
@@ -719,7 +895,7 @@ static void drain_pending_samples(void)
             xSemaphoreGive(s_pending_samples_mutex);
         }
         if (need_send) {
-            handle_sample_event(&sample);
+            handle_sample_event(module_uuid);
         }
     }
 }
@@ -790,7 +966,7 @@ static void exporter_task(void *arg)
 static void observer_on_sample_stored(const sensor_sample_t *sample, void *ctx)
 {
     (void)ctx;
-    upsert_pending_sample(sample);
+    mark_sample_pending(sample->module_uuid, 0, true);
 }
 
 static void observer_on_topology_applied(const topology_registry_entry_t *entry, void *ctx)

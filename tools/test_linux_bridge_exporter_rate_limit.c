@@ -1,8 +1,23 @@
 /*
  * Host-compiled test for the per-module_uuid SAMPLE export rate limit added
- * to components/linux_bridge_exporter/linux_bridge_exporter.c this pass
- * (Power Base -> Linux -> Matter controller transport-load reduction) --
- * links the REAL, unmodified linux_bridge_exporter.c, power_base_transport.c,
+ * to components/linux_bridge_exporter/linux_bridge_exporter.c (Power Base ->
+ * Linux -> Matter controller transport-load reduction), INCLUDING this
+ * correction pass's own fixes for two bugs found in code review of that
+ * original pass -- see linux_bridge_exporter.c's own top comment:
+ *
+ *   1. transmit()'s old fixed-payload retry loop could resend a STALE
+ *      sample_seq on a later retry attempt if a newer sample for the same
+ *      uuid arrived while an earlier attempt was still in flight.
+ *      transmit_sample() now re-reads sensor_root_aggregator fresh
+ *      immediately before EVERY attempt.
+ *   2. do_full_sample_resync() used to bypass the per-uuid rate gate
+ *      entirely, so a reactive publish immediately followed by a periodic
+ *      resync tick could produce two SAMPLE publishes for the same uuid
+ *      inside one rate-limit window. Resync now only marks a uuid pending
+ *      (mark_sample_pending()) -- the actual publish always goes through
+ *      the SAME drain_pending_samples() gate as a reactive publish.
+ *
+ * Links the REAL, unmodified linux_bridge_exporter.c, power_base_transport.c,
  * topology_registry.c, topology_proto.c, sensor_channel.c,
  * sensor_root_aggregator.c, bridge_export_proto.c, pogo_crc16.c, and
  * coap_response_timing.c, same as tools/test_linux_bridge_exporter.c.
@@ -15,15 +30,18 @@
  * tools/test_linux_bridge_exporter.c's own header comment).
  *
  * Covers this follow-up's own test list (section 5, Power Base exporter,
- * items 1-4 and 7-9; items 5/6 -- 4.xx never retried, 5.xx/timeout bounded
+ * items 1-4 and 7-9, PLUS this correction pass's own new items 1/3/6; items
+ * 5/6 (original numbering) -- 4.xx never retried, 5.xx/timeout bounded
  * retry -- are policy-generic across TOPOLOGY and SAMPLE alike and are
  * already exhaustively covered by tools/test_linux_bridge_exporter_retry_policy.c
- * against the SAME transmit()/send_one_attempt() code SAMPLE export also
- * goes through; not duplicated here beyond scenario D's own retry-adjacent
- * check.  Item 8 -- periodic full resync still delivers only the latest
- * value despite the new gate -- is already exercised end-to-end by
- * tools/test_linux_bridge_exporter_timers.c's own 300-rapid-sample scenario,
- * which passes unmodified with this pass's rate limit in place.):
+ * against the SAME send_one_attempt() code SAMPLE export also goes through;
+ * not duplicated here beyond the ordered-attempt-inspection scenario below.
+ * This correction pass's own item 2 (reactive publish immediately followed
+ * by a periodic resync tick must not produce a second publish inside one
+ * rate-limit window) needs the SHORT resync-interval stub to actually
+ * observe a resync tick in real wall-clock time -- see
+ * tools/test_linux_bridge_exporter_timers.c's own new scenario for that,
+ * not duplicated here.):
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -pthread \
@@ -172,6 +190,61 @@ static int count_samples_for(size_t since, const uint8_t uuid[SENSOR_UUID_LEN], 
     return n;
 }
 
+typedef struct {
+    uint32_t seq;
+    int32_t value;
+} sample_attempt_t;
+
+/* Correction pass: collects EVERY captured SAMPLE attempt (in capture
+ * order, i.e. in the exact order transmit_sample() actually dispatched
+ * them -- including ones that will go on to fail) for `uuid` since `since`,
+ * up to `max_out` -- used to verify the FULL ordered sequence of what was
+ * actually put on the wire across a multi-attempt retry cycle, not merely
+ * "the last thing captured" (this file's own test list item 6: "모든 전송
+ * attempt의 UUID/seq/value를 순서대로 검증"). host_pb_bridge_full_sim
+ * captures a send BEFORE consulting its queued outcome (see that file's own
+ * otCoapSendRequestWithParameters()), so a captured entry here is exactly
+ * the payload transmit_sample() built and dispatched for that attempt,
+ * regardless of whether the attempt went on to succeed, get rejected, or
+ * time out. */
+static int collect_sample_attempts(size_t since, const uint8_t uuid[SENSOR_UUID_LEN], sample_attempt_t *out,
+                                    int max_out)
+{
+    int n = 0;
+    size_t total = host_pb_bridge_full_sim_captured_count();
+    for (size_t i = since; i < total && n < max_out; i++) {
+        host_pb_bridge_full_sim_sent_t cap;
+        if (!host_pb_bridge_full_sim_get_captured(i, &cap)) {
+            continue;
+        }
+        if (strcmp(cap.uri_path, "pogo/v1/sample") != 0) {
+            continue;
+        }
+        bridge_export_msg_type_t type;
+        const uint8_t *payload;
+        uint16_t payload_len;
+        if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len) ||
+            type != BRIDGE_EXPORT_MSG_SAMPLE) {
+            continue;
+        }
+        bridge_export_sample_t exp;
+        if (!bridge_export_unpack_sample(payload, payload_len, &exp)) {
+            continue;
+        }
+        sensor_sample_t decoded;
+        if (!sensor_channel_unpack(exp.sensor_channel_payload, exp.sensor_channel_len, &decoded)) {
+            continue;
+        }
+        if (memcmp(decoded.module_uuid, uuid, SENSOR_UUID_LEN) != 0) {
+            continue;
+        }
+        out[n].seq = decoded.sample_seq;
+        out[n].value = decoded.channels[0].value;
+        n++;
+    }
+    return n;
+}
+
 /* Occupies the exporter task with a slow, never-answered (bounded-retry)
  * TOPOLOGY send for `blocker_uuid` so that whatever this scenario upserts
  * next is guaranteed to land in the pending-sample table well before
@@ -244,26 +317,14 @@ int main(void)
         CHECK(last_seq == 100, "the single export carries seq=100, the LATEST of the 100 samples");
         CHECK(last_value == (int32_t)(20000 + 100), "the single export also carries the LATEST value, matching "
                                                        "seq=100 exactly (never an intermediate/stale one)");
-
-        /* After the window reopens (>1000ms since the export above), a
-         * further genuinely-new sample is exported normally -- proves the
-         * gate is a rolling rate limit, never a one-shot latch. */
-        sleep_ms(1100);
-        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
-        size_t since2 = host_pb_bridge_full_sim_captured_count();
-        send_sensor_sample_v(node, 101, 30000, &sent, &code);
-        bool got = false;
-        for (int tries = 0; tries < 400 && !got; tries++) {
-            sleep_ms(5);
-            uint32_t seq2 = 0;
-            int32_t val2 = 0;
-            if (count_samples_for(since2, node, &seq2, &val2) >= 1 && seq2 == 101) {
-                got = true;
-            }
-        }
-        CHECK(got, "once the 1000ms window reopens, a genuinely new sample (seq=101) is exported normally -- the "
-                    "gate is a rolling window, not a permanent stall (test list item 9's own 'never permanently "
-                    "stops sending' property, exercised across a real window-reopen cycle)");
+        /* The "the gate is a rolling window, not a one-shot latch" property
+         * (test list item 9) is proven separately by the retry-exhaustion
+         * scenario further down, which already needs to wait for a window
+         * reopen for its own reason -- not duplicated here, to keep this
+         * file's total wall-clock runtime safely under
+         * CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS (5000ms, the
+         * real production default this file deliberately uses -- see this
+         * file's own top comment on why that must never fire mid-test). */
     }
 
     printf("\n-- scenario: two DIFFERENT uuids rate-limit completely independently (test list item 3) --\n");
@@ -342,9 +403,10 @@ int main(void)
                               "SAMPLE are gated completely independently");
     }
 
-    printf("\n-- scenario: a stale (already-superseded) sample value is never replayed after a transient-failure "
-           "retry exhausts -- the NEXT export, once the window allows it, always carries whatever is CURRENT at "
-           "that time (test list item 7) --\n");
+    printf("\n-- scenario (correction pass, test list item 1): while a SAMPLE's first attempt is still a "
+           "transient failure, a NEWER sample for the SAME uuid is stored -- every subsequent retry attempt is "
+           "inspected IN ORDER, confirming the stale seq is never resent and the retry re-fetches the fresh "
+           "value immediately before dispatching --\n");
     {
         uint8_t node[TOPOLOGY_UUID_LEN];
         make_uuid(node, 0xD1);
@@ -355,48 +417,66 @@ int main(void)
         send_topology_report_full(node, TOPOLOGY_REPORT_ATTACHED, 1, &sent, &code);
         sleep_ms(100);
 
-        /* This sample's own export will fail all 3 bounded attempts
-         * (transient failure -- no response). */
+        /* Attempt 1 (seq=1, the only value in the aggregator at that
+         * moment) will transiently fail; attempt 2 (a retry) will succeed. */
         host_pb_bridge_full_sim_queue_no_response();
-        host_pb_bridge_full_sim_queue_no_response();
-        host_pb_bridge_full_sim_queue_no_response();
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
         size_t since = host_pb_bridge_full_sim_captured_count();
         send_sensor_sample_v(node, 1, 11111, &sent, &code);
         CHECK(code == OT_COAP_CODE_CHANGED, "seq=1 is stored fine at the aggregator level regardless of the "
                                               "export's eventual fate");
 
-        /* While that send is somewhere in its 3 bounded (failing) attempts,
-         * a genuinely NEWER sample arrives and is stored -- this is the
-         * value that must eventually go out, never the failed seq=1. */
-        sleep_ms(30);
-        send_sensor_sample_v(node, 2, 22222, &sent, &code);
-        CHECK(code == OT_COAP_CODE_CHANGED, "seq=2 (newer) is also stored fine at the aggregator level");
-
-        /* Let the failing seq=1 attempt's bounded retry budget exhaust, then
-         * queue a success for whatever the exporter tries next. */
-        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
-        bool found_seq2 = false;
-        bool found_seq1 = false;
-        for (int tries = 0; tries < 400 && !found_seq2; tries++) {
+        /* Deterministically wait for attempt 1 to ACTUALLY dispatch
+         * (captured) before injecting seq=2 -- this is what makes this
+         * scenario a genuine "a newer sample arrives while an earlier
+         * attempt is in flight" case, not just "the aggregator already
+         * held the newest value before the exporter ever looked". */
+        bool attempt1_seen = false;
+        for (int tries = 0; tries < 400 && !attempt1_seen; tries++) {
             sleep_ms(5);
-            uint32_t seq = 0;
-            int32_t val = 0;
-            int n = count_samples_for(since, node, &seq, &val);
-            if (n >= 1) {
-                if (seq == 1) {
-                    found_seq1 = true;
-                }
-                if (seq == 2) {
-                    found_seq2 = true;
-                }
+            if (count_samples_for(since, node, NULL, NULL) >= 1) {
+                attempt1_seen = true;
             }
         }
-        CHECK(found_seq2, "the eventually-successful export carries the NEWER seq=2, coalesced in while seq=1 "
-                            "was still failing its own retries");
-        CHECK(!found_seq1, "the failed seq=1 attempt's payload (never successfully delivered) is never later "
-                             "'replayed' as a stale, separately-visible successful export -- coalescing already "
-                             "overwrote it before the gate ever reopened");
+        CHECK(attempt1_seen, "setup: attempt 1 (seq=1) actually dispatched before seq=2 is injected");
+
+        /* attempt 1 is now somewhere in its ~40ms ack-timeout wait or its
+         * 200ms retry backoff -- comfortably enough time to store seq=2
+         * before attempt 2 fires. */
+        send_sensor_sample_v(node, 2, 22222, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "seq=2 (newer) is stored fine at the aggregator level while attempt "
+                                              "1 is still failing/backing off");
+
+        bool got_two_attempts = false;
+        for (int tries = 0; tries < 400 && !got_two_attempts; tries++) {
+            sleep_ms(5);
+            if (count_samples_for(since, node, NULL, NULL) >= 2) {
+                got_two_attempts = true;
+            }
+        }
+        CHECK(got_two_attempts, "attempt 2 (the retry) has now also dispatched");
+
+        sample_attempt_t attempts[8];
+        int n = collect_sample_attempts(since, node, attempts, 8);
+        CHECK(n == 2, "exactly two attempts were made for this uuid -- attempt 1 failed transiently, attempt 2 "
+                       "succeeded, so no further retry was needed");
+        if (n >= 2) {
+            CHECK(attempts[0].seq == 1, "attempt 1 (in capture order) carried seq=1 -- the only value available "
+                                          "in the aggregator at that exact moment");
+            CHECK(attempts[1].seq == 2, "attempt 2 (in capture order, a retry) carried the NEWER seq=2 -- "
+                                          "re-fetched fresh from sensor_root_aggregator immediately before this "
+                                          "attempt was dispatched, never a cached/stale seq=1 payload reused");
+            CHECK(attempts[1].value == 22222, "attempt 2's value also matches the fresh seq=2 sample exactly");
+        }
     }
+
+    /* Test list item 3 (retry-exhaustion-leaves-uuid-pending-again recovery)
+     * is covered in its own dedicated file,
+     * tools/test_linux_bridge_exporter_retry_exhaustion.c -- that scenario
+     * alone needs close to 2s of real wall-clock time, which does not fit
+     * this file's own budget alongside everything above while staying
+     * safely under CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS
+     * (5000ms) -- see that file's own top comment. */
 
     printf("\n-- scenario (wrap-safe comparison, test list item 9): the exact idiom "
            "drain_pending_samples() uses, `(int32_t)(now - deadline) >= 0`, compares correctly across a "

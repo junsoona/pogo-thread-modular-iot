@@ -134,6 +134,45 @@ static int count_since(size_t since, const char *uri_path)
     return n;
 }
 
+/* Correction pass: counts captured SAMPLE publishes (since `since`) for the
+ * specific `uuid` -- unlike count_since() above (which counts across ALL
+ * uuids), this is needed to check ONE uuid's own per-uuid rate-limit
+ * window in isolation while other nodes attached earlier in this file keep
+ * periodically resyncing in the background. */
+static int count_samples_for_uuid(size_t since, const uint8_t uuid[SENSOR_UUID_LEN])
+{
+    int n = 0;
+    size_t total = host_pb_bridge_full_sim_captured_count();
+    for (size_t i = since; i < total; i++) {
+        host_pb_bridge_full_sim_sent_t cap;
+        if (!host_pb_bridge_full_sim_get_captured(i, &cap)) {
+            continue;
+        }
+        if (strcmp(cap.uri_path, "pogo/v1/sample") != 0) {
+            continue;
+        }
+        bridge_export_msg_type_t type;
+        const uint8_t *payload;
+        uint16_t payload_len;
+        if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len) ||
+            type != BRIDGE_EXPORT_MSG_SAMPLE) {
+            continue;
+        }
+        bridge_export_sample_t exp;
+        if (!bridge_export_unpack_sample(payload, payload_len, &exp)) {
+            continue;
+        }
+        sensor_sample_t decoded;
+        if (!sensor_channel_unpack(exp.sensor_channel_payload, exp.sensor_channel_len, &decoded)) {
+            continue;
+        }
+        if (memcmp(decoded.module_uuid, uuid, SENSOR_UUID_LEN) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
 int main(void)
 {
     host_pb_bridge_full_sim_reset();
@@ -231,9 +270,25 @@ int main(void)
         int topo_count = count_since(since, "pogo/v1/topology");
         int sample_count = count_since(since, "pogo/v1/sample");
         CHECK(topo_count >= 2, "periodic TOPOLOGY resync keeps succeeding across multiple intervals despite the "
-                                "3 injected failures somewhere in the stream");
-        CHECK(sample_count >= 2, "periodic SAMPLE resync ALSO keeps succeeding across multiple intervals -- "
-                                   "recovery is automatic for both message types");
+                                "3 injected failures somewhere in the stream -- TOPOLOGY has no per-uuid rate "
+                                "limit, so it fires roughly once per 150ms resync tick");
+        /* Correction pass: SAMPLE resync no longer dispatches directly on
+         * every 150ms resync tick -- it only marks pending, and the actual
+         * publish is gated to at most once per this stub's own 300ms
+         * CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS (see this
+         * file's own new "test list item 2" scenario further down for a
+         * focused, single-uuid proof of that gate). So a 600ms window now
+         * yields roughly 2 SAMPLE publishes for this node (not "as many as
+         * there were resync ticks", which is exactly the burst this
+         * correction pass fixes) -- this assertion still proves recovery
+         * is automatic (at least one publish happened) while also locking
+         * in the new bounded-by-the-gate upper bound (never "several", the
+         * OLD behavior this pass replaced). */
+        CHECK(sample_count >= 1 && sample_count <= 3,
+              "periodic SAMPLE resync ALSO keeps succeeding after the injected failures -- recovery is automatic "
+              "(at least 1 publish), but now bounded by the SAME per-uuid rate-limit gate a reactive publish "
+              "uses (at most ~1 per 300ms window across this 600ms wait), never one publish per 150ms resync "
+              "tick like before this correction pass");
     }
 
     printf("\n-- scenario: no busy loop -- the generous 200-send budget is never exhausted over a real 1s window "
@@ -352,6 +407,61 @@ int main(void)
               "the periodic full sample resync eventually delivers the LATEST sample (seq=300) for this uuid, "
               "regardless of how many of the 300 rapid reactive upserts were dropped by mutex contention along "
               "the way -- aggregator state + periodic resync is the recovery path, not a busy retry");
+    }
+
+    printf("\n-- scenario (correction pass, test list item 2): a reactive SAMPLE publish immediately followed by "
+           "one or more periodic full-resync ticks (this stub's own 150ms interval) never produces a SECOND "
+           "SAMPLE publish for the SAME uuid before its own 300ms rate-limit window (this stub's own "
+           "CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS) reopens -- resync now shares the exact same "
+           "gate as a reactive publish (do_full_sample_resync() only marks pending, it never dispatches "
+           "directly), instead of bypassing it --\n");
+    {
+        uint8_t r_node[TOPOLOGY_UUID_LEN] = {0xAB, 0, 0, 0, 0, 0, 0, 0x01};
+        bool sent;
+        otCoapCode code;
+
+        /* Generous extra budget for this scenario's own window, on top of
+         * whatever the setup above already pre-queued -- covers this new
+         * node's own periodic topology/sample/heartbeat resync traffic for
+         * the ~500ms this scenario runs. */
+        for (int i = 0; i < 50; i++) {
+            host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
+        }
+
+        send_topology_report(r_node, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "setup: the rate-limit-vs-resync test node attaches OK");
+
+        send_sensor_sample(r_node, 1, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "setup: its first sample is stored fine");
+
+        size_t since;
+        bool first_publish_seen = false;
+        for (int tries = 0; tries < 200 && !first_publish_seen; tries++) {
+            sleep_ms(5);
+            if (count_samples_for_uuid(0, r_node) >= 1) {
+                first_publish_seen = true;
+            }
+        }
+        CHECK(first_publish_seen, "the first (reactive) SAMPLE publish for this uuid is observed");
+        since = host_pb_bridge_full_sim_captured_count();
+
+        /* Well past at least one 150ms resync tick, but comfortably before
+         * this uuid's own 300ms rate-limit window (opened right when the
+         * first publish above was dispatched) reopens. */
+        sleep_ms(200);
+        CHECK(count_samples_for_uuid(since, r_node) == 0,
+              "even though at least one periodic full-resync tick has fired within this 200ms window (marking "
+              "this uuid pending again), NO second SAMPLE publish for it has been dispatched yet -- resync no "
+              "longer bypasses the per-uuid rate-limit gate");
+
+        /* Now let the 300ms window genuinely reopen (well past several
+         * more resync ticks too) -- exactly one further publish should
+         * appear, never a burst of one-per-resync-tick. */
+        sleep_ms(300);
+        int after = count_samples_for_uuid(since, r_node);
+        CHECK(after == 1, "once the uuid's own rate-limit window reopens, exactly ONE further SAMPLE publish "
+                            "appears -- not zero (resync did mark it pending, so it does eventually publish) and "
+                            "not more than one (multiple resync ticks during the wait never produced a burst)");
     }
 
     printf("\n%d failures\n", g_failures);
