@@ -57,3 +57,26 @@
  * components/sensor_transport/sensor_transport.c.
  */
 #define CONFIG_SENSOR_COAP_ACK_TIMEOUT_MS 40
+
+/*
+ * This follow-up (Power Base -> Linux OTBR northbound bridge transport):
+ * same "much smaller, identical logic/ordering, real wall-clock" convention
+ * as every value above -- used by tools/test_linux_bridge_exporter.c, which
+ * links the REAL components/linux_bridge_exporter/linux_bridge_exporter.c.
+ * QUEUE_LEN is deliberately tiny (4) so a test can actually fill it to
+ * exercise the overflow/drop/rate-limited-warning path without sending
+ * dozens of events.
+ */
+#define CONFIG_LINUX_BRIDGE_EXPORTER_QUEUE_LEN 4
+/*
+ * UNLIKE every other "fast" value in this file, these two match the REAL
+ * production Kconfig defaults (5000/10000ms) exactly, on purpose:
+ * tools/test_linux_bridge_exporter.c asserts exact send-count deltas across
+ * its scenarios, which a short periodic resync/heartbeat interval would
+ * intermittently perturb (an extra, correctly-timed-but-untracked send
+ * racing in mid-scenario). Keeping the test's own total runtime well under
+ * 5s avoids that interference entirely while still exercising the exact
+ * production timing values.
+ */
+#define CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS 5000
+#define CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS 10000

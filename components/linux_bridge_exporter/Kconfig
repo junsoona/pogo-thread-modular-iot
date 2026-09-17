@@ -1,0 +1,34 @@
+menu "Linux Bridge Exporter (Power Base -> Linux OTBR host)"
+
+    config LINUX_BRIDGE_EXPORTER_QUEUE_LEN
+        int "Bounded export event queue depth"
+        default 32
+        help
+            Depth of the queue between power_base_transport's bridge-observer
+            callbacks (OT-task context, non-blocking enqueue only) and this
+            component's own sending task. A full queue drops the newest event
+            with a rate-limited warning rather than blocking the OT task or
+            halting anything -- see components/linux_bridge_exporter's own
+            header comment. The periodic full topology resync below recovers
+            any dropped TOPOLOGY event; a dropped SAMPLE event is simply not
+            exported (the power base's own aggregator still has it).
+
+    config LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS
+        int "Full topology resync interval (ms)"
+        default 5000
+        help
+            Every this many ms, resend every topology_registry node's
+            CURRENT state to the Linux host, regardless of whether anything
+            changed -- recovers from a dropped event, a stale/rebuilt Linux
+            registry, or a Linux OTBR host that just restarted (this
+            follow-up's own explicit requirement).
+
+    config LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS
+        int "Bridge exporter heartbeat interval (ms)"
+        default 10000
+        help
+            Liveness-only signal (power_base_uuid + uptime_ms + node_count);
+            never authoritative -- the periodic full topology resync above is
+            what actually reconciles Linux-side state.
+
+endmenu

@@ -39,12 +39,76 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "sensor_channel/sensor_channel.h"
 #include "topology_proto/topology_proto.h"
 #include "topology_registry/topology_registry.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*
+ * Northbound bridge observer (this follow-up: "Power Base의 aggregator
+ * 데이터를 Linux OTBR 호스트로 전달하는 northbound bridge transport"). A
+ * generic callback interface -- this header/this.c file never mentions
+ * components/linux_bridge_exporter by name, and linux_bridge_exporter never
+ * needs to be a REQUIRES of this component -- so there is no circular
+ * dependency: linux_bridge_exporter depends on power_base_transport (for
+ * these types and topology_registry_entry_t), never the other way around.
+ * power_base/main/app_main.c is the only place that wires the two together
+ * (power_base_transport_set_bridge_observer(&observer) where `observer`'s
+ * function pointers are linux_bridge_exporter's own).
+ *
+ * At most one observer is ever registered (a single power base has a single
+ * optional northbound mirror) -- a second call to
+ * power_base_transport_set_bridge_observer() simply replaces the first.
+ * Registering NULL (or never registering at all, the default) disables every
+ * callback below with zero overhead beyond one NULL check per event -- this
+ * is exactly what happens when components/power_base_bridge_config reports
+ * the exporter disabled, and it is what keeps "/s"/"/t" handling and
+ * topology_registry/sensor_root_aggregator entirely independent of whether
+ * any Linux host is even configured, let alone reachable (this follow-up's
+ * own hard requirement: "Linux 수신기가 정지하거나 응답하지 않아도 ...
+ * 계속 동작해야 한다").
+ *
+ * Every callback here fires AFTER the corresponding state change has
+ * already been fully applied and (where relevant) every mutex released --
+ * never from inside a critical section, and never blocking the CoAP
+ * handler/stale-sweep caller on anything the observer itself might do (a
+ * well-behaved observer, like linux_bridge_exporter, only ever does a
+ * non-blocking bounded-queue enqueue from within these callbacks -- see that
+ * component's own header comment).
+ */
+typedef struct {
+    void *ctx;
+    /* A new (module_uuid, sample_seq) sample was ACTUALLY newly recorded by
+     * sensor_root_aggregator (never fired for an exact-duplicate retransmit,
+     * an unknown/offline uuid, or a bitmap-mismatched sample -- all of which
+     * are already rejected before sensor_root_aggregator_record_sample() is
+     * even called, see power_base_transport.c's coap_sensor_handler()). */
+    void (*on_sample_stored)(const sensor_sample_t *sample, void *ctx);
+    /* A topology report was applied to the registry as a REAL change
+     * (topology_registry_apply_report() returned TOPOLOGY_REGISTRY_OK, never
+     * OK_DUPLICATE or any ERR_* value) -- `entry` is a snapshot of that
+     * node's own registry entry immediately after the apply. */
+    void (*on_topology_applied)(const topology_registry_entry_t *entry, void *ctx);
+    /* A node's online flag flipped from true to false for a reason OTHER
+     * than that node's own topology report (a direct DOWNSTREAM POGO detach
+     * cascade, a report elsewhere in the tree cascading this node's subtree
+     * offline, or a stale-timeout sweep). Fired once per affected uuid.
+     * NOT fired for the reporting node of a DETACHED/offline-transitioning
+     * report itself -- that node's own on_topology_applied callback already
+     * conveys its new online=false state. */
+    void (*on_node_offline)(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx);
+} power_base_transport_bridge_observer_t;
+
+/* Registers (or, passing NULL, clears) the bridge observer -- see this
+ * header's own top comment. Call from power_base/main/app_main.c only,
+ * before power_base_transport_init() is exercised by real traffic (there is
+ * no internal locking around the observer pointer itself: it is intended to
+ * be set once, at boot, exactly like every other wiring callback in this
+ * codebase -- pb_get_collector, port_event_dispatcher, ...). */
+void power_base_transport_set_bridge_observer(const power_base_transport_bridge_observer_t *observer);
 
 /*
  * Starts the CoAP server and registers both resources. Call once, after

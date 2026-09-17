@@ -32,10 +32,31 @@ written as STANDALONE(0) and no "active_tlvs" key is written at all -- this
 is the pre-existing, secret-free default and is what a plain
 `tools/gen_power_base_config.sh` invocation still produces.
 
+Optionally ALSO writes the "pb_bridge" namespace (components/
+power_base_bridge_config -- this follow-up: Power Base -> Linux OTBR
+northbound bridge transport, see docs/power-base.md) into the SAME
+image/partition:
+
+    python3 tools/pack_power_base_config.py configs/power_base.json out.bin \\
+        --bridge-host fd11:22::1 --bridge-port 5684
+
+Both --bridge-host and --bridge-port must be given together (or neither).
+The address is validated the same way components/power_base_bridge_config's
+own runtime loader does (rejects the unspecified address, multicast, and
+link-local) -- see docs/power-base.md and
+`sudo ot-ctl ipaddr mleid` on the Linux OTBR host for how to obtain a real
+one. This is NOT a secret the way the Thread Dataset is, but it is still
+never hardcoded here or in any test fixture -- always passed explicitly by
+the operator. Omitting both flags (the default) writes "pb_bridge:enabled=0"
+-- the bridge exporter stays disabled, same as a legacy image with no
+"pb_bridge" namespace at all (see that component's own compatibility
+policy).
+
 Requires the ESP-IDF python environment (for nvs_partition_gen.py) --
 source $IDF_PATH/export.sh first, same as for idf.py.
 """
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -59,7 +80,48 @@ PB_THREAD_NAMESPACE = "pb_thread"
 PB_THREAD_MODE_STANDALONE = 0
 PB_THREAD_MODE_EXTERNAL_OTBR = 1
 
+# Must match components/power_base_bridge_config/include/power_base_bridge_config/
+# power_base_bridge_config.h's own constants and wire layout.
+PB_BRIDGE_NAMESPACE = "pb_bridge"
+PB_BRIDGE_SCHEMA_VERSION = 1
+PB_BRIDGE_BLOB_LEN = 24
+
 _HEX_ONLY_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def validate_bridge_host(addr_str: str) -> bytes:
+    """
+    Parses `addr_str` as an IPv6 address and returns its 16 raw bytes.
+    Rejects a malformed address, the unspecified address (::), a multicast
+    address (ff00::/8), and a link-local address (fe80::/10) -- the exact
+    same policy components/power_base_bridge_config.c's own runtime loader
+    enforces (see that component's own header comment for why link-local is
+    rejected: no interface-index to disambiguate a link-local scope). Never
+    accepts an IPv4 (or IPv4-mapped) literal -- this partition only stores a
+    raw 16-byte value.
+    """
+    try:
+        addr = ipaddress.IPv6Address(addr_str)
+    except ValueError as e:
+        sys.exit(f"refusing to pack: --bridge-host is not a valid IPv6 address: {e}")
+    if addr.is_unspecified:
+        sys.exit("refusing to pack: --bridge-host is the unspecified address (::)")
+    if addr.is_multicast:
+        sys.exit("refusing to pack: --bridge-host is a multicast address (ff00::/8)")
+    if addr.is_link_local:
+        sys.exit("refusing to pack: --bridge-host is a link-local address (fe80::/10) -- use the Linux OTBR "
+                  "host's real Mesh-Local/backbone address (see `sudo ot-ctl ipaddr mleid`)")
+    return addr.packed
+
+
+def pack_pb_bridge_blob(enabled: bool, host_addr: bytes, port: int) -> bytes:
+    """Matches power_base_bridge_config.c's CFG_BLOB_LEN=24 layout exactly:
+    schema_version(4) + enabled(1) + reserved(1) + host_addr(16) + port(2)."""
+    blob = struct.pack(">IBB", PB_BRIDGE_SCHEMA_VERSION, 1 if enabled else 0, 0) + host_addr + struct.pack(">H", port)
+    if len(blob) != PB_BRIDGE_BLOB_LEN:
+        raise AssertionError(f"internal error: packed pb_bridge blob is {len(blob)} bytes, expected "
+                              f"{PB_BRIDGE_BLOB_LEN}")
+    return blob
 
 
 def read_external_dataset_hex_file(path: str) -> bytes:
@@ -260,6 +322,71 @@ def verify_pb_thread_config(image_path: str, expect_external: bool, expected_tlv
                      f"never printed)")
 
 
+def verify_pb_bridge_config(image_path: str, expect_enabled: bool, expected_host_addr: bytes = None,
+                             expected_port: int = None) -> None:
+    """
+    Re-parses the just-generated image and asserts the 'pb_bridge' namespace
+    matches what this run requested. Not a secret the way Dataset TLVs are,
+    but still never logs the raw address bytes -- only a match/mismatch
+    outcome -- to keep this script's output policy uniform across every
+    namespace it writes.
+    """
+    idf_path = os.environ.get("IDF_PATH", "")
+    tool_dir = os.path.join(idf_path, "components", "nvs_flash", "nvs_partition_tool")
+    if not os.path.isdir(tool_dir):
+        sys.exit(f"cannot verify the generated image: nvs_partition_tool not found at {tool_dir}")
+    if tool_dir not in sys.path:
+        sys.path.insert(0, tool_dir)
+    import nvs_parser  # noqa: E402 -- IDF_PATH-dependent, must be imported at runtime
+
+    with open(image_path, "rb") as f:
+        raw = bytearray(f.read())
+    partition = nvs_parser.NVS_Partition(os.path.basename(image_path), raw)
+
+    namespace_id = None
+    blob_entry = None
+    crc_val = None
+    for page in partition.pages:
+        for entry in page.entries:
+            if entry.key == PB_BRIDGE_NAMESPACE and entry.metadata["namespace"] == 0 and entry.data:
+                namespace_id = entry.data.get("value")
+            elif namespace_id is not None and entry.metadata["namespace"] == namespace_id and entry.data:
+                if entry.key == "blob" and entry.metadata["type"] == "blob_data":
+                    blob_entry = entry
+                elif entry.key == "crc":
+                    crc_val = entry.data.get("value")
+
+    if namespace_id is None:
+        sys.exit(f"verify_pb_bridge_config: '{PB_BRIDGE_NAMESPACE}' namespace not found in {image_path}")
+    if blob_entry is None or crc_val is None:
+        sys.exit(f"verify_pb_bridge_config: '{PB_BRIDGE_NAMESPACE}:blob'/'crc' not found in {image_path}")
+
+    raw_bytes = bytearray()
+    for child in blob_entry.children:
+        raw_bytes += child.raw
+    actual_blob = bytes(raw_bytes[:PB_BRIDGE_BLOB_LEN])
+    if len(actual_blob) != PB_BRIDGE_BLOB_LEN:
+        sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:blob is {len(actual_blob)} bytes in "
+                 f"{image_path}, expected {PB_BRIDGE_BLOB_LEN}")
+    if crc16_ccitt(actual_blob) != crc_val:
+        sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:crc does not match the stored blob's own CRC in "
+                 f"{image_path}")
+
+    actual_enabled = actual_blob[4] != 0
+    if actual_enabled != expect_enabled:
+        sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:enabled={actual_enabled} in {image_path}, "
+                 f"expected {expect_enabled}")
+    if expect_enabled:
+        actual_addr = actual_blob[6:22]
+        actual_port = struct.unpack(">H", actual_blob[22:24])[0]
+        if expected_host_addr is not None and actual_addr != expected_host_addr:
+            sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:host_addr content mismatch in {image_path} "
+                     f"(content itself never printed)")
+        if expected_port is not None and actual_port != expected_port:
+            sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:port={actual_port} in {image_path}, "
+                     f"expected {expected_port}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config_json", help="e.g. configs/power_base.json")
@@ -272,11 +399,26 @@ def main():
                           "hex text -- see this script's own module docstring. When given, writes "
                           "pb_thread:mode=EXTERNAL_OTBR(1) and pb_thread:active_tlvs=<these exact bytes>; when "
                           "omitted (default), writes pb_thread:mode=STANDALONE(0) and no active_tlvs key at all.")
+    ap.add_argument("--bridge-host", default=None, metavar="IPV6_ADDR",
+                     help="The Linux OTBR host's real IPv6 address (e.g. from `sudo ot-ctl ipaddr mleid` on that "
+                          "host) -- writes pb_bridge:enabled=1 with this address. Must be given together with "
+                          "--bridge-port. See this script's own module docstring.")
+    ap.add_argument("--bridge-port", type=int, default=None, metavar="PORT",
+                     help="The Linux OTBR host's CoAP ingest port (see linux/matter_bridge/ingest, default 5684 "
+                          "in that program). Must be given together with --bridge-host.")
     args = ap.parse_args()
 
     external_tlvs = None
     if args.external_dataset_file:
         external_tlvs = read_external_dataset_hex_file(args.external_dataset_file)
+
+    if (args.bridge_host is None) != (args.bridge_port is None):
+        sys.exit("refusing to pack: --bridge-host and --bridge-port must be given together (or neither)")
+    bridge_host_bytes = None
+    if args.bridge_host is not None:
+        bridge_host_bytes = validate_bridge_host(args.bridge_host)
+        if not (0 < args.bridge_port <= 0xFFFF):
+            sys.exit(f"refusing to pack: --bridge-port={args.bridge_port} is out of range (1..65535)")
 
     with open(args.config_json, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -344,6 +486,16 @@ def main():
             else:
                 f.write(f"mode,data,u8,{PB_THREAD_MODE_STANDALONE}\n")
 
+            f.write(f"{PB_BRIDGE_NAMESPACE},namespace,,\n")
+            pb_bridge_blob = pack_pb_bridge_blob(bridge_host_bytes is not None, bridge_host_bytes or bytes(16),
+                                                  args.bridge_port or 0)
+            pb_bridge_crc = crc16_ccitt(pb_bridge_blob)
+            pb_bridge_blob_path = os.path.join(tmp, "pb_bridge_blob.bin")
+            with open(pb_bridge_blob_path, "wb") as bf:
+                bf.write(pb_bridge_blob)
+            f.write(f"blob,file,binary,{pb_bridge_blob_path}\n")
+            f.write(f"crc,data,u16,{pb_bridge_crc}\n")
+
         tool = find_nvs_partition_gen()
         out_path = os.path.abspath(args.output_bin)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -356,17 +508,21 @@ def main():
     verify_pb_thread_config(out_path, expect_external=(external_tlvs is not None),
                              expected_tlvs_len=(len(external_tlvs) if external_tlvs is not None else 0),
                              expected_tlvs=external_tlvs)
+    verify_pb_bridge_config(out_path, expect_enabled=(bridge_host_bytes is not None),
+                             expected_host_addr=bridge_host_bytes, expected_port=args.bridge_port)
 
+    bridge_note = (f"pb_bridge:enabled=1 port={args.bridge_port}" if bridge_host_bytes is not None
+                   else "pb_bridge:enabled=0")
     if external_tlvs is not None:
         # A real secret (contains the Network Key) -- the generated image
         # itself must not be group/world-readable (see docs/power-base.md).
         os.chmod(out_path, stat.S_IRUSR | stat.S_IWUSR)
         print(f"wrote {args.output_bin} (blob_crc=0x{crc:04x}, verified power_base_cfg:blob={len(blob)} bytes, "
               f"pb_thread:mode=EXTERNAL_OTBR, pb_thread:active_tlvs={len(external_tlvs)} bytes [content never "
-              f"printed], file mode=0600)")
+              f"printed], {bridge_note}, file mode=0600)")
     else:
         print(f"wrote {args.output_bin} (blob_crc=0x{crc:04x}, verified power_base_cfg:blob={len(blob)} bytes, "
-              f"pb_thread:mode=STANDALONE)")
+              f"pb_thread:mode=STANDALONE, {bridge_note})")
 
 
 if __name__ == "__main__":

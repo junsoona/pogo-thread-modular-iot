@@ -42,6 +42,11 @@ typedef enum {
 esp_err_t nvs_open_from_partition(const char *partition_name, const char *namespace_name, nvs_open_mode_t open_mode,
                                    nvs_handle_t *out_handle);
 esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *out_value);
+/* Added for components/power_base_bridge_config's host test (this follow-up:
+ * northbound bridge transport) -- power_base_config.c's production loader
+ * has used the real nvs_get_u16() for its own "crc" key since before this
+ * stub existed, but had no host test of its own to require it here yet. */
+esp_err_t nvs_get_u16(nvs_handle_t handle, const char *key, uint16_t *out_value);
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *out_value, size_t *length);
 void nvs_close(nvs_handle_t handle);
 

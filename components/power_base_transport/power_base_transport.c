@@ -24,6 +24,106 @@ static SemaphoreHandle_t s_registry_mutex;
 static topology_registry_t s_registry;
 static uint8_t s_power_base_uuid[TOPOLOGY_UUID_LEN];
 
+/* See power_base_transport.h's own top comment on this observer -- a
+ * zero-initialized (all-NULL) struct by default, so every callback site
+ * below is a single NULL check away from a complete no-op when nothing is
+ * registered (the common case: no bridge configured at all). */
+static power_base_transport_bridge_observer_t s_observer;
+
+void power_base_transport_set_bridge_observer(const power_base_transport_bridge_observer_t *observer)
+{
+    if (observer == NULL) {
+        memset(&s_observer, 0, sizeof(s_observer));
+        return;
+    }
+    s_observer = *observer;
+}
+
+/*
+ * True if sensor_root_aggregator already holds this EXACT (module_uuid,
+ * sample_seq) -- i.e. sensor_root_aggregator_record_sample() is about to
+ * treat this as an exact-duplicate retransmit and drop it without storing.
+ * Mirrors that component's own dedup check (see sensor_root_aggregator.c's
+ * record_sample()) from the OUTSIDE, via its existing public
+ * get_node_count()/get_node() accessors, rather than modifying
+ * sensor_root_aggregator itself just to learn "was this actually new" --
+ * sensor_root_aggregator's own file stays completely untouched by this
+ * follow-up. Safe to call unconditionally: an unknown uuid (not yet in the
+ * aggregator at all) simply returns false, i.e. "this will be new". */
+static bool aggregator_has_exact_sample(const uint8_t module_uuid[SENSOR_UUID_LEN], uint32_t sample_seq)
+{
+    size_t count = sensor_root_aggregator_get_node_count();
+    for (size_t i = 0; i < count; i++) {
+        sensor_root_aggregator_node_t node;
+        if (!sensor_root_aggregator_get_node(i, &node)) {
+            continue;
+        }
+        if (memcmp(node.module_uuid, module_uuid, SENSOR_UUID_LEN) == 0) {
+            return node.has_sample && node.last_sample_seq == sample_seq;
+        }
+    }
+    return false;
+}
+
+/* A point-in-time (uuid, online) snapshot of every currently-valid registry
+ * slot -- used to detect exactly which nodes' online flags flip false
+ * across a mutating call (apply_report's internal cascade, a direct
+ * downstream detach, or a stale sweep), so power_base_transport_bridge_observer_t's
+ * on_node_offline can fire once per AFFECTED node without power_base_transport
+ * needing topology_registry.c itself to report that list (which this
+ * follow-up's own ground rules forbid modifying). */
+typedef struct {
+    uint8_t uuid[TOPOLOGY_UUID_LEN];
+    bool online;
+} online_snapshot_entry_t;
+
+/* Caller must already hold s_registry_mutex. */
+static size_t snapshot_online_states(online_snapshot_entry_t out[TOPOLOGY_REGISTRY_MAX_NODES])
+{
+    size_t n = 0;
+    for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) {
+        topology_registry_entry_t e;
+        if (!topology_registry_get(&s_registry, i, &e)) {
+            continue;
+        }
+        memcpy(out[n].uuid, e.module_uuid, TOPOLOGY_UUID_LEN);
+        out[n].online = e.online;
+        n++;
+    }
+    return n;
+}
+
+/* Fires on_node_offline for every uuid present in BOTH snapshots whose
+ * online flag was true "before" and is false "after", except skip_uuid (may
+ * be NULL) -- see this file's callers for why a report's own reporting node
+ * is excluded (its on_topology_applied callback already conveys that). Must
+ * be called AFTER s_registry_mutex has been released -- only ever touches
+ * the two local snapshot arrays, never the registry itself. */
+static void notify_newly_offline(const online_snapshot_entry_t *before, size_t before_n,
+                                  const online_snapshot_entry_t *after, size_t after_n,
+                                  const uint8_t skip_uuid[TOPOLOGY_UUID_LEN])
+{
+    if (s_observer.on_node_offline == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < after_n; i++) {
+        if (after[i].online) {
+            continue;
+        }
+        if (skip_uuid != NULL && memcmp(skip_uuid, after[i].uuid, TOPOLOGY_UUID_LEN) == 0) {
+            continue;
+        }
+        for (size_t j = 0; j < before_n; j++) {
+            if (memcmp(before[j].uuid, after[i].uuid, TOPOLOGY_UUID_LEN) == 0) {
+                if (before[j].online) {
+                    s_observer.on_node_offline(after[i].uuid, s_observer.ctx);
+                }
+                break;
+            }
+        }
+    }
+}
+
 static void send_coap_response(otMessage *request, const otMessageInfo *message_info, otCoapCode code)
 {
     if (otCoapMessageGetType(request) != OT_COAP_TYPE_CONFIRMABLE) {
@@ -99,8 +199,20 @@ static void coap_sensor_handler(void *ctx, otMessage *message, const otMessageIn
                 }
                 code = OT_COAP_CODE_PRECONDITION_FAILED;
             } else {
+                /* Checked BEFORE the store so this always reflects what
+                 * record_sample() is about to do -- see
+                 * aggregator_has_exact_sample()'s own comment on why this
+                 * lives here instead of inside sensor_root_aggregator.c
+                 * itself. Never fired for an exact-duplicate retransmit
+                 * (this "/s" handler's own success response/aggregator
+                 * behavior is completely unaffected either way -- see
+                 * power_base_transport.h's observer doc comment). */
+                bool is_new = !aggregator_has_exact_sample(sample.module_uuid, sample.sample_seq);
                 sensor_root_aggregator_record_sample(&sample);
                 code = OT_COAP_CODE_CHANGED;
+                if (is_new && s_observer.on_sample_stored != NULL) {
+                    s_observer.on_sample_stored(&sample, s_observer.ctx);
+                }
             }
         } else {
             ESP_LOGW(TAG, "malformed sensor sample payload (len=%u) -- dropped", (unsigned)len);
@@ -187,9 +299,37 @@ static void coap_topology_handler(void *ctx, otMessage *message, const otMessage
         topology_report_t report;
         if (read == len && topology_report_unpack(buf, len, &report)) {
             uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            /* Snapshotted/fired OUTSIDE the mutex below -- see
+             * notify_newly_offline()'s own comment. Declared here (rather
+             * than only inside the `if (xSemaphoreTake(...))` block) so they
+             * stay in scope for the observer calls after that block ends. */
+            online_snapshot_entry_t before[TOPOLOGY_REGISTRY_MAX_NODES];
+            online_snapshot_entry_t after[TOPOLOGY_REGISTRY_MAX_NODES];
+            size_t before_n = 0, after_n = 0;
+            bool have_snapshots = false;
+            topology_registry_entry_t applied_entry;
+            bool have_applied_entry = false;
+            topology_registry_result_t result = TOPOLOGY_REGISTRY_ERR_FULL; /* only used if the mutex is acquired */
+
             if (xSemaphoreTake(s_registry_mutex, REGISTRY_MUTEX_WAIT) == pdTRUE) {
-                topology_registry_result_t result =
-                    topology_registry_apply_report(&s_registry, &report, s_power_base_uuid, now_ms);
+                /* Captured BEFORE apply_report() so any cascade it triggers
+                 * internally (a DETACHED report, or downstream_connected
+                 * transitioning true->false -- see topology_registry.h's own
+                 * top comment) can be detected below, without
+                 * topology_registry.c itself needing to report the affected
+                 * list (this follow-up's own ground rules forbid modifying
+                 * it). */
+                before_n = snapshot_online_states(before);
+                result = topology_registry_apply_report(&s_registry, &report, s_power_base_uuid, now_ms);
+                if (result == TOPOLOGY_REGISTRY_OK) {
+                    const topology_registry_entry_t *e = topology_registry_find(&s_registry, report.module_uuid);
+                    if (e != NULL) {
+                        applied_entry = *e;
+                        have_applied_entry = true;
+                    }
+                }
+                after_n = snapshot_online_states(after);
+                have_snapshots = true;
                 xSemaphoreGive(s_registry_mutex);
                 code = topology_result_to_coap_code(result);
                 if (!topology_registry_result_is_ok(result)) {
@@ -213,6 +353,16 @@ static void coap_topology_handler(void *ctx, otMessage *message, const otMessage
             } else {
                 ESP_LOGW(TAG, "topology report: could not acquire registry mutex in time -- treating as unavailable");
                 code = OT_COAP_CODE_SERVICE_UNAVAILABLE;
+            }
+
+            /* Bridge observer notifications -- entirely outside the mutex,
+             * see power_base_transport.h's own doc comment on when these
+             * fire. */
+            if (have_snapshots) {
+                notify_newly_offline(before, before_n, after, after_n, report.module_uuid);
+            }
+            if (have_applied_entry && s_observer.on_topology_applied != NULL) {
+                s_observer.on_topology_applied(&applied_entry, s_observer.ctx);
             }
         } else {
             ESP_LOGW(TAG, "malformed topology report payload (len=%u) -- dropped", (unsigned)len);
@@ -283,14 +433,23 @@ void power_base_transport_on_direct_downstream_detached(void)
     if (s_registry_mutex == NULL || xSemaphoreTake(s_registry_mutex, REGISTRY_MUTEX_WAIT) != pdTRUE) {
         return;
     }
+    online_snapshot_entry_t before[TOPOLOGY_REGISTRY_MAX_NODES];
+    online_snapshot_entry_t after[TOPOLOGY_REGISTRY_MAX_NODES];
+    size_t before_n = snapshot_online_states(before);
     for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) {
         topology_registry_entry_t e;
         if (topology_registry_get(&s_registry, i, &e) && e.depth == 1 && e.online) {
             topology_registry_mark_offline(&s_registry, e.module_uuid);
         }
     }
+    size_t after_n = snapshot_online_states(after);
     xSemaphoreGive(s_registry_mutex);
     ESP_LOGW(TAG, "direct DOWNSTREAM POGO detach -- depth=1 node(s) and their whole subtree marked offline");
+    /* NULL skip_uuid: unlike coap_topology_handler's report-driven path,
+     * there is no single "reporting node" to exclude here -- every node
+     * that actually flipped offline (the direct child(ren) themselves AND
+     * their whole cascaded subtree) is a bridge-observer event. */
+    notify_newly_offline(before, before_n, after, after_n, NULL);
 }
 
 void power_base_transport_sweep_stale(uint32_t now_ms, uint32_t stale_timeout_ms)
@@ -298,8 +457,13 @@ void power_base_transport_sweep_stale(uint32_t now_ms, uint32_t stale_timeout_ms
     if (s_registry_mutex == NULL || xSemaphoreTake(s_registry_mutex, REGISTRY_MUTEX_WAIT) != pdTRUE) {
         return;
     }
+    online_snapshot_entry_t before[TOPOLOGY_REGISTRY_MAX_NODES];
+    online_snapshot_entry_t after[TOPOLOGY_REGISTRY_MAX_NODES];
+    size_t before_n = snapshot_online_states(before);
     topology_registry_sweep_stale(&s_registry, now_ms, stale_timeout_ms);
+    size_t after_n = snapshot_online_states(after);
     xSemaphoreGive(s_registry_mutex);
+    notify_newly_offline(before, before_n, after, after_n, NULL);
 }
 
 size_t power_base_transport_get_node_count(void)

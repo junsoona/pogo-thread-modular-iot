@@ -143,6 +143,22 @@ static inline BaseType_t xQueueReceive(QueueHandle_t q, void *out, TickType_t ti
     return pdTRUE;
 }
 
+/* Added for components/linux_bridge_exporter's host test (this follow-up:
+ * northbound bridge transport) -- its error-handling paths call this on a
+ * queue-creation failure, which no host test actually triggers, but the
+ * symbol must still exist for the real production .c file to link. */
+static inline void vQueueDelete(QueueHandle_t q)
+{
+    if (q == NULL) {
+        return;
+    }
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->not_empty);
+    pthread_cond_destroy(&q->not_full);
+    free(q->buf);
+    free(q);
+}
+
 #ifdef __cplusplus
 }
 #endif

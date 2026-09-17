@@ -17,23 +17,33 @@ nvs,        data, nvs,      0x9000,  0x6000,
 phy_init,   data, phy,      0xf000,  0x1000,
 factory,    app,  factory,  0x10000, 1500K,
 #
-# "cfg" holds the FIXED power-base board configuration -- TWO independent
+# "cfg" holds the FIXED power-base board configuration -- THREE independent
 # NVS namespaces in the SAME partition/image:
 #   - "power_base_cfg" (components/power_base_config): POGO GPIOs, timeouts,
 #     ... -- unchanged by this follow-up.
-#   - "pb_thread" (components/power_base_thread_config, this follow-up):
-#     mode=STANDALONE(0)/EXTERNAL_OTBR(1) and, only for EXTERNAL_OTBR, the
-#     Linux OTBR's real Active Dataset TLVs (a SECRET -- contains the
-#     Network Key; the generated image is written mode 0600 and must never
-#     be committed, see .gitignore). A legacy image with no "pb_thread"
-#     namespace at all is STANDALONE -- this partition is NOT
-#     "standalone-only" any more, but every pre-existing image still works
-#     unchanged. See docs/power-base.md and docs/otbr-rcp.md.
+#   - "pb_thread" (components/power_base_thread_config): mode=STANDALONE(0)/
+#     EXTERNAL_OTBR(1) and, only for EXTERNAL_OTBR, the Linux OTBR's real
+#     Active Dataset TLVs (a SECRET -- contains the Network Key; the
+#     generated image is written mode 0600 and must never be committed, see
+#     .gitignore). A legacy image with no "pb_thread" namespace at all is
+#     STANDALONE -- this partition is NOT "standalone-only" any more, but
+#     every pre-existing image still works unchanged. See docs/power-base.md
+#     and docs/otbr-rcp.md.
+#   - "pb_bridge" (components/power_base_bridge_config, this follow-up:
+#     northbound Power Base -> Linux OTBR host bridge transport):
+#     enabled(bool) + the Linux host's IPv6 address + CoAP port, for
+#     components/linux_bridge_exporter. NOT a secret (no Network Key
+#     involved) -- but still never hardcoded/committed with a real address,
+#     see tools/gen_power_base_bridge_config.sh. A legacy image with no
+#     "pb_bridge" namespace at all, or an explicit enabled=false, is treated
+#     as "exporter disabled" -- NOT a boot failure, unlike the two
+#     namespaces above (see components/power_base_bridge_config's own header
+#     comment's "boot policy" section).
 # Generated offline by tools/pack_power_base_config.py (plain
-# tools/gen_power_base_config.sh for STANDALONE, or
-# tools/gen_power_base_otbr_config.sh for EXTERNAL_OTBR) and treated as
-# read-only by the application at runtime. This is a physically separate
-# flash image from module/partitions.csv's own "cfg" partition (a different
-# board, a different binary) -- reusing the partition NAME is not a
-# collision.
+# tools/gen_power_base_config.sh for STANDALONE, tools/gen_power_base_otbr_config.sh
+# for EXTERNAL_OTBR, and/or tools/gen_power_base_bridge_config.sh to add the
+# "pb_bridge" namespace to either) and treated as read-only by the
+# application at runtime. This is a physically separate flash image from
+# module/partitions.csv's own "cfg" partition (a different board, a
+# different binary) -- reusing the partition NAME is not a collision.
 cfg,        data, nvs,      0x187000, 0x3000,

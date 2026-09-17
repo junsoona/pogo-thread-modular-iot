@@ -196,7 +196,9 @@
 #include "parent_service/parent_service.h"
 #include "power_base_config/power_base_config.h"
 #include "power_base_thread_config/power_base_thread_config.h"
+#include "power_base_bridge_config/power_base_bridge_config.h"
 #include "power_base_transport/power_base_transport.h"
+#include "linux_bridge_exporter/linux_bridge_exporter.h"
 #include "thread_manager/thread_manager.h"
 
 static const char *TAG = "power_base_main";
@@ -212,6 +214,16 @@ static const char *TAG = "power_base_main";
 
 static power_base_config_t s_cfg;
 static power_base_thread_config_t s_thread_cfg;
+/*
+ * This follow-up (Power Base -> Linux OTBR northbound bridge transport):
+ * enabled=false by default, and stays that way for the rest of this boot on
+ * ANY power_base_bridge_config_load() failure -- unlike s_cfg/s_thread_cfg
+ * above, a pb_bridge problem is NEVER a reason to halt the whole power base
+ * (see components/power_base_bridge_config's own header comment's "boot
+ * policy" section: this optional mirror's own config errors must not newly
+ * brick an otherwise-healthy power base).
+ */
+static power_base_bridge_config_t s_bridge_cfg;
 static uint8_t s_own_uuid[POGO_UUID_LEN];
 static parent_service_context_t s_parent_ctx;
 /* Informational provisioning epoch handed out in every SET_COLLECTOR this
@@ -383,6 +395,29 @@ static void start_services_once(otDeviceRole role)
 {
     ESP_ERROR_CHECK(power_base_transport_init(s_own_uuid));
 
+    /*
+     * This follow-up: the optional Linux bridge exporter, started AFTER
+     * power_base_transport_init() (it registers itself as that component's
+     * bridge observer -- see power_base_transport.h's own top comment) and
+     * here in start_services_once() specifically because it also needs
+     * esp_openthread_get_instance() to be meaningful, same ordering
+     * constraint as parent_service_init()/pogo_port_init() below. A failure
+     * here (a genuine resource-creation failure -- see
+     * linux_bridge_exporter.h's own doc comment) is logged and otherwise
+     * ignored: this optional mirror never gates POGO provisioning, Thread
+     * membership, or any other subsystem below.
+     */
+    if (s_bridge_cfg.enabled) {
+        esp_err_t bridge_err = linux_bridge_exporter_init(s_own_uuid, &s_bridge_cfg);
+        if (bridge_err != ESP_OK) {
+            ESP_LOGW(TAG, "linux_bridge_exporter_init failed (%s) -- continuing without the optional Linux bridge "
+                          "mirror this boot",
+                     esp_err_to_name(bridge_err));
+        }
+    } else {
+        ESP_LOGI(TAG, "pb_bridge exporter disabled -- no Linux OTBR mirror this boot");
+    }
+
     s_parent_ctx = (parent_service_context_t){
         .provisioning_allowed = pb_provisioning_allowed,
         .get_own_depth = pb_get_own_depth,
@@ -547,6 +582,23 @@ void app_main(void)
                  (unsigned)s_thread_cfg.active_tlvs_len);
     } else {
         ESP_LOGI(TAG, "Thread dataset mode: STANDALONE");
+    }
+
+    /*
+     * This follow-up (Power Base -> Linux OTBR northbound bridge transport):
+     * UNLIKE the two loads above, a non-ESP_OK return here is NEVER a halt
+     * condition -- see components/power_base_bridge_config's own header
+     * comment's "boot policy" section. A missing "pb_bridge" namespace
+     * (every pre-existing image) or an explicit enabled=false both already
+     * return ESP_OK with enabled=false; only a genuinely malformed/
+     * CRC-mismatched/invalid-when-enabled config reaches this branch, and it
+     * simply disables the optional exporter for the rest of this boot
+     * instead of halting the whole power base.
+     */
+    if (power_base_bridge_config_load(&s_bridge_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "pb_bridge CONFIG_ERROR -- the optional Linux bridge exporter will not start this boot; "
+                      "POGO provisioning, Thread join, and every other subsystem are unaffected");
+        s_bridge_cfg.enabled = false; /* fail-safe: never start the exporter on a load error */
     }
 
     apply_power_rail_sequencing();

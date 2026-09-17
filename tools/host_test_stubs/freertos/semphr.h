@@ -100,6 +100,20 @@ static inline BaseType_t xSemaphoreGive(SemaphoreHandle_t s)
     return pdTRUE;
 }
 
+/* Added for components/linux_bridge_exporter's host test (this follow-up:
+ * northbound bridge transport) -- its error-handling paths call this on a
+ * resource-creation failure, which no host test actually triggers, but the
+ * symbol must still exist for the real production .c file to link. */
+static inline void vSemaphoreDelete(SemaphoreHandle_t s)
+{
+    if (s == NULL) {
+        return;
+    }
+    pthread_mutex_destroy(&s->mutex);
+    pthread_cond_destroy(&s->released);
+    free(s);
+}
+
 #ifdef __cplusplus
 }
 #endif

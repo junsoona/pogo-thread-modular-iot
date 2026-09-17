@@ -38,6 +38,33 @@ static inline void host_esp_log(const char *level, const char *tag, const char *
 #define ESP_LOGD(tag, fmt, ...) host_esp_log("D", tag, fmt, ##__VA_ARGS__)
 #define ESP_LOGV(tag, fmt, ...) host_esp_log("V", tag, fmt, ##__VA_ARGS__)
 
+/* Added for components/power_base_transport's host test (this follow-up:
+ * northbound bridge transport) -- power_base_transport.c has used
+ * ESP_LOG_LEVEL_LOCAL()/esp_log_level_t for its own ATTACHED-vs-HEARTBEAT
+ * log-level choice since before this stub existed, but had no host test of
+ * its own to require it here yet. Levels match ESP-IDF's real esp_log.h
+ * ordering (higher = more verbose). */
+typedef enum {
+    ESP_LOG_NONE = 0,
+    ESP_LOG_ERROR,
+    ESP_LOG_WARN,
+    ESP_LOG_INFO,
+    ESP_LOG_DEBUG,
+    ESP_LOG_VERBOSE,
+} esp_log_level_t;
+
+#define ESP_LOG_LEVEL_LOCAL(level, tag, fmt, ...)                                                                    \
+    do {                                                                                                             \
+        switch (level) {                                                                                             \
+        case ESP_LOG_ERROR: ESP_LOGE(tag, fmt, ##__VA_ARGS__); break;                                                \
+        case ESP_LOG_WARN: ESP_LOGW(tag, fmt, ##__VA_ARGS__); break;                                                 \
+        case ESP_LOG_DEBUG: ESP_LOGD(tag, fmt, ##__VA_ARGS__); break;                                                \
+        case ESP_LOG_VERBOSE: ESP_LOGV(tag, fmt, ##__VA_ARGS__); break;                                              \
+        case ESP_LOG_INFO:                                                                                           \
+        default: ESP_LOGI(tag, fmt, ##__VA_ARGS__); break;                                                           \
+        }                                                                                                             \
+    } while (0)
+
 static inline const char *esp_err_to_name(esp_err_t code)
 {
     switch (code) {

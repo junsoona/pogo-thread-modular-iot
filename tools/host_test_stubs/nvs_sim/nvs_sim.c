@@ -16,6 +16,8 @@ typedef struct {
     bool   used;
     bool   is_blob;
     uint8_t u8_value;
+    uint16_t u16_value;
+    bool   is_u16;
     uint8_t blob[SIM_MAX_BLOB_LEN];
     size_t blob_len;
 } sim_entry_t;
@@ -90,6 +92,15 @@ void nvs_sim_put_u8(const char *partition, const char *ns, const char *key, uint
     e->u8_value = value;
 }
 
+void nvs_sim_put_u16(const char *partition, const char *ns, const char *key, uint16_t value)
+{
+    sim_namespace_t *n = find_ns(partition, ns, true);
+    sim_entry_t *e = find_or_create_entry(n, key);
+    e->is_blob = false;
+    e->is_u16 = true;
+    e->u16_value = value;
+}
+
 void nvs_sim_put_blob(const char *partition, const char *ns, const char *key, const void *data, size_t len)
 {
     sim_namespace_t *n = find_ns(partition, ns, true);
@@ -146,10 +157,20 @@ static sim_entry_t *lookup_entry(nvs_handle_t handle, const char *key)
 esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *out_value)
 {
     sim_entry_t *e = lookup_entry(handle, key);
-    if (e == NULL || e->is_blob) {
+    if (e == NULL || e->is_blob || e->is_u16) {
         return ESP_ERR_NVS_NOT_FOUND;
     }
     *out_value = e->u8_value;
+    return ESP_OK;
+}
+
+esp_err_t nvs_get_u16(nvs_handle_t handle, const char *key, uint16_t *out_value)
+{
+    sim_entry_t *e = lookup_entry(handle, key);
+    if (e == NULL || e->is_blob || !e->is_u16) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    *out_value = e->u16_value;
     return ESP_OK;
 }
 

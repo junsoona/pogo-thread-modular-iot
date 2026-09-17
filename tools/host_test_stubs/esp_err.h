@@ -22,3 +22,9 @@ typedef int esp_err_t;
 #define ESP_ERR_NO_MEM        0x101
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NOT_SUPPORTED 0x110
+/* Added for components/power_base_bridge_config's host test (this
+ * follow-up: northbound bridge transport) -- real ESP-IDF values, matching
+ * power_base_config.c's own pre-existing (never previously host-tested) use
+ * of these same two symbols. */
+#define ESP_ERR_INVALID_CRC     0x109
+#define ESP_ERR_INVALID_VERSION 0x10A

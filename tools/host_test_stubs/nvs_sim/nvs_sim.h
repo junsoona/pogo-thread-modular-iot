@@ -28,6 +28,9 @@ void nvs_sim_create_namespace(const char *partition, const char *ns);
 /* Creates the namespace if needed, then sets/overwrites a u8 key in it. */
 void nvs_sim_put_u8(const char *partition, const char *ns, const char *key, uint8_t value);
 
+/* Creates the namespace if needed, then sets/overwrites a u16 key in it. */
+void nvs_sim_put_u16(const char *partition, const char *ns, const char *key, uint16_t value);
+
 /* Creates the namespace if needed, then sets/overwrites a blob key in it.
  * len == 0 is allowed (models an explicitly-empty blob). */
 void nvs_sim_put_blob(const char *partition, const char *ns, const char *key, const void *data, size_t len);
