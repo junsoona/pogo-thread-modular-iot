@@ -14,18 +14,25 @@
  * knows it exists by name (see power_base_transport.h's own top comment on
  * that observer interface).
  *
- * Runs its own dedicated FreeRTOS task with a bounded event queue. Every
- * power_base_transport_bridge_observer_t callback this component registers
- * (on_sample_stored/on_topology_applied/on_node_offline) fires from within
- * the OpenThread task's own context and does NOTHING but a non-blocking
- * xQueueSend() -- see linux_bridge_exporter.c's own header comment for the
- * full design, including what happens on queue overflow (the event is
- * dropped with a rate-limited warning; the periodic 5-second full topology
- * resync this task also runs is what keeps the Linux side eventually
- * consistent regardless of any dropped event -- see this codebase's
- * requirement that a stalled/unreachable Linux host must NEVER affect POGO
- * provisioning, Thread join, "/s"/"/t" handling, aggregator storage, the
- * topology registry, or any other sensor module's own communication).
+ * Runs its own dedicated FreeRTOS task with a bounded event queue (TOPOLOGY
+ * events) and a bounded, uuid-coalescing table (SAMPLE events -- see
+ * linux_bridge_exporter.c's own top comment for why the two are handled
+ * differently). Every power_base_transport_bridge_observer_t callback this
+ * component registers (on_sample_stored/on_topology_applied/on_node_offline)
+ * fires from within the OpenThread task's own context and does NOTHING but
+ * a STRICTLY non-blocking (0-tick) xQueueSend()/xSemaphoreTake() attempt --
+ * on_topology_applied/on_node_offline enqueue into the topology queue,
+ * on_sample_stored upserts into the pending-sample table -- never a CoAP
+ * send, never a wait that could actually block the OpenThread task. See
+ * linux_bridge_exporter.c's own header comment for the full design,
+ * including what happens when a 0-tick attempt misses (the event is
+ * dropped with a rate-limited warning, never retried in a loop; the
+ * periodic full topology+sample resync this task also runs is what keeps
+ * the Linux side eventually consistent regardless of any dropped event --
+ * see this codebase's requirement that a stalled/unreachable Linux host
+ * must NEVER affect POGO provisioning, Thread join, "/s"/"/t" handling,
+ * aggregator storage, the topology registry, or any other sensor module's
+ * own communication).
  *
  * Sends components/bridge_export_proto-encoded messages as OpenThread CoAP
  * Confirmable POSTs to the configured Linux OTBR host, port, and resources

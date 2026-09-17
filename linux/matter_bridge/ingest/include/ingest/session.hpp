@@ -34,13 +34,17 @@ namespace ingest {
 //                       own CoAP code table exactly)
 //   5.03 Service Unavailable -- a brand-new (power_base_uuid, module_uuid)
 //                       pair, but the bounded registry is full
-// The caller (server.cpp) is responsible for only calling this AFTER
-// deciding the request is otherwise well-formed CoAP, and for only sending
-// an ACK for a Confirmable request (matching
-// components/power_base_transport's own send_coap_response() policy) --
-// this function itself always finishes registry application before
-// returning, so the caller's ACK is only ever sent after that (this
-// follow-up's own explicit ordering requirement).
+// The caller (server.cpp) is responsible for calling this ONLY for a
+// Confirmable request whose method is POST -- a Non-confirmable (or
+// Acknowledgement/Reset) datagram, or a Confirmable non-POST method, must
+// never reach this function at all (never merely "call it but skip the
+// ACK"), so the registry is provably untouched by anything but a
+// Confirmable POST (correction pass; matches
+// components/power_base_transport's own send_coap_response() policy of
+// only ever applying state for a request it will also ACK). This function
+// itself always finishes registry application before returning, so the
+// caller's ACK is only ever sent after that (this follow-up's own explicit
+// ordering requirement).
 uint8_t handle_request(Registry &registry, const CoapMessage &req);
 
 } // namespace ingest

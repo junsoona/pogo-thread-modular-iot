@@ -105,6 +105,26 @@ std::vector<uint8_t> pack_heartbeat_wire(uint8_t pb_tag, uint32_t uptime_ms, uin
     return std::vector<uint8_t>(wire, wire + wlen);
 }
 
+std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, uint8_t depth, uint32_t generation,
+                                         uint32_t last_seq)
+{
+    bridge_export_topology_node_t node;
+    std::memset(&node, 0, sizeof(node));
+    std::memset(node.power_base_uuid, 0xB0, BRIDGE_EXPORT_UUID_LEN);
+    std::memset(node.module_uuid, uuid_tag, BRIDGE_EXPORT_UUID_LEN);
+    std::memset(node.parent_uuid, 0xB0, BRIDGE_EXPORT_UUID_LEN);
+    node.online = online;
+    node.depth = depth;
+    node.role = 3;
+    node.sensor_bitmap = 0x0002;
+    node.downstream_connected = false;
+    node.boot_session_generation = generation;
+    node.last_seq = last_seq;
+    uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+    size_t wlen = bridge_export_pack_topology_node(&node, wire, sizeof(wire));
+    return std::vector<uint8_t>(wire, wire + wlen);
+}
+
 // Resolves the loopback interface's real name on this machine -- "lo" on
 // Linux, "lo0" on macOS/BSD. Aborts the test loudly if neither exists
 // (every POSIX system this program targets has one).
@@ -244,6 +264,67 @@ int main()
         socklen_t from_len = sizeof(from);
         ssize_t n = recvfrom(client, resp_buf, sizeof(resp_buf), 0, reinterpret_cast<sockaddr *>(&from), &from_len);
         CHECK(n < 0, "no response is ever sent for a Non-confirmable request");
+    }
+
+    printf("\n-- scenario (correction pass, item 1): a Non-confirmable TOPOLOGY request never changes registry "
+           "state, not just 'goes un-ACKed' -- verified via the REAL run_server() + registry, not the "
+           "heartbeat-only no-response check above --\n");
+    {
+        CHECK(registry.node_count() == 0, "sanity: the registry is still empty before this scenario (nothing "
+                                            "prior in this test file ever POSTed a real TOPOLOGY_SNAPSHOT)");
+
+        timeval short_tv3{};
+        short_tv3.tv_sec = 0;
+        short_tv3.tv_usec = 300000; // 300ms -- long enough for any real ACK to have arrived
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &short_tv3, sizeof(short_tv3));
+
+        auto payload = pack_topology_wire(0x77, true, 1, 1, 1);
+        auto request = build_request("pogo/v1/topology", payload, 104, ingest::CoapType::NonConfirmable);
+        sendto(client, request.data(), request.size(), 0, reinterpret_cast<sockaddr *>(&server_addr),
+               sizeof(server_addr));
+
+        uint8_t resp_buf2[512];
+        sockaddr_in6 from3{};
+        socklen_t from_len3 = sizeof(from3);
+        ssize_t n = recvfrom(client, resp_buf2, sizeof(resp_buf2), 0, reinterpret_cast<sockaddr *>(&from3),
+                              &from_len3);
+        CHECK(n < 0, "no response is ever sent for a Non-confirmable TOPOLOGY request");
+
+        // Give the server loop a moment in case handle_request() were
+        // (incorrectly) still being called asynchronously -- there is no
+        // such asynchrony in this server, but this keeps the check honest
+        // rather than racing the very next line against the recv above.
+        struct timespec small_wait = {0, 50000000L}; // 50ms
+        nanosleep(&small_wait, nullptr);
+        CHECK(registry.node_count() == 0,
+              "the registry was NEVER touched by the Non-confirmable TOPOLOGY request -- handle_request() must "
+              "not have been called at all, not merely left un-ACKed after mutating state");
+    }
+
+    printf("\n-- scenario: a Confirmable POST TOPOLOGY request still applies normally (regression: the "
+           "Non-confirmable fix above must not affect the Confirmable path) --\n");
+    {
+        timeval tv4{};
+        tv4.tv_sec = 2;
+        tv4.tv_usec = 0;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv4, sizeof(tv4));
+
+        auto payload = pack_topology_wire(0x78, true, 1, 1, 1);
+        auto request = build_request("pogo/v1/topology", payload, 105, ingest::CoapType::Confirmable);
+        sendto(client, request.data(), request.size(), 0, reinterpret_cast<sockaddr *>(&server_addr),
+               sizeof(server_addr));
+
+        uint8_t resp_buf3[512];
+        sockaddr_in6 from4{};
+        socklen_t from_len4 = sizeof(from4);
+        ssize_t n = recvfrom(client, resp_buf3, sizeof(resp_buf3), 0, reinterpret_cast<sockaddr *>(&from4),
+                              &from_len4);
+        CHECK(n >= 4, "a response was received for the Confirmable POST TOPOLOGY request");
+        if (n >= 4) {
+            CHECK(resp_buf3[1] == ingest::kCoapCodeChanged, "the response code is 2.04 Changed");
+        }
+        CHECK(registry.node_count() == 1, "the Confirmable POST DID apply to the registry (exactly the one new "
+                                            "node from this scenario)");
     }
 
     printf("\n-- scenario: a non-POST method gets 4.05 Method Not Allowed --\n");

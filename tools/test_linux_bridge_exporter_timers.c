@@ -250,6 +250,110 @@ int main(void)
               "pre-queued outcome budget and aborted this process long before reaching this check");
     }
 
+    printf("\n-- scenario (correction pass, item 2): observer_on_sample_stored() never blocks the OT-task "
+           "context, even while contending with the exporter's own background task for "
+           "s_pending_samples_mutex -- and the periodic sample resync still delivers the LATEST value "
+           "afterward --\n");
+    {
+        uint8_t nb_node[TOPOLOGY_UUID_LEN] = {0x9B, 0, 0, 0, 0, 0, 0, 0x01};
+        bool sent;
+        otCoapCode code;
+        int base_sends = host_pb_bridge_full_sim_send_count();
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
+        send_topology_report(nb_node, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "setup: the non-blocking-test node attaches OK");
+        CHECK(wait_for_send_count(base_sends + 1, 2000), "setup: its topology export settles");
+
+        /* A generous budget for whatever periodic resync/heartbeat activity
+         * happens to interleave with this burst and the wait afterward --
+         * this scenario's own point is call LATENCY, not exact counts. */
+        for (int i = 0; i < 50; i++) {
+            host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
+        }
+
+        /* Fire a rapid, tight-loop burst of samples for the SAME uuid --
+         * long enough (spanning several EXPORTER_POLL_TICK_MS/resync-
+         * interval cycles) that the exporter's own background task is
+         * genuinely also touching s_pending_samples_mutex (via
+         * drain_pending_samples()/do_full_sample_resync()) throughout,
+         * i.e. this is REAL cross-thread contention on the exact mutex
+         * upsert_pending_sample() takes, not merely a timing measurement in
+         * isolation. Each call's wall-clock latency is measured: with the
+         * 0-tick take (this correction pass), NO call can ever block
+         * regardless of contention -- it either takes the mutex
+         * immediately or gives up immediately. */
+        enum { kBurstCount = 300 };
+        long max_latency_ns = 0;
+        for (int i = 0; i < kBurstCount; i++) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            send_sensor_sample(nb_node, (uint32_t)(i + 1), &sent, &code);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
+            if (elapsed_ns > max_latency_ns) {
+                max_latency_ns = elapsed_ns;
+            }
+        }
+        printf("(worst-case single dispatch latency over %d rapid samples: %ld us)\n", kBurstCount,
+               max_latency_ns / 1000);
+        /* The OLD code's mutex take could block up to 20 ticks (20ms) under
+         * contention -- this asserts comfortably under that bound (5ms),
+         * which a genuinely non-blocking 0-tick take always satisfies
+         * regardless of how much real contention actually occurred. */
+        CHECK(max_latency_ns < 5000000L,
+              "every single dispatch call (which synchronously runs observer_on_sample_stored() in this test's "
+              "own thread) completes in well under 5ms -- never blocks on s_pending_samples_mutex even under "
+              "real contention with the exporter's own background task");
+
+        /* Regardless of how many of the 300 reactive upserts above were won
+         * or dropped by contention, the periodic full sample resync must
+         * still converge on the LATEST value (seq == kBurstCount) within a
+         * bounded number of resync intervals -- this is the recovery path
+         * this correction pass explicitly relies on instead of a busy
+         * retry. */
+        size_t since = host_pb_bridge_full_sim_captured_count();
+        bool found_latest = false;
+        for (int tries = 0; tries < 200 && !found_latest; tries++) {
+            sleep_ms(10);
+            size_t total = host_pb_bridge_full_sim_captured_count();
+            for (size_t idx = since; idx < total; idx++) {
+                host_pb_bridge_full_sim_sent_t cap;
+                if (!host_pb_bridge_full_sim_get_captured(idx, &cap)) {
+                    continue;
+                }
+                if (strcmp(cap.uri_path, "pogo/v1/sample") != 0) {
+                    continue;
+                }
+                bridge_export_msg_type_t type;
+                const uint8_t *payload;
+                uint16_t payload_len;
+                if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len) ||
+                    type != BRIDGE_EXPORT_MSG_SAMPLE) {
+                    continue;
+                }
+                bridge_export_sample_t exp;
+                if (!bridge_export_unpack_sample(payload, payload_len, &exp)) {
+                    continue;
+                }
+                sensor_sample_t decoded;
+                if (!sensor_channel_unpack(exp.sensor_channel_payload, exp.sensor_channel_len, &decoded)) {
+                    continue;
+                }
+                if (memcmp(decoded.module_uuid, nb_node, SENSOR_UUID_LEN) != 0) {
+                    continue;
+                }
+                if (decoded.sample_seq == (uint32_t)kBurstCount) {
+                    found_latest = true;
+                    break;
+                }
+            }
+        }
+        CHECK(found_latest,
+              "the periodic full sample resync eventually delivers the LATEST sample (seq=300) for this uuid, "
+              "regardless of how many of the 300 rapid reactive upserts were dropped by mutex contention along "
+              "the way -- aggregator state + periodic resync is the recovery path, not a busy retry");
+    }
+
     printf("\n%d failures\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

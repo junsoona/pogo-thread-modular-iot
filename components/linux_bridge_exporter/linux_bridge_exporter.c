@@ -19,12 +19,18 @@
  * be sent after (or instead of) a newer one for the same uuid, and no
  * "replay a backlog of stale samples" scenario is possible at all.
  *
- * Both power_base_transport's bridge-observer callbacs
+ * Both power_base_transport's bridge-observer callbacks
  * (observer_on_sample_stored/observer_on_topology_applied/
  * observer_on_node_offline below) run from within the OpenThread task's own
  * context (same as every otCoapAddResource handler in this codebase) and do
- * ONLY a non-blocking enqueue/upsert -- never a CoAP send, never a mutex
- * wait longer than a few ticks. exporter_task() (this component's own,
+ * ONLY a strictly non-blocking enqueue/upsert -- never a CoAP send, and
+ * every xQueueSend()/xSemaphoreTake() call site they reach uses a 0-tick
+ * wait (correction pass: upsert_pending_sample()'s mutex take used to
+ * block up to 20 ticks, which this pass removed -- see that function's own
+ * comment). A 0-tick miss (the exporter task happens to hold the mutex, or
+ * the topology queue is momentarily full) simply drops that one event with
+ * a rate-limited warning; it is never retried in a loop and never handed
+ * to a new task/state machine. exporter_task() (this component's own,
  * dedicated task) is the ONLY thing that ever actually sends network
  * traffic, drains both the topology queue and the pending-sample table, and
  * runs the periodic timers: a full TOPOLOGY resync, a full latest-SAMPLE
@@ -371,12 +377,21 @@ static void do_full_sample_resync(void)
  * true) -- there is never more than one pending export per uuid, so this
  * table can never accumulate or later replay a backlog of stale samples
  * (see this file's own top comment). Called from the OT task's own context
- * (an observer callback) -- bounded to a short mutex wait, never blocks
- * longer than that.
+ * (an observer callback), which must NEVER block (correction pass): the
+ * mutex take below uses a 0-tick (non-blocking) wait -- if the exporter
+ * task happens to be holding s_pending_samples_mutex at that exact instant
+ * (drain_pending_samples()/linux_bridge_exporter_init()'s own brief
+ * critical sections), this reactive upsert is simply dropped with a
+ * rate-limited warning, never retried in a busy loop and never handed off
+ * to a new task/state machine -- the periodic full sample resync
+ * (do_full_sample_resync(), reading sensor_root_aggregator directly) is the
+ * sole recovery path for a dropped upsert, same as every other
+ * best-effort drop in this component (see this file's own top comment on
+ * the overall overflow/drop policy).
  */
 static void upsert_pending_sample(const sensor_sample_t *sample)
 {
-    if (xSemaphoreTake(s_pending_samples_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    if (xSemaphoreTake(s_pending_samples_mutex, 0) != pdTRUE) {
         warn_rate_limited("pending-sample table busy -- dropped one reactive SAMPLE export event (the periodic "
                            "full sample resync still delivers the current value)");
         return;

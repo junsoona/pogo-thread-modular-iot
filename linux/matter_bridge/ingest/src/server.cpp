@@ -158,6 +158,18 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
             continue;
         }
 
+        // Correction pass: "only a Confirmable POST changes state" means
+        // exactly that -- a Non-confirmable (or Acknowledgement/Reset,
+        // which this server should never receive as a request in the
+        // first place) datagram must never reach handle_request() at all,
+        // not merely go un-ACKed after the registry was already mutated.
+        // Dropped here, before ANY method/option check or registry access.
+        if (req.type != CoapType::Confirmable) {
+            std::printf("[non-confirmable] uri=%s type=%d -- dropped: no state change, no response\n",
+                        req.uri_path.c_str(), (int)req.type);
+            continue;
+        }
+
         uint8_t code;
         if (status == ParseStatus::UnknownCriticalOption) {
             // The header (type/message_id/token) parsed fine -- only an
@@ -167,8 +179,8 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
                         req.uri_path.c_str());
             code = kCoapCodeBadOption;
         } else if (req.code != kCoapCodePost) {
-            // Correction pass: only Confirmable POST is accepted as a
-            // state-changing request -- any other method gets 4.05.
+            // Confirmable but not POST -- 4.05 (the non-Confirmable case is
+            // already handled above and never reaches here).
             std::printf("[method-not-allowed] uri=%s code=0x%02x -- rejected (4.05)\n", req.uri_path.c_str(),
                         (unsigned)req.code);
             code = kCoapCodeMethodNotAllowed;
@@ -176,19 +188,16 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
             code = handle_request(registry, req);
         }
 
-        // A Confirmable request always gets a response; Non-confirmable
-        // never does -- same policy as components/power_base_transport's
-        // own send_coap_response(). The response is sent only AFTER
-        // handle_request() has fully applied the state change (this
-        // follow-up's own explicit ordering requirement).
-        if (req.type == CoapType::Confirmable) {
-            std::vector<uint8_t> ack = coap_build_ack(req, code);
-            ssize_t sent = sendto(sock, ack.data(), ack.size(), 0, reinterpret_cast<sockaddr *>(&peer),
-                                   msg.msg_namelen);
-            if (sent < 0 && rate_limit_ok(last_send_err_log, kLogRateLimit)) {
-                std::fprintf(stderr, "ingest: sendto() failed while ACKing uri=%s: %s\n", req.uri_path.c_str(),
-                             std::strerror(errno));
-            }
+        // Every request reaching this point is Confirmable and therefore
+        // always gets a response -- the response is sent only AFTER
+        // handle_request() (if called at all) has fully applied the state
+        // change (this follow-up's own explicit ordering requirement).
+        std::vector<uint8_t> ack = coap_build_ack(req, code);
+        ssize_t sent =
+            sendto(sock, ack.data(), ack.size(), 0, reinterpret_cast<sockaddr *>(&peer), msg.msg_namelen);
+        if (sent < 0 && rate_limit_ok(last_send_err_log, kLogRateLimit)) {
+            std::fprintf(stderr, "ingest: sendto() failed while ACKing uri=%s: %s\n", req.uri_path.c_str(),
+                         std::strerror(errno));
         }
     }
     close(sock);

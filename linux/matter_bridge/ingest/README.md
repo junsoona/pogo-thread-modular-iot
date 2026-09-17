@@ -78,6 +78,13 @@ without a redesign.
 | 4.00 Bad Request | malformed envelope/payload, or a msg_type/resource mismatch |
 | 4.02 Bad Option | an unrecognized CoAP *critical* option (RFC 7252 5.4.1) |
 | 4.04 Not Found | a SAMPLE for a `(power_base_uuid, module_uuid)` with no topology at all yet |
-| 4.05 Method Not Allowed | anything other than a Confirmable POST |
+| 4.05 Method Not Allowed | a **Confirmable** request whose method is anything other than POST |
 | 4.12 Precondition Failed | a SAMPLE for a known-but-offline uuid or a bitmap mismatch, or a stale/reordered TOPOLOGY_SNAPSHOT (generation/sequence ordering, see `registry.hpp`) |
 | 5.03 Service Unavailable | a brand-new uuid once the bounded registry is full |
+
+Only a **Confirmable** request can ever change registry state or receive a
+response. A Non-confirmable (or Acknowledgement/Reset) datagram is dropped
+immediately after CoAP parsing -- `handle_request()` is never called for it,
+the registry is left completely untouched, and no response is ever sent.
+This is checked before the method (POST-only) or option checks above, so a
+Non-confirmable request can never reach 4.02/4.05/2.04/etc. either.

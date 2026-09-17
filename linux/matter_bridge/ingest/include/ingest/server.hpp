@@ -55,10 +55,17 @@ struct ServerConfig {
 // and serves forever, applying every request FROM THAT INTERFACE ONLY to
 // `registry` -- a datagram received on any other interface is dropped
 // before ingest::handle_request() ever sees it (see this header's own
-// SECURITY NOTE). If `should_stop` is non-null, the loop checks it (with a
-// short, bounded poll interval) and returns once it becomes true -- used by
-// the loopback test to shut the server down cleanly; the production entry
-// point (main.cpp) passes nullptr and runs forever.
+// SECURITY NOTE). ONLY a Confirmable POST can ever reach
+// ingest::handle_request() at all (correction pass) -- a Non-confirmable
+// (or Acknowledgement/Reset) datagram, or a Confirmable non-POST method, is
+// either dropped outright (Non-confirmable/Ack/Reset: no state change, no
+// response) or answered with a 4.xx error (Confirmable non-POST: 4.05,
+// Confirmable with an unrecognized critical option: 4.02) without ever
+// calling handle_request() -- see server.cpp's own recv loop for the exact
+// order these checks run in. If `should_stop` is non-null, the loop checks
+// it (with a short, bounded poll interval) and returns once it becomes
+// true -- used by the loopback test to shut the server down cleanly; the
+// production entry point (main.cpp) passes nullptr and runs forever.
 //
 // Returns false immediately (after logging a clear reason to stderr) on ANY
 // startup failure: the named interface does not exist, the socket cannot be
