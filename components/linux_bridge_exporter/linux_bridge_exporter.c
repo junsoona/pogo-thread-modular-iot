@@ -2,27 +2,49 @@
  * See linux_bridge_exporter.h for the full design summary. Implementation
  * notes:
  *
- * Event flow: power_base_transport's bridge-observer callbacks
+ * Event flow (correction pass): TOPOLOGY events (observer_on_topology_applied/
+ * observer_on_node_offline) still go through a small bounded FreeRTOS FIFO
+ * queue (s_topology_queue) -- topology changes are comparatively rare, and
+ * the Linux ingest side's own generation/sequence ordering check
+ * (linux/matter_bridge/ingest's Registry::apply_topology()) makes a
+ * FIFO-drained, possibly-briefly-stale intermediate state harmless (a stale
+ * snapshot is rejected there, never applied out of order). SAMPLE events
+ * are DIFFERENT: they previously went through the same FIFO, which meant a
+ * burst of samples for the same module_uuid could pile up multiple stale
+ * copies ahead of the newest one, and a full queue would drop whichever one
+ * happened to arrive last -- sometimes the newest. SAMPLE events now go
+ * through s_pending_samples, a small bounded table keyed by module_uuid
+ * that ALWAYS COALESCES to the single latest sample per uuid (an upsert,
+ * never an append) -- there is structurally no way for an older sample to
+ * be sent after (or instead of) a newer one for the same uuid, and no
+ * "replay a backlog of stale samples" scenario is possible at all.
+ *
+ * Both power_base_transport's bridge-observer callbacs
  * (observer_on_sample_stored/observer_on_topology_applied/
  * observer_on_node_offline below) run from within the OpenThread task's own
  * context (same as every otCoapAddResource handler in this codebase) and do
- * ONLY a non-blocking xQueueSend(..., 0) -- never a CoAP send, never a
- * mutex wait longer than that. exporter_task() (this component's own,
+ * ONLY a non-blocking enqueue/upsert -- never a CoAP send, never a mutex
+ * wait longer than a few ticks. exporter_task() (this component's own,
  * dedicated task) is the ONLY thing that ever actually sends network
- * traffic, drains the queue, and runs the two periodic timers (a full
- * topology resync every CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
- * and a HEARTBEAT every CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS).
+ * traffic, drains both the topology queue and the pending-sample table, and
+ * runs the periodic timers: a full TOPOLOGY resync, a full latest-SAMPLE
+ * resync, and a HEARTBEAT, all currently sharing
+ * CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS /
+ * CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS. The periodic full
+ * resyncs read straight from the REAL sources of truth
+ * (power_base_transport_get_node()/sensor_root_aggregator_get_node()), so a
+ * Linux OTBR host that was down or just restarted converges to the CURRENT
+ * state within one resync interval regardless of anything dropped earlier --
+ * this component never waits for "the next sensor measurement" to recover.
  *
- * Queue overflow policy (this follow-up's own explicit requirement: "queue
+ * Overflow/drop policy (this follow-up's own explicit requirement: "queue
  * overflow 시 시스템을 멈추지 말고 최신 상태가 이후 snapshot으로 복구되게 할
- * 것"): a dropped SAMPLE event is a genuinely lost export for that one
- * historical sample -- this component is a best-effort mirror, not a source
- * of truth, and the Power Base's own sensor_root_aggregator already has it
- * regardless. A dropped TOPOLOGY event is NOT permanently lost: the next
- * periodic full resync (at most CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS
- * later) re-sends every node's CURRENT state, including whatever the dropped
- * event would have conveyed. Either way, dropping never blocks or crashes
- * anything -- just one rate-limited WARN log line.
+ * 것"): a dropped/coalesced-away SAMPLE is never a source-of-truth loss --
+ * the Power Base's own sensor_root_aggregator already has the latest value
+ * regardless, and the periodic full sample resync re-sends it. A dropped
+ * TOPOLOGY event is likewise recovered by the periodic full topology
+ * resync. Either way, dropping never blocks or crashes anything -- just one
+ * rate-limited WARN log line.
  *
  * CoAP client send state (token/staleness guard): identical pattern to
  * sensor_transport.c's/topology_reporter.c's own s_send_done_sem/
@@ -49,6 +71,7 @@
 
 #include "bridge_export_proto/bridge_export_proto.h"
 #include "sensor_channel/sensor_channel.h"
+#include "sensor_root_aggregator/sensor_root_aggregator.h"
 #include "coap_response_timing/coap_response_timing.h"
 
 static const char *TAG = "linux_bridge_exporter";
@@ -76,11 +99,6 @@ static const uint32_t s_retry_backoff_ms[EXPORTER_MAX_ATTEMPTS] = {0, 200, 500};
  * per-event flood while the Linux host is simply down for a while. */
 #define SEND_FAIL_WARN_INTERVAL_MS 30000
 
-typedef enum {
-    EXPORT_EVT_SAMPLE,
-    EXPORT_EVT_TOPOLOGY,
-} export_evt_kind_t;
-
 typedef struct {
     bool have_full_entry; /* true: `entry` is already the full snapshot (on_topology_applied).
                               false: only `uuid` is known (on_node_offline) -- exporter_task()
@@ -89,19 +107,31 @@ typedef struct {
     topology_registry_entry_t entry;
 } topo_evt_payload_t;
 
+/*
+ * Bounded, uuid-keyed, always-coalescing table of samples still waiting to
+ * be (re-)exported -- see this file's own top comment for why SAMPLE events
+ * no longer share the FIFO topology queue. Sized to
+ * SENSOR_ROOT_AGGREGATOR_MAX_NODES: that is the true upper bound on how
+ * many distinct module_uuids the aggregator (this table's own data source)
+ * can ever hold, so this can never need to reject a legitimate uuid the
+ * aggregator itself would still have room for.
+ */
+#define PENDING_SAMPLES_MAX SENSOR_ROOT_AGGREGATOR_MAX_NODES
+
 typedef struct {
-    export_evt_kind_t kind;
-    union {
-        sensor_sample_t sample;
-        topo_evt_payload_t topo;
-    } data;
-} export_evt_t;
+    bool valid;  /* this slot has ever held a (module_uuid, sample) pair */
+    bool dirty;  /* has NOT been exported since the last upsert -- needs (re-)sending */
+    uint8_t module_uuid[SENSOR_UUID_LEN];
+    sensor_sample_t sample;
+} pending_sample_slot_t;
 
 static uint8_t s_power_base_uuid[TOPOLOGY_UUID_LEN];
 static uint8_t s_host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN];
 static uint16_t s_host_port;
 static uint32_t s_start_tick_ms;
-static QueueHandle_t s_queue;
+static QueueHandle_t s_topology_queue;
+static SemaphoreHandle_t s_pending_samples_mutex;
+static pending_sample_slot_t s_pending_samples[PENDING_SAMPLES_MAX];
 static TickType_t s_last_send_fail_warn_tick;
 
 /* See this file's own top comment: same token-staleness guard pattern as
@@ -279,7 +309,7 @@ static void handle_sample_event(const sensor_sample_t *sample)
     }
     if (!transmit(URI_SAMPLE, wire, wlen)) {
         warn_rate_limited("sample export delivery unconfirmed (Linux OTBR host unreachable? -- the sensor sample "
-                           "itself is already durably stored in this power base's own aggregator regardless)");
+                           "itself is already stored in the Power Base aggregator regardless)");
     }
 }
 
@@ -316,6 +346,92 @@ static void do_full_topology_resync(void)
     }
 }
 
+/*
+ * Re-sends every module's CURRENT last-known sample straight from
+ * sensor_root_aggregator (the real source of truth), regardless of the
+ * pending-sample table's own state -- this is what lets a Linux OTBR host
+ * that just (re)started converge on the latest value within one resync
+ * interval instead of waiting for that module's next sensor measurement
+ * (this follow-up's own explicit requirement).
+ */
+static void do_full_sample_resync(void)
+{
+    size_t count = sensor_root_aggregator_get_node_count();
+    for (size_t i = 0; i < count; i++) {
+        sensor_root_aggregator_node_t node;
+        if (sensor_root_aggregator_get_node(i, &node) && node.has_sample) {
+            handle_sample_event(&node.last_sample);
+        }
+    }
+}
+
+/*
+ * Upserts `sample` into s_pending_samples, coalescing by module_uuid: a
+ * newer sample for a uuid already pending simply overwrites it (dirty stays
+ * true) -- there is never more than one pending export per uuid, so this
+ * table can never accumulate or later replay a backlog of stale samples
+ * (see this file's own top comment). Called from the OT task's own context
+ * (an observer callback) -- bounded to a short mutex wait, never blocks
+ * longer than that.
+ */
+static void upsert_pending_sample(const sensor_sample_t *sample)
+{
+    if (xSemaphoreTake(s_pending_samples_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        warn_rate_limited("pending-sample table busy -- dropped one reactive SAMPLE export event (the periodic "
+                           "full sample resync still delivers the current value)");
+        return;
+    }
+    int slot = -1;
+    int free_slot = -1;
+    for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
+        if (s_pending_samples[i].valid &&
+            memcmp(s_pending_samples[i].module_uuid, sample->module_uuid, SENSOR_UUID_LEN) == 0) {
+            slot = i;
+            break;
+        }
+        if (!s_pending_samples[i].valid && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (slot < 0) {
+        if (free_slot < 0) {
+            xSemaphoreGive(s_pending_samples_mutex);
+            warn_rate_limited("pending-sample table full -- dropped one reactive SAMPLE export event for a new "
+                               "uuid (the periodic full sample resync still delivers it)");
+            return;
+        }
+        slot = free_slot;
+        s_pending_samples[slot].valid = true;
+        memcpy(s_pending_samples[slot].module_uuid, sample->module_uuid, SENSOR_UUID_LEN);
+    }
+    s_pending_samples[slot].sample = *sample; /* coalesce: always the latest wins */
+    s_pending_samples[slot].dirty = true;
+    xSemaphoreGive(s_pending_samples_mutex);
+}
+
+/* Sends every currently-dirty pending sample (clearing dirty as it goes)
+ * and returns. Called once per exporter_task() loop iteration -- bounded
+ * (PENDING_SAMPLES_MAX slots), never blocks on anything but its own short
+ * mutex per slot. */
+static void drain_pending_samples(void)
+{
+    for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
+        sensor_sample_t sample;
+        bool need_send = false;
+        if (xSemaphoreTake(s_pending_samples_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (s_pending_samples[i].valid && s_pending_samples[i].dirty) {
+                sample = s_pending_samples[i].sample;
+                s_pending_samples[i].dirty = false;
+                need_send = true;
+            }
+            xSemaphoreGive(s_pending_samples_mutex);
+        }
+        if (need_send) {
+            handle_sample_event(&sample);
+        }
+    }
+}
+
 static void send_heartbeat(void)
 {
     bridge_export_heartbeat_t hb = {0};
@@ -345,18 +461,19 @@ static void exporter_task(void *arg)
     TickType_t last_heartbeat = xTaskGetTickCount();
 
     while (1) {
-        export_evt_t evt;
-        if (xQueueReceive(s_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE) {
-            if (evt.kind == EXPORT_EVT_SAMPLE) {
-                handle_sample_event(&evt.data.sample);
-            } else {
-                handle_topology_event(&evt.data.topo);
-            }
+        topo_evt_payload_t evt;
+        if (xQueueReceive(s_topology_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE) {
+            handle_topology_event(&evt);
         }
+        /* Runs every loop iteration regardless of whether a topology event
+         * arrived -- bounded (PENDING_SAMPLES_MAX slots), so this never
+         * meaningfully lengthens the loop when nothing is dirty. */
+        drain_pending_samples();
 
         TickType_t now = xTaskGetTickCount();
         if ((now - last_resync) >= pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS)) {
             do_full_topology_resync();
+            do_full_sample_resync();
             last_resync = now;
         }
         if ((now - last_heartbeat) >= pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS)) {
@@ -367,42 +484,34 @@ static void exporter_task(void *arg)
 }
 
 /* ---- power_base_transport bridge-observer callbacks: OT-task context,
- * non-blocking enqueue only -- see this file's own top comment. ---- */
+ * non-blocking enqueue/upsert only -- see this file's own top comment. ---- */
 
 static void observer_on_sample_stored(const sensor_sample_t *sample, void *ctx)
 {
     (void)ctx;
-    export_evt_t evt;
-    evt.kind = EXPORT_EVT_SAMPLE;
-    evt.data.sample = *sample;
-    if (xQueueSend(s_queue, &evt, 0) != pdTRUE) {
-        warn_rate_limited("export queue full -- dropped one SAMPLE export event (the power base's own aggregator "
-                           "storage is completely unaffected)");
-    }
+    upsert_pending_sample(sample);
 }
 
 static void observer_on_topology_applied(const topology_registry_entry_t *entry, void *ctx)
 {
     (void)ctx;
-    export_evt_t evt;
-    evt.kind = EXPORT_EVT_TOPOLOGY;
-    evt.data.topo.have_full_entry = true;
-    evt.data.topo.entry = *entry;
-    if (xQueueSend(s_queue, &evt, 0) != pdTRUE) {
-        warn_rate_limited("export queue full -- dropped one TOPOLOGY export event (the next periodic full resync "
-                           "recovers it)");
+    topo_evt_payload_t evt;
+    evt.have_full_entry = true;
+    evt.entry = *entry;
+    if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
+        warn_rate_limited("topology queue full -- dropped one TOPOLOGY export event (the next periodic full "
+                           "resync recovers it)");
     }
 }
 
 static void observer_on_node_offline(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
 {
     (void)ctx;
-    export_evt_t evt;
-    evt.kind = EXPORT_EVT_TOPOLOGY;
-    evt.data.topo.have_full_entry = false;
-    memcpy(evt.data.topo.uuid, uuid, TOPOLOGY_UUID_LEN);
-    if (xQueueSend(s_queue, &evt, 0) != pdTRUE) {
-        warn_rate_limited("export queue full -- dropped one TOPOLOGY (offline) export event (the next periodic "
+    topo_evt_payload_t evt;
+    evt.have_full_entry = false;
+    memcpy(evt.uuid, uuid, TOPOLOGY_UUID_LEN);
+    if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
+        warn_rate_limited("topology queue full -- dropped one TOPOLOGY (offline) export event (the next periodic "
                            "full resync recovers it)");
     }
 }
@@ -425,13 +534,22 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     s_start_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     s_send_token = 0;
     s_last_send_fail_warn_tick = 0;
+    memset(s_pending_samples, 0, sizeof(s_pending_samples));
 
     s_send_done_sem = xSemaphoreCreateBinary();
     if (s_send_done_sem == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    s_queue = xQueueCreate(CONFIG_LINUX_BRIDGE_EXPORTER_QUEUE_LEN, sizeof(export_evt_t));
-    if (s_queue == NULL) {
+    s_pending_samples_mutex = xSemaphoreCreateMutex();
+    if (s_pending_samples_mutex == NULL) {
+        vSemaphoreDelete(s_send_done_sem);
+        s_send_done_sem = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    s_topology_queue = xQueueCreate(CONFIG_LINUX_BRIDGE_EXPORTER_QUEUE_LEN, sizeof(topo_evt_payload_t));
+    if (s_topology_queue == NULL) {
+        vSemaphoreDelete(s_pending_samples_mutex);
+        s_pending_samples_mutex = NULL;
         vSemaphoreDelete(s_send_done_sem);
         s_send_done_sem = NULL;
         return ESP_ERR_NO_MEM;
@@ -440,8 +558,10 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed -- the bridge exporter will not run this boot (every other subsystem is "
                       "unaffected)");
-        vQueueDelete(s_queue);
-        s_queue = NULL;
+        vQueueDelete(s_topology_queue);
+        s_topology_queue = NULL;
+        vSemaphoreDelete(s_pending_samples_mutex);
+        s_pending_samples_mutex = NULL;
         vSemaphoreDelete(s_send_done_sem);
         s_send_done_sem = NULL;
         return ESP_ERR_NO_MEM;
@@ -455,10 +575,11 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     };
     power_base_transport_set_bridge_observer(&observer);
 
-    ESP_LOGI(TAG, "linux bridge exporter ready: resources='/%s','/%s','/%s' port=%u queue_len=%d "
-                  "resync_interval_ms=%u heartbeat_interval_ms=%u (host address never logged)",
+    ESP_LOGI(TAG, "linux bridge exporter ready: resources='/%s','/%s','/%s' port=%u topology_queue_len=%d "
+                  "pending_samples_max=%d resync_interval_ms=%u heartbeat_interval_ms=%u (host address never "
+                  "logged)",
              URI_SAMPLE, URI_TOPOLOGY, URI_HEARTBEAT, (unsigned)s_host_port, CONFIG_LINUX_BRIDGE_EXPORTER_QUEUE_LEN,
-             (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
+             PENDING_SAMPLES_MAX, (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS,
              (unsigned)CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS);
     return ESP_OK;
 }

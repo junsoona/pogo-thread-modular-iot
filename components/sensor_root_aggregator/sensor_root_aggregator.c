@@ -26,15 +26,15 @@ esp_err_t sensor_root_aggregator_init(void)
     return ESP_OK;
 }
 
-void sensor_root_aggregator_record_sample(const sensor_sample_t *sample)
+sensor_root_aggregator_result_t sensor_root_aggregator_record_sample_result(const sensor_sample_t *sample)
 {
     if (sample == NULL || s_agg_mutex == NULL) {
-        return;
+        return SENSOR_ROOT_AGGREGATOR_INVALID;
     }
     if (xSemaphoreTake(s_agg_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
         ESP_LOGW(TAG, "aggregator busy -- dropping one sample (uuid suffix ..%02x%02x)", sample->module_uuid[6],
                  sample->module_uuid[7]);
-        return;
+        return SENSOR_ROOT_AGGREGATOR_BUSY;
     }
 
     int slot = -1;
@@ -53,7 +53,7 @@ void sensor_root_aggregator_record_sample(const sensor_sample_t *sample)
             ESP_LOGW(TAG, "aggregator full (%d nodes) -- dropping sample from a new module (uuid suffix ..%02x%02x)",
                      SENSOR_ROOT_AGGREGATOR_MAX_NODES, sample->module_uuid[6], sample->module_uuid[7]);
             xSemaphoreGive(s_agg_mutex);
-            return;
+            return SENSOR_ROOT_AGGREGATOR_FULL;
         }
         slot = free_slot;
         s_nodes[slot].valid = true;
@@ -66,7 +66,7 @@ void sensor_root_aggregator_record_sample(const sensor_sample_t *sample)
          * retransmitted CoAP request the sender made because it never saw
          * our earlier ACK -- dropped without re-storing or double-counting. */
         xSemaphoreGive(s_agg_mutex);
-        return;
+        return SENSOR_ROOT_AGGREGATOR_DUPLICATE;
     }
 
     rec->last_sample = *sample;
@@ -77,6 +77,12 @@ void sensor_root_aggregator_record_sample(const sensor_sample_t *sample)
 
     ESP_LOGI(TAG, "sample recorded: uuid=..%02x%02x seq=%u channels=%u", sample->module_uuid[6],
              sample->module_uuid[7], (unsigned)sample->sample_seq, sample->channel_count);
+    return SENSOR_ROOT_AGGREGATOR_STORED;
+}
+
+void sensor_root_aggregator_record_sample(const sensor_sample_t *sample)
+{
+    (void)sensor_root_aggregator_record_sample_result(sample);
 }
 
 void sensor_root_aggregator_record_error(const uint8_t module_uuid[SENSOR_UUID_LEN])

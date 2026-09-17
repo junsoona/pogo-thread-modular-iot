@@ -35,6 +35,12 @@ const char *result_str(ApplyResult r)
         return "duplicate";
     case ApplyResult::StorageFull:
         return "storage_full";
+    case ApplyResult::TopologyUnknown:
+        return "topology_unknown";
+    case ApplyResult::PreconditionFailed:
+        return "precondition_failed";
+    case ApplyResult::StaleSession:
+        return "stale_session";
     }
     return "?";
 }
@@ -48,6 +54,11 @@ uint8_t result_to_coap_code(ApplyResult r)
         return kCoapCodeValid;
     case ApplyResult::StorageFull:
         return kCoapCodeServiceUnavailable;
+    case ApplyResult::TopologyUnknown:
+        return kCoapCodeNotFound;
+    case ApplyResult::PreconditionFailed:
+    case ApplyResult::StaleSession:
+        return kCoapCodePreconditionFailed;
     }
     return kCoapCodeBadRequest;
 }
@@ -78,7 +89,8 @@ uint8_t handle_sample(Registry &registry, const uint8_t *payload, uint16_t paylo
 
     Uuid pb_uuid = to_uuid(exp.power_base_uuid);
     Uuid mod_uuid = to_uuid(decoded.module_uuid);
-    ApplyResult result = registry.apply_sample(pb_uuid, mod_uuid, decoded.sample_seq, decoded.uptime_ms, channels);
+    ApplyResult result = registry.apply_sample(pb_uuid, mod_uuid, decoded.sample_seq, decoded.uptime_ms,
+                                                decoded.sensor_bitmap, channels);
 
     std::printf("[sample] ");
     print_uuid_suffix("pb", pb_uuid);

@@ -13,7 +13,12 @@
 #include "esp_openthread_lock.h"
 
 #define MAX_RESOURCES 4
-#define MAX_QUEUED 64
+/* Raised for this follow-up's correction pass (item 7: real timer test) --
+ * tools/test_linux_bridge_exporter_timers.c pre-queues a generous
+ * (bounded) success budget up front to distinguish "no busy loop" (budget
+ * never exhausted) from a real busy-loop bug (budget exhausted almost
+ * instantly, aborting this process) -- see that test's own header comment. */
+#define MAX_QUEUED 512
 
 typedef enum {
     OUTCOME_SEND_FAILURE,

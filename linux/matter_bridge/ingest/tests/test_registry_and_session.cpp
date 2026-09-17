@@ -4,10 +4,15 @@
 // production bridge_export_pack_*() functions, never hand-crafted byte
 // arrays, so this test can never silently drift from the real wire format.
 //
-// Covers: 2.04/2.03/4.00/5.03 response codes, (power_base_uuid, module_uuid,
-// sample_seq) dedup, different UUIDs with the same seq never confused,
-// topology exact-duplicate detection, and storage-full behavior once the
-// bounded registry is exhausted.
+// Covers: 2.04/2.03/4.00/4.04/4.12/5.03 response codes, (power_base_uuid,
+// module_uuid, sample_seq) dedup, different UUIDs with the same seq never
+// confused, topology exact-duplicate detection, storage-full behavior once
+// the bounded registry is exhausted, the correction pass's SAMPLE topology
+// gating (unknown/offline/bitmap-mismatch), and the correction pass's
+// TOPOLOGY generation/sequence ordering protection (stale/reordered
+// snapshots rejected, a delayed old-generation "online" snapshot can never
+// resurrect a state a newer report already turned offline, a genuine reboot
+// generation is accepted).
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -48,7 +53,8 @@ static CoapMessage make_request(const std::string &uri, const std::vector<uint8_
     return req;
 }
 
-static std::vector<uint8_t> pack_sample_wire(uint8_t uuid_tag, uint32_t seq, int32_t value)
+static std::vector<uint8_t> pack_sample_wire(uint8_t uuid_tag, uint32_t seq, int32_t value,
+                                              uint16_t sensor_bitmap = 0x0002 /* bit for TEMPERATURE */)
 {
     sensor_sample_t s;
     std::memset(&s, 0, sizeof(s));
@@ -56,9 +62,9 @@ static std::vector<uint8_t> pack_sample_wire(uint8_t uuid_tag, uint32_t seq, int
     std::memset(s.module_uuid, uuid_tag, SENSOR_UUID_LEN);
     s.sample_seq = seq;
     s.uptime_ms = 1000;
-    s.sensor_bitmap = 0x0001;
+    s.sensor_bitmap = sensor_bitmap;
     s.channel_count = 1;
-    s.channels[0].type = SENSOR_CHANNEL_TEMPERATURE;
+    s.channels[0].type = SENSOR_CHANNEL_TEMPERATURE; // bit value (1 << 1) = 0x0002
     s.channels[0].scale = SENSOR_SCALE_MILLI;
     s.channels[0].status = SENSOR_CHANNEL_STATUS_OK;
     s.channels[0].value = value;
@@ -77,7 +83,8 @@ static std::vector<uint8_t> pack_sample_wire(uint8_t uuid_tag, uint32_t seq, int
     return std::vector<uint8_t>(wire, wire + wlen);
 }
 
-static std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, uint8_t depth, uint32_t last_seq)
+static std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, uint8_t depth, uint32_t generation,
+                                                uint32_t last_seq, uint16_t sensor_bitmap = 0x0002)
 {
     bridge_export_topology_node_t node;
     std::memset(&node, 0, sizeof(node));
@@ -87,9 +94,9 @@ static std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, ui
     node.online = online;
     node.depth = depth;
     node.role = 3;
-    node.sensor_bitmap = 0x0001;
+    node.sensor_bitmap = sensor_bitmap;
     node.downstream_connected = false;
-    node.boot_session_generation = 42;
+    node.boot_session_generation = generation;
     node.last_seq = last_seq;
 
     uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
@@ -99,9 +106,41 @@ static std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, ui
 
 int main()
 {
-    std::printf("\n-- scenario: a real SAMPLE gets 2.04, an exact-duplicate (same uuid+seq) gets 2.03 --\n");
+    printf("\n-- scenario: a SAMPLE with no topology at all is rejected 4.04 (correction pass) --\n");
     {
         Registry reg;
+        uint8_t code = ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 1, 100)));
+        CHECK(code == ingest::kCoapCodeNotFound, "a sample for an unknown (power_base_uuid, module_uuid) gets 4.04");
+        CHECK(reg.node_count() == 0, "nothing is stored for a rejected sample");
+    }
+
+    printf("\n-- scenario: a SAMPLE for a known but OFFLINE uuid is rejected 4.12 --\n");
+    {
+        Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 1, 1)));
+        uint8_t code = ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 1, 100)));
+        CHECK(code == ingest::kCoapCodePreconditionFailed, "a sample for a known-but-offline uuid gets 4.12");
+    }
+
+    printf("\n-- scenario: a SAMPLE whose bitmap is not a subset of the topology's bitmap is rejected 4.12 --\n");
+    {
+        Registry reg;
+        /* Topology declares ONLY illuminance (bit 0 = 0x0001). */
+        ingest::handle_request(reg,
+                                make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 1, 1, 0x0001)));
+        /* Sample declares temperature (bit 1 = 0x0002) -- not in 0x0001. */
+        uint8_t code =
+            ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 1, 100, 0x0002)));
+        CHECK(code == ingest::kCoapCodePreconditionFailed,
+              "a sample bitmap not a subset of the topology's own bitmap gets 4.12");
+    }
+
+    printf("\n-- scenario: a real SAMPLE (topology known+online, matching bitmap) gets 2.04, an exact-duplicate "
+           "(same uuid+seq) gets 2.03 --\n");
+    {
+        Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 1, 1)));
+
         auto wire1 = pack_sample_wire(0x01, 7, 21000);
         uint8_t code1 = ingest::handle_request(reg, make_request("pogo/v1/sample", wire1));
         CHECK(code1 == ingest::kCoapCodeChanged, "a brand-new sample gets 2.04 Changed");
@@ -109,13 +148,13 @@ int main()
         auto wire2 = pack_sample_wire(0x01, 7, 21000); // identical uuid+seq
         uint8_t code2 = ingest::handle_request(reg, make_request("pogo/v1/sample", wire2));
         CHECK(code2 == ingest::kCoapCodeValid, "an exact-duplicate (same uuid+seq) retransmit gets 2.03 Valid");
-
-        CHECK(reg.node_count() == 1, "only one node is tracked after a duplicate");
     }
 
-    std::printf("\n-- scenario: different UUIDs with the SAME seq are never confused --\n");
+    printf("\n-- scenario: different UUIDs with the SAME seq are never confused --\n");
     {
         Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0xAA, true, 1, 1, 1)));
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0xBB, true, 1, 1, 1)));
         auto wire_a = pack_sample_wire(0xAA, 5, 100);
         auto wire_b = pack_sample_wire(0xBB, 5, 200);
         uint8_t code_a = ingest::handle_request(reg, make_request("pogo/v1/sample", wire_a));
@@ -124,18 +163,17 @@ int main()
         CHECK(code_b == ingest::kCoapCodeChanged,
               "module B's seq=5 sample is ALSO new (2.04) -- the same seq on a different uuid is never treated as "
               "a duplicate of module A's");
-        CHECK(reg.node_count() == 2, "both modules are tracked as separate nodes");
 
         ingest::NodeState node_a, node_b;
         bool found_a = false, found_b = false;
         for (size_t i = 0; i < reg.node_count(); i++) {
             ingest::NodeState n;
             reg.get_node(i, n);
-            if (n.module_uuid[7] == 0xAA) {
+            if (n.module_uuid[7] == 0xAA && n.has_sample) {
                 node_a = n;
                 found_a = true;
             }
-            if (n.module_uuid[7] == 0xBB) {
+            if (n.module_uuid[7] == 0xBB && n.has_sample) {
                 node_b = n;
                 found_b = true;
             }
@@ -147,33 +185,98 @@ int main()
               "module B's stored channel value is its own (200), not module A's");
     }
 
-    std::printf("\n-- scenario: a reordered/different seq is NOT treated as a duplicate --\n");
+    printf("\n-- scenario: a reordered/different seq is NOT treated as a duplicate (sample dedup has no "
+           "monotonicity requirement) --\n");
     {
         Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 1, 1)));
         ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 10, 1)));
         uint8_t code = ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 9, 2)));
         CHECK(code == ingest::kCoapCodeChanged,
               "a different (lower) seq for the same uuid is applied as new, not rejected as a duplicate -- this "
-              "ingest program mirrors sensor_root_aggregator's own 'exact seq match only' dedup rule, not a "
-              "monotonicity check");
+              "ingest program mirrors sensor_root_aggregator's own 'exact seq match only' dedup rule");
     }
 
-    std::printf("\n-- scenario: topology exact-duplicate detection --\n");
+    printf("\n-- scenario: topology exact-duplicate detection --\n");
     {
         Registry reg;
-        uint8_t code1 = ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 5)));
+        uint8_t code1 =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 5)));
         CHECK(code1 == ingest::kCoapCodeChanged, "a brand-new topology node gets 2.04");
-        uint8_t code2 = ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 5)));
-        CHECK(code2 == ingest::kCoapCodeValid, "an exact-duplicate topology snapshot gets 2.03");
-        uint8_t code3 = ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 6)));
-        CHECK(code3 == ingest::kCoapCodeChanged, "a real change (online flips false) gets 2.04 again");
+        uint8_t code2 =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 5)));
+        CHECK(code2 == ingest::kCoapCodeValid, "an exact-duplicate topology snapshot (same generation+seq) gets 2.03");
+        uint8_t code3 =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 100, 6)));
+        CHECK(code3 == ingest::kCoapCodeChanged, "a real change (online flips false, seq increases) gets 2.04 again");
 
         ingest::NodeState n;
         reg.get_node(0, n);
         CHECK(n.online == false, "the node's stored state reflects the latest applied snapshot");
     }
 
-    std::printf("\n-- scenario: malformed payload is rejected with 4.00 --\n");
+    printf("\n-- scenario (correction pass): a stale/reordered seq within the SAME generation is rejected 4.12, "
+           "never applied --\n");
+    {
+        Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 100, 10)));
+        /* A delayed packet with a SMALLER seq in the SAME generation,
+         * claiming online=true -- must NOT resurrect the node. */
+        uint8_t code =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 5)));
+        CHECK(code == ingest::kCoapCodePreconditionFailed, "a smaller seq in the same generation gets 4.12");
+
+        ingest::NodeState n;
+        reg.get_node(0, n);
+        CHECK(n.online == false, "the node's online flag is UNCHANGED by the stale packet -- still offline");
+        CHECK(n.last_seq == 10, "the node's last_seq is UNCHANGED by the stale packet");
+    }
+
+    printf("\n-- scenario (correction pass): a delayed packet from the IMMEDIATELY-PRECEDING generation is "
+           "rejected 4.12 and can never resurrect a newer offline state --\n");
+    {
+        Registry reg;
+        /* Session 1 (generation=100): node comes online. */
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 1)));
+        /* Session 2 (generation=200, e.g. this module rebooted): comes
+         * online again, then a LATER report in session 2 marks it offline. */
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 200, 1)));
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 200, 2)));
+
+        /* A DELAYED packet from session 1 (the immediately-preceding
+         * generation) finally arrives, claiming online=true. */
+        uint8_t code =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 2)));
+        CHECK(code == ingest::kCoapCodePreconditionFailed,
+              "a delayed packet from the superseded (immediately-preceding) generation gets 4.12");
+
+        ingest::NodeState n;
+        reg.get_node(0, n);
+        CHECK(n.online == false, "the delayed session-1 packet never resurrects the node -- still offline (the "
+                                   "REAL, current session-2 state)");
+        CHECK(n.boot_session_generation == 200, "the current generation is still session 2");
+    }
+
+    printf("\n-- scenario (correction pass): a genuinely NEW generation (e.g. a Power Base reboot) is accepted "
+           "normally --\n");
+    {
+        Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 100, 1)));
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 100, 2)));
+        /* A brand-new generation (300) -- neither the current (100) nor the
+         * (nonexistent, since this node has never crossed a generation
+         * boundary yet) superseded one. */
+        uint8_t code =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 300, 1)));
+        CHECK(code == ingest::kCoapCodeChanged, "a genuinely new generation is accepted as a fresh session (2.04)");
+
+        ingest::NodeState n;
+        reg.get_node(0, n);
+        CHECK(n.online == true, "the new session's state (online=true) is applied");
+        CHECK(n.boot_session_generation == 300, "the generation is updated to the new session");
+    }
+
+    printf("\n-- scenario: malformed payload is rejected with 4.00 --\n");
     {
         Registry reg;
         std::vector<uint8_t> garbage = {0x01, 0x02, 0x03};
@@ -182,39 +285,40 @@ int main()
         CHECK(reg.node_count() == 0, "nothing is stored for a malformed message");
     }
 
-    std::printf("\n-- scenario: a msg_type/resource mismatch is rejected with 4.00 --\n");
+    printf("\n-- scenario: a msg_type/resource mismatch is rejected with 4.00 --\n");
     {
         Registry reg;
-        auto topo_wire = pack_topology_wire(0x01, true, 1, 1);
+        auto topo_wire = pack_topology_wire(0x01, true, 1, 1, 1);
         uint8_t code = ingest::handle_request(reg, make_request("pogo/v1/sample", topo_wire));
         CHECK(code == ingest::kCoapCodeBadRequest,
               "posting a TOPOLOGY_SNAPSHOT message to the sample resource is rejected (4.00), not silently "
               "reinterpreted");
     }
 
-    std::printf("\n-- scenario: storage-full (5.03) once the bounded registry is exhausted --\n");
+    printf("\n-- scenario: storage-full (5.03) once the bounded registry is exhausted --\n");
     {
         Registry reg;
         for (int i = 0; i < (int)Registry::kMaxNodes; i++) {
-            uint8_t code = ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire((uint8_t)i, 1, i)));
+            uint8_t code = ingest::handle_request(
+                reg, make_request("pogo/v1/topology", pack_topology_wire((uint8_t)i, true, 1, 1, 1)));
             CHECK(code == ingest::kCoapCodeChanged, "filling the registry: each distinct uuid is accepted as new");
         }
         CHECK(reg.node_count() == Registry::kMaxNodes, "the registry is now exactly full");
-        uint8_t overflow_code =
-            ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0xFE, 1, 999)));
+        uint8_t overflow_code = ingest::handle_request(
+            reg, make_request("pogo/v1/topology", pack_topology_wire(0xFE, true, 1, 1, 1)));
         CHECK(overflow_code == ingest::kCoapCodeServiceUnavailable,
               "a brand-new uuid past capacity gets 5.03 Service Unavailable");
         CHECK(reg.node_count() == Registry::kMaxNodes, "the registry size never exceeds its bound");
 
         // An update to an ALREADY-known uuid must still work even while full.
-        uint8_t existing_update_code =
-            ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x00, 2, 12345)));
+        uint8_t existing_update_code = ingest::handle_request(
+            reg, make_request("pogo/v1/topology", pack_topology_wire(0x00, true, 1, 1, 2)));
         CHECK(existing_update_code == ingest::kCoapCodeChanged,
-              "a new sample for an ALREADY-tracked uuid still succeeds while the registry is full (it's an "
+              "a new report for an ALREADY-tracked uuid still succeeds while the registry is full (it's an "
               "update, not a new slot)");
     }
 
-    std::printf("\n-- scenario: heartbeat is always accepted (2.04), never rejected as a duplicate --\n");
+    printf("\n-- scenario: heartbeat is always accepted (2.04), never rejected as a duplicate --\n");
     {
         Registry reg;
         bridge_export_heartbeat_t hb;

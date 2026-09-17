@@ -28,8 +28,14 @@
  *                           uuid, OR a sensor_type_bitmap that is not a
  *                           subset of that node's own reported bitmap
  *   5.03 Service Unavailable -- couldn't acquire the registry mutex in time,
- *                           or the registry table is full (TOPOLOGY_REGISTRY_ERR_FULL)
+ *                           the registry table is full (TOPOLOGY_REGISTRY_ERR_FULL),
+ *                           or (correction pass) a "/s" sample that
+ *                           sensor_root_aggregator itself reports as
+ *                           SENSOR_ROOT_AGGREGATOR_BUSY/_FULL -- i.e. nothing
+ *                           was actually stored, so this is never reported
+ *                           as 2.04 Changed
  *
+
  * (OpenThread's CoAP implementation only defines the base RFC 7252 code set
  * -- there is no distinct "4.09 Conflict" available, hence folding
  * conflict/stale-session into 4.12 Precondition Failed.)
@@ -82,10 +88,14 @@ extern "C" {
 typedef struct {
     void *ctx;
     /* A new (module_uuid, sample_seq) sample was ACTUALLY newly recorded by
-     * sensor_root_aggregator (never fired for an exact-duplicate retransmit,
-     * an unknown/offline uuid, or a bitmap-mismatched sample -- all of which
-     * are already rejected before sensor_root_aggregator_record_sample() is
-     * even called, see power_base_transport.c's coap_sensor_handler()). */
+     * sensor_root_aggregator -- i.e.
+     * sensor_root_aggregator_record_sample_result() returned
+     * SENSOR_ROOT_AGGREGATOR_STORED, never for an exact-duplicate retransmit
+     * (DUPLICATE), a momentarily-busy or full aggregator (BUSY/FULL -- see
+     * power_base_transport.c's coap_sensor_handler(), which also never
+     * reports these as CoAP 2.04 to the sender), or an unknown/offline uuid
+     * or a bitmap-mismatched sample (all three rejected even earlier, before
+     * the aggregator is ever called at all). */
     void (*on_sample_stored)(const sensor_sample_t *sample, void *ctx);
     /* A topology report was applied to the registry as a REAL change
      * (topology_registry_apply_report() returned TOPOLOGY_REGISTRY_OK, never

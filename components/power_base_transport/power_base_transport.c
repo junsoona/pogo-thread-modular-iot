@@ -39,32 +39,6 @@ void power_base_transport_set_bridge_observer(const power_base_transport_bridge_
     s_observer = *observer;
 }
 
-/*
- * True if sensor_root_aggregator already holds this EXACT (module_uuid,
- * sample_seq) -- i.e. sensor_root_aggregator_record_sample() is about to
- * treat this as an exact-duplicate retransmit and drop it without storing.
- * Mirrors that component's own dedup check (see sensor_root_aggregator.c's
- * record_sample()) from the OUTSIDE, via its existing public
- * get_node_count()/get_node() accessors, rather than modifying
- * sensor_root_aggregator itself just to learn "was this actually new" --
- * sensor_root_aggregator's own file stays completely untouched by this
- * follow-up. Safe to call unconditionally: an unknown uuid (not yet in the
- * aggregator at all) simply returns false, i.e. "this will be new". */
-static bool aggregator_has_exact_sample(const uint8_t module_uuid[SENSOR_UUID_LEN], uint32_t sample_seq)
-{
-    size_t count = sensor_root_aggregator_get_node_count();
-    for (size_t i = 0; i < count; i++) {
-        sensor_root_aggregator_node_t node;
-        if (!sensor_root_aggregator_get_node(i, &node)) {
-            continue;
-        }
-        if (memcmp(node.module_uuid, module_uuid, SENSOR_UUID_LEN) == 0) {
-            return node.has_sample && node.last_sample_seq == sample_seq;
-        }
-    }
-    return false;
-}
-
 /* A point-in-time (uuid, online) snapshot of every currently-valid registry
  * slot -- used to detect exactly which nodes' online flags flip false
  * across a mutating call (apply_report's internal cascade, a direct
@@ -199,19 +173,42 @@ static void coap_sensor_handler(void *ctx, otMessage *message, const otMessageIn
                 }
                 code = OT_COAP_CODE_PRECONDITION_FAILED;
             } else {
-                /* Checked BEFORE the store so this always reflects what
-                 * record_sample() is about to do -- see
-                 * aggregator_has_exact_sample()'s own comment on why this
-                 * lives here instead of inside sensor_root_aggregator.c
-                 * itself. Never fired for an exact-duplicate retransmit
-                 * (this "/s" handler's own success response/aggregator
-                 * behavior is completely unaffected either way -- see
-                 * power_base_transport.h's observer doc comment). */
-                bool is_new = !aggregator_has_exact_sample(sample.module_uuid, sample.sample_seq);
-                sensor_root_aggregator_record_sample(&sample);
-                code = OT_COAP_CODE_CHANGED;
-                if (is_new && s_observer.on_sample_stored != NULL) {
-                    s_observer.on_sample_stored(&sample, s_observer.ctx);
+                /* Correction pass: the CoAP response code (and whether the
+                 * bridge observer fires at all) now reflects what
+                 * sensor_root_aggregator ACTUALLY did, not an assumption
+                 * that storing always succeeds -- see
+                 * sensor_root_aggregator_result_t's own doc comment. Only
+                 * STORED means new data now sits in the aggregator; every
+                 * other result leaves it completely unchanged, and must
+                 * never be reported to the sender as 2.04 Changed nor
+                 * exported to Linux. */
+                sensor_root_aggregator_result_t agg_result = sensor_root_aggregator_record_sample_result(&sample);
+                switch (agg_result) {
+                case SENSOR_ROOT_AGGREGATOR_STORED:
+                    code = OT_COAP_CODE_CHANGED;
+                    if (s_observer.on_sample_stored != NULL) {
+                        s_observer.on_sample_stored(&sample, s_observer.ctx);
+                    }
+                    break;
+                case SENSOR_ROOT_AGGREGATOR_DUPLICATE:
+                    /* An idempotent retransmit of the already-accepted
+                     * sample -- distinct 2.03 (not 2.04), same convention
+                     * as the topology registry's own OK_DUPLICATE mapping
+                     * below. Never fires the bridge observer (nothing
+                     * changed). */
+                    code = OT_COAP_CODE_VALID;
+                    break;
+                case SENSOR_ROOT_AGGREGATOR_BUSY:
+                case SENSOR_ROOT_AGGREGATOR_FULL:
+                    /* Nothing was stored -- this sender's data did not
+                     * actually reach the aggregator. Must not look like
+                     * success: never 2.xx, never exported. */
+                    code = OT_COAP_CODE_SERVICE_UNAVAILABLE;
+                    break;
+                case SENSOR_ROOT_AGGREGATOR_INVALID:
+                default:
+                    code = OT_COAP_CODE_BAD_REQUEST;
+                    break;
                 }
             }
         } else {

@@ -259,11 +259,82 @@ int main(void)
         bool sent;
         otCoapCode code;
         send_sensor_sample(node_a, 42, &sent, &code); /* same seq as the previous scenario */
-        CHECK(code == OT_COAP_CODE_CHANGED, "the Power Base still ACKs an exact-duplicate '/s' retransmit with "
-                                             "2.04 (unchanged existing behavior)");
+        CHECK(code == OT_COAP_CODE_VALID, "the Power Base ACKs an exact-duplicate '/s' retransmit with 2.03 Valid "
+                                            "(correction pass: distinct from 2.04 -- nothing was actually re-stored)");
         sleep_ms(150); /* generous settle window -- no send should ever appear */
         CHECK(host_pb_bridge_full_sim_send_count() == before_sends,
               "no additional export was ever sent for the exact-duplicate sample");
+    }
+
+    printf("\n-- scenario: rapid samples for the SAME uuid coalesce to a single export of the LATEST value --\n");
+    {
+        uint8_t node_e[TOPOLOGY_UUID_LEN];
+        make_uuid(node_e, 0xEE);
+        bool sent;
+        otCoapCode code;
+        int setup_base = host_pb_bridge_full_sim_send_count();
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
+        send_topology_report(node_e, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 800, 1, false, &sent, &code);
+        CHECK(wait_for_send_count(setup_base + 1, 2000), "setup: node_e's topology attach settles");
+
+        /* Occupy the exporter task with a slow (bounded-retry, never
+         * answered) TOPOLOGY blocker so both samples below are upserted
+         * into the pending-sample table well before the task's next
+         * drain_pending_samples() call -- makes the coalescing outcome
+         * deterministic instead of a timing race. */
+        uint8_t blocker2[TOPOLOGY_UUID_LEN];
+        make_uuid(blocker2, 0xEF);
+        host_pb_bridge_full_sim_queue_no_response();
+        host_pb_bridge_full_sim_queue_no_response();
+        host_pb_bridge_full_sim_queue_no_response();
+        int before_sends = host_pb_bridge_full_sim_send_count();
+        send_topology_report(blocker2, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 801, 1, false, &sent, &code);
+
+        send_sensor_sample(node_e, 1, &sent, &code); /* stale -- should never be exported on its own */
+        CHECK(code == OT_COAP_CODE_CHANGED, "node_e's first sample (seq=1) is stored fine at the aggregator "
+                                              "level -- coalescing only affects the EXPORT, never storage");
+        send_sensor_sample(node_e, 2, &sent, &code); /* the only value that should ever be exported */
+        CHECK(code == OT_COAP_CODE_CHANGED, "node_e's second sample (seq=2) is also stored fine");
+
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED); /* for the coalesced sample */
+        size_t since = host_pb_bridge_full_sim_captured_count();
+        CHECK(wait_for_send_count(before_sends + 4, 3000),
+              "the blocker's 3 bounded attempts complete, then exactly one coalesced sample export follows");
+
+        int sample_sends_for_node_e = 0;
+        uint32_t last_seen_seq = 0;
+        size_t total = host_pb_bridge_full_sim_captured_count();
+        for (size_t i = since; i < total; i++) {
+            host_pb_bridge_full_sim_sent_t cap;
+            host_pb_bridge_full_sim_get_captured(i, &cap);
+            if (strcmp(cap.uri_path, "pogo/v1/sample") != 0) {
+                continue;
+            }
+            bridge_export_msg_type_t type;
+            const uint8_t *payload;
+            uint16_t payload_len;
+            if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len) ||
+                type != BRIDGE_EXPORT_MSG_SAMPLE) {
+                continue;
+            }
+            bridge_export_sample_t exp;
+            if (!bridge_export_unpack_sample(payload, payload_len, &exp)) {
+                continue;
+            }
+            sensor_sample_t decoded;
+            if (!sensor_channel_unpack(exp.sensor_channel_payload, exp.sensor_channel_len, &decoded)) {
+                continue;
+            }
+            if (memcmp(decoded.module_uuid, node_e, SENSOR_UUID_LEN) != 0) {
+                continue;
+            }
+            sample_sends_for_node_e++;
+            last_seen_seq = decoded.sample_seq;
+        }
+        CHECK(sample_sends_for_node_e == 1,
+              "exactly ONE sample export was sent for node_e -- the first (seq=1) never went out on its own, it "
+              "was coalesced away by the second (seq=2) before the task ever drained it");
+        CHECK(last_seen_seq == 2, "the single exported sample carries the LATEST seq (2), never the stale seq=1");
     }
 
     printf("\n-- scenario: a DETACHED report cascading a child offline exports BOTH nodes --\n");

@@ -239,10 +239,44 @@ int main(void)
 
         reset_observer_recording();
         send_sensor_sample(NODE_A_UUID, 7, &sent, &code);
-        CHECK(code == OT_COAP_CODE_CHANGED,
-              "an exact-duplicate (same seq) retransmit STILL gets CoAP 2.04 -- this follow-up's observer wiring "
-              "must never change the existing '/s' response-code contract");
+        CHECK(code == OT_COAP_CODE_VALID,
+              "an exact-duplicate (same seq) retransmit gets CoAP 2.03 Valid (correction pass: distinct from 2.04, "
+              "matching the topology registry's own OK_DUPLICATE convention -- nothing was actually re-stored)");
         CHECK(s_sample_stored_count == 0, "on_sample_stored does NOT fire for an exact-duplicate retransmit");
+    }
+
+    printf("\n-- scenario: the aggregator reporting FULL never returns 2.04 and never fires on_sample_stored --\n");
+    {
+        fresh_transport();
+        bool sent;
+        otCoapCode code;
+        /* Fill the aggregator to SENSOR_ROOT_AGGREGATOR_MAX_NODES (16) with
+         * 16 distinct, topology-known, online, unrestricted-bitmap uuids. */
+        uint8_t uuid[TOPOLOGY_UUID_LEN];
+        for (int i = 0; i < 16; i++) {
+            memset(uuid, 0, TOPOLOGY_UUID_LEN);
+            uuid[7] = (uint8_t)(0xC0 + i);
+            send_topology_report(uuid, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 900 + i, 1, false, &sent, &code);
+            CHECK(code == OT_COAP_CODE_CHANGED, "setup: each of the 16 filler nodes attaches OK");
+            send_sensor_sample(uuid, 1, &sent, &code);
+            CHECK(code == OT_COAP_CODE_CHANGED, "setup: each of the 16 filler nodes' first sample is stored");
+        }
+
+        /* A 17th, brand-new uuid's topology can still attach (topology_registry's
+         * own capacity is 32, independent of the aggregator's 16) ... */
+        uint8_t uuid17[TOPOLOGY_UUID_LEN];
+        memset(uuid17, 0, TOPOLOGY_UUID_LEN);
+        uuid17[7] = 0xD0;
+        send_topology_report(uuid17, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 999, 1, false, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "the 17th uuid's topology attach still succeeds (registry has room)");
+
+        /* ... but its FIRST sample cannot be stored: the aggregator itself
+         * (a SEPARATE, smaller 16-slot table) is now full. */
+        reset_observer_recording();
+        send_sensor_sample(uuid17, 1, &sent, &code);
+        CHECK(code == OT_COAP_CODE_SERVICE_UNAVAILABLE,
+              "a sample for a brand-new uuid once the aggregator is FULL gets CoAP 5.03, never 2.04");
+        CHECK(s_sample_stored_count == 0, "on_sample_stored does NOT fire when the aggregator reports FULL");
     }
 
     printf("\n-- scenario: a DETACHED report cascading a child offline fires on_topology_applied ONCE for the "

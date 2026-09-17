@@ -22,6 +22,16 @@ namespace ingest {
 //   2.03 Valid    -- an exact-duplicate retransmit (already applied, no change)
 //   4.00 Bad Request -- malformed envelope/payload, or a msg_type that does
 //                       not match the resource it was posted to
+//   4.04 Not Found -- a SAMPLE from a (power_base_uuid, module_uuid) this
+//                       registry has no topology at all for yet (correction
+//                       pass -- see registry.hpp's own top comment)
+//   4.12 Precondition Failed -- a SAMPLE from a known-but-OFFLINE uuid, a
+//                       sensor_bitmap that is not a subset of (or a channel
+//                       that contradicts) the topology's own declared
+//                       bitmap, OR a TOPOLOGY_SNAPSHOT whose
+//                       generation/sequence is stale/reordered (correction
+//                       pass -- mirrors components/power_base_transport's
+//                       own CoAP code table exactly)
 //   5.03 Service Unavailable -- a brand-new (power_base_uuid, module_uuid)
 //                       pair, but the bounded registry is full
 // The caller (server.cpp) is responsible for only calling this AFTER

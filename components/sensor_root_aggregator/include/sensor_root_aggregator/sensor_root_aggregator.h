@@ -53,11 +53,45 @@ typedef struct {
 esp_err_t sensor_root_aggregator_init(void);
 
 /*
- * Records one sample (this node's own, or one relayed up over CoAP).
- * Deduplicates by (module_uuid, sample_seq): an exact repeat of the
- * last-recorded seq for that UUID is dropped without re-storing. A
- * brand-new UUID past SENSOR_ROOT_AGGREGATOR_MAX_NODES is dropped and
- * logged, never overwriting an existing node's slot.
+ * This follow-up (correction pass on the northbound bridge transport):
+ * power_base_transport's "/s" handler needs to know whether a sample was
+ * ACTUALLY newly stored before it fires its bridge-observer's
+ * on_sample_stored() or reports a CoAP success code -- a caller that only
+ * ever saw a void return had no way to distinguish "stored", "an idempotent
+ * duplicate retransmit", "the aggregator was momentarily too busy to take
+ * its own mutex", or "the table is full" (all four were previously folded
+ * into the same silent no-return-value outcome, and the CoAP layer once
+ * incorrectly reported 2.04 Changed / exported to Linux even when nothing
+ * was actually stored).
+ */
+typedef enum {
+    SENSOR_ROOT_AGGREGATOR_STORED,    /* a genuinely new (module_uuid, sample_seq) was recorded */
+    SENSOR_ROOT_AGGREGATOR_DUPLICATE, /* exact repeat of the last-recorded seq for this uuid -- not re-stored */
+    SENSOR_ROOT_AGGREGATOR_BUSY,      /* could not acquire the aggregator's own mutex in time -- nothing stored */
+    SENSOR_ROOT_AGGREGATOR_FULL,      /* a brand-new uuid, but the table is already full -- nothing stored */
+    SENSOR_ROOT_AGGREGATOR_INVALID,   /* sample == NULL, or the aggregator was never initialized */
+} sensor_root_aggregator_result_t;
+
+/*
+ * Records one sample (this node's own, or one relayed up over CoAP) and
+ * reports exactly what happened -- see sensor_root_aggregator_result_t
+ * above. Deduplicates by (module_uuid, sample_seq): an exact repeat of the
+ * last-recorded seq for that UUID is dropped without re-storing
+ * (DUPLICATE). A brand-new UUID past SENSOR_ROOT_AGGREGATOR_MAX_NODES is
+ * dropped and logged (FULL), never overwriting an existing node's slot.
+ * Only SENSOR_ROOT_AGGREGATOR_STORED means new data now sits in this
+ * aggregator -- every other result means the aggregator's stored state is
+ * completely unchanged by this call.
+ */
+sensor_root_aggregator_result_t sensor_root_aggregator_record_sample_result(const sensor_sample_t *sample);
+
+/*
+ * Back-compat wrapper for every pre-existing caller that only ever needed
+ * "store it, I don't need to know what happened" (sensor_service.c's
+ * MODULE_ROLE_ROOT/DEV_ROOT path) -- behaviorally IDENTICAL to before this
+ * follow-up, just implemented in terms of
+ * sensor_root_aggregator_record_sample_result() now instead of duplicating
+ * the storage logic.
  */
 void sensor_root_aggregator_record_sample(const sensor_sample_t *sample);
 

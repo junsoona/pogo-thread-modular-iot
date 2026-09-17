@@ -29,7 +29,10 @@ extern "C" {
 #endif
 
 #define HOST_PB_BRIDGE_FULL_SIM_MAX_PAYLOAD 300
-#define HOST_PB_BRIDGE_FULL_SIM_MAX_CAPTURED 64
+/* Raised alongside MAX_QUEUED (host_pb_bridge_full_sim.c) for this
+ * follow-up's correction pass (item 7: real timer test) -- see that file's
+ * own comment. */
+#define HOST_PB_BRIDGE_FULL_SIM_MAX_CAPTURED 512
 
 /* Clears every registered resource, queued client outcome, and captured
  * outgoing send. Call at the start of every scenario. */

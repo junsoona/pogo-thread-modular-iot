@@ -4,26 +4,32 @@ namespace ingest {
 
 namespace {
 
+enum class OptionParseResult {
+    Ok,
+    PayloadMarker,
+    Malformed,
+};
+
 // Reads one CoAP option header + value starting at *pos, advancing *pos
-// past it. `running_number` is updated by the option's delta. Returns
-// false on any malformed/out-of-bounds option (caller aborts the whole
-// parse). *is_payload_marker is set true (and nothing else is touched) if
-// the byte at *pos is the payload marker (0xFF) rather than an option
-// header -- see RFC 7252 3.1: a delta/length nibble pair of 15/15 is
-// reserved and MUST NOT be used as an option header, so encountering that
-// exact byte unambiguously means "payload starts here", the same
-// simplification essentially every minimal CoAP parser relies on.
-bool parse_one_option(const uint8_t *data, size_t len, size_t *pos, uint32_t *running_number, uint16_t *out_number,
-                       std::vector<uint8_t> *out_value, bool *is_payload_marker)
+// past it. `running_number` is updated by the option's delta and checked
+// against kCoapMaxOptionNumber (correction pass: the previous version
+// silently truncated an overflowed running_number into a uint16_t instead
+// of rejecting it). Returns Malformed on any out-of-bounds/overflowed
+// option (caller aborts the whole parse), PayloadMarker if the byte at
+// *pos is 0xFF rather than an option header -- see RFC 7252 3.1: a
+// delta/length nibble pair of 15/15 is reserved and MUST NOT be used as an
+// option header, so encountering that exact byte unambiguously means
+// "payload starts here", the same simplification essentially every minimal
+// CoAP parser relies on.
+OptionParseResult parse_one_option(const uint8_t *data, size_t len, size_t *pos, uint32_t *running_number,
+                                    uint16_t *out_number, std::vector<uint8_t> *out_value)
 {
-    *is_payload_marker = false;
     if (*pos >= len) {
-        return false;
+        return OptionParseResult::Malformed;
     }
     uint8_t header = data[*pos];
     if (header == 0xFF) {
-        *is_payload_marker = true;
-        return true;
+        return OptionParseResult::PayloadMarker;
     }
     uint8_t delta_nibble = (header >> 4) & 0x0F;
     uint8_t length_nibble = header & 0x0F;
@@ -34,18 +40,18 @@ bool parse_one_option(const uint8_t *data, size_t len, size_t *pos, uint32_t *ru
         delta = delta_nibble;
     } else if (delta_nibble == 13) {
         if (*pos >= len) {
-            return false;
+            return OptionParseResult::Malformed;
         }
         delta = 13u + data[*pos];
         (*pos)++;
     } else if (delta_nibble == 14) {
         if (*pos + 1 >= len) {
-            return false;
+            return OptionParseResult::Malformed;
         }
         delta = 269u + ((uint32_t)data[*pos] << 8) + data[*pos + 1];
         *pos += 2;
     } else {
-        return false; // 15 as delta alone (without length also 15) is invalid
+        return OptionParseResult::Malformed; // 15 as delta alone (without length also 15) is invalid
     }
 
     uint32_t length;
@@ -53,48 +59,53 @@ bool parse_one_option(const uint8_t *data, size_t len, size_t *pos, uint32_t *ru
         length = length_nibble;
     } else if (length_nibble == 13) {
         if (*pos >= len) {
-            return false;
+            return OptionParseResult::Malformed;
         }
         length = 13u + data[*pos];
         (*pos)++;
     } else if (length_nibble == 14) {
         if (*pos + 1 >= len) {
-            return false;
+            return OptionParseResult::Malformed;
         }
         length = 269u + ((uint32_t)data[*pos] << 8) + data[*pos + 1];
         *pos += 2;
     } else {
-        return false;
+        return OptionParseResult::Malformed;
     }
 
     if (*pos + length > len) {
-        return false;
+        return OptionParseResult::Malformed;
     }
-    *running_number += delta;
+    uint64_t new_running_number = (uint64_t)*running_number + delta;
+    if (new_running_number > kCoapMaxOptionNumber) {
+        // Correction pass: reject outright instead of silently truncating
+        // into a uint16_t (a truncated option number could previously have
+        // been misidentified as a DIFFERENT, smaller option number).
+        return OptionParseResult::Malformed;
+    }
+    *running_number = (uint32_t)new_running_number;
     *out_number = static_cast<uint16_t>(*running_number);
     out_value->assign(data + *pos, data + *pos + length);
     *pos += length;
-    return true;
+    return OptionParseResult::Ok;
 }
-
-constexpr uint16_t kOptionUriPath = 11;
 
 } // namespace
 
-bool coap_parse(const uint8_t *data, size_t len, CoapMessage &out)
+ParseStatus coap_parse(const uint8_t *data, size_t len, CoapMessage &out)
 {
     if (data == nullptr || len < 4) {
-        return false;
+        return ParseStatus::Malformed;
     }
     uint8_t first = data[0];
     uint8_t version = (first >> 6) & 0x03;
     if (version != 1) {
-        return false;
+        return ParseStatus::Malformed;
     }
     uint8_t type_bits = (first >> 4) & 0x03;
     uint8_t tkl = first & 0x0F;
     if (tkl > 8) {
-        return false; // RFC 7252: 9-15 reserved, malformed
+        return ParseStatus::Malformed; // RFC 7252: 9-15 reserved, malformed
     }
     out.version = version;
     out.type = static_cast<CoapType>(type_bits);
@@ -103,7 +114,7 @@ bool coap_parse(const uint8_t *data, size_t len, CoapMessage &out)
 
     size_t pos = 4;
     if (pos + tkl > len) {
-        return false;
+        return ParseStatus::Malformed;
     }
     out.token.assign(data + pos, data + pos + tkl);
     pos += tkl;
@@ -114,28 +125,40 @@ bool coap_parse(const uint8_t *data, size_t len, CoapMessage &out)
     while (pos < len) {
         uint16_t option_number = 0;
         std::vector<uint8_t> value;
-        bool is_payload_marker = false;
-        if (!parse_one_option(data, len, &pos, &running_number, &option_number, &value, &is_payload_marker)) {
-            return false;
+        OptionParseResult r = parse_one_option(data, len, &pos, &running_number, &option_number, &value);
+        if (r == OptionParseResult::Malformed) {
+            return ParseStatus::Malformed;
         }
-        if (is_payload_marker) {
+        if (r == OptionParseResult::PayloadMarker) {
             pos++; // skip the 0xFF marker itself
             if (pos >= len) {
-                return false; // marker present but no payload bytes follow -- malformed
+                return ParseStatus::Malformed; // marker present but no payload bytes follow -- malformed
             }
             out.payload.assign(data + pos, data + len);
             break;
         }
-        if (option_number == kOptionUriPath) {
+        if (option_number == kCoapOptionUriPath) {
+            if (value.size() > kCoapMaxUriPathLen) {
+                return ParseStatus::Malformed; // correction pass: bound a single segment's length
+            }
+            if (out.uri_path.size() + 1 + value.size() > kCoapMaxUriPathLen) {
+                return ParseStatus::Malformed; // correction pass: bound the assembled path's total length
+            }
             if (!out.uri_path.empty()) {
                 out.uri_path.push_back('/');
             }
             out.uri_path.append(reinterpret_cast<const char *>(value.data()), value.size());
+        } else if (CoapOptionIsCritical(option_number)) {
+            // Correction pass: an unrecognized CRITICAL option must reject
+            // the whole message (4.02 Bad Option), not be silently
+            // ignored like an elective one -- RFC 7252 5.4.1.
+            return ParseStatus::UnknownCriticalOption;
         }
-        // Every other option (Content-Format, ...) is intentionally ignored --
-        // this ingest program has nothing to do with them.
+        // Every other elective (even-numbered) option (Content-Format, ...)
+        // is intentionally ignored -- this ingest program has nothing to do
+        // with them.
     }
-    return true;
+    return ParseStatus::Ok;
 }
 
 std::vector<uint8_t> coap_build_ack(const CoapMessage &request, uint8_t response_code)

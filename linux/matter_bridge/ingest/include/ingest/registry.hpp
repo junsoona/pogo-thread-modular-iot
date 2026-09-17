@@ -5,6 +5,23 @@
 // firmware's own topology_registry_t/sensor_root_aggregator design
 // deliberately: bounded array, mutex-protected, dedup by an exact-match key
 // -- never an unbounded/dynamically-growing table.
+//
+// Correction pass (this follow-up):
+//   - apply_topology() now mirrors components/topology_registry's own
+//     generation/sequence ordering policy EXACTLY (see that component's own
+//     header comment) instead of only detecting byte-for-byte exact
+//     duplicates: within the SAME boot_session_generation, only a
+//     STRICTLY LARGER last_seq is applied; a smaller one is rejected as
+//     STALE (a reordered/delayed packet must never roll back an already
+//     newer state, including resurrecting an online flag a later report
+//     already turned offline). A generation change is accepted as a new
+//     session UNLESS it exactly matches the just-superseded generation (a
+//     delayed packet from the immediately-preceding session).
+//   - apply_sample() now requires this (power_base_uuid, module_uuid) pair
+//     to already have known, ONLINE topology with a sensor_bitmap that is a
+//     superset of the sample's own bitmap, and requires every channel's
+//     type to actually be a bit set in the sample's declared bitmap --
+//     mirroring components/power_base_transport's own "/s" handler gating.
 #pragma once
 
 #include <array>
@@ -40,6 +57,13 @@ struct NodeState {
     bool downstream_connected = false;
     uint32_t boot_session_generation = 0;
     uint32_t last_seq = 0; // topology report sequence
+    // Mirrors components/topology_registry's own bookkeeping exactly (see
+    // that component's header comment) -- the generation just before
+    // boot_session_generation, so a delayed packet from that exact old
+    // session is recognized and rejected regardless of how its numeric
+    // value compares to the current one.
+    uint32_t superseded_generation = 0;
+    bool has_superseded_generation = false;
 
     bool has_sample = false;
     uint32_t last_sample_seq = 0;
@@ -48,9 +72,12 @@ struct NodeState {
 };
 
 enum class ApplyResult {
-    AppliedNew,    // a genuine new state (2.04 Changed)
-    DuplicateExact, // byte-for-byte identical to what's already stored (2.03 Valid)
-    StorageFull,   // a brand-new (power_base_uuid, module_uuid) pair, but the table is full (5.03)
+    AppliedNew,           // a genuine new state (2.04 Changed)
+    DuplicateExact,       // byte-for-byte identical to what's already stored (2.03 Valid)
+    StorageFull,          // a brand-new (power_base_uuid, module_uuid) pair, but the table is full (5.03)
+    TopologyUnknown,      // apply_sample only: no topology at all for this (power_base_uuid, module_uuid) (4.04)
+    PreconditionFailed,   // apply_sample only: known topology but offline, or a bitmap mismatch (4.12)
+    StaleSession,         // apply_topology only: an old-generation/reordered-seq snapshot, rejected (4.12)
 };
 
 // Thread-safe (one mutex guards both the writer/CoAP-handling thread and any
@@ -66,8 +93,12 @@ public:
 
     // sample_seq/uptime_ms/channels are this sample's own decoded fields
     // (via the real sensor_channel_unpack(), never reinterpreted here).
+    // sample_sensor_bitmap is the SAMPLE's own declared bitmap (distinct
+    // from the topology's stored sensor_bitmap, which is checked against
+    // it -- see this header's own top comment).
     ApplyResult apply_sample(const Uuid &power_base_uuid, const Uuid &module_uuid, uint32_t sample_seq,
-                              uint32_t uptime_ms, const std::vector<ChannelReading> &channels);
+                              uint32_t uptime_ms, uint16_t sample_sensor_bitmap,
+                              const std::vector<ChannelReading> &channels);
 
     // Heartbeats are pure liveness signals with no meaningful "duplicate"
     // concept (this follow-up's own design: never authoritative) -- always

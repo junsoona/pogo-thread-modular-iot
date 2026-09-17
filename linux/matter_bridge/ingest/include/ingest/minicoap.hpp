@@ -14,6 +14,13 @@
 // libcoap3-swap note. The registry/session logic in registry.hpp/session.hpp
 // is completely decoupled from this transport shim -- swapping it for a
 // real libcoap3 server later only touches server.cpp/main.cpp.
+//
+// Correction pass (this follow-up, item 5): coap_parse() now distinguishes
+// WHY a datagram failed to parse (Malformed vs. an unrecognized CRITICAL
+// option, RFC 7252 5.4.1) so the caller can reply 4.00 vs. 4.02 instead of
+// folding every parse failure into 4.00. Method (POST-only) and Uri-Path
+// resource dispatch are NOT this layer's concern -- see server.cpp for the
+// 4.05 Method Not Allowed check, which happens after a successful parse.
 #pragma once
 
 #include <cstdint>
@@ -37,10 +44,37 @@ constexpr uint8_t CoapCode(uint8_t cls, uint8_t detail)
     return static_cast<uint8_t>((cls << 5) | detail);
 }
 constexpr uint8_t kCoapCodePost = CoapCode(0, 2);
-constexpr uint8_t kCoapCodeChanged = CoapCode(2, 4);   // 2.04
-constexpr uint8_t kCoapCodeValid = CoapCode(2, 3);     // 2.03
-constexpr uint8_t kCoapCodeBadRequest = CoapCode(4, 0);       // 4.00
+constexpr uint8_t kCoapCodeChanged = CoapCode(2, 4);            // 2.04
+constexpr uint8_t kCoapCodeValid = CoapCode(2, 3);              // 2.03
+constexpr uint8_t kCoapCodeBadRequest = CoapCode(4, 0);         // 4.00
+constexpr uint8_t kCoapCodeNotFound = CoapCode(4, 4);           // 4.04
+constexpr uint8_t kCoapCodeMethodNotAllowed = CoapCode(4, 5);   // 4.05
+constexpr uint8_t kCoapCodeBadOption = CoapCode(4, 2);          // 4.02
+constexpr uint8_t kCoapCodePreconditionFailed = CoapCode(4, 12); // 4.12
 constexpr uint8_t kCoapCodeServiceUnavailable = CoapCode(5, 3); // 5.03
+
+// A CoAP option number is "critical" (RFC 7252 5.4.1) iff its LSB is 1 --
+// an unrecognized critical option must reject the whole message (4.02); an
+// unrecognized elective (even) option is safely ignored. This parser only
+// ever recognizes Uri-Path (11, critical).
+constexpr bool CoapOptionIsCritical(uint16_t option_number)
+{
+    return (option_number & 1) != 0;
+}
+constexpr uint16_t kCoapOptionUriPath = 11;
+
+// Hard bounds this minimal parser enforces beyond the base RFC 7252 token
+// length limit (8, already implied by the 4-bit TKL field) -- both
+// generous for this program's own fixed, short "pogo/v1/..." resource
+// paths, and small enough to bound per-datagram parse work/memory.
+constexpr size_t kCoapMaxUriPathLen = 64;
+constexpr size_t kCoapMaxOptionNumber = 0xFFFF;
+
+enum class ParseStatus {
+    Ok,
+    Malformed,             // -> 4.00 Bad Request
+    UnknownCriticalOption, // -> 4.02 Bad Option
+};
 
 struct CoapMessage {
     uint8_t version = 1;
@@ -52,10 +86,10 @@ struct CoapMessage {
     std::vector<uint8_t> payload;
 };
 
-// Parses `data`/`len` into `out`. Returns false for anything this minimal
-// subset cannot safely interpret (too short, bad version, a token/option
-// length that runs past the buffer, ...) -- never guesses.
-bool coap_parse(const uint8_t *data, size_t len, CoapMessage &out);
+// Parses `data`/`len` into `out`. See ParseStatus above for the two
+// distinct failure reasons this minimal subset reports; never guesses at a
+// malformed or partially-understood datagram.
+ParseStatus coap_parse(const uint8_t *data, size_t len, CoapMessage &out);
 
 // Builds a complete Acknowledgement datagram for `request` with the given
 // response code, no options, no payload (this ingest program's own
