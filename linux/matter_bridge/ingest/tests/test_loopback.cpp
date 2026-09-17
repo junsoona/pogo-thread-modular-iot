@@ -228,6 +228,70 @@ int main()
             CHECK(resp_code == ingest::kCoapCodeChanged, "the ACK's response code is 2.04 Changed");
             CHECK(resp_mid == 100, "the ACK's message_id matches the request's");
         }
+        // The core regression this follow-up fixes: `from` here is the
+        // ACK datagram's actual IP-layer SOURCE address (recvfrom()'s
+        // out-parameter reports who the packet came from, i.e. the source
+        // address the server's sendmsg()+IPV6_PKTINFO pinned it to) -- it
+        // must exactly match server_addr, the address this test's request
+        // was sent TO, not some other address the kernel might otherwise
+        // have chosen for an interface with more than one configured
+        // address (this loopback interface has only ::1, but the same
+        // sendmsg()+IPV6_PKTINFO mechanism is what pins the source address
+        // on wpan0's MLEID/RLOC/ALOC/OMR too -- see
+        // test_ack_transport_static.cpp for a check that specifically
+        // guards against silently reverting to a plain sendto() here).
+        CHECK(std::memcmp(&from.sin6_addr, &server_addr.sin6_addr, sizeof(in6_addr)) == 0,
+              "the ACK's source IPv6 address exactly matches the destination address the request was sent to");
+    }
+
+    printf("\n-- scenario: an oversized Confirmable datagram that exceeds the server's receive buffer "
+           "(MSG_TRUNC) is discarded outright -- no ACK, no registry mutation, and the server stays alive --\n");
+    {
+        size_t node_count_before = registry.node_count();
+
+        // Larger than the server's fixed 2048-byte recv buffer (see
+        // server.cpp's `uint8_t buf[2048]`) so the kernel sets MSG_TRUNC on
+        // this recvmsg(). The content doesn't need to be a valid CoAP
+        // message at all -- the server must discard it due to truncation
+        // before ever attempting to parse it.
+        std::vector<uint8_t> oversized(3000, 0xAA);
+
+        timeval short_tv4{};
+        short_tv4.tv_sec = 0;
+        short_tv4.tv_usec = 300000; // 300ms -- long enough for any real ACK to have arrived
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &short_tv4, sizeof(short_tv4));
+
+        ssize_t oversized_sent = sendto(client, oversized.data(), oversized.size(), 0,
+                                         reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr));
+        CHECK(oversized_sent == static_cast<ssize_t>(oversized.size()),
+              "the oversized datagram was sent in full (truncation happens on the receiving side, not here)");
+
+        uint8_t resp_buf[512];
+        sockaddr_in6 from{};
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(client, resp_buf, sizeof(resp_buf), 0, reinterpret_cast<sockaddr *>(&from), &from_len);
+        CHECK(n < 0, "no ACK is ever sent for a datagram the server received truncated (MSG_TRUNC)");
+
+        struct timespec small_wait2 = {0, 50000000L}; // 50ms
+        nanosleep(&small_wait2, nullptr);
+        CHECK(registry.node_count() == node_count_before,
+              "the truncated datagram never touched registry state");
+
+        // Server must still be alive and answer a follow-up valid request.
+        timeval tv5{};
+        tv5.tv_sec = 2;
+        tv5.tv_usec = 0;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv5, sizeof(tv5));
+        auto payload = pack_heartbeat_wire(0xAB, 6500, 2);
+        auto request = build_request("pogo/v1/heartbeat", payload, 106);
+        sendto(client, request.data(), request.size(), 0, reinterpret_cast<sockaddr *>(&server_addr),
+               sizeof(server_addr));
+        uint8_t resp_buf2[512];
+        sockaddr_in6 from2{};
+        socklen_t from_len2 = sizeof(from2);
+        ssize_t n2 = recvfrom(client, resp_buf2, sizeof(resp_buf2), 0, reinterpret_cast<sockaddr *>(&from2),
+                               &from_len2);
+        CHECK(n2 >= 4, "the server is still alive and answers a follow-up request after a truncated datagram");
     }
 
     printf("\n-- scenario: a malformed datagram over the real socket is dropped without crashing the server --\n");

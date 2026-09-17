@@ -92,6 +92,7 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
 
     std::chrono::steady_clock::time_point last_recv_err_log{};
     std::chrono::steady_clock::time_point last_wrong_iface_log{};
+    std::chrono::steady_clock::time_point last_trunc_log{};
     std::chrono::steady_clock::time_point last_send_err_log{};
 
     uint8_t buf[2048];
@@ -125,28 +126,48 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
             continue;
         }
 
+        // A truncated payload (MSG_TRUNC) or truncated ancillary data
+        // (MSG_CTRUNC) is discarded outright, before it ever reaches the
+        // interface check below or handle_request() -- MSG_CTRUNC in
+        // particular means the IPV6_PKTINFO this loop is about to read
+        // could itself be incomplete/absent, so neither the interface
+        // filter nor registry state may be trusted to or applied from this
+        // datagram.
+        if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+            if (rate_limit_ok(last_trunc_log, kLogRateLimit)) {
+                std::fprintf(stderr, "ingest: dropped a truncated datagram (msg_flags=0x%x) -- discarded, not applied\n",
+                             msg.msg_flags);
+            }
+            continue;
+        }
+
         // Find IPV6_PKTINFO among the ancillary data to learn which LOCAL
-        // interface this datagram actually arrived on -- see server.hpp's
-        // own SECURITY NOTE for why this is enforced per-packet rather than
-        // only at bind() time (bind() to in6addr_any accepts every
-        // interface; this is what actually restricts it to one).
-        unsigned int recv_ifindex = 0;
+        // interface this datagram actually arrived on, AND the exact local
+        // destination address (ipi6_addr) it was sent to -- see server.hpp's
+        // own SECURITY NOTE for why the interface check is enforced
+        // per-packet rather than only at bind() time (bind() to in6addr_any
+        // accepts every interface; this is what actually restricts it to
+        // one). The destination address is kept so the ACK below can be
+        // sent back FROM that same address -- wpan0 carries multiple IPv6
+        // addresses (MLEID/RLOC/ALOC/OMR/...), and a plain sendto() lets the
+        // kernel pick any of them as source, which a Power Base that sent
+        // to a specific address (its configured OTBR MLEID) will not
+        // recognize as the response to its own CoAP transaction.
+        in6_pktinfo recv_pktinfo{};
         bool have_pktinfo = false;
         for (cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
-                in6_pktinfo pi{};
-                std::memcpy(&pi, CMSG_DATA(cmsg), sizeof(pi));
-                recv_ifindex = pi.ipi6_ifindex;
+                std::memcpy(&recv_pktinfo, CMSG_DATA(cmsg), sizeof(recv_pktinfo));
                 have_pktinfo = true;
                 break;
             }
         }
-        if (!have_pktinfo || recv_ifindex != required_ifindex) {
+        if (!have_pktinfo || recv_pktinfo.ipi6_ifindex != required_ifindex) {
             if (rate_limit_ok(last_wrong_iface_log, kLogRateLimit)) {
                 std::fprintf(stderr,
                              "ingest: dropped a datagram received on ifindex=%u (expected '%s'=%u, or no "
                              "IPV6_PKTINFO at all) -- see server.hpp's SECURITY NOTE\n",
-                             recv_ifindex, config.interface_name.c_str(), required_ifindex);
+                             recv_pktinfo.ipi6_ifindex, config.interface_name.c_str(), required_ifindex);
             }
             continue;
         }
@@ -192,12 +213,53 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         // always gets a response -- the response is sent only AFTER
         // handle_request() (if called at all) has fully applied the state
         // change (this follow-up's own explicit ordering requirement).
+        //
+        // The ACK is sent via sendmsg() with an outgoing IPV6_PKTINFO,
+        // rather than a plain sendto(), specifically to pin its source
+        // address to recv_pktinfo.ipi6_addr -- the exact local address the
+        // request was addressed to -- and its egress interface to the
+        // already-verified required_ifindex. Without this, the kernel is
+        // free to pick any address configured on the outgoing interface
+        // (wpan0 typically carries MLEID/RLOC/ALOC/OMR simultaneously) as
+        // the ACK's source, which a Power Base awaiting the ACK for a
+        // specific CoAP transaction to its configured OTBR MLEID will not
+        // match, causing it to retry (see docs/matter-bridge.md).
         std::vector<uint8_t> ack = coap_build_ack(req, code);
-        ssize_t sent =
-            sendto(sock, ack.data(), ack.size(), 0, reinterpret_cast<sockaddr *>(&peer), msg.msg_namelen);
-        if (sent < 0 && rate_limit_ok(last_send_err_log, kLogRateLimit)) {
-            std::fprintf(stderr, "ingest: sendto() failed while ACKing uri=%s: %s\n", req.uri_path.c_str(),
-                         std::strerror(errno));
+
+        iovec send_iov{};
+        send_iov.iov_base = ack.data();
+        send_iov.iov_len = ack.size();
+
+        in6_pktinfo send_pktinfo{};
+        send_pktinfo.ipi6_addr = recv_pktinfo.ipi6_addr;
+        send_pktinfo.ipi6_ifindex = required_ifindex;
+
+        uint8_t send_cmsg_buf[CMSG_SPACE(sizeof(send_pktinfo))];
+        std::memset(send_cmsg_buf, 0, sizeof(send_cmsg_buf));
+
+        msghdr send_msg{};
+        send_msg.msg_name = &peer;
+        send_msg.msg_namelen = msg.msg_namelen;
+        send_msg.msg_iov = &send_iov;
+        send_msg.msg_iovlen = 1;
+        send_msg.msg_control = send_cmsg_buf;
+        send_msg.msg_controllen = sizeof(send_cmsg_buf);
+
+        cmsghdr *send_cmsg = CMSG_FIRSTHDR(&send_msg);
+        send_cmsg->cmsg_level = IPPROTO_IPV6;
+        send_cmsg->cmsg_type = IPV6_PKTINFO;
+        send_cmsg->cmsg_len = CMSG_LEN(sizeof(send_pktinfo));
+        std::memcpy(CMSG_DATA(send_cmsg), &send_pktinfo, sizeof(send_pktinfo));
+
+        ssize_t sent = sendmsg(sock, &send_msg, 0);
+        if (sent < 0) {
+            if (rate_limit_ok(last_send_err_log, kLogRateLimit)) {
+                std::fprintf(stderr, "ingest: sendmsg() failed while ACKing uri=%s: %s\n", req.uri_path.c_str(),
+                             std::strerror(errno));
+            }
+        } else if (sent != static_cast<ssize_t>(ack.size()) && rate_limit_ok(last_send_err_log, kLogRateLimit)) {
+            std::fprintf(stderr, "ingest: sendmsg() sent only %zd of %zu bytes while ACKing uri=%s\n", sent,
+                         ack.size(), req.uri_path.c_str());
         }
     }
     close(sock);

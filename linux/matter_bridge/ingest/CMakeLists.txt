@@ -77,3 +77,12 @@ add_test(NAME ingest_unit_tests COMMAND ingest_unit_tests)
 add_executable(ingest_loopback_test tests/test_loopback.cpp src/server.cpp)
 target_link_libraries(ingest_loopback_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_loopback_test COMMAND ingest_loopback_test)
+
+# Static check that the ACK path in src/server.cpp still uses
+# sendmsg()+IPV6_PKTINFO rather than a plain sendto() -- see that test's own
+# top comment for why this is needed in addition to the socket-based
+# loopback regression above.
+add_executable(ingest_ack_transport_static_test tests/test_ack_transport_static.cpp)
+target_compile_definitions(ingest_ack_transport_static_test PRIVATE
+    INGEST_SERVER_CPP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/server.cpp")
+add_test(NAME ingest_ack_transport_static_test COMMAND ingest_ack_transport_static_test)
