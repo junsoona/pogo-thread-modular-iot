@@ -1,17 +1,26 @@
 /*
  * Linker-level override of the `openthread` component's own
  * $IDF_PATH/components/openthread/src/esp_openthread_platform.cpp:
- * esp_openthread_platform_process() -- the CONFIRMED root cause (real-
- * hardware coredump analysis, not a leading hypothesis) of a crashed
- * `ot_main` task:
+ * esp_openthread_platform_process().
+ *
+ * CONFIRMED by a real-hardware coredump (diagnostic build, section 10 of
+ * docs/otbr-rcp.md), read back with `idf.py coredump-debug`:
  *
  *   - crashed task: ot_main
  *   - assert address 0x4200f9ee
  *   - esp_openthread.cpp:279's esp_openthread_launch_mainloop() returns,
  *     then esp_openthread.cpp:283's `assert(false)` fires
  *
- * The exact call chain, read directly from ESP-IDF v6.1's own sources
- * (never modified -- see rcp_usb_rx_recovery.h's own comment):
+ * The coredump does NOT preserve the `errno` value from the moment of the
+ * panic, so it confirms ONLY that esp_openthread_launch_mainloop() returned
+ * and that the subsequent assert(false) fired -- it does not, by itself,
+ * identify which registered workflow or which specific error caused that
+ * return. Steps 1-2 and 4-5 below are read directly from ESP-IDF v6.1's
+ * own sources (never modified) and match the coredump exactly; step 3
+ * (which workflow, and the EIO trigger) is the most plausible mechanism
+ * this source reading points to, cross-checked against two real-hardware
+ * trials (see docs/otbr-rcp.md section 12.1) rather than read out of the
+ * coredump itself:
  *
  *   1. esp_openthread.cpp:esp_openthread_launch_mainloop()'s own `while`
  *      loop calls `select()` on the registered workflow fds, then calls
@@ -23,18 +32,27 @@
  *      the FIRST workflow to return non-ESP_OK makes
  *      esp_openthread_platform_process() itself return that same
  *      non-ESP_OK immediately.
- *   3. For this project's RCP-over-USB-Serial/JTAG build, the one
- *      registered workflow is esp_openthread_uart.c's
- *      esp_openthread_uart_process(), which does exactly one
- *      `read(s_uart_fd, ...)`. USB Serial/JTAG's own VFS read path can
- *      return -1/EIO for the width of one usb_serial_jtag_is_connected()
- *      false negative -- a few ms around attach/enumeration/brief
- *      host-side backpressure -- even though the link is otherwise fine
- *      one read() call later (the SAME espressif/esp-idf#18490/#18506
- *      class of false negative already documented for the USB Spinel TX
- *      path, see rcp_uart_tx_retry.h and docs/otbr-rcp.md section 9 -- but
- *      here on the RX side). `esp_openthread_uart_process()` treats ANY
- *      read() errno other than EAGAIN as fatal: `return ESP_FAIL;`.
+ *   3. For this project's RCP-over-USB-Serial/JTAG build, FOUR workflows
+ *      are registered during esp_openthread_platform_init(): alarm
+ *      (esp_openthread_alarm.c), UART (esp_openthread_uart.c, since
+ *      CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y selects the USB host
+ *      connection mode), task queue (esp_openthread_task_queue.c), and
+ *      radio (esp_openthread_radio.c). Of those four, only the UART
+ *      workflow's process_func -- esp_openthread_uart_process() -- can
+ *      return ESP_FAIL from this path (the other three either always
+ *      return ESP_OK or `assert()` internally instead of returning
+ *      ESP_FAIL; confirmed by reading each one's own process_func):
+ *      it does exactly one `read(s_uart_fd, ...)`, and treats ANY read()
+ *      errno other than EAGAIN as fatal: `return ESP_FAIL;`. USB
+ *      Serial/JTAG's own VFS read path CAN return -1/EIO for the width of
+ *      one usb_serial_jtag_is_connected() false negative -- a few ms
+ *      around attach/enumeration/brief host-side backpressure -- even
+ *      though the link is otherwise fine one read() call later (the SAME
+ *      espressif/esp-idf#18490/#18506 class of false negative already
+ *      documented for the USB Spinel TX path, see rcp_uart_tx_retry.h and
+ *      docs/otbr-rcp.md section 9 -- but here on the RX side). This EIO
+ *      path is a plausible producer of the ESP_FAIL step 4 needs, not
+ *      something the coredump itself shows happening.
  *   4. Back in esp_openthread_launch_mainloop(): `error != ESP_OK` breaks
  *      the mainloop's own `while` loop, and esp_openthread_launch_mainloop()
  *      returns that error.
@@ -44,19 +62,24 @@
  *          ESP_LOGE(OT_PLAT_LOG_TAG, "RCP deinitialization is not supported for now");
  *          assert(false);
  *      -- i.e. this project's RCP build NEVER expects the mainloop to
- *      exit for any reason. A momentary USB RX false negative reaching
- *      step 3 is therefore enough, by itself, to crash the whole task via
- *      this unconditional assert(false) -- exactly the observed coredump.
+ *      exit for any reason. Steps 4-5 are exactly what the coredump shows;
+ *      step 3 is why this file specifically targets ESP_FAIL+EIO rather
+ *      than absorbing every possible non-ESP_OK return.
  *
- * This file fixes that by absorbing the one specific, confirmed-transient
- * condition (ESP_FAIL from esp_openthread_platform_process() with
- * errno == EIO) with a bounded retry, so esp_openthread_launch_mainloop()
- * never sees a non-ESP_OK return for that condition and its `while` loop
- * simply keeps running -- exactly as if the transient read() had never
- * happened. See rcp_usb_rx_recovery.h's own comment for why this is a
- * SEPARATE fix from the existing USB Spinel TX retry hardening
- * (rcp_uart_tx_retry.c et al.) and does not claim to be a root fix for
- * that TX-side RESET_FAULT symptom.
+ * This file absorbs the one specific condition identified above (ESP_FAIL
+ * from esp_openthread_platform_process() with errno == EIO) with a
+ * bounded retry, so esp_openthread_launch_mainloop() never sees a
+ * non-ESP_OK return for that condition and its `while` loop simply keeps
+ * running -- exactly as if the transient read() had never happened. Any
+ * OTHER error is passed through unmodified (see
+ * __wrap_esp_openthread_platform_process()'s own comment below), so this
+ * fix narrows rather than widens what can reach the diagnostic
+ * assert()/coredump path. See rcp_usb_rx_recovery.h's own comment for why
+ * this is a SEPARATE fix from the existing USB Spinel TX retry hardening
+ * (rcp_uart_tx_retry.c et al.) and does not claim to be a fix for that
+ * TX-side RESET_FAULT symptom -- the two were applied and verified
+ * TOGETHER on real hardware (docs/otbr-rcp.md section 12.6), which does
+ * not by itself isolate either fix's own individual contribution.
  *
  * ESP-IDF's own documented `--wrap` linker mechanism
  * ($IDF_PATH/examples/build_system/wrappers/README.md, "Using wrapper to
@@ -102,13 +125,13 @@ esp_err_t __wrap_esp_openthread_platform_process(otInstance *instance,
 
         if (err != ESP_FAIL || errno != EIO) {
             /*
-             * Not the one confirmed-transient USB RX condition this file
-             * exists to absorb -- return the ORIGINAL error, completely
-             * unmodified, on this very first attempt. Hiding this would
-             * defeat the diagnostic assert()/coredump path a genuine,
-             * non-transient failure is supposed to reach (this file's own
-             * header comment, step 5) -- never suppress or retry anything
-             * else.
+             * Not the one ESP_FAIL+EIO condition this file treats as
+             * transient USB RX noise -- return the ORIGINAL error,
+             * completely unmodified, on this very first attempt. Hiding
+             * this would defeat the diagnostic assert()/coredump path a
+             * genuine, non-transient failure is supposed to reach (this
+             * file's own header comment, step 5) -- never suppress or
+             * retry anything else.
              */
             return err;
         }

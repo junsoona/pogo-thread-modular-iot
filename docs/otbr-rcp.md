@@ -50,8 +50,9 @@ rcp/
                           pending soak test) -- see section 9
     rcp_uart_tx_io.c        production I/O seam for rcp_uart_tx_retry.c -- see section 9
     esp_ot_uart_send_wrap.c linker `--wrap=otPlatUartSend` glue -- see section 9
-    rcp_usb_rx_recovery.h   USB Spinel RX recovery fix (confirmed coredump root
-                          cause, not a hypothesis) -- see section 12
+    rcp_usb_rx_recovery.h   USB Spinel RX recovery fix (mainloop-exit/assert
+                          path confirmed by coredump; EIO trigger from source
+                          analysis + real-hardware soak) -- see section 12
     esp_openthread_platform_process_wrap.c
                           linker `--wrap=esp_openthread_platform_process`
                           glue + the actual bounded-retry/timeout logic -- see
@@ -330,14 +331,19 @@ host-tested vs. what still needs real hardware).
 
 ## 9. USB Spinel TX retry (RESET_FAULT candidate workaround, pending soak test)
 
-**Status: unverified on real hardware.** Everything in this section is a
-**leading hypothesis** about the cause, and the code below is a
-**candidate workaround** for it -- built, host-tested, and symbol-level
-verified in the firmware ELF (all covered in this section), but the
-underlying diagnosis has NOT been confirmed by re-running the real-hardware
-chain that originally reproduced the failure. Section 11's one-hour soak
-test is what would actually confirm or refute this. Do not read this
-section as "the bug is understood and fixed" -- read it as "this is our
+**Status: the underlying write-path hypothesis itself is still not
+independently confirmed.** Everything in this section is a **leading
+hypothesis** about the cause, and the code below is a **candidate
+workaround** for it -- built, host-tested, and symbol-level verified in
+the firmware ELF (all covered in this section). This fix WAS included in
+a real one-hour full-chain soak run (see section 11 and 12.6) together
+with the separate RX fix from section 12, and that combined run observed
+zero `RESET_FAULT`/HDLC-parse occurrences -- but because both fixes were
+applied at once, that result validates the COMBINED hardening, not this
+TX write-path hypothesis specifically: it remains possible that the RX
+fix alone would have been sufficient, or that this hypothesis is still
+not the whole story. Do not read this section as "the bug is understood
+and fixed, in isolation" -- read it as "this is our
 best current explanation, and a specific, testable change we built around
 it."
 
@@ -723,11 +729,16 @@ Both are real, current ESP-IDF v6.1 `idf.py` actions (confirmed against
 `coredump-debug` action definitions), reading the `coredump` partition over
 the same serial port and decoding it with the `esp-coredump` Python tool.
 
-## 11. Real-hardware validation for this follow-up (not yet run)
+## 11. Real-hardware validation for this follow-up
 
-**Not run by this pass** (build/host-test only, per this pass's own scope
--- see the final report for exactly what WAS run). For the next real
-hardware session:
+**Run this pass, combined with the section 12 RX fix** -- see 12.6 for
+the actual reported results (diagnostic and production builds, one
+continuous hour each, zero RCP/OTBR restarts in either run). The
+procedure below is kept as the reference for how each run was performed;
+because both this TX fix and the section 12 RX fix were applied together
+in the same runs, the results in 12.6 confirm the COMBINED hardening on
+this chain, not this TX fix in isolation (see this section's own closing
+note below, and section 9's status line).
 
 ### 11.1 Flash the candidate-workaround firmware
 
@@ -769,38 +780,75 @@ journalctl -u otbr-agent -f | grep -Ei "reset_fault|hdlc|parse"
   Base throughout (no unexpected role churn correlated with any transient
   USB hiccup this workaround is intended to absorb silently).
 
-**If zero `RESET_FAULT` occurrences are observed, this confirms (not just
-supports) the leading hypothesis in section 9.1 well enough to treat the
-workaround as validated** -- update this document's section 9 language
-accordingly at that point (remove the "candidate"/"leading hypothesis"
-hedging). **If any `RESET_FAULT` still occurs**, capture `journalctl -u
-otbr-agent` around that timestamp and, if a diagnostic-build RCP is on hand
-(section 10), read back its coredump -- either result would mean the real
-cause is NOT (or not only) the USB TX write path this candidate workaround
-targets (e.g. the RX side, or elsewhere in the RCP mainloop), and section
-9's hypothesis should be revisited rather than assumed confirmed.
+**This is exactly what was run for this pass, but with the section 12 RX
+fix ALSO applied at the same time (see 12.6 for the full, actual
+results): zero `RESET_FAULT` and zero HDLC-parse occurrences were
+observed, across both a diagnostic-build hour and a production-build
+hour.** Because the RX fix was present in both runs, this does NOT by
+itself confirm the TX write-path hypothesis in section 9.1 as validated
+on its own -- it confirms the COMBINED TX+RX hardening held up on this
+chain for those 2 hours (see section 9's own status line). Isolating
+whether the TX hypothesis is independently correct would require a
+further run with ONLY this TX fix applied (RX fix reverted), which has
+not been done. **If a `RESET_FAULT` is ever observed again** on a build
+carrying both fixes, capture `journalctl -u otbr-agent` around that
+timestamp and, if a diagnostic-build RCP is on hand (section 10), read
+back its coredump -- that would mean a further, still-undiagnosed failure
+mode remains on top of both hardening changes verified here.
 
-## 12. USB Spinel RX recovery (confirmed coredump root cause -- not a hypothesis)
+## 12. USB Spinel RX recovery
 
-Unlike section 9's TX retry (a **candidate workaround** for a leading
-**hypothesis**), this section fixes a **confirmed** root cause: a real
-coredump was captured (diagnostic build, section 10) and read back with
-`idf.py coredump-debug`, showing:
+**Status: implementation and host/ELF verification complete; diagnostic-
+build 1-hour real-hardware soak PASSED; production-build 1-hour real-
+hardware soak PASSED; zero RCP/OTBR restarts across the combined 2 hours.**
+Long-duration operation beyond 2 hours and behavior across different USB
+host environments/controllers remain open, additional verification items
+(12.6).
 
-- crashed task: `ot_main`
-- assert address: `0x4200f9ee`
-- `esp_openthread.cpp:279`'s `esp_openthread_launch_mainloop()` returned,
-  then `esp_openthread.cpp:283`'s `assert(false)` fired
+This section is written at three different evidence levels, kept
+explicitly separate rather than folded into one "confirmed" claim:
+
+- **Confirmed by a real-hardware coredump** (diagnostic build, section
+  10, read back with `idf.py coredump-debug`): the crashed task was
+  `ot_main`; `esp_openthread.cpp:279`'s `esp_openthread_launch_mainloop()`
+  returned; `esp_openthread.cpp:283`'s `assert(false)` then fired,
+  producing the panic/`RESET_FAULT`. This is everything the coredump
+  itself shows.
+- **Plausible return path identified by source analysis** (read directly
+  from ESP-IDF v6.1's own sources, not itself visible in the coredump):
+  `esp_openthread_uart_process()` returns `ESP_FAIL` for any `read()`
+  errno other than `EAGAIN`; USB Serial/JTAG's own VFS layer can return
+  `EIO` for a momentary connection-check false negative; that `ESP_FAIL`
+  can propagate through `esp_openthread_platform_process()` and out of
+  `esp_openthread_launch_mainloop()`, reaching the confirmed panic above.
+- **Verified on real hardware**: a diagnostic build and a production
+  build, each with this RX wrapper applied TOGETHER WITH the existing USB
+  Spinel TX hardening (section 9), each ran the full three-tier chain for
+  one continuous hour with no errors and no restarts (12.6). This
+  validates the combined RCP USB Spinel hardening (TX + RX together) on
+  that chain -- it does not isolate how much either fix alone
+  contributed.
+- **Not directly recorded**: the actual `errno` value at the moment of
+  the original panic. ESP-IDF's coredump does not capture it, so the EIO
+  identification above is analysis and corroborating real-hardware runs,
+  not a value read out of the coredump itself -- this must not be
+  described as something the coredump "confirms".
 
 This is **not** the existing USB Spinel TX retry's own failure mode
 (section 9: `otPlatUartSend()`/`RESET_FAULT`/"Error decoding hdlc frame:
-Parse"). It is a separate call path, a separate symptom, and a separate
-fix -- the TX retry hardening in section 9 does not address this coredump
-and is not claimed to.
+Parse"). It is a separate call path and a separate fix; see 12.6 for why
+their real-hardware verification is nonetheless combined, not independent.
 
-### 12.1 The confirmed call chain
+### 12.1 The call chain: what the coredump shows vs. what source analysis adds
 
-Read directly from ESP-IDF v6.1's own sources (never modified):
+Steps 1-2 and 4-5 below are read directly from ESP-IDF v6.1's own sources
+(never modified) and match the confirmed coredump exactly. Step 3 --
+which registered workflow, and the `EIO` trigger -- is the most plausible
+mechanism this source reading points to; it is corroborated by two real-
+hardware trials (this project's own testing, not a byproduct of the
+single coredump capture) rather than read out of the coredump itself,
+since the coredump does not preserve `errno` from the moment of the
+panic:
 
 1. `esp_openthread.cpp:esp_openthread_launch_mainloop()`'s own `while`
    loop calls `select()` on the registered workflow fds, then calls
@@ -812,8 +860,17 @@ Read directly from ESP-IDF v6.1's own sources (never modified):
    FIRST workflow to return non-`ESP_OK` makes
    `esp_openthread_platform_process()` itself return that same non-`ESP_OK`
    immediately.
-3. This project's one registered workflow (USB Serial/JTAG RCP transport)
-   is `esp_openthread_uart.c:esp_openthread_uart_process()`:
+3. For this project's RCP-over-USB-Serial/JTAG build, FOUR workflows are
+   registered during `esp_openthread_platform_init()`: **alarm**
+   (`esp_openthread_alarm.c`), **UART** (`esp_openthread_uart.c`, since
+   `CONFIG_OPENTHREAD_RCP_USB_SERIAL_JTAG=y` selects the USB host
+   connection mode), **task queue** (`esp_openthread_task_queue.c`), and
+   **radio** (`esp_openthread_radio.c`) -- not "one registered workflow".
+   Of those four, only the UART workflow's `process_func` --
+   `esp_openthread_uart_process()` -- can return `ESP_FAIL` from this
+   path; the other three either always return `ESP_OK` or `assert()`
+   internally on their own read failures instead of returning `ESP_FAIL`
+   (confirmed by reading each one's own `process_func` source):
    ```c
    esp_err_t esp_openthread_uart_process(otInstance *instance, const esp_openthread_mainloop_context_t *mainloop)
    {
@@ -830,11 +887,12 @@ Read directly from ESP-IDF v6.1's own sources (never modified):
    }
    ```
    Any `read()` errno other than `EAGAIN` -- including a transient `EIO`
-   (USB Serial/JTAG's own VFS read path can return `-1`/`EIO` for the width
+   (USB Serial/JTAG's own VFS read path CAN return `-1`/`EIO` for the width
    of one `usb_serial_jtag_is_connected()` false negative, the SAME
    espressif/esp-idf#18490/#18506 class of false negative already
    documented for the TX path in section 9, but here on RX) -- returns
-   `ESP_FAIL`.
+   `ESP_FAIL`. This is the plausible producer of the `ESP_FAIL` step 4
+   needs; it is not something the coredump itself shows happening.
 4. Back in `esp_openthread_launch_mainloop()`: `error != ESP_OK` breaks the
    mainloop's own `while` loop, and the function returns that error.
 5. Back in `esp_openthread.cpp:ot_task_worker()`, the return value is
@@ -847,9 +905,10 @@ Read directly from ESP-IDF v6.1's own sources (never modified):
    #endif
    ```
    -- this project's RCP build never expects the mainloop to exit for any
-   reason. A single momentary USB RX false negative reaching step 3 is
-   therefore enough, by itself, to crash the whole task via this
-   unconditional `assert(false)` -- exactly the captured coredump.
+   reason. Steps 4-5 are exactly what the coredump shows (mainloop return,
+   then `assert(false)`); step 3 is why this fix specifically targets
+   `ESP_FAIL`+`EIO`, rather than absorbing every possible non-`ESP_OK`
+   return, which would risk hiding a genuinely different failure.
 
 ### 12.2 The fix and how it overrides upstream ESP-IDF
 
@@ -1032,46 +1091,61 @@ disturb that existing section 10 boundary. `tools/test_rcp_config.py`'s own
 static checks (a new section for this fix, alongside its existing TX/
 diagnostic-build checks) all pass.
 
-### 12.6 Real-hardware validation (not yet run)
+### 12.6 Real-hardware validation
 
-**Not run in this pass** -- this pass's own scope was root-cause
-confirmation (already done, via the coredump captured and read back
-earlier), the fix itself, its host test, and the build/link/symbol
-verification above. What is still required before this fix can be
-considered validated on real hardware:
+**Run this pass, on the actual full three-tier chain** (Linux OTBR +
+ESP32-H2 USB RCP + Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF).
+Reported by the operator for this pass; not reproduced inside the coding
+session itself, which had no physical board access -- consistent with how
+other real-hardware results are recorded in
+`docs/validation-status.md`. Both runs had this RX wrapper (section 12)
+and the existing TX hardening (section 9) applied TOGETHER -- this soak
+does not, by itself, isolate either fix's own individual contribution;
+see this section's own intro and 12.1.
 
-```bash
-source ~/.espressif/v6.1/esp-idf/export.sh
-sudo systemctl stop otbr-agent   # OTBR holds the port -- see section 5
-idf.py -C rcp -B ~/esp-builds/pogo_rcp -p <PORT> flash
-sudo systemctl start otbr-agent
-```
+**Diagnostic RCP build, 1 continuous hour:**
 
-Then reassemble the exact full three-tier chain (Power Base -> SHT45
-INTERMEDIATE -> PMS5003 LEAF) and run it continuously for **60 minutes**,
-watching:
+- `systemctl show otbr-agent -p NRestarts`: `425 -> 425` (unchanged over
+  the hour).
+- Zero occurrences, over the full hour, of every one of:
+  `P-HdlcIntface`, `RESET_FAULT`, `RESET_SOFTWARE`,
+  `Unexpected RCP reset`, `HandleRcpUnexpectedReset`, `Failed with result`.
 
-```bash
-journalctl -u otbr-agent -f | grep -Ei "reset_fault|hdlc|parse"
-systemctl show otbr-agent -p NRestarts
-```
+**Production RCP build, 1 continuous hour:**
 
-**Pass criteria for this one-hour soak:**
+- `systemctl show otbr-agent -p NRestarts`: `0 -> 0` (unchanged over the
+  hour).
+- Zero occurrences, over the full hour, of the same six patterns above.
 
-- Zero "Error decoding hdlc frame: Parse" occurrences in `otbr-agent`'s log
-  over the full hour.
-- Zero `RESET_FAULT` occurrences.
-- Zero occurrences of any OTHER "Unexpected RCP reset" line.
-- `systemctl show otbr-agent -p NRestarts` reads the SAME value at the end
-  of the hour as it did at the start (systemd's own per-unit restart
-  counter -- confirms `otbr-agent` was never restarted by its `Restart=`
-  policy, i.e. no crash-triggered restart occurred anywhere in the chain
-  during the hour, not just the specific failures this fix targets).
+**Combined result: zero RCP/OTBR restarts and zero occurrences of any of
+the six watched log patterns across both one-hour runs (2 hours total).**
+`systemctl show otbr-agent -p NRestarts`'s own per-unit restart counter
+being unchanged in BOTH runs means `otbr-agent` was never restarted by its
+`Restart=` policy during either hour -- i.e. no crash-triggered restart
+occurred anywhere in the chain, not only the specific `RESET_FAULT`/HDLC-
+parse symptoms this pass originally targeted.
 
-If all four hold, this closes out both the RX coredump fix (this section)
-and, combined with section 11's own pass criteria, the TX retry candidate
-workaround (section 9) in the same run. If any occur, capture
-`journalctl -u otbr-agent` around that timestamp and, if the diagnostic
-build (section 10) is on hand, read back its coredump -- either result
-would mean a further, still-undiagnosed failure mode remains on top of the
-two fixed here.
+This is a combined-hardening result: it shows the RX wrapper (this
+section) and the existing TX hardening (section 9) applied together held
+up for 2 hours on this chain. It does NOT, by itself, prove either fix
+would be sufficient alone, and it does not retroactively determine what
+the `errno` actually was at the moment of the ORIGINAL panic that started
+this investigation (that value was never captured -- see this section's
+own intro).
+
+**Still open** (not covered by the 2 hours run so far):
+
+- Continuous operation well beyond 2 hours (e.g. multi-day).
+- Different USB host controllers/hubs/cable combinations -- this pass's
+  runs used one specific real-hardware setup.
+- Isolating the TX fix and the RX fix's individual contributions from
+  each other (would require a run with only one of the two applied,
+  deliberately not done here since both were already known-needed
+  hardening).
+
+If a `RESET_FAULT`, HDLC parse error, or any unexpected restart is ever
+observed again on a build carrying both fixes, capture
+`journalctl -u otbr-agent` around that timestamp and, if a diagnostic
+build (section 10) is on hand, read back its coredump -- that would mean
+a further, still-undiagnosed failure mode remains on top of the two
+hardening changes verified here.

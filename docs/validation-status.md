@@ -178,6 +178,14 @@ inside this session, which had no physical board access):
   identified root cause. The systemd auto-recovery above means a `RESET_FAULT`
   episode is no longer a hands-on incident, but it does **not** mean the fault itself
   has been fixed or explained -- this pass makes no such claim.
+- **Update (a later pass than this one)**: a real-hardware coredump separately
+  confirmed a DIFFERENT, specific RCP crash mechanism (`ot_main` task,
+  `assert(false)` after `esp_openthread_launch_mainloop()` returned -- see
+  `docs/otbr-rcp.md` section 12 for the full evidence-tier breakdown). That
+  coredump confirms the crash/assert path itself, not which error triggered it;
+  a USB RX `EIO` trigger is source analysis, not something read out of the
+  coredump. See the new section below for the real-hardware soak result on the
+  fix for that mechanism, combined with the existing TX hardening above.
 
 **Implementation (SAMPLE/Matter-publish transport-load reduction -- NOT a
 `RESET_FAULT` fix, tracked as a separate, unrelated change):**
@@ -213,6 +221,24 @@ inside this session, which had no physical board access):
   ESP-IDF v6.1 `power_base`/`module` fullclean builds (zero warnings) and this
   repository's full host test suite were run for both passes; see each pass's own
   final report for the complete list.
+
+## RCP USB Spinel RX recovery + combined TX/RX real-hardware soak (a later pass than the one above)
+
+See `docs/otbr-rcp.md` section 12 for the full write-up (evidence tiers,
+call-chain analysis, host test, ELF verification). Summary here per this
+document's own "single source of truth" role:
+
+| Item | Host test / build | Real hardware | Notes |
+|---|---|---|---|
+| RX wrapper (`esp_openthread_platform_process_wrap.c`, `--wrap=esp_openthread_platform_process`, bounded `ESP_FAIL`+`EIO` retry, silent restart on exhaustion) | Yes (`tools/test_rcp_usb_rx_recovery.c`, links the real, unmodified wrapper; 6 scenarios / 24 checks pass, 0 warnings). Real ESP-IDF v6.1 `rcp/` fullclean build, both production and diagnostic sdkconfig variants, 0 warnings; `nm`/`objdump` confirm the call site and the wrap/real/recovery symbol chain in the linked ELF. | **Verified**, combined with the existing TX hardening (see below) | Mainloop-exit/`assert(false)` crash path is coredump-confirmed; the specific `EIO` trigger is source analysis, corroborated (not proven) by the real-hardware runs below -- see `docs/otbr-rcp.md` section 12's own evidence-tier breakdown. |
+| Combined RCP USB Spinel hardening (this RX fix + the existing TX retry, section 9) -- diagnostic RCP build, 1 continuous hour, full 3-tier chain (Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF) | N/A (real-hardware only) | **Verified** (reported by the operator for this pass; not reproduced inside this session, which had no physical board access) | `systemctl show otbr-agent -p NRestarts`: `425 -> 425`. Zero occurrences of `P-HdlcIntface`, `RESET_FAULT`, `RESET_SOFTWARE`, `Unexpected RCP reset`, `HandleRcpUnexpectedReset`, `Failed with result`. |
+| Combined RCP USB Spinel hardening -- production RCP build, 1 continuous hour, same chain | N/A (real-hardware only) | **Verified** (reported by the operator for this pass; not reproduced inside this session) | `systemctl show otbr-agent -p NRestarts`: `0 -> 0`. Same six log patterns above, zero occurrences. |
+
+**Not isolated by the above**: both real-hardware runs had the RX fix and
+the TX fix applied TOGETHER. This confirms the combined hardening across
+2 continuous hours (zero RCP/OTBR restarts total), not either fix's own
+individual contribution. Also not covered: continuous operation beyond
+2 hours, and behavior across different USB host controllers/hubs/cables.
 
 ## Explicitly out of scope (not implemented, not planned this pass)
 

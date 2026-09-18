@@ -45,16 +45,22 @@ idf_component_register(SRCS "esp_ot_rcp.c" "rcp_uart_tx_retry.c" "rcp_uart_tx_io
 # during the final link's symbol resolution), so without this it could
 # otherwise be left out of a plain archive scan.
 #
-# USB Spinel RX recovery fix (confirmed root cause of a real-hardware
-# coredump -- crashed task ot_main, assert(false) at
-# esp_openthread.cpp:283 right after esp_openthread_launch_mainloop()
-# returned at esp_openthread.cpp:279 -- see
-# esp_openthread_platform_process_wrap.c's own header comment and
-# docs/otbr-rcp.md's "USB Spinel RX recovery" section): overrides the
-# `openthread` component's own esp_openthread_platform_process() via the
-# same documented `--wrap` mechanism, same reasoning as the TX fix above.
-# This is a SEPARATE fix for a SEPARATE, confirmed failure -- not a
-# restatement of, and not dependent on, the TX fix.
+# USB Spinel RX recovery fix -- see esp_openthread_platform_process_wrap.c's
+# own header comment and docs/otbr-rcp.md's "USB Spinel RX recovery" section
+# (section 12) for the full evidence-tier breakdown. Confirmed by a real-
+# hardware coredump: the crash MECHANISM itself -- crashed task ot_main,
+# assert(false) at esp_openthread.cpp:283 right after
+# esp_openthread_launch_mainloop() returned at esp_openthread.cpp:279. The
+# coredump does NOT preserve errno from the moment of the panic, so it does
+# not by itself confirm that ESP_FAIL+EIO was the trigger -- that specific
+# recovery target is identified by source analysis and backed by a combined
+# diagnostic+production real-hardware soak (2 hours total, zero RCP/OTBR
+# restarts) that had this RX fix and the existing TX fix (above) applied
+# TOGETHER, which does not isolate either fix's own individual effect.
+# Overrides the `openthread` component's own esp_openthread_platform_process()
+# via the same documented `--wrap` mechanism, same reasoning as the TX fix
+# above. This is a SEPARATE fix on a SEPARATE call path -- not a restatement
+# of, and not dependent on, the TX fix.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=otPlatUartSend"
     "-Wl,-u,__wrap_otPlatUartSend"

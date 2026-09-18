@@ -1,23 +1,43 @@
 /*
- * Bounded-retry-or-controlled-restart recovery for a transient USB Serial/
- * JTAG Spinel RX error surfacing through esp_openthread_platform_process()
- * -- the CONFIRMED root cause (via real-hardware coredump analysis, not a
- * leading hypothesis) of a crashed `ot_main` task hitting `assert(false)`
- * at $IDF_PATH/components/openthread/src/esp_openthread.cpp:283, right
- * after esp_openthread.cpp:279's esp_openthread_launch_mainloop() returned.
- * See esp_openthread_platform_process_wrap.c's own header comment for the
- * full call-chain writeup.
+ * Bounded-retry-or-controlled-restart recovery for a USB Serial/JTAG
+ * Spinel RX error surfacing through esp_openthread_platform_process().
+ *
+ * Evidence tiers -- see esp_openthread_platform_process_wrap.c's own
+ * header comment for the full call-chain writeup and docs/otbr-rcp.md
+ * section 12 for the complete evidence-level breakdown:
+ *   - CONFIRMED by a real-hardware coredump: the crashed task was
+ *     `ot_main`; $IDF_PATH/components/openthread/src/esp_openthread.cpp:279's
+ *     esp_openthread_launch_mainloop() returned; esp_openthread.cpp:283's
+ *     `assert(false)` then fired. The coredump does NOT preserve the
+ *     `errno` value from the moment of the panic, so it does not, by
+ *     itself, identify which error made esp_openthread_platform_process()
+ *     return non-ESP_OK.
+ *   - Identified by SOURCE ANALYSIS as the plausible trigger (not directly
+ *     observed in the captured coredump): among this project's four
+ *     registered workflows (alarm/UART/task queue/radio -- see
+ *     esp_openthread_platform_process_wrap.c), only the UART workflow's
+ *     esp_openthread_uart_process() returns ESP_FAIL for a read() errno
+ *     other than EAGAIN, and USB Serial/JTAG's own VFS read path can
+ *     return EIO for a momentary connectivity false negative -- a
+ *     plausible way for that ESP_FAIL to reach and exit
+ *     esp_openthread_launch_mainloop().
+ *   - VERIFIED on real hardware: a diagnostic-build RCP and a
+ *     production-build RCP, each with this RX wrapper AND the existing
+ *     USB Spinel TX hardening (section 9) applied TOGETHER, each ran the
+ *     full Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF chain for one
+ *     continuous hour with zero RCP/OTBR resets. This is a combined-
+ *     hardening result (both fixes applied at once) -- it does not
+ *     isolate this RX fix's own individual contribution.
  *
  * This is a SEPARATE fix from the existing USB Spinel TX retry hardening
  * (rcp_uart_tx_retry.h/.c, rcp_uart_tx_io.c, esp_ot_uart_send_wrap.c --
  * docs/otbr-rcp.md section 9): that one wraps otPlatUartSend() (the TX
- * path) and is a candidate workaround, pending its own real-hardware soak
- * test, for a different symptom (RESET_FAULT / "Error decoding hdlc frame:
- * Parse"). This file wraps esp_openthread_platform_process() (the RX path,
- * inside the mainloop's own select()-driven poll) and fixes a confirmed
- * coredump. Neither file depends on, restates, or substitutes for the
- * other -- do not conflate the two, and do not describe the TX fix as
- * addressing this coredump.
+ * path) and hardens short/failed writes being silently reported as sent.
+ * This file wraps esp_openthread_platform_process() (the RX path, inside
+ * the mainloop's own select()-driven poll) and absorbs the RX-side
+ * ESP_FAIL/EIO condition identified above. Neither file depends on,
+ * restates, or substitutes for the other -- do not conflate the two, and
+ * do not credit either fix alone for the combined real-hardware result.
  */
 #pragma once
 
@@ -112,8 +132,9 @@ esp_err_t __real_esp_openthread_platform_process(otInstance *instance,
  * esp_openthread_platform_process() (rcp/main/CMakeLists.txt's
  * `-Wl,--wrap=esp_openthread_platform_process`). Resets errno to 0
  * immediately before every __real_esp_openthread_platform_process() call.
- * If that call returns ESP_FAIL with errno == EIO (the one, confirmed
- * transient USB RX condition this file exists to absorb): sleeps
+ * If that call returns ESP_FAIL with errno == EIO (the one condition this
+ * file treats as transient USB RX noise -- see this header's own top
+ * comment for the evidence level behind that treatment): sleeps
  * RCP_USB_RX_RECOVERY_RETRY_YIELD_MS (a real, bounded yield -- never a busy
  * spin) and retries, within RCP_USB_RX_RECOVERY_TOTAL_TIMEOUT_MS overall;
  * on a successful retry, returns ESP_OK so
@@ -128,7 +149,8 @@ esp_err_t __real_esp_openthread_platform_process(otInstance *instance,
  * the diagnostic assert()/coredump path a real failure is supposed to
  * reach (esp_openthread.cpp's own `assert(false)` after
  * esp_openthread_launch_mainloop() returns) -- this file only ever absorbs
- * the one specific, confirmed-transient condition, never anything else.
+ * the one specific ESP_FAIL+EIO condition it treats as transient, never
+ * anything else.
  */
 esp_err_t __wrap_esp_openthread_platform_process(otInstance *instance,
                                                   const esp_openthread_mainloop_context_t *mainloop);
