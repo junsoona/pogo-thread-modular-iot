@@ -46,6 +46,22 @@ rcp/
                           upstream external-coexistence and IEEE 802.15.4
                           debug-console integrations were removed -- see that file's
                           own header comment
+    rcp_uart_tx_retry.h/.c  USB Spinel TX retry candidate workaround (RESET_FAULT,
+                          pending soak test) -- see section 9
+    rcp_uart_tx_io.c        production I/O seam for rcp_uart_tx_retry.c -- see section 9
+    esp_ot_uart_send_wrap.c linker `--wrap=otPlatUartSend` glue -- see section 9
+    rcp_usb_rx_recovery.h   USB Spinel RX recovery fix (confirmed coredump root
+                          cause, not a hypothesis) -- see section 12
+    esp_openthread_platform_process_wrap.c
+                          linker `--wrap=esp_openthread_platform_process`
+                          glue + the actual bounded-retry/timeout logic -- see
+                          section 12
+    rcp_usb_rx_recovery_restart.c
+                          noreturn recovery hook (silent esp_restart()) -- see
+                          section 12
+  sdkconfig.diag          RCP-only diagnostic build fragment (coredump-to-flash),
+                          NOT used by production -- see section 10
+  partitions_diag.csv     partitions.csv + a `coredump` partition, diagnostic-build only
 ```
 
 This project does **not** use `EXTRA_COMPONENT_DIRS` and does **not** touch
@@ -311,3 +327,751 @@ No real Linux OTBR + `rcp/` + Power Base have actually been joined together
 on real hardware -- see `docs/validation-status.md`'s "Linux OTBR external
 Dataset join" table for the precise, current per-item status (what is
 host-tested vs. what still needs real hardware).
+
+## 9. USB Spinel TX retry (RESET_FAULT candidate workaround, pending soak test)
+
+**Status: unverified on real hardware.** Everything in this section is a
+**leading hypothesis** about the cause, and the code below is a
+**candidate workaround** for it -- built, host-tested, and symbol-level
+verified in the firmware ELF (all covered in this section), but the
+underlying diagnosis has NOT been confirmed by re-running the real-hardware
+chain that originally reproduced the failure. Section 11's one-hour soak
+test is what would actually confirm or refute this. Do not read this
+section as "the bug is understood and fixed" -- read it as "this is our
+best current explanation, and a specific, testable change we built around
+it."
+
+### 9.1 The failure this is a candidate workaround for
+
+Under real hardware load (Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF,
+the full three-tier chain), the RCP was observed to hit `RESET_FAULT` up to
+4 times in 25 minutes. OTBR's own log order for each occurrence:
+
+```
+P-HdlcIntface: Error decoding hdlc frame: Parse
+Unexpected RCP reset: RESET_FAULT
+```
+
+...followed by systemd restarting `otbr-agent`. This did NOT reproduce with
+the Linux RCP alone or with only the Power Base connected for 25 minutes
+each -- only under the full chain's higher Spinel traffic rate. No USB
+disconnect/re-enumeration was ever seen at the Linux kernel level, USB
+autosuspend was already off, and neither the module nor the Power Base
+itself ever rebooted (their own sensor sequence numbers kept incrementing
+throughout) -- pointing at the RCP's own USB Spinel TX path, not the
+physical link or the peer devices. That pointing is circumstantial, not
+proof: it rules out several other explanations, it does not by itself
+confirm this one.
+
+**Leading hypothesis (not yet confirmed by a real-hardware soak test)**:
+ESP-IDF v6.1's own
+`$IDF_PATH/components/openthread/src/port/esp_openthread_uart.c`
+`otPlatUartSend()` calls `write()` **exactly once** and unconditionally
+calls `otPlatUartSendDone()` right afterward, even if that `write()` failed
+outright or returned fewer bytes than requested:
+
+```c
+otError otPlatUartSend(const uint8_t *buf, uint16_t buf_length)
+{
+    int rval = write(s_uart_fd, buf, buf_length);
+    ...
+    otPlatUartSendDone();
+    if (rval != (int)buf_length) {
+        return OT_ERROR_FAILED;
+    }
+    return OT_ERROR_NONE;
+}
+```
+
+`$IDF_PATH/components/openthread/src/ncp/esp_openthread_ncp.cpp`'s own
+`NcpSend()` -- the only caller, wired in via `otNcpHdlcInit()` -- then
+throws that returned `otError` away entirely:
+
+```c
+static int NcpSend(const uint8_t *aBuf, uint16_t aBufLength)
+{
+    IgnoreError(otPlatUartSend(aBuf, aBufLength));
+    return aBufLength;
+}
+```
+
+...so, IF a `write()` genuinely does fail or return short under real
+traffic, it would be reported to the OpenThread NCP/HDLC layer as a
+complete success regardless. Separately, USB Serial/JTAG's own VFS write
+path
+(`$IDF_PATH/components/esp_driver_usb_serial_jtag/src/usb_serial_jtag_vfs.c`)
+CAN return `-1`/`EIO` for the width of one `usb_serial_jtag_is_connected()`
+false negative -- a few ms around attach/enumeration/brief host-side
+backpressure -- even though the link is otherwise fine one `write()` call
+later (matching espressif/esp-idf#18490 and #18506). A dropped or truncated
+Spinel/HDLC frame IS a plausible producer of OTBR's "Error decoding hdlc
+frame: Parse" followed by a RESET_FAULT -- but no real-hardware run has yet
+directly observed a short/failed `write()` at the moment a `RESET_FAULT`
+occurred; this chain of reasoning is the leading hypothesis, not a
+confirmed root cause.
+
+If this hypothesis holds, `NcpSend()` ignoring the return value entirely
+means the only place this can be addressed is inside `otPlatUartSend()`
+itself: it must not return (and therefore must not signal completion)
+until the full frame has actually been written, or it has handed off to a
+recovery path -- never simply report a failure back up a call chain that
+ignores it.
+
+### 9.2 The candidate workaround and how it overrides upstream ESP-IDF
+
+**The real ESP-IDF install under `~/.espressif` is never modified.** This
+candidate workaround instead uses ESP-IDF's own documented mechanism for
+redefining a single public function without touching `$IDF_PATH`: the
+linker's `--wrap` feature, demonstrated in
+`$IDF_PATH/examples/build_system/wrappers` ("Using wrapper to redefine IDF
+functions"). This was chosen over ESP-IDF's OTHER documented override
+mechanism -- placing a same-named component earlier in the component search
+path (`build-system.rst`'s "Multiple Components with the Same Name") --
+because the `openthread` component's own `CMakeLists.txt` is a large,
+version-specific file (submodule git-describe calls, `srcs_radio.cmake`
+file lists, mbedtls config, ...): forking the ENTIRE component just to
+change one function in one file would be far more fragile across future
+ESP-IDF upgrades than wrapping one symbol.
+
+New files, all under `rcp/main/` (nothing outside `rcp/` is touched):
+
+- **`rcp_uart_tx_retry.h` / `rcp_uart_tx_retry.c`** -- the actual retry
+  policy, `rcp_uart_tx_retry_send()`. Written with zero ESP-IDF VFS/USB
+  Serial/JTAG dependency (only FreeRTOS + `esp_timer`), so it links
+  unmodified into a host test (see 9.4).
+- **`rcp_uart_tx_io.c`** -- the production I/O seam: opens a second,
+  TX-only, non-blocking fd on `/dev/usbserjtag` (safe -- that VFS driver's
+  `open()`/`write()` are stateless beyond a single shared non-blocking
+  flag, which the original RX-side fd already sets the same way) and calls
+  `write()`/preserves the original's `usb_serial_jtag_ll_txfifo_flush()`
+  call (see 9.3) on it. Also provides the recovery hook (9.3): a silent
+  `esp_restart()`.
+- **`esp_ot_uart_send_wrap.c`** -- the linker glue: `__wrap_otPlatUartSend()`
+  calls `rcp_uart_tx_retry_send()`.
+
+`rcp/main/CMakeLists.txt` adds these sources and:
+
+```cmake
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=otPlatUartSend"
+    "-Wl,-u,__wrap_otPlatUartSend")
+```
+
+`--wrap=otPlatUartSend` redirects `NcpSend()`'s call (the only caller) to
+`__wrap_otPlatUartSend()` instead; `-u,__wrap_otPlatUartSend` guarantees the
+linker pulls that object out of `libmain.a` even though nothing calls it by
+that literal name at compile time. Verified in the real firmware ELF after
+a full `idf.py fullclean && idf.py build` (production variant):
+
+```
+$ riscv32-esp-elf-nm pogo_rcp.elf | grep -Ei 'otPlatUartSend|rcp_uart_tx_(flush|recovery_restart)'
+4200bc74 T __wrap_otPlatUartSend
+4200e88c T otPlatUartSendDone
+4200bd46 T rcp_uart_tx_flush
+4200bd58 T rcp_uart_tx_recovery_restart
+$ riscv32-esp-elf-objdump -d pogo_rcp.elf | grep -B1 '__wrap_otPlatUartSend>$'
+4200eef2: jal 4200bc74 <__wrap_otPlatUartSend>
+$ riscv32-esp-elf-objdump -d pogo_rcp.elf | grep -A1 '<rcp_uart_tx_recovery_restart>:'
+4200bd58 <rcp_uart_tx_recovery_restart>:
+4200bd58: jal 420014c8 <esp_restart>
+```
+
+The stock `otPlatUartSend()` no longer appears in the linked binary at all
+(dead code, removed by `--gc-sections` once nothing references it) --
+`NcpSend()` really does call the new retry path, and a fatal failure really
+does reach `esp_restart()` rather than returning.
+
+### 9.3 Retry policy, timing, flush, and SendDone/recovery semantics
+
+**This subsection reflects a correction pass** on an earlier version of
+this workaround that returned `OT_ERROR_FAILED` for a permanent failure.
+That was itself a bug: `NcpSend()` (9.1) ignores whatever `otError` it gets
+back and reports success to the HDLC layer regardless of what
+`otPlatUartSend()` returns -- so returning `OT_ERROR_FAILED` was exactly as
+silently discarded as stock ESP-IDF's own bug, just one level up. The
+current version never returns an error code for a fatal failure at all; it
+hands off to a controlled restart instead (below).
+
+Constants (`rcp_uart_tx_retry.h`) -- plain `#define`s rather than Kconfig
+items, since this project deliberately carries no `Kconfig.projbuild`
+surface at all (`tools/test_rcp_config.py` checks this), and the task's
+own requirement allows "constant OR Kconfig":
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `RCP_UART_TX_RETRY_YIELD_MS` | 2 ms | Sleep between retry attempts after a transient failure. `rcp/sdkconfig.defaults` sets `CONFIG_FREERTOS_HZ=1000` (1 ms/tick), so this is always >= 1 real tick. |
+| `RCP_UART_TX_TOTAL_TIMEOUT_MS` | 200 ms | Overall budget, across every retry, for ONE `otPlatUartSend()` call (one HDLC frame). Chosen to comfortably absorb the few-ms transient failure this hypothesis targets, far under any FreeRTOS watchdog timeout. |
+
+`rcp_uart_tx_retry_send()`'s loop, per attempt:
+
+- `write()` returns `n > 0` (full or partial): advance the offset by `n`
+  and immediately retry the remainder -- **no delay on real progress**.
+- Either way, `rcp_uart_tx_flush()` is called immediately after EVERY
+  `write()` attempt, success or failure -- see below.
+- `n == 0`, or `n < 0` with `errno` in `{EAGAIN, EWOULDBLOCK, EIO}`
+  (transient): if the total timeout has not yet elapsed, sleep
+  `RCP_UART_TX_RETRY_YIELD_MS` via `vTaskDelay()` (a real, bounded yield --
+  **never a busy spin**) and retry; otherwise, call the recovery hook.
+- `n < 0` with any other `errno` (non-transient, e.g. `ENODEV`): call the
+  recovery hook immediately, without waiting out the rest of the budget.
+
+**Preserving the original's `usb_serial_jtag_ll_txfifo_flush()` (DIG-727).**
+Stock `otPlatUartSend()` calls `usb_serial_jtag_ll_txfifo_flush()`
+immediately after its own (single) `write()`, unconditionally -- pushing a
+possibly-sub-64-byte trailing USB packet to the host promptly instead of
+waiting on the driver's own internal timeout. `rcp_uart_tx_io.c` exposes
+this as `rcp_uart_tx_flush()`, and `rcp_uart_tx_retry_send()` calls it after
+EVERY `write()` attempt in its loop (not just the last one), preserving the
+original's write-then-flush ordering at each individual attempt.
+`tools/test_rcp_uart_tx_retry.c` asserts the exact write/flush call
+ORDER (not just counts) for a full write, partial writes, a write exactly
+on a 64-byte USB packet boundary, and a write after transient `EIO` -- see
+9.4.
+
+**`otPlatUartSendDone()` is called exactly once, and ONLY on a fully
+successful send.** On a fatal failure (non-transient errno, or
+`RCP_UART_TX_TOTAL_TIMEOUT_MS` exhausted), `rcp_uart_tx_retry_send()` calls
+`rcp_uart_tx_recovery_restart()` -- declared `__attribute__((noreturn))`,
+implemented as a silent `esp_restart()` -- **and never returns**: no
+`otPlatUartSendDone()` call, and no `otError` return value reaches
+`NcpSend()` at all. This is a direct consequence of the correction above:
+since `NcpSend()` ignores a returned error, the ONLY way to avoid a
+corrupted/dropped frame being silently treated as delivered is to never
+hand control back to it on a failure the retry loop cannot recover from.
+`esp_restart()` itself never logs (see
+`$IDF_PATH/components/esp_system/esp_system.c`) and never touches any
+console/VFS fd, so this restart path writes nothing to the USB Spinel
+stream either -- confirmed in the firmware ELF (9.2): the recovery hook
+calls `esp_restart()` directly.
+
+No diagnostic text is ever written to the USB Spinel stream by this code:
+the retry path contains no `ESP_LOGx`/`printf` calls at all (on top of
+`rcp/sdkconfig.defaults`'s existing `CONFIG_LOG_DEFAULT_LEVEL_NONE=y`).
+
+### 9.4 Host test
+
+`tools/test_rcp_uart_tx_retry.c` links the REAL, unmodified
+`rcp/main/rcp_uart_tx_retry.c` against a scripted fake I/O seam + recovery
+hook (`tools/host_test_stubs/host_rcp_uart_tx_sim.c`), exactly like this
+repository's other host tests link real component `.c` files against
+`tools/host_test_stubs/*`:
+
+```bash
+cc -Wall -Wextra -pthread \
+   -I tools/host_test_stubs -I rcp/main \
+   -o /tmp/test_rcp_uart_tx_retry tools/test_rcp_uart_tx_retry.c \
+   rcp/main/rcp_uart_tx_retry.c tools/host_test_stubs/host_rcp_uart_tx_sim.c \
+&& /tmp/test_rcp_uart_tx_retry
+```
+
+Scenarios covered, each asserting the exact byte sequence "sent" and the
+exact ordered write()/flush() call log:
+
+1. First write succeeds immediately (write, flush).
+2. Three transient `EIO` failures, then success (write/flush ordering
+   across every failed attempt too).
+3. A transient `EAGAIN` failure, then success.
+4. Three partial writes in a row, summing to the full frame.
+5. A 0-byte write, then success.
+6. A write landing exactly on, and split across, a 64-byte USB packet
+   boundary -- still flushed the same way as any other write.
+7. A non-transient (hard) write error: the recovery hook fires, verified
+   with `sigsetjmp()`/`siglongjmp()` that `rcp_uart_tx_retry_send()` really
+   never returns to its caller (not just that a fake hook function got
+   called), `otPlatUartSendDone()` is never called, and a next-frame
+   attempt through the same (now-halted) session also cannot succeed.
+8. Permanent connection loss via repeated transient-looking `EIO` that
+   never stops: the recovery hook fires only after
+   `RCP_UART_TX_TOTAL_TIMEOUT_MS` is exhausted, never sooner and never
+   later than a bounded multiple of it.
+
+All 8 scenarios / 84 individual checks pass. This proves the workaround's
+OWN internal logic behaves as designed under every scripted I/O condition
+-- it does NOT prove the workaround fixes the real RESET_FAULT (that is
+what section 11's real-hardware soak test would show).
+
+## 10. RCP-only diagnostic build: core dump to flash
+
+A separate, opt-in build configuration -- **never used for the production
+build** -- adds ESP-IDF's core-dump-to-flash feature for post-mortem
+debugging of a real RCP crash, while guaranteeing zero panic text ever
+reaches the same USB Serial/JTAG endpoint the production build carries raw
+Spinel bytes over.
+
+### 10.1 Why this is safe on a single-USB-peripheral chip
+
+ESP32-H2 has exactly one USB Serial/JTAG peripheral, shared in this project
+between the Spinel VFS device and (per `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`)
+the "secondary console." `$IDF_PATH/components/esp_system/panic.c`'s entire
+"Panic print functions" section -- including its
+`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG` branch, which would
+otherwise write panic text to that same physical peripheral -- is compiled
+out entirely when `CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y` (already set in
+`rcp/sdkconfig.defaults` for production, and re-stated explicitly in the
+diagnostic fragment below). With that option set, `PANIC_INFO_DUMP()`'s
+`dump_fn` is never wired to any print function, so a panic prints nothing
+on any console -- while `esp_core_dump_write()` (gated purely by
+`CONFIG_ESP_COREDUMP_ENABLE`, independent of the silent-reboot setting)
+still runs and writes the core dump straight to the flash `coredump`
+partition via `esp_partition_write()`, never touching a console/VFS fd at
+all.
+
+One more source checked directly (not assumed): `espcoredump`'s own optional
+debug-log macros
+(`$IDF_PATH/components/espcoredump/include_core_dump/esp_core_dump_types.h`'s
+`ESP_COREDUMP_LOG*()`, gated by `CONFIG_ESP_COREDUMP_LOGS`) call
+`esp_rom_printf()` directly -- bypassing the normal `ESP_LOGx`/VFS path
+entirely, so `CONFIG_LOG_DEFAULT_LEVEL_NONE=y` alone does not prove they
+stay silent. In this project `esp_rom_printf()` is harmless regardless (it
+targets the ROM's fixed PRIMARY-console UART -- `CONFIG_ESP_CONSOLE_UART_DEFAULT=y`
+/ UART0, confirmed in the generated sdkconfig below -- a physically unwired
+peripheral entirely separate from the USB Serial/JTAG endpoint the Spinel
+stream uses), but `rcp/sdkconfig.diag` disables `CONFIG_ESP_COREDUMP_LOGS`
+anyway for defense-in-depth (and to save ~5 KB of DRAM).
+
+### 10.2 Building the diagnostic variant
+
+New files, both RCP-only and never referenced by the production build:
+
+- `rcp/sdkconfig.diag` -- fragment applied ON TOP of `sdkconfig.defaults`:
+  `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y` (the real, current ESP-IDF v6.1
+  Kconfig name -- see `$IDF_PATH/components/espcoredump/Kconfig`'s
+  `ESP_COREDUMP_TO_FLASH_OR_UART` choice), points the partition table at
+  `partitions_diag.csv`, disables `CONFIG_ESP_COREDUMP_LOGS` (10.1), and
+  re-states `CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y` explicitly.
+- `rcp/partitions_diag.csv` -- identical to `rcp/partitions.csv` plus one
+  added `coredump` partition (64 KB, right after the 1 MB factory app;
+  this target's flash is 2 MB, so plenty of room remains).
+- `rcp/main/CMakeLists.txt` now `PRIV_REQUIRES`s `espcoredump`
+  unconditionally (both variants). This was NOT obvious in advance and was
+  found only by actually building the diagnostic variant: `rcp/CMakeLists.txt`
+  sets `MINIMAL_BUILD ON`, which excludes any component nothing else
+  `REQUIRES` -- including from the merged Kconfig tree, not just the link
+  -- so before this was added, `kconfgen` logged `unknown kconfig symbol
+  'ESP_COREDUMP_ENABLE_TO_FLASH'` and the setting was silently dropped.
+  Listing `espcoredump` costs nothing in the production build: with the
+  default `CONFIG_ESP_COREDUMP_ENABLE_TO_NONE`, its code compiles out to
+  nothing, confirmed below.
+
+Built with an isolated `-DSDKCONFIG` path so this variant's generated
+config never overwrites the production build's own `rcp/sdkconfig` (both
+live at the project root by default -- pointing this variant at its own
+build-directory copy keeps the two completely separate):
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+idf.py -C rcp -B ~/esp-builds/pogo_rcp_diag \
+    -DSDKCONFIG=$HOME/esp-builds/pogo_rcp_diag/sdkconfig \
+    -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+    set-target esp32h2
+idf.py -C rcp -B ~/esp-builds/pogo_rcp_diag \
+    -DSDKCONFIG=$HOME/esp-builds/pogo_rcp_diag/sdkconfig \
+    -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+    fullclean
+idf.py -C rcp -B ~/esp-builds/pogo_rcp_diag \
+    -DSDKCONFIG=$HOME/esp-builds/pogo_rcp_diag/sdkconfig \
+    -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+    build
+```
+
+(`fullclean` removes `CMakeCache.txt`, which forgets `-D` values passed to
+an earlier `set-target` -- so `-DSDKCONFIG`/`-DSDKCONFIG_DEFAULTS` must be
+repeated on every subsequent `idf.py` invocation against this same build
+directory, including `build` itself, or the reconfigure silently falls
+back to defaults.)
+
+Verified directly in the generated `~/esp-builds/pogo_rcp_diag/sdkconfig`
+and partition table after a full `fullclean && build` (0 warnings):
+
+```
+$ grep -E '^CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH|^CONFIG_ESP_COREDUMP_ENABLE=|^CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT|^CONFIG_PARTITION_TABLE_FILENAME' sdkconfig
+CONFIG_PARTITION_TABLE_FILENAME="partitions_diag.csv"
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_ENABLE=y
+
+$ gen_esp32part.py partition_table/partition-table.bin -
+# Name,   Type, SubType,  Offset,  Size, Flags
+nvs,data,nvs,0x9000,24K,
+phy_init,data,phy,0xf000,4K,
+factory,app,factory,0x10000,1M,
+coredump,data,coredump,0x110000,64K,
+
+$ riscv32-esp-elf-nm pogo_rcp.elf | grep esp_core_dump_write
+4200bd84 T esp_core_dump_write
+```
+
+...and confirmed ABSENT from the production build's own ELF
+(`riscv32-esp-elf-nm ~/esp-builds/pogo_rcp/pogo_rcp.elf | grep esp_core_dump_write`
+prints nothing) and from its own `rcp/sdkconfig`/`partition-table.bin`
+(`partitions.csv`, no `coredump` partition, no `ESP_COREDUMP_ENABLE_TO_FLASH`)
+-- the diagnostic-only addition really does stay out of the default build.
+
+### 10.3 Reading a coredump back
+
+After a diagnostic-build RCP has crashed at least once (stop `otbr-agent`
+first -- section 5 -- since it holds the port):
+
+```bash
+idf.py -C rcp -B ~/esp-builds/pogo_rcp_diag -p <PORT> coredump-info
+# or, to get an ELF core file and drop into a live GDB session against it:
+idf.py -C rcp -B ~/esp-builds/pogo_rcp_diag -p <PORT> coredump-debug
+```
+
+Both are real, current ESP-IDF v6.1 `idf.py` actions (confirmed against
+`$IDF_PATH/tools/idf_py_actions/debug_ext.py`'s `coredump-info`/
+`coredump-debug` action definitions), reading the `coredump` partition over
+the same serial port and decoding it with the `esp-coredump` Python tool.
+
+## 11. Real-hardware validation for this follow-up (not yet run)
+
+**Not run by this pass** (build/host-test only, per this pass's own scope
+-- see the final report for exactly what WAS run). For the next real
+hardware session:
+
+### 11.1 Flash the candidate-workaround firmware
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+sudo systemctl stop otbr-agent   # OTBR holds the port -- see section 5
+idf.py -C rcp -B ~/esp-builds/pogo_rcp -p <PORT> flash
+```
+
+### 11.2 Restart Linux OTBR
+
+```bash
+sudo systemctl start otbr-agent
+journalctl -u otbr-agent -f   # confirm a clean RCP reset/version handshake, no immediate RESET_FAULT
+```
+
+### 11.3 One-hour full-chain soak test
+
+Reassemble the exact configuration that previously reproduced the failure
+-- Power Base -> SHT45 INTERMEDIATE -> PMS5003 LEAF, all three tiers
+connected -- and let it run for **60 continuous minutes**, watching:
+
+```bash
+journalctl -u otbr-agent -f | grep -Ei "reset_fault|hdlc|parse"
+```
+
+**Pass criteria:**
+
+- Zero `RESET_FAULT` occurrences in `otbr-agent`'s log over the full hour
+  (baseline before this fix: 4 in 25 minutes under this exact chain).
+- Zero "Error decoding hdlc frame: Parse" occurrences.
+- `otbr-agent` is never restarted by systemd during the hour
+  (`systemctl status otbr-agent` shows one continuous run, not a recent
+  restart).
+- The module/Power Base's own sensor sequence numbers keep incrementing
+  throughout (confirming the workaround didn't newly introduce a stall anywhere
+  downstream).
+- `ot-ctl state` continues to report a stable Thread role for the Power
+  Base throughout (no unexpected role churn correlated with any transient
+  USB hiccup this workaround is intended to absorb silently).
+
+**If zero `RESET_FAULT` occurrences are observed, this confirms (not just
+supports) the leading hypothesis in section 9.1 well enough to treat the
+workaround as validated** -- update this document's section 9 language
+accordingly at that point (remove the "candidate"/"leading hypothesis"
+hedging). **If any `RESET_FAULT` still occurs**, capture `journalctl -u
+otbr-agent` around that timestamp and, if a diagnostic-build RCP is on hand
+(section 10), read back its coredump -- either result would mean the real
+cause is NOT (or not only) the USB TX write path this candidate workaround
+targets (e.g. the RX side, or elsewhere in the RCP mainloop), and section
+9's hypothesis should be revisited rather than assumed confirmed.
+
+## 12. USB Spinel RX recovery (confirmed coredump root cause -- not a hypothesis)
+
+Unlike section 9's TX retry (a **candidate workaround** for a leading
+**hypothesis**), this section fixes a **confirmed** root cause: a real
+coredump was captured (diagnostic build, section 10) and read back with
+`idf.py coredump-debug`, showing:
+
+- crashed task: `ot_main`
+- assert address: `0x4200f9ee`
+- `esp_openthread.cpp:279`'s `esp_openthread_launch_mainloop()` returned,
+  then `esp_openthread.cpp:283`'s `assert(false)` fired
+
+This is **not** the existing USB Spinel TX retry's own failure mode
+(section 9: `otPlatUartSend()`/`RESET_FAULT`/"Error decoding hdlc frame:
+Parse"). It is a separate call path, a separate symptom, and a separate
+fix -- the TX retry hardening in section 9 does not address this coredump
+and is not claimed to.
+
+### 12.1 The confirmed call chain
+
+Read directly from ESP-IDF v6.1's own sources (never modified):
+
+1. `esp_openthread.cpp:esp_openthread_launch_mainloop()`'s own `while`
+   loop calls `select()` on the registered workflow fds, then calls
+   `esp_openthread_platform_process(instance, &mainloop)` once per
+   iteration.
+2. `esp_openthread_platform.cpp:esp_openthread_platform_process()` walks
+   every registered workflow's `process_func()` via
+   `ESP_RETURN_ON_ERROR(current_workflow->process_func(...), ...)` -- the
+   FIRST workflow to return non-`ESP_OK` makes
+   `esp_openthread_platform_process()` itself return that same non-`ESP_OK`
+   immediately.
+3. This project's one registered workflow (USB Serial/JTAG RCP transport)
+   is `esp_openthread_uart.c:esp_openthread_uart_process()`:
+   ```c
+   esp_err_t esp_openthread_uart_process(otInstance *instance, const esp_openthread_mainloop_context_t *mainloop)
+   {
+       int rval = read(s_uart_fd, s_uart_buffer, sizeof(s_uart_buffer));
+       if (rval > 0) {
+           otPlatUartReceived(s_uart_buffer, (uint16_t)rval);
+       } else if (rval < 0) {
+           if (errno != EAGAIN) {
+               ESP_LOGW(OT_PLAT_LOG_TAG, "read uart failed: %d", errno);
+               return ESP_FAIL;
+           }
+       }
+       return ESP_OK;
+   }
+   ```
+   Any `read()` errno other than `EAGAIN` -- including a transient `EIO`
+   (USB Serial/JTAG's own VFS read path can return `-1`/`EIO` for the width
+   of one `usb_serial_jtag_is_connected()` false negative, the SAME
+   espressif/esp-idf#18490/#18506 class of false negative already
+   documented for the TX path in section 9, but here on RX) -- returns
+   `ESP_FAIL`.
+4. Back in `esp_openthread_launch_mainloop()`: `error != ESP_OK` breaks the
+   mainloop's own `while` loop, and the function returns that error.
+5. Back in `esp_openthread.cpp:ot_task_worker()`, the return value is
+   discarded, but since this project builds `CONFIG_OPENTHREAD_RADIO=y`
+   (RCP), the code immediately after the call is:
+   ```c
+   #if CONFIG_OPENTHREAD_RADIO
+       ESP_LOGE(OT_PLAT_LOG_TAG, "RCP deinitialization is not supported for now");
+       assert(false);
+   #endif
+   ```
+   -- this project's RCP build never expects the mainloop to exit for any
+   reason. A single momentary USB RX false negative reaching step 3 is
+   therefore enough, by itself, to crash the whole task via this
+   unconditional `assert(false)` -- exactly the captured coredump.
+
+### 12.2 The fix and how it overrides upstream ESP-IDF
+
+Same documented ESP-IDF `--wrap` linker mechanism as section 9, applied to
+a different symbol: `esp_openthread_platform_process()`. The real ESP-IDF
+install under `~/.espressif` is never modified.
+
+New files, all under `rcp/main/` (nothing outside `rcp/` is touched):
+
+- **`rcp_usb_rx_recovery.h`** -- shared declarations: the retry-yield (2 ms)
+  and total-timeout (200 ms) constants (own, separately named from
+  section 9's `RCP_UART_TX_*` constants -- the two fixes are not merged),
+  the noreturn recovery hook, and the `__real_`/`__wrap_` function
+  prototypes. `otInstance`/`esp_openthread_mainloop_context_t` are
+  forward-declared **opaquely** here rather than pulled in via ESP-IDF's
+  real (heavy) `openthread/instance.h`/`esp_openthread_types.h` headers:
+  the wrapper only ever forwards these two pointers through to
+  `__real_esp_openthread_platform_process()`, never dereferencing either
+  itself, so only their address ever needs to cross this file's boundary --
+  ABI-identical to the real, complete types either way, and what keeps the
+  wrapper file host-testable without a real ESP-IDF/OpenThread environment
+  (12.4).
+- **`esp_openthread_platform_process_wrap.c`** -- the actual wrapper,
+  `__wrap_esp_openthread_platform_process()`: resets `errno` to `0`
+  immediately before every `__real_esp_openthread_platform_process()` call;
+  on `ESP_FAIL` with `errno == EIO`, sleeps
+  `RCP_USB_RX_RECOVERY_RETRY_YIELD_MS` (a real `vTaskDelay()` -- never a
+  busy spin) and retries, within `RCP_USB_RX_RECOVERY_TOTAL_TIMEOUT_MS`
+  overall; returns `ESP_OK` on a successful retry; calls
+  `rcp_usb_rx_recovery_restart()` (never returns) once that budget is
+  exhausted; returns any OTHER error (a different `esp_err_t`, or
+  `ESP_FAIL` with any other `errno`) **completely unmodified, on the very
+  first attempt** -- never hidden, so a genuine, non-transient failure
+  still reaches the diagnostic `assert()`/coredump path (12.1, step 5)
+  exactly as before.
+- **`rcp_usb_rx_recovery_restart.c`** -- the noreturn hook: a silent
+  `esp_restart()`, kept in its own file/function rather than reusing
+  section 9's `rcp_uart_tx_recovery_restart()` (same reasoning: two
+  separate, independently auditable fixes for two separate failures).
+
+`rcp/main/CMakeLists.txt` adds these sources and:
+
+```cmake
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=otPlatUartSend"
+    "-Wl,-u,__wrap_otPlatUartSend"
+    "-Wl,--wrap=esp_openthread_platform_process"
+    "-Wl,-u,__wrap_esp_openthread_platform_process")
+```
+
+Verified in the real firmware ELF after a full `idf.py fullclean && idf.py
+build` (production variant, 0 warnings):
+
+```
+$ riscv32-esp-elf-nm pogo_rcp.elf | grep -Ei 'esp_openthread_platform_process|rcp_usb_rx_recovery'
+4200bc76 T __wrap_esp_openthread_platform_process
+4200ed8a T esp_openthread_platform_process
+4200bdc4 T rcp_uart_tx_recovery_restart
+4200bcde T rcp_usb_rx_recovery_restart
+
+$ riscv32-esp-elf-objdump -d pogo_rcp.elf | grep -B2 '__wrap_esp_openthread_platform_process>$'
+4200e996:	858a                	mv	a1,sp
+4200e998:	854e                	mv	a0,s3
+4200e99a:	adcfd0ef          	jal	4200bc76 <__wrap_esp_openthread_platform_process>
+
+$ riscv32-esp-elf-objdump -d pogo_rcp.elf | grep -A40 '<__wrap_esp_openthread_platform_process>:' \
+    | grep -E 'esp_openthread_platform_process|rcp_usb_rx_recovery_restart|vTaskDelay|esp_timer_get_time'
+	690080e7          	jalr	1680(ra) # 4080031a <esp_timer_get_time>
+	0e2030ef          	jal	4200ed8a <esp_openthread_platform_process>
+	662080e7          	jalr	1634(ra) # 4080031a <esp_timer_get_time>
+	2809                	jal	4200bcde <rcp_usb_rx_recovery_restart>
+	1e31f0ef          	jal	4202b6b2 <vTaskDelay>
+
+$ riscv32-esp-elf-objdump -d pogo_rcp.elf | grep -A1 '<rcp_usb_rx_recovery_restart>:'
+4200bcde <rcp_usb_rx_recovery_restart>:
+4200bcde:	feaf50ef          	jal	420014c8 <esp_restart>
+```
+
+This confirms, in the linked binary itself: `esp_openthread.cpp`'s call
+site (inside `esp_openthread_launch_mainloop()`) now reaches
+`__wrap_esp_openthread_platform_process`; that wrapper's own
+`__real_esp_openthread_platform_process()` call is resolved by the same
+`--wrap` mechanism straight to the ORIGINAL `esp_openthread_platform_process`
+definition (address `0x4200ed8a`, still present and reachable, never
+removed -- unlike section 9's stock `otPlatUartSend()`, which this project
+fully replaces); the wrapper calls `esp_timer_get_time()` (deadline
+setup/check), `vTaskDelay()` (the bounded retry sleep), and
+`rcp_usb_rx_recovery_restart()` on exhaustion; and that hook calls
+`esp_restart()` directly, with no logging call anywhere in between.
+
+### 12.3 Errno-reset, retry, and non-EIO preservation semantics
+
+`errno = 0;` is the first statement inside the retry loop, immediately
+before every single `__real_esp_openthread_platform_process()` call --
+including every retry, not just the first attempt -- so a stale `errno`
+left over from an earlier, unrelated failure can never be misread as this
+attempt's own result.
+
+Only the EXACT combination `err == ESP_FAIL && errno == EIO` is ever
+treated as transient:
+
+- Any other `esp_err_t` (e.g. from a future additional registered
+  workflow) is returned unmodified, even if `errno` happens to be `EIO`.
+- `ESP_FAIL` with any `errno` other than `EIO` (e.g. a real `ENODEV`) is
+  also returned unmodified.
+
+Both cases bail out on the very first attempt, with no retry and no delay
+-- never silently absorbed, so they still reach the diagnostic
+`assert()`/coredump path exactly as before this fix.
+
+On a successful retry, `__wrap_esp_openthread_platform_process()` returns
+`ESP_OK` -- `esp_openthread_launch_mainloop()`'s own `while` loop sees
+nothing different from a clean iteration and simply continues. No
+`ESP_LOGx`/`printf` call exists anywhere in the retry path itself (on top
+of `rcp/sdkconfig.defaults`'s existing `CONFIG_LOG_DEFAULT_LEVEL_NONE=y`),
+so a transient EIO absorbed by this fix writes nothing to the USB Spinel
+stream either.
+
+### 12.4 Host test
+
+`tools/test_rcp_usb_rx_recovery.c` links the REAL, unmodified
+`rcp/main/esp_openthread_platform_process_wrap.c` -- the actual production
+`--wrap` wrapper, including its own errno-reset/retry/timeout logic; unlike
+section 9's TX fix, there is no separate "retry engine" file here to link
+instead -- against a scripted fake `__real_esp_openthread_platform_process()`
++ recovery hook (`tools/host_test_stubs/host_rcp_usb_rx_sim.c`):
+
+```bash
+cc -Wall -Wextra -pthread \
+   -I tools/host_test_stubs -I rcp/main \
+   -o /tmp/test_rcp_usb_rx_recovery tools/test_rcp_usb_rx_recovery.c \
+   rcp/main/esp_openthread_platform_process_wrap.c \
+   tools/host_test_stubs/host_rcp_usb_rx_sim.c \
+&& /tmp/test_rcp_usb_rx_recovery
+```
+
+Scenarios covered:
+
+1. OK passthrough: `__real_esp_openthread_platform_process()` succeeds
+   immediately -- no retry, no delay.
+2. A few transient `EIO` failures, then success: `errno` was `0` at the
+   entry of EVERY real call (not just the first), and
+   `__wrap_esp_openthread_platform_process()` itself returns `ESP_OK`.
+3. Repeated (19x) transient `EIO` before eventual success: real wall-clock
+   time actually elapses roughly proportional to the retry count --
+   proving a bounded, yielding retry loop, never a busy spin -- while
+   staying comfortably under the 200 ms budget.
+4. `EIO` that never clears: the recovery hook fires only after
+   `RCP_USB_RX_RECOVERY_TOTAL_TIMEOUT_MS` has actually elapsed (never
+   sooner, never much later), and `__wrap_esp_openthread_platform_process()`
+   never returns to its caller -- proven with `sigsetjmp()`/`siglongjmp()`,
+   not just a call count -- and a next-attempt call through the same
+   (now-halted) session also cannot succeed.
+5. `ESP_FAIL` with a non-`EIO` errno (`ENODEV`): returned completely
+   unmodified, on the first attempt, with no retry.
+6. A non-`ESP_FAIL` `esp_err_t` (`ESP_ERR_INVALID_STATE`), even with
+   `errno == EIO`: also returned completely unmodified -- proving only the
+   exact `ESP_FAIL`+`EIO` combination is ever treated as transient.
+
+All 6 scenarios / 24 individual checks pass, 0 compiler warnings
+(`-Wall -Wextra`).
+
+### 12.5 Build verification
+
+Both variants built with a full `idf.py fullclean && idf.py build`
+(diagnostic variant with its own isolated `-DSDKCONFIG`, exactly as
+section 10.2 describes) -- **0 warnings in either build**:
+
+```
+$ grep -ci "warning:" /tmp/pogo_rcp_build.log
+0
+$ grep -ci "warning:" /tmp/pogo_rcp_diag_build.log
+0
+```
+
+The diagnostic variant's own coredump-only symbol
+(`esp_core_dump_write`) is present in `pogo_rcp_diag`'s ELF and still
+confirmed ABSENT from the production ELF -- this RX recovery fix did not
+disturb that existing section 10 boundary. `tools/test_rcp_config.py`'s own
+static checks (a new section for this fix, alongside its existing TX/
+diagnostic-build checks) all pass.
+
+### 12.6 Real-hardware validation (not yet run)
+
+**Not run in this pass** -- this pass's own scope was root-cause
+confirmation (already done, via the coredump captured and read back
+earlier), the fix itself, its host test, and the build/link/symbol
+verification above. What is still required before this fix can be
+considered validated on real hardware:
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+sudo systemctl stop otbr-agent   # OTBR holds the port -- see section 5
+idf.py -C rcp -B ~/esp-builds/pogo_rcp -p <PORT> flash
+sudo systemctl start otbr-agent
+```
+
+Then reassemble the exact full three-tier chain (Power Base -> SHT45
+INTERMEDIATE -> PMS5003 LEAF) and run it continuously for **60 minutes**,
+watching:
+
+```bash
+journalctl -u otbr-agent -f | grep -Ei "reset_fault|hdlc|parse"
+systemctl show otbr-agent -p NRestarts
+```
+
+**Pass criteria for this one-hour soak:**
+
+- Zero "Error decoding hdlc frame: Parse" occurrences in `otbr-agent`'s log
+  over the full hour.
+- Zero `RESET_FAULT` occurrences.
+- Zero occurrences of any OTHER "Unexpected RCP reset" line.
+- `systemctl show otbr-agent -p NRestarts` reads the SAME value at the end
+  of the hour as it did at the start (systemd's own per-unit restart
+  counter -- confirms `otbr-agent` was never restarted by its `Restart=`
+  policy, i.e. no crash-triggered restart occurred anywhere in the chain
+  during the hour, not just the specific failures this fix targets).
+
+If all four hold, this closes out both the RX coredump fix (this section)
+and, combined with section 11's own pass criteria, the TX retry candidate
+workaround (section 9) in the same run. If any occur, capture
+`journalctl -u otbr-agent` around that timestamp and, if the diagnostic
+build (section 10) is on hand, read back its coredump -- either result
+would mean a further, still-undiagnosed failure mode remains on top of the
+two fixed here.

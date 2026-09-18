@@ -164,6 +164,127 @@ def main():
            f"rcp/ never references components/'s shared GPIO defines, EXTRA_COMPONENT_DIRS, "
            f"or the other projects' own configs/ files (found: {cross_reference_hits})")
 
+    # --- 7. USB Spinel TX retry fix (RESET_FAULT follow-up -- see
+    # docs/otbr-rcp.md's "USB Spinel TX retry" section). Static presence/
+    # wiring checks only; the actual retry/backoff behavior is exercised by
+    # tools/test_rcp_uart_tx_retry.c, and the real ESP-IDF build/link is
+    # covered separately (see the final report, not this script). ---
+    retry_files = (
+        os.path.join(RCP_DIR, "main", "rcp_uart_tx_retry.h"),
+        os.path.join(RCP_DIR, "main", "rcp_uart_tx_retry.c"),
+        os.path.join(RCP_DIR, "main", "rcp_uart_tx_io.c"),
+        os.path.join(RCP_DIR, "main", "esp_ot_uart_send_wrap.c"),
+    )
+    for path in retry_files:
+        record(os.path.isfile(path), f"{os.path.relpath(path, ROOT_DIR)} exists")
+
+    main_cmake_path = os.path.join(RCP_DIR, "main", "CMakeLists.txt")
+    if os.path.isfile(main_cmake_path):
+        main_cmake = read(main_cmake_path)
+        record("rcp_uart_tx_retry.c" in main_cmake and "rcp_uart_tx_io.c" in main_cmake
+               and "esp_ot_uart_send_wrap.c" in main_cmake,
+               "rcp/main/CMakeLists.txt builds the retry-fix sources")
+        record("-Wl,--wrap=otPlatUartSend" in main_cmake,
+               "rcp/main/CMakeLists.txt wires the otPlatUartSend --wrap override "
+               "(ESP-IDF's own documented mechanism -- $IDF_PATH itself is never modified)")
+        record("esp_hal_usb" in main_cmake,
+               "rcp/main/CMakeLists.txt requires esp_hal_usb (hal/usb_serial_jtag_ll.h, "
+               "for rcp_uart_tx_io.c's rcp_uart_tx_flush())")
+
+    retry_header_path = os.path.join(RCP_DIR, "main", "rcp_uart_tx_retry.h")
+    if os.path.isfile(retry_header_path):
+        retry_header = read(retry_header_path)
+        record("rcp_uart_tx_flush(void)" in retry_header,
+               "rcp_uart_tx_retry.h declares rcp_uart_tx_flush() (preserves stock otPlatUartSend()'s "
+               "post-write usb_serial_jtag_ll_txfifo_flush(), \"DIG-727\")")
+        record("rcp_uart_tx_recovery_restart(void)" in retry_header and "noreturn" in retry_header,
+               "rcp_uart_tx_retry.h declares a noreturn rcp_uart_tx_recovery_restart() hook "
+               "(a failed/timed-out send must never return an otError to NcpSend(), which ignores it)")
+
+    retry_c_path = os.path.join(RCP_DIR, "main", "rcp_uart_tx_retry.c")
+    if os.path.isfile(retry_c_path):
+        retry_c = read(retry_c_path)
+        record("OT_ERROR_FAILED" not in retry_c,
+               "rcp_uart_tx_retry.c never returns OT_ERROR_FAILED -- a fatal send hands off to "
+               "rcp_uart_tx_recovery_restart() instead of returning to NcpSend()")
+        record(retry_c.count("rcp_uart_tx_flush()") >= 1,
+               "rcp_uart_tx_retry.c calls rcp_uart_tx_flush() after every write attempt")
+
+    diag_sdkconfig_path = os.path.join(RCP_DIR, "sdkconfig.diag")
+    if os.path.isfile(diag_sdkconfig_path):
+        diag_sdkconfig = read(diag_sdkconfig_path)
+        record(has_config_line(diag_sdkconfig, "ESP_COREDUMP_ENABLE_TO_FLASH", "y"),
+               "sdkconfig.diag: CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y")
+        record(has_config_line(diag_sdkconfig, "ESP_SYSTEM_PANIC_SILENT_REBOOT", "y"),
+               "sdkconfig.diag: CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y "
+               "(coredump-to-flash must never re-enable panic text on the Spinel wire)")
+    else:
+        record(False, "rcp/sdkconfig.diag exists")
+
+    diag_partitions_path = os.path.join(RCP_DIR, "partitions_diag.csv")
+    if os.path.isfile(diag_partitions_path):
+        diag_partitions = read(diag_partitions_path)
+        record(re.search(r"^coredump,\s*data,\s*coredump,", diag_partitions, re.MULTILINE) is not None,
+               "partitions_diag.csv declares a `coredump` data partition")
+    else:
+        record(False, "rcp/partitions_diag.csv exists")
+
+    # Production sdkconfig.defaults/partitions.csv (used by a normal build)
+    # must stay untouched by the diagnostic-build addition -- no coredump/
+    # panic-print settings leaking into the default, non-diagnostic build.
+    record(not has_config_line(defaults, "ESP_COREDUMP_ENABLE_TO_FLASH", "y"),
+           "sdkconfig.defaults (production) does NOT enable coredump-to-flash")
+    record("CONFIG_PARTITION_TABLE_FILENAME=\"partitions.csv\"" in defaults,
+           "sdkconfig.defaults (production) still points at partitions.csv, not partitions_diag.csv")
+
+    # --- 8. USB Spinel RX recovery fix (confirmed coredump root cause --
+    # crashed task ot_main, assert(false) at esp_openthread.cpp:283 -- see
+    # docs/otbr-rcp.md's "USB Spinel RX recovery" section). Static
+    # presence/wiring checks only; the actual retry/timeout/errno-reset
+    # behavior is exercised by tools/test_rcp_usb_rx_recovery.c, and the
+    # real ESP-IDF build/link/nm/objdump verification is covered separately
+    # (see the final report, not this script). ---
+    rx_recovery_files = (
+        os.path.join(RCP_DIR, "main", "rcp_usb_rx_recovery.h"),
+        os.path.join(RCP_DIR, "main", "esp_openthread_platform_process_wrap.c"),
+        os.path.join(RCP_DIR, "main", "rcp_usb_rx_recovery_restart.c"),
+    )
+    for path in rx_recovery_files:
+        record(os.path.isfile(path), f"{os.path.relpath(path, ROOT_DIR)} exists")
+
+    if os.path.isfile(main_cmake_path):
+        main_cmake = read(main_cmake_path)
+        record("esp_openthread_platform_process_wrap.c" in main_cmake and "rcp_usb_rx_recovery_restart.c" in main_cmake,
+               "rcp/main/CMakeLists.txt builds the RX recovery fix sources")
+        record("-Wl,--wrap=esp_openthread_platform_process" in main_cmake,
+               "rcp/main/CMakeLists.txt wires the esp_openthread_platform_process --wrap override "
+               "(ESP-IDF's own documented mechanism -- $IDF_PATH itself is never modified)")
+        record("-Wl,-u,__wrap_esp_openthread_platform_process" in main_cmake,
+               "rcp/main/CMakeLists.txt forces the linker to pull __wrap_esp_openthread_platform_process "
+               "out of libmain.a")
+
+    rx_recovery_header_path = os.path.join(RCP_DIR, "main", "rcp_usb_rx_recovery.h")
+    if os.path.isfile(rx_recovery_header_path):
+        rx_recovery_header = read(rx_recovery_header_path)
+        record("rcp_usb_rx_recovery_restart(void)" in rx_recovery_header and "noreturn" in rx_recovery_header,
+               "rcp_usb_rx_recovery.h declares a noreturn rcp_usb_rx_recovery_restart() hook "
+               "(EIO persisting for the whole retry budget must never return control to the mainloop)")
+        record("RCP_USB_RX_RECOVERY_RETRY_YIELD_MS" in rx_recovery_header
+               and "RCP_USB_RX_RECOVERY_TOTAL_TIMEOUT_MS" in rx_recovery_header,
+               "rcp_usb_rx_recovery.h declares its own retry-yield/total-timeout constants "
+               "(kept separate from the TX fix's own RCP_UART_TX_* constants)")
+
+    rx_recovery_wrap_path = os.path.join(RCP_DIR, "main", "esp_openthread_platform_process_wrap.c")
+    if os.path.isfile(rx_recovery_wrap_path):
+        rx_recovery_wrap = read(rx_recovery_wrap_path)
+        record("errno = 0" in rx_recovery_wrap,
+               "esp_openthread_platform_process_wrap.c resets errno to 0 before calling "
+               "__real_esp_openthread_platform_process()")
+        record("EIO" in rx_recovery_wrap and "ESP_FAIL" in rx_recovery_wrap,
+               "esp_openthread_platform_process_wrap.c checks for the exact ESP_FAIL+EIO combination")
+        record("vTaskDelay" in rx_recovery_wrap,
+               "esp_openthread_platform_process_wrap.c yields via vTaskDelay() -- never a busy spin")
+
     # --- Sanity: the existing projects' own top-level CMakeLists.txt files
     # were not touched by this pass (this test only checks THEIR project name
     # still matches what they always were -- the real "did I edit shared

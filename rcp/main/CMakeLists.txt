@@ -11,7 +11,52 @@
 # is required here explicitly instead. `console` is listed even though the
 # default build (CONFIG_OPENTHREAD_RCP_SPINEL_CONSOLE=n) never opens
 # esp_console.h, so flipping that one Kconfig option back on later does not
-# also require editing this file.
-idf_component_register(SRCS "esp_ot_rcp.c"
+# also require editing this file. `esp_timer` was added by the USB Spinel
+# TX retry fix below -- rcp_uart_tx_retry.c calls esp_timer_get_time() for
+# its bounded retry deadline. `esp_hal_usb` was added for
+# rcp_uart_tx_io.c's rcp_uart_tx_flush(), which calls
+# usb_serial_jtag_ll_txfifo_flush() (hal/usb_serial_jtag_ll.h) to preserve
+# stock otPlatUartSend()'s own post-write flush semantics -- see
+# rcp_uart_tx_retry.h's own comment. `espcoredump` is REQUIRED here
+# (unconditionally, in both the production and diagnostic sdkconfig
+# variants) because rcp/CMakeLists.txt sets MINIMAL_BUILD ON: a component
+# that nothing REQUIRES is excluded from the build entirely, which also
+# hides its Kconfig options ("unknown kconfig symbol
+# 'ESP_COREDUMP_ENABLE_TO_FLASH'" from kconfgen) -- confirmed by an actual
+# diagnostic-variant build before this line was added. Listing it here
+# costs nothing in the production build: with the default
+# CONFIG_ESP_COREDUMP_ENABLE_TO_NONE (rcp/sdkconfig.defaults never touches
+# this), $IDF_PATH/components/esp_system/panic.c's own
+# `#if CONFIG_ESP_COREDUMP_ENABLE` block (and everything else in
+# `espcoredump`) compiles out to nothing -- see docs/otbr-rcp.md section 10.
+idf_component_register(SRCS "esp_ot_rcp.c" "rcp_uart_tx_retry.c" "rcp_uart_tx_io.c" "esp_ot_uart_send_wrap.c"
+                             "esp_openthread_platform_process_wrap.c" "rcp_usb_rx_recovery_restart.c"
                        INCLUDE_DIRS "."
-                       PRIV_REQUIRES openthread nvs_flash esp_event vfs console)
+                       PRIV_REQUIRES openthread nvs_flash esp_event vfs console esp_timer esp_hal_usb espcoredump)
+
+# USB Spinel TX retry fix (RESET_FAULT under real hardware load -- see
+# rcp_uart_tx_retry.c/esp_ot_uart_send_wrap.c and docs/otbr-rcp.md's "USB
+# Spinel TX retry" section): overrides the `openthread` component's own
+# otPlatUartSend() via ESP-IDF's own documented linker `--wrap` mechanism
+# ($IDF_PATH/examples/build_system/wrappers) instead of touching
+# $IDF_PATH itself. `-Wl,-u,__wrap_otPlatUartSend` additionally forces the
+# linker to pull that symbol's object out of libmain.a: nothing calls it by
+# that literal name at compile time (the --wrap substitution only happens
+# during the final link's symbol resolution), so without this it could
+# otherwise be left out of a plain archive scan.
+#
+# USB Spinel RX recovery fix (confirmed root cause of a real-hardware
+# coredump -- crashed task ot_main, assert(false) at
+# esp_openthread.cpp:283 right after esp_openthread_launch_mainloop()
+# returned at esp_openthread.cpp:279 -- see
+# esp_openthread_platform_process_wrap.c's own header comment and
+# docs/otbr-rcp.md's "USB Spinel RX recovery" section): overrides the
+# `openthread` component's own esp_openthread_platform_process() via the
+# same documented `--wrap` mechanism, same reasoning as the TX fix above.
+# This is a SEPARATE fix for a SEPARATE, confirmed failure -- not a
+# restatement of, and not dependent on, the TX fix.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=otPlatUartSend"
+    "-Wl,-u,__wrap_otPlatUartSend"
+    "-Wl,--wrap=esp_openthread_platform_process"
+    "-Wl,-u,__wrap_esp_openthread_platform_process")

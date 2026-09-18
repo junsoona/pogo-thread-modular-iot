@@ -1,0 +1,58 @@
+#
+# RCP-only DIAGNOSTIC build fragment -- NOT used by a normal production
+# build. Applied ON TOP of rcp/sdkconfig.defaults via:
+#
+#   idf.py -C rcp -B <diag-build-dir> \
+#       -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+#       set-target esp32h2
+#
+# See docs/otbr-rcp.md's "RCP-only diagnostic build: core dump to flash"
+# section for the full rationale, read-back commands
+# (`idf.py coredump-info` / `coredump-debug`), and exactly why this cannot
+# leak any text onto the same USB Serial/JTAG endpoint the production build
+# carries raw Spinel bytes over.
+#
+
+# Points this diagnostic build at rcp/partitions_diag.csv instead of the
+# production rcp/partitions.csv -- adds ONE partition (`coredump`) and
+# leaves nvs/phy_init/factory byte-identical to production.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_diag.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_diag.csv"
+
+# Core dump destination: FLASH (the new `coredump` partition above), never
+# UART/USB -- see $IDF_PATH/components/espcoredump/Kconfig's
+# ESP_COREDUMP_TO_FLASH_OR_UART choice. This alone (separately from the
+# panic-print suppression below) is what keeps a coredump off the wire:
+# esp_core_dump_write() talks to the flash partition via
+# esp_partition_write(), never to any console/VFS fd.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# (ESP_COREDUMP_ENABLE_TO_FLASH's own Kconfig `select` already turns on
+# ESP_COREDUMP_ENABLE -- confirmed in the actual generated sdkconfig, not
+# just assumed from the Kconfig source -- restated here only for a reader
+# scanning this file, not because it needs to be set explicitly.)
+
+# espcoredump's own optional debug log strings
+# ($IDF_PATH/components/espcoredump/include_core_dump/esp_core_dump_types.h's
+# ESP_COREDUMP_LOG*() macros) call esp_rom_printf() directly -- bypassing
+# the normal ESP_LOGx path entirely, so CONFIG_LOG_DEFAULT_LEVEL_NONE alone
+# does not prove they stay silent. In THIS project esp_rom_printf() is
+# harmless regardless (it targets the ROM's fixed primary-console UART --
+# CONFIG_ESP_CONSOLE_UART_DEFAULT=y / UART0 here, confirmed in the
+# generated sdkconfig -- a physically unwired peripheral entirely separate
+# from the USB Serial/JTAG endpoint the Spinel stream uses), but this is
+# turned off anyway for defense-in-depth and to save ~5KB of DRAM this
+# diagnostic build has no use for.
+CONFIG_ESP_COREDUMP_LOGS=n
+
+# Explicitly restated (already the production default, see
+# rcp/sdkconfig.defaults) rather than left implicit: this is the setting
+# that actually guarantees zero panic text on the wire. It gates out
+# $IDF_PATH/components/esp_system/panic.c's ENTIRE "Panic print functions"
+# section at compile time (panic_print_str()/panic_print_char(), including
+# the CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG branch that would
+# otherwise share this chip's one physical USB Serial/JTAG peripheral with
+# the Spinel byte stream) -- so a panic never prints anything, on ANY
+# console, before esp_core_dump_write() runs. Do not remove this in a
+# diagnostic build: coredump-to-flash and silent-panic are independent
+# Kconfig choices, and only their COMBINATION is silent-on-the-wire.
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y

@@ -1,0 +1,11 @@
+# Name,   Type, SubType,  Offset,  Size, Flags
+# Diagnostic-build partition table ONLY -- used together with
+# rcp/sdkconfig.diag (see docs/otbr-rcp.md's "RCP-only diagnostic build:
+# core dump to flash" section). Identical to rcp/partitions.csv except for
+# the added `coredump` partition, so a diagnostic build's factory/nvs/
+# phy_init layout stays byte-identical to production. Not used by a normal
+# production build (rcp/partitions.csv, unchanged, still is).
+nvs,        data, nvs,      0x9000,  0x6000,
+phy_init,   data, phy,      ,        0x1000,
+factory,    app,  factory,  0x10000, 1M,
+coredump,   data, coredump, 0x110000, 64K,
