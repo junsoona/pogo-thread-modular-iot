@@ -320,6 +320,113 @@ selector jumper/switch; or a proper power-ORing/load-switch circuit. Modules
 receive 5V+GND from the power base over POGO and never have their 3.3V rails
 tied together across modules.
 
+### 8.1 POGO 5V supply circuit requirements (this pass -- documentation only)
+
+**No POGO 5V circuit exists on any bench board today.** This section
+organizes what a future revision's circuit needs to get right before
+`power_enable_gpio` is ever assigned a real pin and `power_startup_delay_ms`
+tuned to a real value -- it does **not** assign a GPIO, does not modify
+`configs/power_base.json`, and does not enable POGO 5V on any board. Every
+board in this project stays independently USB-powered, unchanged, until
+this circuit is built AND the checklist below is actually run on real
+hardware.
+
+**Switch stage.** `power_base_config.power_enable_gpio`/
+`power_enable_active_high` (`power_base/main/app_main.c`'s
+`apply_power_rail_sequencing()`) already assume a single GPIO drives an
+enable line for the whole POGO 5V rail -- this is a **high-side load
+switch**, not a mechanical relay: the enable line should gate a P-channel
+MOSFET (or an integrated load-switch IC, e.g. the general class TI's
+TPS22919/TPS2280x or Diodes AP2280x families belong to -- named here only
+to identify the CATEGORY of part to look for, not as a pre-verified
+selection; the actual part must be chosen and checked against this
+project's real measured current/voltage needs, see the checklist below)
+sitting between the Power Base's own upstream 5V source and the POGO
+connector's 5V pin. **Inrush current is a property of the switch circuit
+itself (its own soft-start ramp and current limit, chosen when the
+component is selected), never something `power_startup_delay_ms` controls
+or shapes** -- the real implementation (`power_base/main/app_main.c`'s
+`apply_power_rail_sequencing()`) only drives the enable GPIO to its
+configured level and then `vTaskDelay(pdMS_TO_TICKS(power_startup_delay_ms))`
+before returning; by the time that delay even starts, whatever inrush
+transient the switch produced has already happened at the hardware level,
+entirely outside this firmware's control. This delay's own real purpose is
+narrower: giving a rail that the CIRCUIT already soft-started time to
+settle to a stable voltage before the MCU proceeds to depend on it (e.g.
+before probing a downstream module over POGO) -- a software wait for
+"is the rail probably up by now", not a current-limiting mechanism.
+Current design intent (per `power_enable_gpio` living only in
+`power_base_config`, never per-module config) is a SINGLE switch point at
+the Power Base feeding the entire downstream POGO chain over the
+connector's own 5V pin -- **this assumption itself needs confirming
+against the actual POGO connector/PCB routing** once a real 5V-carrying
+board exists, since this document does not have independent confirmation
+that 5V is wired straight through every module's pass-through port rather
+than re-switched per module.
+
+**Current limiting.** Whatever switch is chosen must have (a) its own
+integrated current limit (most load-switch ICs do) set with real headroom
+above this project's actual measured worst-case draw (see below -- not
+guessed), and (b) an upstream resettable fuse (PTC) as a second,
+independent layer in case the switch itself fails shorted -- never rely on
+the switch IC's current limit alone as the only protection. Sized only
+after real measurement: an ESP32-H2 module plus one I2C sensor (SHT45/
+BH1750/SGP40/SGP41, each a few mA typ.) or PMS5003 (its fan draws
+meaningfully more than the I2C sensors, per its own datasheet) drawing
+briefly during Thread radio TX peaks, multiplied by however many modules
+this rail is actually expected to carry simultaneously in the chain depths
+this project already exercises (currently up to depth=2, see "POGO
+physical topology depth" in `docs/validation-status.md`) -- this project
+has never measured this current on real hardware, so no specific
+milliamp figure is asserted here.
+
+**Reverse-power / back-feed protection.** The existing safety note above
+(never tie POGO 5V and a module's own USB 5V together unprotected) needs
+an actual circuit answer, not just an operator-discipline rule, once
+modules might legitimately be USB-connected (e.g. for `idf.py monitor`)
+while ALSO docked and receiving POGO 5V: a series ideal-diode/ORing
+controller (or, at minimum, a Schottky diode in series with each power
+source feeding a module's own local rail) so neither source can back-feed
+the other or fight over which one wins. A load-switch IC's own
+integrated reverse-current blocking (many include this) can substitute
+for a discrete diode's own reverse-recovery/drop tradeoffs if the specific
+chosen part actually documents that protection -- this is a per-part
+datasheet check for a future revision, not a claim this document makes for
+an unpicked component.
+
+**Real-hardware verification checklist (all still outstanding -- none of
+this has been run; this is a requirements list, not a report of results):**
+
+1. Inrush current at switch turn-on (with a real oscilloscope/current
+   probe), tuning the switch circuit's OWN soft-start/current-limit
+   configuration (never `power_startup_delay_ms`, which only delays this
+   firmware's own next boot step -- see this section's own note above) so
+   downstream modules never see a brown-out at their own POGO 5V input.
+   Once the circuit's own ramp is characterized, `power_startup_delay_ms`
+   can be set to comfortably exceed it, so the MCU never proceeds before
+   the rail has actually settled.
+2. Steady-state current draw across the deepest real chain this project
+   exercises (Power Base -> INTERMEDIATE -> LEAF, all three actively
+   sampling/transmitting), confirming it stays comfortably under both the
+   switch's current limit and the fuse's rating with real margin.
+3. Voltage droop at the FAR END of the chain (the LEAF's own POGO 5V input,
+   not just at the Power Base) under that same worst-case load --
+   POGO connector contact resistance and cable/trace length both matter
+   here and neither has been characterized.
+4. Thermal check on the switch/fuse under sustained worst-case current
+   (a bench thermal-camera or simple touch-temperature check over a
+   multi-minute soak, not just an instantaneous reading).
+5. Reverse-power fault injection: deliberately power a docked module from
+   its own USB port while the Power Base's POGO 5V is also live, and
+   confirm neither source is damaged and neither rail is back-fed --
+   exactly the scenario the existing "Safety note" above already warns an
+   operator to avoid by discipline; this item is what proves the CIRCUIT
+   itself enforces it too, not just operator care.
+
+Until all five pass on real hardware, `power_enable_gpio` stays `-1` (5V
+rail assumed always-on, current behavior, unchanged by this pass) in every
+real config this project ships.
+
 ## 9. Topology reporting
 
 Every sensor module (never the power base itself) sends a fixed-length,
@@ -1347,3 +1454,227 @@ base yet, at any point in this project); the rate-limited warning's actual
 cadence on a real console; confirmation that a real attach arriving well
 after 30s still triggers `start_services_once()` correctly on real hardware
 (only host-tested so far).
+
+## 20. Automatic Light-sleep feasibility review (this pass -- no code changed)
+
+Section 19.6 already named Light-sleep (not Deep-sleep) as the right future
+mechanism for a terminal LEAF's short-polling-period power saving, and
+listed it as "explicitly NOT implemented." This pass reviewed whether it
+could safely become the DEFAULT behavior for such a LEAF now. **Conclusion:
+no code change was made** -- this remains not implemented, the terminal
+LEAF's existing Thread SED configuration (`mRxOnWhenIdle=false`, via
+`thread_manager_join_with_dataset(THREAD_MANAGER_ROLE_LEAF, ...)`) is
+completely unchanged, and INTERMEDIATE/Power Base remain always-on FTD,
+exactly as before. The reasoning follows.
+
+### 20.1 What was actually checked
+
+A real `connectedhomeip`-style verification, not a general-knowledge
+guess: this pass cloned the real `espressif/esp-idf` repository at exactly
+tag `v6.1` (`git describe --tags --exact-match` confirmed -- the same
+ESP-IDF version this project's own `source ~/.espressif/v6.1/esp-idf/export.sh`
+commands already build against) and read the OFFICIAL OpenThread
+sleepy-device example this task asked to cross-check against:
+`examples/openthread/ot_sleepy_device/light_sleep/` (`esp_ot_sleepy_device.c`,
+`README.md`, `sdkconfig.defaults`) -- the exact upstream reference for
+"Thread SED + automatic Light-sleep" on an 802.15.4 SoC including ESP32-H2.
+Also checked: `components/esp_driver_uart/include/driver/uart_wakeup.h`
+and `examples/system/light_sleep/main/uart_wakeup.c` (the general-purpose
+UART-wakeup-from-sleep mechanism, to see whether it could close the gap
+found below).
+
+### 20.2 Required configuration vs. the example's own performance tuning -- kept distinct
+
+Automatic Light-sleep itself needs exactly three settings, and this is all
+`esp_pm_configure()`/tickless idle actually require to function at all:
+`CONFIG_PM_ENABLE`, `CONFIG_FREERTOS_USE_TICKLESS_IDLE`, and (for a Thread
+SED specifically, so the 802.15.4 radio itself can also sleep between
+polls rather than just the CPU) `CONFIG_IEEE802154_SLEEP_ENABLE`.
+
+The official example's own `sdkconfig.defaults` additionally sets
+`CONFIG_FREERTOS_HZ=1000` (bumped from the default 100Hz) -- **this is the
+example's own performance/tuning choice for its own short (3s in its own
+README) poll period, not a requirement of Light-sleep itself.** Its own
+comment says it exists "to lower sleep time threshold": a coarser 100Hz
+tick makes the scheduler's own idle-time estimate too imprecise to bother
+entering Light-sleep for a SHORT idle window, so raising the tick rate
+lets the scheduler recognize shorter idle gaps as worth sleeping through.
+A future revision could instead choose a longer LEAF poll period and/or a
+different light-sleep threshold tuning that keeps this project's current
+`CONFIG_FREERTOS_HZ=100` -- that tradeoff has simply not been made yet,
+and this project's own driver files' tick-vs-millisecond assumptions (see
+`components/sht45/sht45.c`, `components/bh1750/bh1750.c`,
+`components/sgp40/sgp40.c`, `components/sgp41/sgp41.c`'s own "code review
+follow-up (SHT45 wake-reboot fix, item 7)" comments on `pdMS_TO_TICKS()`
+rounding at 100Hz) are a real reason to make that choice deliberately
+rather than copy the example's tick rate along with everything else.
+`CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y` is likewise the example's own
+additional power-saving choice, not a Light-sleep prerequisite.
+
+`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` (also in the example's
+`sdkconfig.defaults`) is the one setting that is NOT just a tuning choice
+-- see the next section for why it forecloses the UART wakeup option
+entirely, which is why this section does not suggest enabling both
+together.
+
+### 20.3 The blocking finding: `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` and UART wakeup are MUTUALLY EXCLUSIVE on ESP32-H2, and POGO IS a UART protocol
+
+Confirmed directly from Espressif's own official ESP32-H2 sleep-modes
+documentation (`docs.espressif.com/.../esp32h2/api-reference/system/sleep_modes.html`,
+the v6.1-current page, fetched and read this pass): **"In Light-sleep
+mode, setting Kconfig option `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP`
+will invalidate UART wakeup."** The same page's own
+`esp_sleep_enable_uart_wakeup()` reference is even more explicit: **"If
+`PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` is enabled (if target
+supported), this API is unavailable since the UART module is powered down
+during sleep."** This is not a reliability caveat to work around -- it is
+a hard mutual exclusion. **A test plan must pick ONE of the two
+configurations below, never both together:**
+
+- **(A) Maximum power savings** (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y`,
+  what the official `ot_sleepy_device` example itself ships): UART wakeup
+  is categorically unavailable -- not merely unreliable. Any POGO frame
+  arriving while this device is asleep is entirely missed, and **waking up
+  later on a periodic timer does not by itself recover it** -- the timer
+  wake only lets the CPU resume; it does nothing to make an already-lost
+  frame reappear. Recovery, if it happens at all, depends entirely on TWO
+  things this project has never verified for this specific failure mode:
+  (i) the SENDING peer (the upstream POGO neighbor, whose own UART was
+  never asleep) actually retrying the transmission after not hearing back
+  within its own timeout, and (ii) this device's own POGO port/session
+  state machine (`pogo_port.c`/`child_service.c`/`parent_service.c`)
+  correctly treating that as an ordinary retry rather than a fault --
+  never triggering `DOCK_TIMEOUT`/`LIVENESS_LOST` or a session desync
+  purely because it was asleep, not actually disconnected. This project's
+  existing retry/backoff mechanisms (`components/node_calc`'s UUID-hash
+  backoff, the AUTO-mode hotswap recovery in section "Core POGO /
+  provisioning" of `docs/validation-status.md`) were built and verified
+  around network delay and genuine physical disconnect/reconnect -- a
+  DIFFERENT failure shape from "the physically-still-docked peer's UART
+  was deliberately unpowered for a scheduled window." **Until real
+  hardware proves this specific resend-and-resynchronize path actually
+  recovers a lost frame without tripping a fault path or leaving a stale
+  Matter reading, option (A) must not be presented as a viable candidate
+  for the user's own "stay always-online in Matter" normal-operation
+  requirement** -- it is, today, a way to lose data with no proven
+  recovery, not a power-saving mode with an acceptable, bounded latency
+  cost.
+- **(B) Keep the UART peripheral powered** (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=n`,
+  a deviation from the official example's own settings, not yet evaluated
+  by this project): `esp_sleep_enable_uart_wakeup()` becomes usable. The
+  same docs page lists real ESP32-H2 wakeup modes beyond the simple
+  edge-count one the general-purpose `examples/system/light_sleep` sample
+  uses -- notably Mode 1 (`UART_WK_MODE_FIFO_THRESH`), where "the UART
+  Core clock remains active, the UART RX can still receive data and store
+  it in the RX FIFO," waking only once enough real bytes have
+  accumulated. Because this mode keeps the UART peripheral genuinely
+  receiving (not just detecting edges to trigger a CPU wake), it is the
+  more promising candidate for POGO's own asynchronous, arbitrary-length
+  framed traffic -- **but it is not automatically loss-free either**: the
+  RX FIFO has a fixed, finite depth, and the CPU still takes some real
+  time to actually resume execution after the wake interrupt fires: if
+  the sender keeps transmitting past the configured `rx_fifo_threshold`
+  faster than the FIFO drains once the CPU resumes, or a subsequent frame
+  arrives back-to-back before the driver has fully caught up, bytes can
+  still be dropped to hardware overflow. This project has not implemented
+  or tested this mode, and choosing it means giving up
+  peripheral-power-down's own power savings for whichever UART(s) POGO
+  needs to wake on -- **whether a COMPLETE real POGO frame (header
+  through CRC, at this project's actual baud rate and frame sizes) is
+  reliably received, not just the first few bytes that trigger the wake,
+  must be confirmed on real hardware before this can be trusted either.**
+
+Either way, **POGO's own physical link** (`components/pogo_port`'s UART
+carrying `PEER_HELLO`, capability negotiation, `JOIN_RESULT_ACK`,
+`POGO_MSG_SET_COLLECTOR`/`SET_DATASET`, and depending on wiring,
+onward-relayed topology/sensor traffic through an INTERMEDIATE) receives
+this traffic ASYNCHRONOUSLY and at an unpredictable time relative to this
+device's own sleep/wake schedule -- unlike a Thread SED's own poll, which
+this device itself initiates on its own timer. Option (A) simply cannot
+receive it at all while asleep, with no proven recovery path; option
+(B)'s Mode 1 is the more credible candidate for preserving a frame, but
+"more credible" is not "proven" -- full-frame reception under this
+project's own real traffic has not been demonstrated.
+
+Separately, and true under EITHER option above: **no sensor driver or
+`pogo_port.c` in this codebase currently takes out an `esp_pm_lock` around
+its own I2C/UART transactions** (unlike the official example's own
+`s_cli_pm_lock`, held at CPU-max-freq specifically to keep the CLI UART
+responsive until the device is fully attached). Enabling
+`CONFIG_PM_ENABLE`/automatic Light-sleep today, with no further change,
+would let the scheduler enter Light-sleep in the middle of any I2C
+measurement poll loop (`sht45.c`/`bh1750.c`/`sgp40.c`/`sgp41.c`'s own
+`vTaskDelay()`-based wait) or mid-UART-transaction
+(`pms5003.c`/`pogo_port.c`) regardless of which peripheral-power-down
+choice is made.
+
+### 20.4 Conclusion and what would actually be needed before this is safe to enable
+
+**Not safe to make the default today.** The gap is not "untested," it is
+"the necessary protections do not exist in this codebase yet, the two
+configurations that maximize power savings vs. preserve UART wakeup are
+mutually exclusive on this exact chip (section 20.3), and NEITHER option
+has a proven story for not losing a POGO frame that arrives during the
+sleep window -- option (A) has no recovery path at all pending real
+verification, and option (B)'s FIFO-threshold wakeup can still overflow
+before full-frame reception has actually been demonstrated." Turning this
+on as a default now would risk exactly the class of failure section 9.1
+of `docs/matter-bridge.md` and the "SED CoAP response timing correction"
+work (`docs/state-machine.md`, `docs/validation-status.md`'s own section)
+already spent real effort fixing: a data-loss-shaped symptom that is
+actually a timing/framing artifact. **Deep-sleep for normal operation is
+likewise not applied by this pass or any change in this repository** --
+the user's own requirement is that sensors stay always-online in Matter,
+and neither Light-sleep nor Deep-sleep is enabled as a default anywhere.
+
+Before this could become the default for a terminal LEAF (never for
+INTERMEDIATE or Power Base, which must stay always-on FTD, unchanged):
+
+1. Decide the `CONFIG_FREERTOS_HZ` question deliberately (1000Hz project-wide,
+   or a different, smaller light-sleep threshold tuning that keeps 100Hz) --
+   not as an incidental side effect of copying the example's `sdkconfig.defaults`
+   (see 20.2 -- this is the example's own tuning choice, not a Light-sleep
+   requirement).
+2. Add `esp_pm_lock_acquire()`/`release()` around every I2C transaction in
+   `sht45.c`/`bh1750.c`/`sgp40.c`/`sgp41.c` and every UART transaction in
+   `pms5003.c`/`pogo_port.c` (mirroring the official example's own
+   attach-until-child CLI lock pattern), so Light-sleep can only ever be
+   entered between transactions, never mid-transaction.
+3. Decide between section 20.3's option (A) and (B), deliberately, before
+   any implementation -- note that a MORE FREQUENT periodic wake does NOT
+   by itself fix option (A): the frequency only bounds how long this
+   device stays deaf, it does nothing to make an already-lost frame
+   reappear once it wakes:
+   - (A): before treating this as viable at all, first prove (on real
+     hardware) that the SENDING peer's own existing retry/timeout logic
+     actually resends a message this device missed while asleep, AND that
+     this device's own POGO port/session state machine resynchronizes
+     cleanly afterward -- no spurious `DOCK_TIMEOUT`/`LIVENESS_LOST`, no
+     desync, no stale Matter reading outliving the sleep window by more
+     than that resend's own delay. Until that is demonstrated, do not
+     treat option (A) as a candidate for the user's always-online
+     requirement, regardless of how short the sleep/poll period is tuned.
+   - (B): keep the relevant UART's peripheral power domain on
+     (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=n`) and prototype
+     `esp_sleep_enable_uart_wakeup()` Mode 1 (`UART_WK_MODE_FIFO_THRESH`)
+     specifically, then prove (with a real logic analyzer / real hardware
+     capture) that it reliably preserves an ENTIRE real POGO frame --
+     header through CRC, at this project's actual baud rate and frame
+     sizes, not just the leading bytes that trigger the wake -- with no
+     RX FIFO overflow once the sender keeps going past the configured
+     threshold.
+   Do not test a configuration that combines peripheral power-down with
+   UART wakeup -- section 20.3 confirms that combination cannot work at
+   all.
+4. Real-hardware soak test (after 1-3 above, not instead of them): a
+   terminal LEAF with Light-sleep enabled, under the SAME 3-tier chain
+   this project already validates elsewhere (Power Base -> INTERMEDIATE
+   -> LEAF), confirming no `JOIN_RESULT_ACK` loss, no sensor SAMPLE
+   loss/false-timeout (the exact symptom the SED CoAP timing correction
+   pass already found and fixed once), and no POGO frame CRC/resync
+   errors, over a run long enough to exercise many sleep/wake cycles --
+   none of which has been attempted (no real hardware in this or any
+   prior session that did this specific review).
+
+None of the above was implemented this pass -- this section is the
+"remaining work" list the user asked for, not a partial implementation.

@@ -36,11 +36,121 @@ code exists for this yet.
 
 | Sensor | Config | Host test | Real hardware | Notes |
 |---|---|---|---|---|
-| SHT45 | `configs/prototype_sht45.json` | Yes | **Verified** | Power Base + SHT45, depth=1. |
+| SHT45 | `configs/prototype_sht45.json` | Yes (`tools/test_sht45_convert.c`; plus `tools/test_sht45_driver.c` -- **new this pass**, links the real, unmodified `sht45.c` against a fake I2C device, see below) | **Verified** | Power Base + SHT45, depth=1. |
 | PMS5003 | `configs/prototype_pms5003.json` | Yes (`tools/test_pms5003_driver.c`, `tools/test_pms5003_parser.c`, `tools/test_pms5003_terminal_config.py`) | **Verified** | Power Base + PMS5003, depth=1, including hotswap -- see above. |
-| BH1750 | `configs/prototype_bh1750.json` | Yes (`tools/test_bh1750_convert.c`, plus `matter_bridge_core`'s `ConvertIlluminance` coverage) | **Verified**, including the full Matter path end to end | Reported by the operator (not reproduced inside any session, none of which had physical board or real Linux host access), across two real-hardware results: (1) a real BH1750 on module `..d357` produced real CoAP SAMPLE traffic (`type=0`, `scale=1`, `status=0`) that `linux/matter_bridge/ingest`'s real, unmodified `Registry` received and decoded correctly across an 18-15,273 lux range under real shading/lighting changes, with the existing PMS5003-terminal 3-tier chain unaffected; (2) a LATER result: `tools/build_matter_bridge.sh` completed a real final compile+link on a real Linux host, and `chip-tool illuminancemeasurement read measured-value 1 3` against the running `pogo_matter_bridge` returned values from 0 to 22369 (endpoint **3**, `EndpointStore`'s own first-ever dynamic id, confirmed in real use) as real lighting changed -- 22369 decodes to ~172.5 lux, 0 correctly reflecting the spec's "too low to measure" sentinel. **Not covered by either result**: this later pass's own Identify (every endpoint)/Air Quality (PMS5003) cluster conformance additions (`docs/matter-bridge.md` section 5.1) postdate result (2) and have not yet been built or read back via `chip-tool`; the sensor-bitmap-mismatch/restart procedure (section 8.2) was not exercised alongside either result either. See `docs/matter-bridge.md` section 14 for the full, dated breakdown. |
-| SGP40 | `configs/prototype_sgp40.json` | Yes (I2C commands, CRC, vendored Gas Index Algorithm) | **Verified** (sensor + wire format + Linux ingest reception only) | Reported by the operator for this pass: a real SGP40 on module `..d357` produced real VOC RAW/INDEX samples that the same real ingest `Registry` received correctly. Gas Index is deliberately **not** bridged to any Matter cluster (unitless algorithmic index, not a calibrated concentration -- see `docs/matter-bridge.md` section 3.1) -- this reception result does not change that scope, and there is nothing further to verify on the Matter side for this sensor. |
-| SGP41 | `configs/prototype_sgp41.json` | Yes (I2C commands, CRC, vendored Gas Index Algorithm, conditioning-vs-measure command switch) | Not yet | Not exercised this pass; still unwired. |
+| BH1750 | `configs/prototype_bh1750.json` | Yes (`tools/test_bh1750_convert.c`; plus `tools/test_bh1750_driver.c` -- **new this pass**, same fake-I2C-device approach; plus `matter_bridge_core`'s `ConvertIlluminance` coverage) | **Verified**, including the full Matter path end to end | Real BH1750 samples from module `..d357` reached Linux ingest under changing light. On the Linux host, the final bridge build linked successfully; `chip-tool illuminancemeasurement read measured-value 1 3` returned changing values from 0 to 22369 as the sensor was shaded and uncovered. A later build including the required Identify cluster also linked and ran; endpoint 3 returned `IdentifyTime: 0`, and `chip-tool identify identify 2 1 3` completed with Matter status `SUCCESS`. This does not test the sensor-bitmap-mismatch/restart procedure (section 8.2) or confirm how Apple Home/Google Home render illuminance. See `docs/matter-bridge.md` section 14. |
+| SGP40 | `configs/prototype_sgp40.json` | Yes (`tools/test_sgp40_driver.c` -- **new this pass**, links the real, unmodified `sgp40.c` against a fake I2C device, see below; plus CRC and the vendored Gas Index Algorithm) | **Verified** (sensor + wire format + Linux ingest reception only) | Reported by the operator for this pass: a real SGP40 on module `..d357` produced real VOC RAW/INDEX samples that the same real ingest `Registry` received correctly. Gas Index is deliberately **not** bridged to any Matter cluster (unitless algorithmic index, not a calibrated concentration -- see `docs/matter-bridge.md` section 3.1) -- this reception result does not change that scope, and there is nothing further to verify on the Matter side for this sensor. |
+| SGP41 | `configs/prototype_sgp41.json` | Yes (`tools/test_sgp41_driver.c` -- **new this pass**, same fake-I2C-device approach as SGP40 above, covers the conditioning-command response shape; plus CRC and the vendored Gas Index Algorithm) | **Verified** (sensor init + POGO/Thread join + Linux ingest reception only) | Reported by the operator for this pass; not reproduced inside this session, which had no physical board or real Linux host access. A real SGP41 on module `..d357` joined as INTERMEDIATE at depth=1 (the first `SENSOR_HELLO` attempt failed; the next attempt completed `JOIN OK`), and the existing PMS5003 module (`..d07a`) redocked downstream of it and re-registered at depth=2, continuing to send samples. On Linux ingest, the VOC channels initially reported `status=7` (`SENSOR_STATUS_CONDITIONING`) right after boot, then all four channels (VOC_RAW/VOC_INDEX/NOX_RAW/NOX_INDEX) transitioned to `status=0` roughly 10 seconds later -- consistent with `SGP41_CONDITIONING_WINDOW_MS` -- with the sample sequence number continuing to increase. See "SGP41 real-board result" below for the full scope note: this does **not** confirm the tick-budget timeout fix (below) actually fired on this run, and does **not** extend to SGP41's VOC/NOx reaching `pogo_matter_bridge` or any Matter cluster (out of scope by design, same as SGP40 above). |
+
+**This pass**: fixed the same real bug in all four I2C sensor drivers --
+`components/sht45/sht45.c`, `components/bh1750/bh1750.c`,
+`components/sgp40/sgp40.c`, `components/sgp41/sgp41.c`'s
+`read_measurement()` -- the polling loop's CALLER-tick-budget timeout
+branch (`(xTaskGetTickCount() - wait_start) >= timeout_ticks`) returned
+`ESP_ERR_TIMEOUT` without setting `measuring = false` or `status =
+SENSOR_STATUS_TIMEOUT`, unlike the elapsed-real-time timeout branch
+immediately above it in the same loop, which already did both (a
+correction pass fixed an earlier version of this same entry that
+overstated the impact -- see below for the corrected, non-exaggerated
+description).
+
+**Real production impact** (via `components/sensor_service/sensor_service.c`'s
+`sensor_service_measure_once()`, the ONLY real caller of any of these
+four drivers' `read_measurement()`): when this tick-budget branch wins the
+narrow race against the elapsed-time branch (both are configured to the
+same millisecond value by `sensor_service_measure_once()` today, but
+`xTaskGetTickCount()`'s coarser tick quantization can cross its threshold
+slightly first), `status` stays whatever it was (`SENSOR_STATUS_OK`)
+instead of `SENSOR_STATUS_TIMEOUT` for that one polling cycle --
+`sensor_service_get_status()` misreports a timed-out reading as healthy
+until the NEXT periodic measurement's own `start_measurement()`/
+`read_measurement()` pair naturally overwrites it. It does **not**
+permanently wedge the driver: `sensor_service_measure_once()` always
+calls `start_measurement()` again immediately before every
+`read_measurement()`, which unconditionally re-arms `measuring`/
+`start_time_us` regardless of the previous state, so the "measuring left
+stuck true forever" scenario is never actually observed by this driver's
+real caller. That scenario IS real and testable, though -- it's the
+driver's own API contract (`read_measurement()` without a preceding
+`start_measurement()` must fail cleanly with `ESP_ERR_INVALID_STATE`, not
+silently resume polling against stale timing), which a HYPOTHETICAL future
+caller could violate even though today's only real caller does not.
+
+Fixed by applying the exact same two-line state transition already used
+by the elapsed-time branch, in all four drivers. Host-tested by
+`tools/test_sht45_driver.c`/`tools/test_bh1750_driver.c`/
+`tools/test_sgp40_driver.c`/`tools/test_sgp41_driver.c` (all new this
+pass, see their own rows above): each links and runs the REAL, unmodified
+driver `.c` file against a new fake I2C device
+(`tools/host_test_stubs/driver/i2c_master.h` +
+`tools/host_test_stubs/host_i2c_fake_device.c`, also new this pass) that
+drives `read_measurement()` into exactly the buggy branch and asserts both
+the `status` transition (the real production-impact fix) and the API
+contract (the synthetic-but-defensible fix); each test was also run
+against the PRE-FIX driver source (via `git show HEAD:...`) to confirm it
+actually fails there (3 checks fail per driver without the fix) rather
+than passing vacuously. Not yet re-verified on real hardware -- this is a
+host-test-only fix; no ESP-IDF board build of these four drivers'
+production behavior was run this pass (a real `module` build was run this
+pass to confirm compilation, see below, but not flashed/exercised on a
+physical sensor), and the existing per-sensor real-hardware rows above are
+otherwise unaffected by this fix.
+
+### SGP41 real-board result (this pass)
+
+**Reported by the operator for this pass; not reproduced inside this
+session, which had no physical board or real Linux host access.** Scope
+of this result is sensor initialization, POGO/Thread join, and Linux
+ingest reception only -- the same boundary already used for the SGP40 row
+above.
+
+A real SGP41 on module `..d357` was flashed and docked as an INTERMEDIATE
+at depth=1 (a different topology shape than the LEAF-swap test this
+section previously outlined -- the operator instead docked it ahead of
+the existing PMS5003 chain, extending it to depth=2). The first
+`SENSOR_HELLO` attempt failed; the next attempt completed `JOIN OK`, and
+the Power Base registered the module normally. The existing PMS5003
+module (`..d07a`) redocked downstream of it and re-registered at
+depth=2, continuing to send samples throughout.
+
+On Linux ingest: immediately after boot, the VOC channels reported
+`status=7` (`SENSOR_STATUS_CONDITIONING`, see
+`components/sensor_provider/include/sensor_provider/sensor_provider.h`);
+roughly 10 seconds later -- consistent with SGP41's own
+`SGP41_CONDITIONING_WINDOW_MS` -- all four channels (VOC_RAW/VOC_INDEX/
+NOX_RAW/NOX_INDEX) reported `status=0`, and the sample sequence number
+kept incrementing. No `CONFIG_ERROR`, `THREAD_JOIN_TIMEOUT`, or
+crash/reboot loop was reported.
+
+**Not covered by this result:**
+
+- Whether this pass's own tick-budget timeout fix (`read_measurement()`'s
+  CALLER-tick-budget branch, described above) actually fired on this
+  run. Nothing in this report indicates a timeout occurred either way --
+  the fix remains verified only by the host test for SGP41, same as the
+  other three drivers.
+- Whether SGP41's VOC/NOx values reach `pogo_matter_bridge` or any Matter
+  cluster. By design, Gas Index is never bridged to a Matter
+  concentration cluster (see the SGP40 row above and
+  `docs/matter-bridge.md` section 3.1) -- this result does not change
+  that scope decision.
+- The first failed `SENSOR_HELLO` attempt's own cause -- only that the
+  existing retry recovered it on the next attempt.
+
+The flash procedure used to produce this result, kept here for a future
+re-test (SDA=GPIO0, SCL=GPIO1, I2C address 0x59, see
+`configs/prototype_sgp41.json`; the board stays separately USB powered
+until the POGO 5V circuit exists):
+
+```sh
+cd "/Users/junsoona/no-icloud/main project_1"
+source ~/.espressif/v6.1/esp-idf/export.sh
+bash tools/gen_config.sh build/cfg_images
+SGP41_PORT=/dev/cu.usbmodemXXXX
+idf.py -C module -B ~/esp-builds/pogo_module -p "$SGP41_PORT" flash
+python -m esptool --chip esp32h2 -p "$SGP41_PORT" write-flash 0x187000 build/cfg_images/prototype_sgp41_config.bin
+idf.py -C module -B ~/esp-builds/pogo_module -p "$SGP41_PORT" monitor
+```
 
 ## POGO physical topology depth
 
@@ -138,8 +248,8 @@ correction" section for the full root-cause analysis and fix.
 
 | Feature | Host test | Real hardware | Notes |
 |---|---|---|---|
-| TOPOLOGY export (uuid-coalesced queue, current-state-at-drain-time, periodic full resync) | Yes (`tools/test_linux_bridge_exporter.c`, `tools/test_linux_bridge_exporter_timers.c`, `tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | Links the real, unmodified `linux_bridge_exporter.c`/`power_base_transport.c` against a simulated Linux CoAP host (`tools/host_test_stubs/host_pb_bridge_full_sim.c`); no real Linux OTBR host has actually received this component's own CoAP traffic yet. |
-| SAMPLE export (uuid-coalesced pending table, latest-wins, periodic full resync) | Yes (same three files above) | Not yet | Same caveat as TOPOLOGY export above. |
+| TOPOLOGY export (uuid-coalesced queue, current-state-at-drain-time, periodic full resync) | Yes (`tools/test_linux_bridge_exporter.c`, `tools/test_linux_bridge_exporter_timers.c`, `tools/test_linux_bridge_exporter_retry_policy.c`) | **Verified for delivery to the real Linux host** | The running Linux ingest received depth=1 and depth=2 topology reports from the real Power Base. Queue coalescing and every resync edge case remain host-test claims, not separate hardware measurements. |
+| SAMPLE export (uuid-coalesced pending table, latest-wins, periodic full resync) | Yes (same three files above) | **Verified for delivery to the real Linux host** | The running Linux ingest logged changing BH1750, PMS5003, and earlier SGP40 samples from the Power Base. Exact per-UUID publish limits and retry-exhaustion behavior have not been measured separately on hardware. |
 | CoAP retry policy (2.xx success; 4.xx final, never retried; timeout/OT-error/5.xx bounded retry, shared by TOPOLOGY and SAMPLE) | Yes (`tools/test_linux_bridge_exporter_retry_policy.c`) | Not yet | |
 | Per-module_uuid SAMPLE export rate limit (`CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`, default 1000ms) -- coalescing to the latest sample, wrap-safe timing, TOPOLOGY unaffected | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`, `tools/test_linux_bridge_exporter_retry_exhaustion.c`, `tools/test_linux_bridge_exporter_timers.c`, all linking the real, unmodified `linux_bridge_exporter.c`) | Not yet | See "RCP/OTBR fault recovery and transport-load reduction" below. |
 | **Correction pass**: unified SAMPLE scheduler -- the periodic full sample resync no longer bypasses the rate-limit gate (it now only marks a uuid pending, exactly like a reactive callback, via the shared `mark_sample_pending()`); `transmit_sample()` re-reads `sensor_root_aggregator`'s CURRENT value and re-packs the wire payload immediately before EVERY attempt (including retries), fixing a real bug where a stale `sample_seq` could be resent on attempt 2/3 if a newer sample arrived mid-retry; a fully-exhausted transient-failure retry sequence re-marks the uuid pending so the next allowed window republishes automatically | Yes (`tools/test_linux_bridge_exporter_rate_limit.c`'s ordered-attempt-inspection scenario, `tools/test_linux_bridge_exporter_retry_exhaustion.c`, `tools/test_linux_bridge_exporter_timers.c`'s new resync-vs-gate scenario -- all link the real, unmodified `linux_bridge_exporter.c` and inspect every captured CoAP attempt in order, not just the last one) | Not yet | Fixes two bugs found in code review of the rate-limit pass immediately above (stale-payload-on-retry, and periodic resync silently bypassing the per-uuid gate) -- see `linux_bridge_exporter.c`'s own top comment ("Unified SAMPLE scheduler"/"Per-attempt fresh payload" paragraphs) and `CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS`'s own Kconfig help text for the precise unit (one LOGICAL PUBLISH, i.e. a whole bounded attempt sequence, never one per individual CoAP attempt). |
@@ -154,11 +264,11 @@ from before that commit, corrected in this pass.
 | Feature | Host test | Real hardware | Notes |
 |---|---|---|---|
 | `linux/matter_bridge/ingest` (CoAP ingest server, `Registry::apply_topology()`/`apply_sample()`/`apply_heartbeat()`, generation/sequence ordering, conflict-safe (power_base_uuid, module_uuid) keying) | Yes (`ingest_unit_tests`, `ingest_registry_snapshot_test`, `ingest_loopback_test`, `ingest_ack_transport_static_test` -- all pass via `cmake`+`ctest`, zero warnings) | **Verified** (this pass, reported by the operator, not reproduced inside this session) | Real BH1750 and SGP40 CoAP SAMPLE traffic (module `..d357`) was correctly received/decoded by this exact `Registry` code -- see the Sensors table above for the precise evidence and what this does/doesn't also confirm about `pogo_matter_bridge`'s own Matter-side (`app/chip`) code. |
-| `linux/matter_bridge/app/core` (`value_mapping`, `EndpointStore` persistence, `BridgeManager::Reconcile()`/conflict detection/dedup) | Yes (`matter_bridge_core_unit_tests` via `cmake`+`ctest`, zero warnings) | Not yet | Also CHIP-SDK-independent -- see `core/CMakeLists.txt`'s own top comment. |
-| `linux/matter_bridge/app/chip` (`chip_endpoint.cpp`/`main.cpp`, the only files that touch the real Matter SDK) | Partial -- a real `connectedhomeip v1.6.0.0` checkout compiled 449/476 GN targets with `target_os="linux"` on a macOS development sandbox, including every one of this application's own source files; the remaining 5 failures were all genuinely Linux-only headers (`<linux/netlink.h>`, `<linux/ethtool.h>`, `<netpacket/packet.h>`, glibc `fdatasync`) inside connectedhomeip's own `src/platform/Linux/*`, not this application's code -- see `docs/matter-bridge.md` section 14 for the full detail | Not yet | The final Linux-only **link** step, actually running the binary, and `chip-tool` commissioning all still require a real Ubuntu x86_64 host (or container) and have never been attempted. |
+| `linux/matter_bridge/app/core` (`value_mapping`, `EndpointStore` persistence, `BridgeManager::Reconcile()`/conflict detection/dedup) | Yes (`matter_bridge_core_unit_tests` via `cmake`+`ctest`, zero warnings) | **Verified for live BH1750 value mapping** | Real BH1750 changes reached `chip-tool` as changing Illuminance values at stable endpoint 3. Independent tests for endpoint-map corruption/recovery, every conflict path, and every restart edge case remain host-test-only. |
+| `linux/matter_bridge/app/chip` (`chip_endpoint.cpp`/`main.cpp`, the files that touch the real Matter SDK) | Core host tests pass; the earlier macOS sandbox could only partially compile Linux targets | **Verified for the tested BH1750 and PMS5003 paths** | The operator built and linked `pogo_matter_bridge` against connectedhomeip v1.6.0.0 on the real Linux host, ran it, and read BH1750 Illuminance and PMS5003 Air Quality through an already commissioned `chip-tool`. This does not establish formal Matter certification or every cluster/device permutation. |
 | **A prior pass (SAMPLE/Matter-publish transport-load reduction)**: `BridgeManager::TryBeginSchedule()`/`AbortSchedule()`/`EndSchedule()` (per-uuid Matter-work-item coalescing + rate limit), `CommitApplied()` (commit-only-on-confirmed-success dedup state, replacing the old eager-commit-inside-`Reconcile()` design), `ReconcileOne()` (re-derive from a fresh snapshot at actual apply time), `EndpointStore` internal locking (newly required now that `get_or_assign()` is called from two threads) | Yes (`core/tests/test_bridge_manager.cpp` and `core/tests/test_endpoint_store.cpp`, both extended that pass -- the latter adds a real multi-threaded `get_or_assign()` contention scenario; links the real, unmodified `bridge_manager.cpp`/`endpoint_store.cpp`) | Not yet | That pass re-cloned and re-bootstrapped a real `connectedhomeip v1.6.0.0` checkout and `gn gen` again resolved the identical 6256-target graph, but no Linux cross-compiler was available in that pass's sandbox (unlike the earlier pass above), so `ninja` could not compile anything at all that time -- a host-toolchain difference, not a new code finding. `chip_endpoint.cpp`'s new `ApplyOutcome`-returning `Apply()` and `main.cpp`'s rewritten `RegistryWatcherThreadMain()`/`ApplyUpdateOnMatterThread()` were instead verified by manual review against the exact same API shapes the already-compiled pre-existing code used -- see `docs/matter-bridge.md` section 14's own note on that pass. |
 | **An earlier pass**: BH1750 -> Illuminance Measurement (0x0400) bridging (`ConvertIlluminance()`'s CSA log-encoding, `IlluminanceMeasurementCluster`/Light Sensor device type wiring), and `BridgeManager::SensorBitmapMismatches()` (detects + withholds channel updates for a module_uuid whose sensor hardware changed without a bridge restart), plus a follow-up correction fixing a real `minMeasuredValue`/`maxMeasuredValue` mismatch bug (see `docs/matter-bridge.md` section 3's own Illuminance entry and the shared `kIlluminanceMeasuredValueMin`/`Max` constants) | Yes -- `core/tests/test_value_mapping.cpp`/`test_bridge_manager.cpp`, extended across those passes; 137/137 checks pass, 0 warnings, **including under a full AddressSanitizer run** (`-fsanitize=address`, added after ASan caught a real out-of-bounds bug in the TEST code itself, not production code) | **Verified** (reported by the operator, a later pass than the code changes themselves -- see the Sensors table's BH1750 row above for the full result: real final build+link, `chip-tool illuminancemeasurement read measured-value 1 3` returning 0-22369 against live BH1750 samples) | Those passes took a narrower, source-verification-first approach rather than attempting a full SDK build themselves: cloned the real `connectedhomeip` repository at exactly tag `v1.6.0.0` (`git describe --tags --exact-match` confirmed) to read `IlluminanceMeasurementCluster.{h,cpp}` and the CSA data-model XML directly, so the new cluster's constructor/`SetMeasuredValue()` signature and the log-encoding formula/valid-range constants were matched against real source, not general knowledge or guesswork -- the operator's own later real-hardware run (Sensors table above) has since confirmed that source-level verification produced genuinely working code. |
-| **This pass**: device-type/mandatory-cluster conformance audit -- every dynamic endpoint's `DeviceTypeList` cross-checked against a real v1.6.0.0 `matter-devices.xml`; adds the real `IdentifyCluster` (unconditionally, every endpoint -- Temperature/Humidity/Air Quality/Light Sensor device types all mark it mandatory) and the real `AirQualityCluster` (PMS5003/Air Quality Sensor endpoints only, fixed at `Unknown` forever -- see `docs/matter-bridge.md` section 5.1 for why no Good/Fair/Moderate/Poor grade is ever computed from PM concentrations) | N/A -- both additions are `chip/chip_endpoint.{hpp,cpp}`-only (no `linux/matter_bridge/app/core` changes; Identify's timer/`TriggerEffect` state and Air Quality's fixed value are both handled entirely inside the CHIP-SDK-dependent layer, which has no CHIP-independent host test of its own, same as every other real cluster wiring in this file) | Not yet | New `BUILD.gn` dependencies (`identify-server`, `air-quality-server`) and new constructor call shapes were checked line-by-line against a real v1.6.0.0 checkout's actual `IdentifyCluster.h`/`AirQualityCluster.h` (cloned fresh this pass) but never compiled -- this session still has no Linux host/container/CHIP_ROOT of its own. Needs the same `tools/build_matter_bridge.sh` + `chip-tool` procedure the operator already ran for Illuminance Measurement above, extended with `chip-tool identify read identify-type`/`chip-tool airquality read air-quality` (`docs/matter-bridge.md` section 13). |
+| Device-type/mandatory-cluster conformance audit -- required `IdentifyCluster` on dynamic endpoints and `AirQualityCluster` on PMS5003, fixed at `Unknown` (see `docs/matter-bridge.md` section 5.1) | SDK-dependent code; no CHIP-independent host test | **Verified for BH1750 and PMS5003 endpoints** | The operator's updated Linux build linked successfully. Endpoint 3 (BH1750) and endpoint 4 (PMS5003) returned `IdentifyTime: 0`; `chip-tool identify identify 2 1 3` and `... 1 4` each returned `SUCCESS`. Endpoint 4 returned `AirQuality: 0` (`Unknown`), as designed. SHT45's Identify endpoint was not exercised in this run; `TriggerEffect` and certification were not tested. |
 
 ## RCP/OTBR fault recovery and transport-load reduction (this pass)
 
@@ -247,7 +357,8 @@ individual contribution. Also not covered: continuous operation beyond
 | Feature | Status |
 |---|---|
 | Deep-sleep | Not implemented. GPIO12 was reserved as a future deep-sleep wake source (see `docs/pogo-interface.md`), but no deep-sleep code exists. |
-| POGO 5V power supply over the POGO connector | Not implemented -- every board is powered independently over USB; `power_enable_gpio` is unconfigured (`power_base_main: power_enable_gpio not configured -- 5V rail assumed always-on`). |
+| Light-sleep (automatic, for a terminal LEAF's short Thread SED polling period) | Not implemented -- **reviewed this pass, real code unchanged**. `docs/power-base.md` section 20 cross-checks the official ESP-IDF v6.1 `examples/openthread/ot_sleepy_device/light_sleep` example (cloned at exactly that tag) against this project's own POGO UART/CoAP/measurement timing and found it not yet safe to enable by default: `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` and UART wakeup are mutually exclusive on ESP32-H2 (confirmed against Espressif's own official sleep-modes documentation) -- max power savings means this device cannot be woken by incoming POGO traffic at all while asleep, and the alternative (keep the UART powered) still needs real-hardware proof that a full POGO frame, not just a byte or two, survives the wake -- no sensor or `pogo_port.c` driver in this codebase currently holds an `esp_pm_lock` around its I2C/UART transactions either. `CONFIG_FREERTOS_HZ=1000` is the example's OWN tuning choice for its own short (3s) poll period, not a requirement of Light-sleep itself -- a future revision could keep this project's current 100Hz tick rate with a different threshold tuning instead. See that section for the full remaining-work checklist. Sensors stay always-online in Matter as the user requires; the terminal LEAF's existing Thread SED (`mRxOnWhenIdle=false`) is unaffected. |
+| POGO 5V power supply over the POGO connector | Not implemented -- every board is powered independently over USB; `power_enable_gpio` is unconfigured (`power_base_main: power_enable_gpio not configured -- 5V rail assumed always-on`). See `docs/power-base.md` section 8.1 for the circuit requirements (switch, current limit, reverse-power protection) and real-hardware checklist a future revision needs before this can be enabled -- not implemented this pass either, and `power_enable_gpio` remains deliberately unassigned. |
 
 ## Stale claims corrected by this pass
 
@@ -277,8 +388,13 @@ individual contribution. Also not covered: continuous operation beyond
   `chip-tool`/Apple Home/Google Home result -- those remain "Not yet",
   unchanged, and the Linux Matter Bridge MVP table's own new row for this
   pass's Illuminance Measurement bridging spells out exactly that
-  distinction. SGP41 is left as "Not yet" -- it was not exercised this
-  pass. SGP40/41's Gas Index is, and remains, never represented as a
-  Matter concentration-cluster value (`docs/matter-bridge.md` section 3.1)
-  -- this pass's real-hardware VOC RAW/INDEX reception does not change
-  that scope decision.
+  distinction. SGP41's row has since been corrected to **Verified**, but
+  strictly scoped to sensor init + POGO/Thread join + Linux ingest
+  reception -- see the Sensors table and "SGP41 real-board result" above
+  for the full evidence and the explicit "not covered by this result"
+  list (the tick-budget timeout fix firing on real hardware, and any
+  Matter-side reception, are both still unconfirmed). SGP40/41's Gas
+  Index is, and remains, never represented as a Matter
+  concentration-cluster value (`docs/matter-bridge.md` section 3.1) --
+  this pass's real-hardware VOC RAW/INDEX reception does not change that
+  scope decision.

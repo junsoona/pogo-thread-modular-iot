@@ -167,7 +167,40 @@ static esp_err_t bh1750_read_measurement(sensor_provider_ctx_t *ctx, sensor_meas
             return ESP_ERR_TIMEOUT;
         }
         if ((xTaskGetTickCount() - wait_start) >= timeout_ticks) {
-            return ESP_ERR_TIMEOUT; /* caller's own wait budget expired; measurement may still be running */
+            /* Same state transition as the elapsed_ms timeout above -- this
+             * is the CALLER's own tick budget running out (a narrow race:
+             * xTaskGetTickCount()'s coarser tick quantization can cross its
+             * threshold slightly before esp_timer_get_time()'s own
+             * elapsed_ms check does for the same real interval, even when
+             * both budgets are configured to the same millisecond value, as
+             * sensor_service_measure_once() always does today), not a
+             * different kind of failure. This used to return ESP_ERR_TIMEOUT
+             * here with NEITHER `measuring` nor `status` updated (the
+             * previous version of this comment noted "measurement may still
+             * be running", true of the physical BH1750 conversion itself,
+             * which the datasheet says completes and auto-powers-down on its
+             * own either way -- but that observation does not extend to this
+             * driver's OWN `status`, which would then stay whatever it was
+             * (SENSOR_STATUS_OK) instead of reporting TIMEOUT for this one
+             * polling cycle, so sensor_service_get_status() would misreport
+             * it as healthy until the NEXT periodic measurement's own
+             * start_measurement()/read_measurement() pair naturally
+             * overwrites it). Separately (and this is the smaller of the two
+             * effects, since sensor_service_measure_once() is this driver's
+             * only production caller and it always calls start_measurement()
+             * again before every read_measurement(), never leaving
+             * `measuring` to be observed stale by a real caller): leaving
+             * `measuring` true here would also make a HYPOTHETICAL second
+             * read_measurement() call with no intervening start_measurement()
+             * silently re-enter this same polling loop against the stale
+             * start_time_us instead of cleanly failing with
+             * ESP_ERR_INVALID_STATE (see the top of this function) -- an
+             * API-contract correctness fix for any future/alternate caller,
+             * not a bug this driver's actual current caller can trigger
+             * today. */
+            ctx->measuring = false;
+            ctx->status = SENSOR_STATUS_TIMEOUT;
+            return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(BH1750_POLL_DELAY_TICKS);
     }

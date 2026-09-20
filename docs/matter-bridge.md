@@ -899,21 +899,18 @@ had physical board or real Linux host access):**
   (see this document's own note above and `docs/validation-status.md`'s
   Sensors table) -- not reported either way this round.
 
-**This pass's own device-type/mandatory-cluster conformance audit
-(Identify on every endpoint, Air Quality on PMS5003 endpoints -- section
-5.1): NOT yet build- or real-hardware-verified.** Like the min/max fix
-pass above, this pass added a new GN dependency
-(`identify-server`/`air-quality-server`, `BUILD.gn`) and new constructor
-call shapes in `chip_endpoint.{hpp,cpp}` that were checked line-by-line
-against a real `connectedhomeip v1.6.0.0` checkout's actual
-`IdentifyCluster.h`/`AirQualityCluster.h` source (cloned fresh this pass)
-but never compiled -- this session still has no Linux host, container, or
-CHIP_ROOT of its own (same constraint as every prior pass; see the
-operator confirmation immediately above for why that gap can only be
-closed by the operator's own real Linux host). The recommended next step
-is exactly the same `tools/build_matter_bridge.sh` + `chip-tool` procedure
-that already confirmed the Illuminance Measurement work above, extended
-with the two new `identify`/`airquality` read commands in section 13.
+**Later operator verification of the device-type/mandatory-cluster additions
+(Identify on dynamic endpoints, Air Quality on PMS5003 -- section 5.1):**
+On the real Linux host, `tools/build_matter_bridge.sh` completed its final
+link against connectedhomeip v1.6.0.0 after these additions. The updated
+bridge ran with its existing commissioned fabric and persistent endpoint
+IDs. `chip-tool identify read identify-time 1 3` (BH1750) and `... 1 4`
+(PMS5003) each returned `IdentifyTime: 0`; `chip-tool identify identify 2
+1 3` and `... 1 4` both completed with Matter status `SUCCESS`. The PMS5003
+endpoint returned `AirQuality: 0` (`Unknown`) from `chip-tool airquality
+read air-quality 1 4`, exactly as designed. This verifies the tested
+endpoints and commands, not SHT45's Identify endpoint, `TriggerEffect`,
+formal Matter certification, or any particular Apple Home/Google Home UI.
 
 ## 15. Test coverage summary
 

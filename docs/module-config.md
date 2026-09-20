@@ -213,8 +213,10 @@ headers they mirror).
 | `sensor_type_bitmap` | `["TEMPERATURE", "HUMIDITY"]` | `["ILLUMINANCE"]` | `["VOC_RAW", "VOC_INDEX"]` | `["VOC_RAW", "VOC_INDEX", "NOX_RAW", "NOX_INDEX"]` |
 | `measurement_timeout_ms` | 200 | 300 | 200 | 200 |
 
-SGP40/SGP41 notes (real hardware for these two boards is still **not**
-wired/tested -- see docs/validation-status.md):
+SGP40/SGP41 notes (both sensors' output and Linux ingest reception have
+been observed on real hardware, scoped to sensor init + POGO/Thread join
++ Linux ingest reception -- see docs/validation-status.md for the
+per-sensor evidence and what remains unverified, e.g. the Matter side):
 
 - `measurement_timeout_ms=200` is chosen the same way as SHT45's: it must
   stay comfortably above the driver's own hardware measurement ceiling
