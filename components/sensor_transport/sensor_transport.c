@@ -17,6 +17,7 @@
 #include "node_calc/node_calc.h"
 #include "topology_gate/topology_gate.h"
 #include "coap_response_timing/coap_response_timing.h"
+#include "thread_manager/thread_manager.h"
 
 static const char *TAG = "sensor_transport";
 
@@ -330,6 +331,18 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
                  sample->module_uuid[6], sample->module_uuid[7], (unsigned)sample->sample_seq);
         return;
     }
+    /*
+     * Thread radio multi-hop diagnostic (see docs/validation-status.md's
+     * "Thread radio multi-hop routing" section): re-checks this device's
+     * CURRENT Thread radio parent right at this sample's own transmission
+     * point, not just at join time -- thread_manager's own
+     * OT_CHANGED_THREAD_ROLE hook cannot see a parent change that never
+     * takes otDeviceRole out of CHILD. Logs only on the first observation
+     * or an actual parent change (never once per sample/retry -- see that
+     * function's own header comment), does nothing while not CHILD, and
+     * never affects what gets sent below or this function's own retry
+     * behavior -- diagnostic only. */
+    thread_manager_check_parent_for_sample();
     uint8_t payload[SENSOR_CHANNEL_MAX_WIRE_LEN];
     size_t len = sensor_channel_pack(sample, payload, sizeof(payload));
     if (len == 0) {

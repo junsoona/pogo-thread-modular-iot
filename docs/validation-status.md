@@ -184,17 +184,17 @@ the Power Base -- OpenThread's own mesh routing could equally have delivered tha
 direct radio link between the LEAF and the Power Base (or via some other router already in
 range), independent of the POGO chain's physical shape.
 
-### This pass: automatic radio-parent/role logging (code only, not yet run on real hardware)
+### Part 1 (an earlier pass): automatic radio-parent/role logging on role change
 
 Investigated the existing OpenThread state-change path first rather than adding a new one:
 `components/thread_manager/thread_manager.c` already registers `ot_state_changed_cb()` via
 `otSetStateChangedCallback()` on every role (Power Base, INTERMEDIATE, LEAF all call
 `thread_manager_init()`), and already reacts to `OT_CHANGED_THREAD_ROLE` -- the correct,
 already-existing hook for "this device's own role/parent just changed," fired only on a real
-transition, never on a timer. This pass extends that SAME callback (new
-`log_role_and_parent()`, called only from inside `ot_state_changed_cb()`, so it still only runs
-on an actual role-change event -- no new polling task, no repeated logging while nothing
-changes) to also log, using the real, unmodified `otLinkGetExtendedAddress()`:
+transition, never on a timer. That pass extended that SAME callback (`log_role_and_parent()`,
+called only from inside `ot_state_changed_cb()`, so it still only runs on an actual role-change
+event -- no new polling task, no repeated logging while nothing changes) to also log, using the
+real, unmodified `otLinkGetExtendedAddress()`:
 
 - This device's own Extended Address and `otDeviceRole`, on every role change, for every role
   (Power Base, INTERMEDIATE, LEAF) -- so a LEAF's reported parent can be matched against an
@@ -204,65 +204,90 @@ changes) to also log, using the real, unmodified `otLinkGetExtendedAddress()`:
   it reads OpenThread's own MLE parent record, never `power_base_transport.c`'s
   application-layer topology report.
 
-Log line (new this pass, `TAG=thread_manager`):
+Log line: `thread radio: role=<n>(<ROLE>) own_ext_addr=xx:...:xx [parent_ext_addr=xx:...:xx
+parent_rloc16=0x----]` (the `parent_*` fields only present while `role=CHILD`).
 
-```
-thread radio: role=<n>(<ROLE>) own_ext_addr=xx:xx:xx:xx:xx:xx:xx:xx [parent_ext_addr=xx:xx:xx:xx:xx:xx:xx:xx parent_rloc16=0x----]
-```
+**Gap found in this mechanism (why part 2 below exists):** part 1 only fires on
+`OT_CHANGED_THREAD_ROLE` -- a LEAF attaching, detaching, or re-attaching through a `DETACHED`
+transition. It does **not** see a parent change that keeps `otDeviceRole` at `CHILD` the whole
+time (a reparent that never passes back through `DETACHED`), and, more importantly for judging
+any one sample, it only captures the parent **at join time** -- not necessarily who the parent
+still is by the time a LEAF's `/s` sample is actually sent, possibly much later. Join-time parent
+address plus a later, separately-timed Linux reception is not enough to attribute that specific
+sample to a specific radio path.
 
-(the `parent_*` fields are only present while `role=CHILD`; ROUTER/LEADER/DETACHED/DISABLED log
-only their own address).
+### Part 2 (this pass): parent re-check at each `/s` sample transmission
 
-Locking: every OpenThread API call added this pass runs from inside `ot_state_changed_cb()`
-itself, which already runs on the OpenThread task -- per the existing rule already documented at
-that callback's own top ("Called back from inside the OpenThread task itself: the API lock must
-NOT be taken again here"), no `esp_openthread_lock_acquire()`/`release()` call was added or
-needed. No POGO protocol byte, sensor measurement period, SED link-mode setting, OTBR Dataset,
-Matter endpoint ID, or Matter pairing/fabric store was touched -- this is logging only.
+Closes the gap above without a new polling task or timer: `sensor_transport_send_sample()`
+(`components/sensor_transport/sensor_transport.c`) already runs once per real sample -- this
+pass adds a call to a new `thread_manager_check_parent_for_sample()` right before that function
+packs and sends the payload (after the existing topology-gate early-return, so it only runs when
+a real transmission attempt is actually about to happen). This ties the parent re-check to an
+event that was already going to happen anyway, rather than inventing a new one.
 
-**Known limitation of this mechanism** (documented, not fixed): it fires on `OT_CHANGED_THREAD_ROLE`,
-which covers a LEAF attaching, detaching, or re-attaching through a `DETACHED` transition (the
-normal Thread MLE behavior for losing and finding a parent) -- it would NOT separately log a
-parent change that somehow never causes `otDeviceRole` to leave `CHILD` even momentarily (an
-edge case OpenThread's own MLE implementation does not appear to produce for a simple parent
-loss/switch, but has not been independently confirmed absent on this project's own real
-hardware).
+`thread_manager_check_parent_for_sample()` (`components/thread_manager/thread_manager.c`):
+acquires the OpenThread API lock itself (unlike part 1's callback, this runs on
+`sensor_transport`'s own task, never the OpenThread task, so -- per the existing locking rule --
+the lock MUST be taken here), reads the current role and, only while `CHILD`, the current parent
+via the same real `otThreadGetParentInfo()`. Logs (`thread radio: parent re-check at sample send
+-- parent_ext_addr=... parent_rloc16=...`) **only** on the first observation or when the parent's
+Extended Address actually differs from the last one this function logged (a small critical
+section around a cached last-logged address, same short-critical-section idiom
+`sensor_transport.c`'s own `s_send_lock` already uses) -- an unchanged parent produces no log
+line at all, no matter how many samples or retries call it. Does nothing while not `CHILD`
+(INTERMEDIATE/Power Base already get their own address from part 1).
 
-**Build verification only, no real-hardware run yet**: real ESP-IDF v6.1 `module` and
-`power_base` fullclean-equivalent builds (a touched `thread_manager.c` forcing a real
-recompile of just this file, then full link) both completed with zero warnings.
-`thread_manager.c` remains not host-compilable (real OpenThread/FreeRTOS dependencies), same as
-before this pass -- see other rows in this document for that same pre-existing limitation.
+Dependency direction: `sensor_transport` gains a one-way `REQUIRES thread_manager`
+(`components/sensor_transport/CMakeLists.txt`) -- consistent with the existing precedent
+(`child_service` already requires both `sensor_service` and `thread_manager`); `thread_manager`
+itself has no dependency back onto `sensor_transport` or anything that depends on it, so this
+introduces no cycle. `sensor_transport_send_sample()`'s own retry loop, backoff schedule, and
+payload are completely unchanged -- the new call is a side-effect-free diagnostic read that
+never affects what gets sent or how many times.
 
-### Judgement criteria for the next real-hardware pass
+**Build verification only, no real-hardware run yet**: real ESP-IDF v6.1 `module` build
+(`sensor_transport` links against `module` only, not `power_base`) and a real `power_base` build
+(confirming `thread_manager.c`'s own shared change still compiles cleanly there) both completed
+with zero warnings, with `thread_manager.c`/`sensor_transport.c` force-recompiled to confirm.
+Neither file is host-compilable (real OpenThread/FreeRTOS dependencies), unchanged from before
+this pass.
+
+### Judgement criteria for the next real-hardware pass (revised this pass)
 
 Do **not** force a particular route, change routing preference, or modify the Dataset to try to
 produce a desired result -- this diagnostic only observes whatever OpenThread itself already
 decided.
 
-Capture the `idf.py monitor` log from all three devices (Power Base, INTERMEDIATE, LEAF) across
-a reboot/(re)join of the LEAF, and read each device's own `thread radio: ...` line(s):
+**Join-time parent address plus a later, separately-timed Linux sample arrival is NOT sufficient
+to confirm multi-hop** -- the parent may have changed between join and that sample (exactly the
+gap part 2 above exists to close). Use the parent recorded by part 2's re-check, from the same
+sample-send window as the sample actually being judged:
 
-1. **Genuine radio multi-hop through the INTERMEDIATE is confirmed** when ALL of the following
-   hold from the same capture window: (a) the LEAF's `parent_ext_addr` equals the
-   INTERMEDIATE's own logged `own_ext_addr`; (b) the INTERMEDIATE's own line shows
-   `role=ROUTER` (or `LEADER`, though INTERMEDIATE is never expected to be Leader) -- i.e. it is
-   genuinely acting as a Thread router, not merely attached as a child itself; and (c) a LEAF
-   sensor sample is independently confirmed reaching Linux ingest (see "Linux northbound
-   bridge" above) during that same window.
-2. **Only POGO depth=2 is confirmed, radio multi-hop is NOT** when the LEAF's `parent_ext_addr`
-   instead matches the Power Base's own logged `own_ext_addr` (or, under EXTERNAL_OTBR, some
-   other router the OTBR itself exposes) -- the LEAF attached directly over the radio, and the
-   POGO chain's physical docking order is not what carried that CoAP traffic. This is a valid,
-   expected OpenThread outcome, not a bug -- mesh routing is free to pick the best available
-   radio path independent of physical docking order.
+1. **Genuine radio multi-hop through the INTERMEDIATE is confirmed** for a given sample only
+   when ALL of the following hold together: (a) that sample's own `parent re-check at sample
+   send` line (or the most recent one logged before it, if this particular send didn't trigger a
+   change) shows `parent_ext_addr` equal to the INTERMEDIATE's own logged `own_ext_addr`
+   (from part 1); (b) the INTERMEDIATE's own line shows `role=ROUTER` (or `LEADER`, though
+   INTERMEDIATE is never expected to be Leader) -- i.e. it is genuinely acting as a Thread
+   router, not merely attached as a child itself; and (c) that SAME sample (matched by
+   `sample_seq`) is independently confirmed reaching Linux ingest (see "Linux northbound bridge"
+   above).
+2. **Only POGO depth=2 is confirmed, radio multi-hop is NOT** when the LEAF's parent at
+   sample-send time instead matches the Power Base's own logged `own_ext_addr` (or, under
+   EXTERNAL_OTBR, some other router the OTBR itself exposes) -- the LEAF attached directly over
+   the radio for that sample, and the POGO chain's physical docking order is not what carried
+   that CoAP traffic. This is a valid, expected OpenThread outcome, not a bug -- mesh routing is
+   free to pick the best available radio path independent of physical docking order, and is also
+   the correct verdict if the parent seen at join (part 1) differs from the parent seen at
+   sample-send time (part 2) and neither matches the INTERMEDIATE.
 3. Neither outcome should be recorded in the table below as **Verified** until an operator
-   actually runs this capture on real hardware and states which of the two above was observed;
-   this pass adds the instrumentation only.
+   actually runs this capture on real hardware, ties a specific `sample_seq` to a specific
+   parent re-check log line, and states which of the two above was observed; this pass adds the
+   instrumentation only.
 
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
-| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | The `thread radio: ...` log line above (own Ext Addr + role always; parent Ext Addr + RLOC16 while CHILD) is now emitted automatically on every real role change, on all three roles -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge with the three-point criteria immediately above. Not yet run on real hardware. |
+| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | Own Ext Addr + role logged on every real role change (part 1); the LEAF's CURRENT parent Ext Addr additionally re-checked and logged (on change only) at each real `/s` sample send (part 2, this pass) -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge per-sample with the three-point criteria immediately above; a join-time-only match is not sufficient. Not yet run on real hardware. |
 
 ## Thread join timing (open observation, this pass)
 

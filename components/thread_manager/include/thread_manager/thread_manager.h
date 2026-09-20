@@ -198,6 +198,36 @@ bool thread_manager_poll_role_change(otDeviceRole *out_role);
  */
 const char *thread_manager_role_to_str(otDeviceRole role);
 
+/*
+ * Thread radio multi-hop diagnostic, part 2 (see docs/validation-status.md's
+ * "Thread radio multi-hop routing" section for the full judgement
+ * criteria this feeds, and ot_state_changed_cb()'s own comment in
+ * thread_manager.c for part 1). Part 1 only logs the radio parent on an
+ * actual OT_CHANGED_THREAD_ROLE transition, so it cannot see a parent
+ * change that keeps otDeviceRole at CHILD the whole time (a reparent that
+ * never passes back through DETACHED). This function closes that gap by
+ * re-reading the CURRENT parent right at a LEAF's own sample-transmission
+ * point instead of waiting for a role transition.
+ *
+ * Thread-safe (acquires the OpenThread API lock itself -- unlike
+ * ot_state_changed_cb(), this is called from the CALLER's own task, never
+ * from inside the OpenThread task, so the lock must be taken here). Does
+ * nothing (no OT call, no log) unless the current role is actually CHILD
+ * -- a LEAF's normal state; INTERMEDIATE/Power Base run as ROUTER/LEADER
+ * and already get their own address logged by ot_state_changed_cb() on
+ * every real role change.
+ *
+ * Logs ONLY the first time this is ever called while CHILD, or when the
+ * parent's Extended Address actually differs from the last one this
+ * function logged -- an unchanged parent produces no log line at all, no
+ * matter how many times (how many samples, how many retries of the same
+ * sample) this is called. Intended call site: once per real `/s`
+ * transmission attempt (see sensor_transport.c), never a new polling
+ * task or timer of its own, and never changes what sensor_transport
+ * itself sends or how it retries.
+ */
+void thread_manager_check_parent_for_sample(void);
+
 #ifdef __cplusplus
 }
 #endif

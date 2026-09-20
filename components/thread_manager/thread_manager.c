@@ -19,6 +19,7 @@
 #include "esp_vfs_eventfd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "openthread/ip6.h"
 #include "openthread/thread_ftd.h" /* otThreadSetRouterEligible() -- module always builds FTD (see sdkconfig.defaults) */
 
@@ -90,6 +91,54 @@ static void ot_state_changed_cb(otChangedFlags flags, void *context)
         otDeviceRole role = otThreadGetDeviceRole(instance);
         log_role_and_parent(instance, role);
         xQueueSend(s_role_change_queue, &role, 0);
+    }
+}
+
+/* Guards s_parent_known/s_last_logged_parent below -- read-modify-write from
+ * whatever task calls thread_manager_check_parent_for_sample() (currently
+ * always sensor_transport's own task, but this stays correct even if a
+ * second caller is ever added). Same short-critical-section idiom
+ * sensor_transport.c's own s_send_lock already uses for a comparable
+ * "shared between callers, compare-then-write" case. */
+static portMUX_TYPE s_parent_check_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_parent_known;
+static otExtAddress s_last_logged_parent;
+
+void thread_manager_check_parent_for_sample(void)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return; /* diagnostic only -- never block or fail the caller's real send */
+    }
+    otDeviceRole role = otThreadGetDeviceRole(instance);
+    if (role != OT_DEVICE_ROLE_CHILD) {
+        /* Not a LEAF's normal attached state right now -- nothing to
+         * re-check (own address + role on ROUTER/LEADER transitions are
+         * already covered by ot_state_changed_cb() above). */
+        esp_openthread_lock_release();
+        return;
+    }
+    otRouterInfo parent;
+    otError err = otThreadGetParentInfo(instance, &parent);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        return;
+    }
+
+    bool changed;
+    taskENTER_CRITICAL(&s_parent_check_lock);
+    changed = !s_parent_known || memcmp(&parent.mExtAddress, &s_last_logged_parent, sizeof(otExtAddress)) != 0;
+    if (changed) {
+        s_last_logged_parent = parent.mExtAddress;
+        s_parent_known = true;
+    }
+    taskEXIT_CRITICAL(&s_parent_check_lock);
+
+    if (changed) {
+        char parent_str[24];
+        format_ext_addr(&parent.mExtAddress, parent_str);
+        ESP_LOGI(TAG, "thread radio: parent re-check at sample send -- parent_ext_addr=%s parent_rloc16=0x%04x",
+                 parent_str, parent.mRloc16);
     }
 }
 
