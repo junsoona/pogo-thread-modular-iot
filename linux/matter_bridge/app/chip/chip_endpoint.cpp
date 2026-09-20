@@ -54,11 +54,14 @@ DECLARE_DYNAMIC_CLUSTER(Descriptor::Id, descriptorAttrs, ZAP_CLUSTER_MASK(SERVER
 DECLARE_DYNAMIC_ENDPOINT(moduleEndpointType, moduleClusters);
 
 // (taken from src/app/zap-templates/zcl/data-model/chip/matter-devices.xml,
-// see docs/matter-bridge.md for the investigation these were picked from)
+// cross-checked against a real connectedhomeip v1.6.0.0 checkout at exactly
+// that tag this pass -- see docs/matter-bridge.md for the investigation
+// these were picked from)
 constexpr uint16_t kDeviceTypeBridgedNode = 0x0013;
 constexpr uint16_t kDeviceTypeTempSensor = 0x0302;
 constexpr uint16_t kDeviceTypeHumiditySensor = 0x0307;
 constexpr uint16_t kDeviceTypeAirQualitySensor = 0x002C;
+constexpr uint16_t kDeviceTypeLightSensor = 0x0106;
 constexpr uint16_t kDeviceVersionDefault = 1;
 
 constexpr EmberAfDeviceType kBridgedNodeOnlyDeviceTypes[] = {
@@ -71,6 +74,19 @@ constexpr EmberAfDeviceType kSht45DeviceTypes[] = {
 };
 constexpr EmberAfDeviceType kPms5003DeviceTypes[] = {
     {kDeviceTypeAirQualitySensor, kDeviceVersionDefault},
+    {kDeviceTypeBridgedNode, kDeviceVersionDefault},
+};
+// BH1750-only module: Light Sensor (matter-devices.xml requires Identify +
+// Descriptor + Illuminance Measurement -- this bridge, like
+// examples/bridge-app/linux's own bridged temperature/humidity sensors,
+// does not implement an Identify cluster instance on its dynamic endpoints
+// at all; ZAP's "requireCluster"/"requireAttribute" conformance rules are
+// only enforced for STATIC/zap-declared endpoints, never checked at runtime
+// for a dynamic bridge endpoint like this one -- kSht45DeviceTypes/
+// kPms5003DeviceTypes above already establish this exact precedent for the
+// same device-type family).
+constexpr EmberAfDeviceType kBh1750DeviceTypes[] = {
+    {kDeviceTypeLightSensor, kDeviceVersionDefault},
     {kDeviceTypeBridgedNode, kDeviceVersionDefault},
 };
 
@@ -127,6 +143,14 @@ DataModel::Nullable<float> ToNullable(const matter_bridge::PmConcentrationUgm3 &
     return DataModel::MakeNullable(pm.value);
 }
 
+DataModel::Nullable<uint16_t> ToNullable(const matter_bridge::IlluminanceMeasuredValue &lux)
+{
+    if (lux.state != matter_bridge::Measurement::Valid) {
+        return DataModel::Nullable<uint16_t>();
+    }
+    return DataModel::MakeNullable(lux.value);
+}
+
 // PMS5003's own rated maximum (datasheet: 0..1000 ug/m3 for PM1/PM2.5,
 // 0..1000 ug/m3 for PM10 too) with generous headroom -- this is the
 // cluster's OWN configured valid range (SetMeasuredValue() rejects
@@ -146,6 +170,22 @@ ConcentrationMeasurement::ConcentrationMeasurementCluster::Config MakePmConfig(C
     cfg.maxMeasured = DataModel::MakeNullable(kPmMaxUgm3);
     return cfg;
 }
+
+// This cluster's own configured minMeasuredValue/maxMeasuredValue are
+// matter_bridge::kIlluminanceMeasuredValueMin/Max (value_mapping.hpp) --
+// the SAME shared constants matter_bridge::ConvertIlluminance() itself uses
+// to decide Valid vs. Invalid -- deliberately NOT a narrower,
+// device-tuned bound the way kPmMaxUgm3 above is for PM. An earlier
+// version of this file used a narrower literal (50000, ~99,995 lux) here,
+// which real direct-sunlight illuminance (~100,000 lux, encoding to
+// ~50001) could exceed: ConvertIlluminance() would still report it Valid,
+// but SetMeasuredValue() would reject it (ConstraintError) every single
+// time, forever, since BridgeManager has no way to tell "will succeed on
+// retry" apart from "structurally can never succeed" -- see
+// value_mapping.hpp's own doc comment on kIlluminanceMeasuredValueMax for
+// the full reasoning. Sharing the exact same constant instead of
+// maintaining two independently-tuned bounds makes that class of bug
+// structurally impossible to reintroduce.
 
 } // namespace
 
@@ -194,6 +234,8 @@ bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
         device_types = Span<const EmberAfDeviceType>(kSht45DeviceTypes);
     } else if (update.has_pm1_channel || update.has_pm25_channel || update.has_pm10_channel) {
         device_types = Span<const EmberAfDeviceType>(kPms5003DeviceTypes);
+    } else if (update.has_illuminance_channel) {
+        device_types = Span<const EmberAfDeviceType>(kBh1750DeviceTypes);
     } else {
         // Should not happen -- matter_bridge::BridgeManager never emits an
         // is_new_endpoint update for a module with none of these channels
@@ -260,6 +302,24 @@ bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
         LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->pm10.Registration()));
     }
 
+    if (update.has_illuminance_channel) {
+        // LightSensorType is exposed (BH1750 is a photodiode-based ambient
+        // light sensor per its own datasheet, not a CMOS imager) -- Tolerance
+        // is left unset/unexposed, same as TemperatureMeasurementCluster's
+        // own optional_attrs(0) above: this bridge has no real tolerance
+        // figure from the sensor_channel wire format to report.
+        IlluminanceMeasurementCluster::OptionalAttributeSet optional_attrs;
+        optional_attrs.Set<IlluminanceMeasurement::Attributes::LightSensorType::Id>();
+        ep->illuminance.Create(ep->endpoint_id, optional_attrs,
+                               IlluminanceMeasurementCluster::StartupConfiguration{
+                                   .minMeasuredValue = DataModel::MakeNullable(matter_bridge::kIlluminanceMeasuredValueMin),
+                                   .maxMeasuredValue = DataModel::MakeNullable(matter_bridge::kIlluminanceMeasuredValueMax),
+                                   .tolerance = 0,
+                                   .lightSensorType = DataModel::MakeNullable(IlluminanceMeasurement::LightSensorTypeEnum::kPhotodiode),
+                               });
+        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->illuminance.Registration()));
+    }
+
     modules_[ep->endpoint_id] = std::move(ep);
     return true;
 }
@@ -317,6 +377,11 @@ matter_bridge::ApplyOutcome ChipEndpointManager::Apply(const matter_bridge::Modu
         CHIP_ERROR err = ep.pm10.Cluster().SetMeasuredValue(ToNullable(*update.pm10));
         LogErrorOnFailure(err);
         outcome.pm10_applied = (err == CHIP_NO_ERROR);
+    }
+    if (update.illuminance.has_value() && ep.illuminance.IsConstructed()) {
+        CHIP_ERROR err = ep.illuminance.Cluster().SetMeasuredValue(ToNullable(*update.illuminance));
+        LogErrorOnFailure(err);
+        outcome.illuminance_applied = (err == CHIP_NO_ERROR);
     }
     return outcome;
 }

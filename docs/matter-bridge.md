@@ -58,8 +58,8 @@ itself -- see section 7.
 | `SENSOR_CHANNEL_PM1_0`        | PMS5003  | PM1 Concentration Measurement       | 0x042C     |
 | `SENSOR_CHANNEL_PM2_5`        | PMS5003  | PM2.5 Concentration Measurement     | 0x042A     |
 | `SENSOR_CHANNEL_PM10`         | PMS5003  | PM10 Concentration Measurement      | 0x042D     |
-| `SENSOR_CHANNEL_ILLUMINANCE`  | BH1750   | *(not bridged in this MVP)*         | --         |
-| `SENSOR_CHANNEL_VOC_*`/`NOX_*`| SGP40/41 | *(not bridged in this MVP)*         | --         |
+| `SENSOR_CHANNEL_ILLUMINANCE`  | BH1750   | Illuminance Measurement             | 0x0400     |
+| `SENSOR_CHANNEL_VOC_*`/`NOX_*`| SGP40/41 | *(not bridged -- see 3.1)*          | --         |
 
 Conversion is pure, CHIP-SDK-independent logic in
 `linux/matter_bridge/app/core/include/matter_bridge/value_mapping.hpp` /
@@ -82,23 +82,58 @@ Conversion is pure, CHIP-SDK-independent logic in
   with `minMeasured=0`, `maxMeasured=2000` (PMS5003's own rated range with
   headroom) -- `SetMeasuredValue()` enforces that range independently (see
   `chip/chip_endpoint.cpp`).
+- **Illuminance** (BH1750, added this pass): `sensor_channel` reports
+  milli-lux (`SENSOR_SCALE_MILLI`, see `components/bh1750/bh1750_convert.c`).
+  Matter's Illuminance Measurement `MeasuredValue` is **not** lux or
+  milli-lux -- it is the CSA/ZCL log-encoded `uint16` the cluster spec
+  defines (confirmed against `src/app/clusters/illuminance-measurement-server/
+  IlluminanceMeasurementCluster.{h,cpp}` and
+  `data_model/1.6/clusters/IlluminanceMeasurement.xml` in a real
+  `connectedhomeip v1.6.0.0` checkout at exactly that tag, cloned this pass
+  specifically to confirm this API and formula rather than assume them):
+  `MeasuredValue = round(10000 * log10(lux)) + 1` for `lux >= 1`, and the
+  spec's own `MeasuredValue = 0` "too low to be measured" sentinel for any
+  `lux < 1` (including exactly 0 -- the log formula is undefined/nonsensical
+  below 1 lux and is never evaluated there). Rejected (never clamped) if the
+  wire scale isn't `SENSOR_SCALE_MILLI`, the raw value is negative, or the
+  encoded result somehow falls outside `[1, 65534]` (the attribute's own
+  absolute representable ceiling -- mathematically unreachable for any real
+  32-bit non-negative milli-lux value, since even `INT32_MAX` millilux
+  encodes to ~63,320, but guarded rather than assumed, same as
+  `ConvertTemperature()`/`ConvertHumidity()`'s own range checks). The
+  cluster itself is additionally configured with `minMeasuredValue=1`,
+  `maxMeasuredValue=50000` (~99,995 lux -- generous headroom over this
+  driver's own realistic ~54,612 lux ceiling at `raw=65535`,
+  `correction_permille=1000`; see `chip/chip_endpoint.cpp`'s own comment)
+  and `lightSensorType=Photodiode` (BH1750's own sensing element per its
+  datasheet) -- `SetMeasuredValue()` enforces the min/max range
+  independently, same division of responsibility as the PM clusters above.
+  See `value_mapping.hpp`'s own `IlluminanceMeasuredValue` doc comment and
+  `core/tests/test_value_mapping.cpp`'s `ConvertIlluminance` scenarios
+  (boundary values at exactly 1 lux, just under 1 lux, exactly 0, this
+  pass's own real field-test range of 18-15,273 lux -- see section 14 --
+  and the near-`INT32_MAX` non-overflow case).
 
-### 3.1 VOC/NOx and illuminance: not bridged in this MVP
+### 3.1 VOC/NOx: not bridged in this MVP
 
 `SENSOR_CHANNEL_VOC_RAW`/`VOC_INDEX` (SGP40, SGP41) and
 `SENSOR_CHANNEL_NOX_RAW`/`NOX_INDEX` (SGP41) are Sensirion's own **Gas
 Index** values (0..500, unitless, algorithmically derived -- see
 `components/sensirion_gas_index_algorithm`), not a calibrated gas
 concentration in any real unit. `pogo_matter_bridge` never publishes a Gas
-Index as a VOC Concentration Measurement `MeasuredValue`, and does not
-define a manufacturer-specific cluster for it either -- `bridge_manager.cpp`
-simply never creates an endpoint for a module whose `sensor_bitmap` has
-none of the five bridged channel bits set (a BH1750-only or
-SGP40/41-only module gets **no Matter endpoint at all**, not an empty
-one), and never routes these channel types through `Apply()` even for a
-module that also has a bridged channel. `SENSOR_CHANNEL_ILLUMINANCE`
-(BH1750) is left for a future revision (Illuminance Measurement cluster,
-0x0400) -- explicitly out of scope here.
+Index as a VOC Concentration Measurement `MeasuredValue` (that cluster's
+`MeasuredValue` is defined in a real concentration unit -- µg/m³, ppm, etc
+-- and a unitless 0..500 index dressed up as one would misrepresent it to
+every Matter controller/app that reads it), and does not define a
+manufacturer-specific cluster for it either -- `bridge_manager.cpp` simply
+never creates an endpoint for a module whose `sensor_bitmap` has none of
+the six bridged channel bits set (an SGP40/41-only module gets **no
+Matter endpoint at all**, not an empty one), and never routes these
+channel types through `Apply()` even for a module that also has a bridged
+channel. This is out of scope for any future revision of this MVP too,
+absent an actual calibrated concentration reading from a different
+sensor -- a Gas Index number simply has no correct Matter representation
+today.
 
 ### 3.2 Non-OK channel status -> null, never the stale value
 
@@ -149,13 +184,23 @@ reading may be stale" without discarding it (see
     registered directly (never ember-declared), `UniqueId` = the
     `module_uuid`'s own lowercase-hex encoding.
   - **Temperature Measurement** / **Relative Humidity Measurement**
-    (SHT45) or **Pm1/Pm25/Pm10ConcentrationMeasurement** (PMS5003) --
-    whichever the module's `sensor_bitmap` declares, each the modern
-    v1.6.0.0 code-driven `ServerCluster` class for that cluster
+    (SHT45), **Pm1/Pm25/Pm10ConcentrationMeasurement** (PMS5003), or
+    **Illuminance Measurement** (BH1750, added this pass) -- whichever the
+    module's `sensor_bitmap` declares, each the modern v1.6.0.0
+    code-driven `ServerCluster` class for that cluster
     (`TemperatureMeasurementCluster`, `RelativeHumidityMeasurementCluster`,
-    `ConcentrationMeasurementCluster`), constructed and registered
-    directly, exactly the same registration mechanism Bridged Device Basic
-    Information uses.
+    `ConcentrationMeasurementCluster`, `IlluminanceMeasurementCluster`),
+    constructed and registered directly, exactly the same registration
+    mechanism Bridged Device Basic Information uses. A BH1750-only
+    endpoint's `DeviceTypeList` is `{Light Sensor (0x0106), Bridged Node
+    (0x0013)}` (`matter-devices.xml`'s Light Sensor device type also lists
+    Identify as required, but -- exactly like this bridge's existing
+    Temperature/Humidity/Air-Quality-Sensor device types, and
+    `examples/bridge-app/linux`'s own bridged temperature sensors -- no
+    Identify cluster instance is implemented on this dynamic endpoint;
+    ZAP's `requireCluster` conformance is only enforced for STATIC
+    zap-declared endpoints, never checked at runtime for a dynamic bridge
+    endpoint).
 
 ## 6. Dynamic-endpoint constraint investigation: no child endpoints needed
 
@@ -247,6 +292,91 @@ this round: no arbitrary "pick one" resolution, and whatever Matter state
 already existed (if any) is left exactly as-is until the conflict resolves
 back down to at most one online source. Covered by
 `core/tests/test_bridge_manager.cpp`.
+
+### 8.2 A module_uuid's sensor hardware changing while the bridge runs: detected, never silently kept (this pass)
+
+This bridge's whole endpoint-creation design assumes a `module_uuid`'s
+`sensor_bitmap` is fixed for that module's entire lifetime, set once, the
+first time it's ever seen (section 2, section 8) -- **this remains the
+policy for a real deployed module** and is not changed by anything below.
+It does not hold, however, for a single physical development/test board
+whose sensor is deliberately swapped while `pogo_matter_bridge` keeps
+running (the exact scenario this pass's own hardware validation used: the
+same ESP32-H2 board `..d357` reconfigured SHT45 -> BH1750 -> SGP40, one at
+a time, without restarting the bridge in between).
+
+Without any handling, this would be silent and permanently broken: the
+endpoint already exists (via `EndpointStore`, keyed by `module_uuid`, and
+in `ChipEndpointManager::modules_`) with whichever clusters the ORIGINAL
+sensor declared, and the newly-reported channel type has no cluster on
+that endpoint to receive it -- `SetMeasuredValue()` would never even be
+called (the cluster's `LazyRegisteredServerCluster` was never
+`Create()`'d), so the new reading would simply vanish with no error
+anywhere.
+
+**What this bridge actually does instead:**
+
+- `matter_bridge::BridgeManager` records the bridgeable `sensor_bitmap`
+  bits (illuminance/temperature/humidity/pm1/pm25/pm10) a module's
+  endpoint was ACTUALLY created with (`ModuleUpdate::declared_sensor_bitmap`,
+  persisted into `CommitApplied()`'s `LastApplied` entry only once, at
+  creation). Every later `Reconcile()` pass compares the CURRENT
+  topology-reported `sensor_bitmap` against that recorded value.
+- A mismatch is recorded and observable via
+  `BridgeManager::SensorBitmapMismatches()` (same style as
+  `ConflictedModules()`), and `chip/main.cpp`'s registry-watcher thread
+  logs it once per `module_uuid` (`ChipLogError`, see
+  `LogNewSensorBitmapMismatches()`) -- unlike a Power-Base conflict, this
+  does **not** self-resolve; it persists until the process restarts.
+- While mismatched, `Reconcile()`/`ReconcileOne()` **never** produce a
+  value for a channel type outside the endpoint's ORIGINAL declared set --
+  the new sensor's readings are computed by `value_mapping.cpp` exactly as
+  normal, but withheld before ever reaching `ChipEndpointManager::Apply()`,
+  so this bridge never repeatedly calls a doomed `SetMeasuredValue()`
+  against a cluster that doesn't exist. Channels that WERE part of the
+  original declaration (e.g. Reachable) keep working normally throughout.
+  This is a detection-and-withhold policy, not an auto-migration one --
+  see `core/tests/test_bridge_manager.cpp`'s sensor-bitmap-mismatch
+  scenario for the exact before/after behavior, including the "nothing to
+  say" case (no field in the original declaration changed, so no
+  `ModuleUpdate` is emitted at all even though the mismatch is still
+  recorded) and the "a real Reachable transition still happens, but the
+  new channel is still withheld" case.
+
+**Restart procedure for development-time sensor swap testing** (this
+does NOT apply to, and must never be used to justify changing, the fixed
+sensor-identification policy for a real deployed module):
+
+1. Reconfigure/reflash the physical test board with the new sensor.
+2. Restart `pogo_matter_bridge` itself (the whole process -- e.g.
+   `systemctl restart <the unit>`, or re-run the binary). Do **not**
+   delete or edit `<state-dir>/endpoint_map.bin` -- that is exactly what
+   makes the next step preserve the same numeric endpoint id.
+3. On restart, `BridgeManager`'s in-memory `last_applied_`/
+   `declared_sensor_bitmap` state starts empty (this state was never
+   persisted -- only `EndpointStore`'s `module_uuid -> endpoint id`
+   mapping is). The first `TOPOLOGY_SNAPSHOT` this `module_uuid` sends
+   after restart (the Power Base's own periodic full resync, at most 5s,
+   same as section 8's own startup-behavior note) is therefore seen as
+   `is_new` again, and `ChipEndpointManager::CreateEndpoint()` runs fresh,
+   registering whichever clusters the CURRENT `sensor_bitmap` declares --
+   on the SAME persisted endpoint id (`EndpointStore::get_or_assign()` is
+   idempotent per `module_uuid`), so a controller's existing binding to
+   that endpoint id is preserved even though its cluster set just changed
+   underneath it.
+4. Re-commission is **not** required for this -- the endpoint id and the
+   device's overall Matter identity (`UniqueId` = the same `module_uuid`
+   hex string) are unchanged; only re-read the specific attributes that
+   are now relevant (a controller that already subscribed to the old
+   cluster's attributes will simply stop getting updates for it, since
+   that cluster is no longer registered on the endpoint after the
+   restart).
+
+This procedure is a development-only workaround for repeatedly
+reconfiguring ONE physical test board; it is not a supported production
+migration path, and no code in this bridge tries to make an in-place
+cluster-set change happen without a restart (see the withholding behavior
+above).
 
 ## 9. Threading model
 
@@ -448,7 +578,15 @@ chip-tool bridgeddevicebasicinformation read reachable 1 <module endpoint id>
 chip-tool temperaturemeasurement read measured-value 1 <module endpoint id>
 chip-tool relativehumiditymeasurement read measured-value 1 <module endpoint id>
 chip-tool pm25concentrationmeasurement read measured-value 1 <module endpoint id>
+chip-tool illuminancemeasurement read measured-value 1 <module endpoint id>
 ```
+
+`illuminancemeasurement read measured-value` returns the CSA log-encoded
+`uint16` (see section 3's own Illuminance entry), not lux -- convert with
+`lux = 10 ^ ((MeasuredValue - 1) / 10000)` (or `MeasuredValue == 0` means
+"too low to be measured") to sanity-check it against what the module is
+actually seeing. `chip-tool illuminancemeasurement read light-sensor-type
+1 <module endpoint id>` should read back `Photodiode` (0).
 
 Test Vendor ID/Product ID: this application uses connectedhomeip's own
 standard `config/standalone` **test** VID/PID (`chip::VendorId::TestVendor1`
@@ -548,6 +686,103 @@ coverage of the underlying `BridgeManager` logic those two files call into.
 A real cross-toolchain-equipped (or native Linux) re-run of `ninja -k`
 against these exact two files is the top recommended follow-up before
 deploying this pass's Matter-side change.
+
+**This pass's own attempt (BH1750 -> Illuminance Measurement bridging,
+sensor-bitmap-mismatch detection):**
+
+**Pre-deploy correction pass (before this feature shipped, same overall
+effort):** code review found a real bug in the pass above before any real
+hardware saw it: `linux/matter_bridge/app/BUILD.gn` never gained a
+dependency on `${chip_root}/src/app/clusters/illuminance-measurement-server`
+(now added -- every other cluster this bridge uses was already listed
+there), and `chip_endpoint.cpp` configured this cluster's own
+`maxMeasuredValue` as a narrower, device-tuned `50000` (~99,995 lux)
+while `matter_bridge::ConvertIlluminance()` itself accepted encoded values
+up to `65534` -- real direct-sunlight illuminance (~100,000 lux, encoding
+to `50001`) would have converted successfully but then been permanently
+rejected by `SetMeasuredValue()`'s own `ConstraintError`, retried forever,
+never reaching Matter. Fixed by sharing ONE pair of constants
+(`matter_bridge::kIlluminanceMeasuredValueMin`/`Max`, in
+`value_mapping.hpp`) between `ConvertIlluminance()` and
+`chip_endpoint.cpp`'s `StartupConfiguration`, so the two layers can no
+longer drift apart -- see `value_mapping.hpp`'s own doc comment on
+`kIlluminanceMeasuredValueMax` for the full reasoning. A new regression
+test (`core/tests/test_value_mapping.cpp`, the "100,000 lux direct
+sunlight" scenario) asserts this against the real production constant,
+not a hardcoded literal, so this specific class of drift cannot silently
+reappear. **Not attempted in this correction pass either** (explicitly
+deferred to the operator, who has the actual Linux OTBR host and BH1750
+hardware this needs): the real `tools/build_matter_bridge.sh` final
+compile+link on a real Linux host, and `chip-tool` verification that
+`MeasuredValue` actually updates from a real BH1750 sample -- see this
+document's own "Building"/"Running"/"Commissioning and verification"
+sections (11-13) and section 8.2's restart procedure for exactly how to
+run that.
+
+- **Real hardware, confirmed (reported by the operator for this pass, not
+  reproduced inside this session, which had no physical board access)**:
+  a real BH1750 on the same intermediate-module position previously used
+  for SHT45 (module `..d357`) produced real CoAP `SAMPLE` traffic that
+  `linux/matter_bridge/ingest`'s existing, unmodified `Registry` received
+  and decoded correctly -- `type=0` (`SENSOR_CHANNEL_ILLUMINANCE`),
+  `scale=1` (`SENSOR_SCALE_MILLI`), `status=0` (OK), values swinging from
+  18 to 15,273 lux under real shading/lighting changes. The existing
+  PMS5003-terminal 3-tier chain (Power Base -> intermediate -> PMS5003
+  LEAF) continued working with BH1750 in the intermediate position, and a
+  real SGP40 separately produced VOC RAW/INDEX samples the same ingest
+  path also received correctly. **This confirms the real sensor hardware,
+  its firmware driver, the wire format, and Linux ingest reception** --
+  it does NOT confirm anything below this bullet, since no
+  `pogo_matter_bridge` process (the `chip/` binary that actually creates
+  Matter endpoints) was run against this hardware.
+- **Source-verified, not build-verified, this pass**: this pass cloned the
+  real `connectedhomeip` repository at exactly tag `v1.6.0.0` (sparse
+  checkout, verified via `git describe --tags --exact-match` = `v1.6.0.0`)
+  specifically to read `IlluminanceMeasurementCluster.{h,cpp}`,
+  `illuminance-measurement-server/tests/TestIlluminanceMeasurementCluster.cpp`,
+  `matter-devices.xml` (Light Sensor device type, 0x0106), and
+  `data_model/1.6/clusters/IlluminanceMeasurement.xml` (the formal
+  attribute constraints) directly, rather than assume the CSA log-encoding
+  formula, valid ranges, or constructor/`SetMeasuredValue()` signatures
+  from general knowledge or from the already-compiled sibling clusters'
+  shapes (the prior pass's own stated method, see the paragraph above).
+  `chip_endpoint.{hpp,cpp}`'s new `IlluminanceMeasurementCluster` wiring
+  (constructor `StartupConfiguration`, `OptionalAttributeSet`,
+  `SetMeasuredValue(DataModel::Nullable<uint16_t>)`) is a direct match to
+  that real source, not a guess.
+- **NOT attempted this pass**: cloning the FULL (non-sparse)
+  `connectedhomeip v1.6.0.0` tree, `gn gen`, `ninja`, linking, running the
+  actual `pogo_matter_bridge` binary, or `chip-tool` commissioning/reads --
+  none of these were run, so none of them are claimed. This is a stricter
+  scope cut than the prior two passes above (which did attempt `gn
+  gen`/`ninja` against a full checkout); it was made deliberately given
+  this pass's own time/resource budget, favoring exact-source API
+  verification over a partial build attempt. **The single highest-value
+  follow-up is exactly what section 11-13 already describe**: a real
+  Ubuntu x86_64 (or Linux container) build + `chip-tool` run, now
+  additionally exercising `illuminancemeasurement read measured-value`
+  (section 13) against real BH1750 hardware.
+- **Apple Home / Google Home**: Illuminance Measurement (0x0400) and the
+  Light Sensor device type (0x0106) are both mandatory, standard Matter
+  elements (not manufacturer-specific) -- so, as a matter of protocol
+  conformance, a Matter controller that already renders an ambient-light
+  sensor for a standard Light Sensor endpoint should render this one the
+  same way. That is a **standard-cluster-conformance expectation**, not an
+  observed result: this session did not pair this bridge with an actual
+  Apple Home or Google Home hub, and this document makes no claim about
+  either app's specific UI for this cluster. Do not conflate the two --
+  the distinction docs/validation-status.md's Sensors table also
+  preserves.
+- Host-test coverage (CHIP-SDK-independent, see section 15): the CSA
+  log-encoding boundary values (exactly 1 lux, just under 1 lux, exactly
+  0, this pass's own real 18-15,273 lux field range, and the
+  near-`INT32_MAX` non-overflow case), invalid type/scale/status/negative
+  rejection, a brand-new BH1750-only endpoint's capability flags and
+  initial value, and the sensor-bitmap-mismatch detection/withholding
+  behavior (section 8.2) are all covered by
+  `core/tests/test_value_mapping.cpp` and
+  `core/tests/test_bridge_manager.cpp`, extended this pass -- 133/133
+  checks pass, 0 warnings, including under AddressSanitizer.
 
 ## 15. Test coverage summary
 

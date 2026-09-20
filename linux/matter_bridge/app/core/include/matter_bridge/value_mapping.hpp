@@ -61,6 +61,48 @@ struct PmConcentrationUgm3 {
     bool operator!=(const PmConcentrationUgm3 &o) const { return !(*this == o); }
 };
 
+// Illuminance Measurement's own absolute representable ceiling for
+// MeasuredValue (and the one below the reserved 0xFFFF), per the CSA spec
+// (data_model/1.6/clusters/IlluminanceMeasurement.xml -- MinMeasuredValue
+// itself is constrained to [1, 65533], and MaxMeasuredValue may legally be
+// one above that, 65534, with no real reading ever valid above it either).
+// Shared here (rather than re-typed as a separate literal in
+// linux/matter_bridge/app/chip/chip_endpoint.cpp, this codebase's usual
+// pattern for Temperature/Humidity's own spec-range constants) specifically
+// so this bridge's configured Illuminance Measurement cluster
+// minMeasuredValue/maxMeasuredValue can never be STRICTER than what
+// ConvertIlluminance() itself ever returns as Valid -- a real bug this pass
+// fixes: chip_endpoint.cpp used to configure a narrower, device-tuned
+// maxMeasuredValue of 50000, which real direct-sunlight illuminance
+// (~100,000 lux encodes to ~50001) could exceed, silently and permanently
+// rejected by SetMeasuredValue()'s own ConstraintError every single time
+// (BridgeManager has no way to distinguish "will succeed on retry" from
+// "structurally can never succeed", so it would have retried forever).
+constexpr uint16_t kIlluminanceMeasuredValueMin = 1;
+constexpr uint16_t kIlluminanceMeasuredValueMax = 65534;
+
+struct IlluminanceMeasuredValue {
+    Measurement state = Measurement::Invalid;
+    // Matter IlluminanceMeasurement::MeasuredValue (cluster 0x0400) units:
+    // NOT lux, NOT milli-lux -- this is the CSA-defined log-encoded uint16
+    // (src/app/clusters/illuminance-measurement-server, connectedhomeip
+    // v1.6.0.0, confirmed against that exact tag's real source and
+    // data_model/1.6/clusters/IlluminanceMeasurement.xml):
+    //   lux >= 1:  value = round(10000 * log10(lux)) + 1, valid range
+    //              [kIlluminanceMeasuredValueMin, kIlluminanceMeasuredValueMax]
+    //              (this file's own constants, above).
+    //   lux <  1 (including exactly 0): value = 0, the spec's own "too low
+    //              to be measured" sentinel -- NEVER computed via the log
+    //              formula (log10 of a value < 1 lux would produce a
+    //              nonsensical non-positive encoded value).
+    // Meaningful only when state == Valid; value == 0 is itself a valid
+    // reading (dark/near-zero light), never confused with Invalid/null.
+    uint16_t value = 0;
+
+    bool operator==(const IlluminanceMeasuredValue &o) const { return state == o.state && (state != Measurement::Valid || value == o.value); }
+    bool operator!=(const IlluminanceMeasuredValue &o) const { return !(*this == o); }
+};
+
 // `ch` must be a channel of type SENSOR_CHANNEL_TEMPERATURE (the caller
 // selects the right ChannelReading out of NodeState::last_channels --
 // this function does not search for it). Returns Invalid if ch.type is
@@ -85,5 +127,19 @@ HumidityCentiPercent ConvertHumidity(const ingest::ChannelReading &ch);
 // this function only rejects values that could never be a real
 // concentration reading in the first place.
 PmConcentrationUgm3 ConvertPm(const ingest::ChannelReading &ch);
+
+// `ch` must be SENSOR_CHANNEL_ILLUMINANCE (BH1750). Invalid if ch.status !=
+// OK, ch.scale != SENSOR_SCALE_MILLI (this firmware's own BH1750 driver's
+// only scale for this channel -- see components/bh1750/bh1750.c), or
+// ch.value < 0 (a physically impossible negative lux). Otherwise applies the
+// Illuminance Measurement cluster's own CSA log encoding (see
+// IlluminanceMeasuredValue's own doc comment): raw lux under 1.0 (including
+// exactly 0) becomes the spec's MeasuredValue=0 "too low to measure"
+// sentinel; raw lux >= 1.0 is log-encoded and rejected (never clamped) if
+// the encoded result falls outside the attribute's own representable
+// ceiling -- unreachable for any real BH1750 reading (this driver's own
+// 32-bit milli-lux ceiling encodes to well under that limit) but never
+// silently truncated if it ever were.
+IlluminanceMeasuredValue ConvertIlluminance(const ingest::ChannelReading &ch);
 
 } // namespace matter_bridge

@@ -73,6 +73,21 @@ struct ModuleUpdate {
     bool has_pm1_channel = false;
     bool has_pm25_channel = false;
     bool has_pm10_channel = false;
+    bool has_illuminance_channel = false;
+
+    // This module's bridgeable sensor_bitmap bits (illuminance | temperature
+    // | humidity | pm1 | pm25 | pm10) AT THE MOMENT this endpoint was
+    // created -- only meaningful (and only ever set) when is_new_endpoint is
+    // true. BridgeManager persists this (see CommitApplied()) so a LATER
+    // Reconcile() pass can detect a module_uuid whose topology-reported
+    // sensor_bitmap no longer matches what its already-created endpoint's
+    // cluster set reflects (see SensorBitmapMismatches()'s own doc comment)
+    // -- a real scenario during development when the SAME physical test
+    // board is reflashed/reconfigured with a different sensor while this
+    // bridge process keeps running, never expected for a real deployed
+    // module (see docs/matter-bridge.md's own restart-for-sensor-swap
+    // section).
+    uint16_t declared_sensor_bitmap = 0;
 
     // Present iff the Reachable attribute needs to change (or this is a
     // brand-new endpoint, which always needs an initial value).
@@ -83,6 +98,7 @@ struct ModuleUpdate {
     std::optional<PmConcentrationUgm3> pm1;
     std::optional<PmConcentrationUgm3> pm25;
     std::optional<PmConcentrationUgm3> pm10;
+    std::optional<IlluminanceMeasuredValue> illuminance;
 };
 
 // What actually happened when a caller tried to apply one ModuleUpdate to
@@ -99,6 +115,7 @@ struct ApplyOutcome {
     bool pm1_applied = false;
     bool pm25_applied = false;
     bool pm10_applied = false;
+    bool illuminance_applied = false;
 };
 
 class BridgeManager {
@@ -206,6 +223,31 @@ public:
     // once a later Reconcile() sees at most one online source again.
     std::vector<Uuid> ConflictedModules() const;
 
+    // module_uuids whose CURRENT topology-reported sensor_bitmap (masked to
+    // the bits this bridge acts on: illuminance/temperature/humidity/pm1/
+    // pm25/pm10) no longer matches the bitmap this module's Matter endpoint
+    // was actually CREATED with (ModuleUpdate::declared_sensor_bitmap at the
+    // last confirmed CommitApplied() with endpoint_created==true). This can
+    // only happen if the same physical module_uuid's sensor hardware is
+    // reconfigured while this bridge process keeps running -- see this
+    // header's own top comment on ModuleUpdate::declared_sensor_bitmap and
+    // docs/matter-bridge.md's restart-for-sensor-swap section. Recomputed
+    // fresh on every whole-registry Reconcile() pass (same style as
+    // ConflictedModules()) from every module_uuid currently present in the
+    // snapshot with a known last_applied_ entry -- unlike a conflict, this
+    // does NOT self-resolve (the endpoint's actual cluster set never changes
+    // without a process restart), so a module_uuid here stays here for the
+    // remainder of this process's lifetime once its sensor genuinely
+    // changes. While a module_uuid is in this list, Reconcile()/
+    // ReconcileOne() never emit a value for a channel type that is not part
+    // of its ORIGINAL declared_sensor_bitmap (see ComputeUpdateForModule()'s
+    // own top comment) -- this bridge never silently keeps trying (and
+    // silently failing) to push a reading onto a cluster its endpoint was
+    // never actually given, and never fabricates a new cluster for it
+    // in-place either (this bridge's fixed-sensor-module-identity policy for
+    // a real deployed module is unchanged -- see docs/matter-bridge.md).
+    std::vector<Uuid> SensorBitmapMismatches() const;
+
 private:
     struct LastApplied {
         bool has_reachable = false;
@@ -220,6 +262,15 @@ private:
         PmConcentrationUgm3 pm25;
         bool has_pm10 = false;
         PmConcentrationUgm3 pm10;
+        bool has_illuminance = false;
+        IlluminanceMeasuredValue illuminance;
+        // The sensor_bitmap (masked) this module's endpoint was actually
+        // created with -- see ModuleUpdate::declared_sensor_bitmap's own doc
+        // comment. Set once, when this LastApplied entry is first created
+        // (endpoint_created confirmed), never updated afterward -- this IS
+        // the "original declaration" SensorBitmapMismatches() compares
+        // against.
+        uint16_t declared_sensor_bitmap = 0;
     };
 
     struct ScheduleState {
@@ -235,15 +286,23 @@ private:
     // WITHOUT mutating last_applied_ (see this header's own top comment --
     // that now only ever happens in CommitApplied()). Sets *out_conflicted
     // and returns std::nullopt if more than one entry is online at once.
+    // Sets *out_mismatched (independent of *out_conflicted) if this is an
+    // EXISTING module_uuid whose current sensor_bitmap no longer matches
+    // last_applied_'s own declared_sensor_bitmap -- see
+    // SensorBitmapMismatches()'s own doc comment; a mismatched module still
+    // gets a normal (possibly empty) update for its ORIGINALLY-declared
+    // channels, it simply never gains a value for a channel type outside
+    // that original declaration.
     std::optional<ModuleUpdate> ComputeUpdateForModule(const Uuid &module_uuid,
                                                          const std::vector<const ingest::NodeState *> &entries,
-                                                         bool *out_conflicted);
+                                                         bool *out_conflicted, bool *out_mismatched);
 
     EndpointStore &endpoint_store_;
     mutable std::mutex mutex_;
     std::unordered_map<Uuid, LastApplied, UuidHash> last_applied_;
     std::unordered_map<Uuid, ScheduleState, UuidHash> schedule_state_;
     std::vector<Uuid> conflicted_;
+    std::vector<Uuid> sensor_bitmap_mismatches_;
 };
 
 } // namespace matter_bridge

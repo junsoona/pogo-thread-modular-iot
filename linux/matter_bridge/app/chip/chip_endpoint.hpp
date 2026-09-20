@@ -21,12 +21,12 @@
 //     "one endpoint per measurement". Every channel this bridge supports
 //     maps to a DIFFERENT cluster ID (TemperatureMeasurement 0x0402,
 //     RelativeHumidityMeasurement 0x0405, Pm25/Pm1/Pm10ConcentrationMeasurement
-//     0x042A/0x042C/0x042D -- Matter deliberately gives every "concentration
-//     measurement" species its own cluster ID for exactly this reason), so
-//     one module's entire channel set fits on its own single endpoint with
-//     zero conflicts. See this file's own README section in
-//     docs/matter-bridge.md for the investigation this conclusion is based
-//     on.
+//     0x042A/0x042C/0x042D, IlluminanceMeasurement 0x0400 -- Matter
+//     deliberately gives every "concentration measurement" species its own
+//     cluster ID for exactly this reason), so one module's entire channel
+//     set fits on its own single endpoint with zero conflicts. See this
+//     file's own README section in docs/matter-bridge.md for the
+//     investigation this conclusion is based on.
 //
 // Cluster implementation choices per endpoint:
 //   - Descriptor: the classic ember DECLARE_DYNAMIC_ATTRIBUTE path (see
@@ -37,17 +37,17 @@
 //     confirmed integration path in this SDK version is CodegenIntegration
 //     for STATIC/zap-declared endpoints, not dynamic ones).
 //   - Bridged Device Basic Information, Temperature Measurement, Relative
-//     Humidity Measurement, and each PM Concentration Measurement instance:
-//     the modern v1.6.0.0 code-driven ServerCluster classes
-//     (BridgedDeviceBasicInformationCluster, TemperatureMeasurementCluster,
-//     RelativeHumidityMeasurementCluster, ConcentrationMeasurementCluster),
-//     constructed directly and registered into
-//     CodegenDataModelProvider::Instance().Registry() -- exactly the same
-//     mechanism examples/bridge-app/linux's own Device::CreateBridgedDeviceInfo()
-//     already uses for Bridged Device Basic Information on a dynamic
-//     endpoint, extended here to the other four clusters since v1.6.0.0
-//     ships the same kind of class for them too (see each cluster's own
-//     src/app/clusters/*/README.md).
+//     Humidity Measurement, each PM Concentration Measurement instance, and
+//     Illuminance Measurement: the modern v1.6.0.0 code-driven ServerCluster
+//     classes (BridgedDeviceBasicInformationCluster, TemperatureMeasurementCluster,
+//     RelativeHumidityMeasurementCluster, ConcentrationMeasurementCluster,
+//     IlluminanceMeasurementCluster), constructed directly and registered
+//     into CodegenDataModelProvider::Instance().Registry() -- exactly the
+//     same mechanism examples/bridge-app/linux's own
+//     Device::CreateBridgedDeviceInfo() already uses for Bridged Device
+//     Basic Information on a dynamic endpoint, extended here to the other
+//     clusters since v1.6.0.0 ships the same kind of class for them too (see
+//     each cluster's own src/app/clusters/*/README.md).
 #pragma once
 
 #include <array>
@@ -57,6 +57,7 @@
 
 #include <app/clusters/bridged-device-basic-information-server/BridgedDeviceBasicInformationCluster.h>
 #include <app/clusters/concentration-measurement-server/ConcentrationMeasurementCluster.h>
+#include <app/clusters/illuminance-measurement-server/IlluminanceMeasurementCluster.h>
 #include <app/clusters/relative-humidity-measurement-server/RelativeHumidityMeasurementCluster.h>
 #include <app/clusters/temperature-measurement-server/TemperatureMeasurementCluster.h>
 #include <app/server-cluster/ServerClusterInterfaceRegistry.h>
@@ -109,6 +110,7 @@ private:
             pm25;
         chip::app::LazyRegisteredServerCluster<chip::app::Clusters::ConcentrationMeasurement::ConcentrationMeasurementCluster>
             pm10;
+        chip::app::LazyRegisteredServerCluster<chip::app::Clusters::IlluminanceMeasurementCluster> illuminance;
     };
 
     // Returns true iff the endpoint itself was actually created

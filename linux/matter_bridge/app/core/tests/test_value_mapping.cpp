@@ -11,6 +11,7 @@ extern "C" {
 #include "test_check.hpp"
 
 using matter_bridge::ConvertHumidity;
+using matter_bridge::ConvertIlluminance;
 using matter_bridge::ConvertPm;
 using matter_bridge::ConvertTemperature;
 using matter_bridge::Measurement;
@@ -103,5 +104,91 @@ void RunValueMappingTests(int *failures)
             MB_CHECK(ConvertPm(wrong_scale).state == Measurement::Invalid,
                      "an unexpected wire scale is rejected rather than misinterpreted");
         }
+    }
+
+    printf("\n-- ConvertIlluminance: BH1750 milli-lux -> Matter's CSA log-encoded MeasuredValue (cluster 0x0400) "
+           "--\n");
+    {
+        // Real field-test range observed via the Linux ingest server on a
+        // real BH1750 (see docs/matter-bridge.md): 18 lux (heavily shaded)
+        // to 15,273 lux (bright light) on module ..d357. Expected encoded
+        // values below are round(10000*log10(lux)+1), computed independently
+        // (not copied from the production formula).
+        auto low = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 18000);
+        auto low_v = ConvertIlluminance(low);
+        MB_CHECK(low_v.state == Measurement::Valid, "an 18 lux OK sample converts to Valid");
+        MB_CHECK(low_v.value == 12554, "18000 millilux (18 lux) encodes to MeasuredValue 12554");
+
+        auto high = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 15273000);
+        auto high_v = ConvertIlluminance(high);
+        MB_CHECK(high_v.state == Measurement::Valid, "a 15,273 lux OK sample converts to Valid");
+        MB_CHECK(high_v.value == 41840, "15,273,000 millilux (15,273 lux) encodes to MeasuredValue 41840");
+
+        auto exactly_1_lux = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 1000);
+        MB_CHECK(ConvertIlluminance(exactly_1_lux).state == Measurement::Valid && ConvertIlluminance(exactly_1_lux).value == 1,
+                 "exactly 1.000 lux (the formula's own log10(1)=0 case) encodes to MeasuredValue 1, the attribute's "
+                 "own spec-defined minimum");
+
+        auto just_under_1_lux =
+            make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 999);
+        auto under_v = ConvertIlluminance(just_under_1_lux);
+        MB_CHECK(under_v.state == Measurement::Valid && under_v.value == 0,
+                 "999 millilux (0.999 lux, just under the spec's 1 lux floor) is still a Valid reading, encoded as "
+                 "the spec's own MeasuredValue=0 'too low to be measured' sentinel -- never computed via the log "
+                 "formula, which is undefined/nonsensical below 1 lux");
+
+        auto exactly_zero = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 0);
+        auto zero_v = ConvertIlluminance(exactly_zero);
+        MB_CHECK(zero_v.state == Measurement::Valid && zero_v.value == 0,
+                 "exactly 0 millilux (full darkness) is Valid with MeasuredValue=0 -- 0 is a legitimate reading, "
+                 "never confused with an Invalid/null measurement");
+
+        // Regression test for a real bug this pass fixes: chip_endpoint.cpp
+        // used to configure this cluster's own maxMeasuredValue as a
+        // narrower, device-tuned 50000 (~99,995 lux) rather than this
+        // shared matter_bridge::kIlluminanceMeasuredValueMax constant --
+        // real direct-sunlight illuminance (commonly cited around 100,000
+        // lux) encodes to 50001, ABOVE that old bound, so this function
+        // would report it Valid while SetMeasuredValue() rejected it
+        // (ConstraintError) every single time, forever. Asserting it here
+        // against the actual production constant (not a hardcoded literal)
+        // makes the two layers' agreement itself the thing under test.
+        auto bright_sunlight =
+            make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 100000000);
+        auto sunlight_v = ConvertIlluminance(bright_sunlight);
+        MB_CHECK(sunlight_v.state == Measurement::Valid, "100,000,000 millilux (100,000 lux, direct sunlight) is a "
+                                                            "normal, real reading and must convert to Valid");
+        MB_CHECK(sunlight_v.value == 50001, "100,000 lux encodes to MeasuredValue 50001");
+        MB_CHECK(sunlight_v.value <= matter_bridge::kIlluminanceMeasuredValueMax,
+                 "this Valid reading falls within the cluster's own configured maxMeasuredValue (the SAME shared "
+                 "constant chip_endpoint.cpp uses) -- it must never be silently and permanently rejected by "
+                 "SetMeasuredValue() the way a narrower, independently-tuned SDK-side bound once allowed");
+
+        MB_CHECK(matter_bridge::kIlluminanceMeasuredValueMin == 1 && matter_bridge::kIlluminanceMeasuredValueMax == 65534,
+                 "sanity check: the shared min/max constants themselves are exactly the attribute's own spec-defined "
+                 "absolute range, matching every boundary case tested above and below");
+
+        auto near_int32_max =
+            make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 2147483647);
+        auto near_max_v = ConvertIlluminance(near_int32_max);
+        MB_CHECK(near_max_v.state == Measurement::Valid && near_max_v.value == 63320,
+                 "even this channel's full 32-bit non-negative range (2,147,483,647 millilux, an unrealistic BH1750 "
+                 "reading but a legal wire value) encodes to 63320 -- comfortably inside the attribute's own "
+                 "representable ceiling, never spuriously rejected as an overflow");
+
+        auto negative = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, -1);
+        MB_CHECK(ConvertIlluminance(negative).state == Measurement::Invalid,
+                 "a physically impossible negative lux is rejected, never clamped to 0");
+
+        auto not_ok = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_TIMEOUT, 18000);
+        MB_CHECK(ConvertIlluminance(not_ok).state == Measurement::Invalid, "status != OK -> Invalid");
+
+        auto wrong_scale = make_channel(SENSOR_CHANNEL_ILLUMINANCE, SENSOR_SCALE_UNIT, SENSOR_CHANNEL_STATUS_OK, 18);
+        MB_CHECK(ConvertIlluminance(wrong_scale).state == Measurement::Invalid,
+                 "an unexpected wire scale is rejected rather than misinterpreted as millilux");
+
+        auto wrong_type = make_channel(SENSOR_CHANNEL_TEMPERATURE, SENSOR_SCALE_MILLI, SENSOR_CHANNEL_STATUS_OK, 18000);
+        MB_CHECK(ConvertIlluminance(wrong_type).state == Measurement::Invalid,
+                 "a channel of the wrong type is rejected, not silently reinterpreted");
     }
 }

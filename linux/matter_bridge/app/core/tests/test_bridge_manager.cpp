@@ -68,6 +68,7 @@ void commit_success(BridgeManager &mgr, const ModuleUpdate &u)
     outcome.pm1_applied = u.pm1.has_value();
     outcome.pm25_applied = u.pm25.has_value();
     outcome.pm10_applied = u.pm10.has_value();
+    outcome.illuminance_applied = u.illuminance.has_value();
     mgr.CommitApplied(u.module_uuid, u, outcome);
 }
 
@@ -110,9 +111,24 @@ ingest::ChannelReading temp_channel(int32_t milli_value, uint8_t status = SENSOR
     return ch;
 }
 
+ingest::ChannelReading illuminance_channel(int32_t milli_lux, uint8_t status = SENSOR_CHANNEL_STATUS_OK)
+{
+    ingest::ChannelReading ch;
+    ch.type = SENSOR_CHANNEL_ILLUMINANCE;
+    ch.scale = SENSOR_SCALE_MILLI;
+    ch.status = status;
+    ch.value = milli_lux;
+    return ch;
+}
+
 uint16_t sht45_bitmap()
 {
     return (uint16_t)((1u << SENSOR_CHANNEL_TEMPERATURE) | (1u << SENSOR_CHANNEL_HUMIDITY));
+}
+
+uint16_t bh1750_bitmap()
+{
+    return (uint16_t)(1u << SENSOR_CHANNEL_ILLUMINANCE);
 }
 
 } // namespace
@@ -238,20 +254,121 @@ void RunBridgeManagerTests(int *failures)
                                                         "(this repo's test list item 6)");
     }
 
-    printf("\n-- scenario: a module with only an unbridged channel (BH1750 illuminance) never gets a Matter "
-           "endpoint at all in this MVP (docs/matter-bridge.md section 3.1) --\n");
+    printf("\n-- scenario: a module with only an unbridged channel type (SGP40 VOC) never gets a Matter endpoint "
+           "at all in this MVP (docs/matter-bridge.md section 3.1) --\n");
     {
         std::string dir = make_temp_dir();
         EndpointStore store(dir);
         store.load();
         BridgeManager mgr(store);
 
-        uint16_t illuminance_bitmap = (uint16_t)(1u << SENSOR_CHANNEL_ILLUMINANCE);
-        auto node = make_node(0xB0, 0x01, true, illuminance_bitmap, false);
+        uint16_t voc_bitmap = (uint16_t)((1u << SENSOR_CHANNEL_VOC_RAW) | (1u << SENSOR_CHANNEL_VOC_INDEX));
+        auto node = make_node(0xB0, 0x01, true, voc_bitmap, false);
         auto updates = mgr.Reconcile({node});
-        MB_CHECK(updates.empty(), "a BH1750-only module produces no ModuleUpdate -- no Matter endpoint is ever "
-                                   "created for it in this MVP");
+        MB_CHECK(updates.empty(), "an SGP40-only module produces no ModuleUpdate -- no Matter endpoint is ever "
+                                   "created for it in this MVP (Gas Index has no Matter concentration cluster)");
         MB_CHECK(store.size() == 0, "no endpoint id is consumed for a module this bridge will never expose");
+    }
+
+    printf("\n-- scenario: a brand-new BH1750-only module gets a Matter endpoint with the illuminance capability "
+           "flag set and its initial CSA log-encoded MeasuredValue (this pass: BH1750 -> Illuminance Measurement) "
+           "--\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        auto node = make_node(0xB0, 0x01, true, bh1750_bitmap(), true, {illuminance_channel(18000)});
+        auto updates = mgr.Reconcile({node});
+
+        MB_CHECK(updates.size() == 1, "a BH1750-only module now produces exactly one ModuleUpdate");
+        const ModuleUpdate &u = updates[0];
+        MB_CHECK(u.is_new_endpoint, "it is a new endpoint");
+        MB_CHECK(u.has_illuminance_channel, "the illuminance capability flag reflects the topology's own "
+                                             "sensor_bitmap (BH1750-only)");
+        MB_CHECK(!u.has_temperature_channel && !u.has_humidity_channel && !u.has_pm1_channel && !u.has_pm25_channel &&
+                     !u.has_pm10_channel,
+                 "no other capability flag is ever set for a BH1750-only module");
+        MB_CHECK(u.declared_sensor_bitmap == bh1750_bitmap(), "the declared sensor bitmap captured at creation is "
+                                                                "exactly this module's illuminance bit");
+        MB_CHECK(u.illuminance.has_value() && u.illuminance->state == Measurement::Valid && u.illuminance->value == 12554,
+                 "the new module's initial illuminance is the CSA log-encoded MeasuredValue (18 lux -> 12554)");
+        MB_CHECK(store.size() == 1, "exactly one endpoint id is now consumed for this module");
+    }
+
+    printf("\n-- scenario (this pass): a module_uuid whose topology-reported sensor_bitmap changes while its "
+           "endpoint already exists (a development-time sensor swap on the same physical test board, e.g. "
+           "SHT45 -> BH1750 on module ..d357) is detected via SensorBitmapMismatches(), and the new channel type "
+           "is never pushed to Matter (its cluster was never created for this endpoint) --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        auto sht45_node = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
+        auto first = mgr.Reconcile({sht45_node});
+        uint16_t ep = first[0].endpoint_id;
+        commit_all_success(mgr, first);
+        MB_CHECK(mgr.SensorBitmapMismatches().empty(), "no mismatch yet -- the sensor hasn't changed");
+
+        // Same module_uuid, but the board was reflashed/reconfigured with a
+        // BH1750 instead -- the topology report now carries a DIFFERENT
+        // sensor_bitmap for the exact same module_uuid, and the sample now
+        // carries an illuminance channel instead of a temperature one.
+        auto bh1750_node = make_node(0xB0, 0x01, true, bh1750_bitmap(), true, {illuminance_channel(500)});
+        auto after_swap = mgr.Reconcile({bh1750_node});
+
+        auto mismatched = mgr.SensorBitmapMismatches();
+        MB_CHECK(mismatched.size() == 1 && mismatched[0] == make_uuid(0x01),
+                 "the sensor-bitmap change is detected and observable via SensorBitmapMismatches(), even though "
+                 "the mismatch itself produces no visible ModuleUpdate below");
+        MB_CHECK(after_swap.empty(),
+                 "no ModuleUpdate is emitted at all this round: Reachable is unchanged (still online), and the new "
+                 "illuminance channel is never pushed -- this endpoint's Illuminance Measurement cluster was never "
+                 "created (it was created as an SHT45 endpoint), so ComputeUpdateForModule() gates it out entirely "
+                 "rather than silently retrying a doomed SetMeasuredValue() forever");
+
+        // Bring the module offline and back online (still reporting BH1750)
+        // to force a REAL Reachable-driven update while still mismatched --
+        // proving the illuminance gating holds even when an update IS
+        // emitted, not just in the "nothing to say" case above.
+        auto bh1750_offline = make_node(0xB0, 0x01, false, bh1750_bitmap(), true, {illuminance_channel(500)});
+        commit_all_success(mgr, mgr.Reconcile({bh1750_offline}));
+        auto bh1750_online_again = make_node(0xB0, 0x01, true, bh1750_bitmap(), true, {illuminance_channel(500)});
+        auto after_reachable_change = mgr.Reconcile({bh1750_online_again});
+
+        MB_CHECK(after_reachable_change.size() == 1, "the Reachable transition itself still produces an update "
+                                                        "while mismatched");
+        MB_CHECK(after_reachable_change[0].endpoint_id == ep, "the endpoint id itself never changes without a "
+                                                                 "restart -- EndpointStore's persistence is "
+                                                                 "independent of the sensor swap");
+        MB_CHECK(!after_reachable_change[0].is_new_endpoint, "the endpoint is NOT recreated in-place -- this "
+                                                                "bridge's fixed endpoint-per-module_uuid identity "
+                                                                "policy is unchanged");
+        MB_CHECK(!after_reachable_change[0].illuminance.has_value(),
+                 "even alongside a real Reachable update, the illuminance value is still never pushed -- the gate "
+                 "applies per-channel, not just when there is otherwise nothing to say");
+
+        // The mismatch persists across further passes (it does not
+        // self-resolve the way a conflict does) until a restart, which a
+        // real process achieves by starting with an empty in-memory
+        // last_applied_ -- see docs/matter-bridge.md's restart-for-
+        // sensor-swap section. A fresh BridgeManager over the SAME
+        // EndpointStore simulates exactly that restart.
+        BridgeManager restarted_mgr(store);
+        auto after_restart = restarted_mgr.Reconcile({bh1750_node});
+        MB_CHECK(after_restart.size() == 1, "after a restart, the module produces a fresh update");
+        MB_CHECK(after_restart[0].is_new_endpoint, "the restart treats it as a new endpoint again (in-memory "
+                                                     "last_applied_ is empty)");
+        MB_CHECK(after_restart[0].endpoint_id == ep, "...but reuses the SAME persisted endpoint id (EndpointStore "
+                                                       "survives the restart)");
+        MB_CHECK(after_restart[0].has_illuminance_channel && !after_restart[0].has_temperature_channel,
+                 "the recreated endpoint's capability flags now reflect the CURRENT (BH1750) sensor_bitmap");
+        MB_CHECK(after_restart[0].illuminance.has_value() && after_restart[0].illuminance->value == 0,
+                 "the illuminance value from the sample (500 millilux, under the 1 lux floor) is now pushed as the "
+                 "spec's own MeasuredValue=0 sentinel");
     }
 
     printf("\n-- scenario: two different module_uuids always get two different endpoint ids (this repo's test "

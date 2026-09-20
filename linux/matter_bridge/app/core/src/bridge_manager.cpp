@@ -8,14 +8,31 @@ extern "C" {
 
 namespace matter_bridge {
 
+namespace {
+
+// This bridge's own bridgeable sensor_bitmap bits -- see
+// ModuleUpdate::declared_sensor_bitmap's own doc comment. Every channel type
+// this bridge ever creates a Matter cluster for is one of these bits; adding
+// a new bridged channel type only ever means adding its bit here, never
+// renumbering an existing one (mirrors sensor_channel.h's own append-only
+// enum policy).
+constexpr uint16_t kBridgeableSensorBitmask =
+    (1u << SENSOR_CHANNEL_ILLUMINANCE) | (1u << SENSOR_CHANNEL_TEMPERATURE) | (1u << SENSOR_CHANNEL_HUMIDITY) |
+    (1u << SENSOR_CHANNEL_PM1_0) | (1u << SENSOR_CHANNEL_PM2_5) | (1u << SENSOR_CHANNEL_PM10);
+
+} // namespace
+
 BridgeManager::BridgeManager(EndpointStore &endpoint_store) : endpoint_store_(endpoint_store) {}
 
 std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &module_uuid,
                                                                     const std::vector<const ingest::NodeState *> &entries,
-                                                                    bool *out_conflicted)
+                                                                    bool *out_conflicted, bool *out_mismatched)
 {
     if (out_conflicted != nullptr) {
         *out_conflicted = false;
+    }
+    if (out_mismatched != nullptr) {
+        *out_mismatched = false;
     }
 
     std::vector<const ingest::NodeState *> online_entries;
@@ -58,22 +75,20 @@ std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &mo
         peeked_is_new = (last_applied_.find(module_uuid) == last_applied_.end());
     }
 
+    uint16_t bridgeable_mask = effective->sensor_bitmap & kBridgeableSensorBitmask;
+
     if (peeked_is_new) {
-        // BH1750/SGP40/SGP41-only modules never get a Matter endpoint in
-        // this MVP (docs/matter-bridge.md section 3.1 and this repo's own
-        // scope) -- a module whose declared sensor_bitmap has none of the
-        // five bridged channel bits set is skipped BEFORE ever consuming an
-        // EndpointStore slot, so it can never exhaust the bounded endpoint
-        // id space either. A module's sensor_bitmap never changes after its
-        // first sighting (same as module_config's own fixed-at-flash-time
-        // bitmap), so this check only ever needs to run once per
-        // module_uuid, right here.
-        bool bridgeable = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_TEMPERATURE)) != 0 ||
-                           (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_HUMIDITY)) != 0 ||
-                           (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM1_0)) != 0 ||
-                           (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM2_5)) != 0 ||
-                           (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM10)) != 0;
-        if (!bridgeable) {
+        // SGP40/SGP41-only modules never get a Matter endpoint in this MVP
+        // (docs/matter-bridge.md section 3.1 and this repo's own scope) -- a
+        // module whose declared sensor_bitmap has none of the six bridged
+        // channel bits set is skipped BEFORE ever consuming an EndpointStore
+        // slot, so it can never exhaust the bounded endpoint id space
+        // either. A REAL deployed module's sensor_bitmap never changes after
+        // its first sighting (same as module_config's own
+        // fixed-at-flash-time bitmap); see SensorBitmapMismatches()'s own
+        // doc comment for the one case where it can (development-time
+        // sensor swap on the same test board) and how that is detected.
+        if (bridgeable_mask == 0) {
             return std::nullopt;
         }
     }
@@ -99,12 +114,33 @@ std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &mo
     upd.is_new_endpoint = is_new;
 
     if (is_new) {
-        upd.has_temperature_channel = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_TEMPERATURE)) != 0;
-        upd.has_humidity_channel = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_HUMIDITY)) != 0;
-        upd.has_pm1_channel = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM1_0)) != 0;
-        upd.has_pm25_channel = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM2_5)) != 0;
-        upd.has_pm10_channel = (effective->sensor_bitmap & (1u << SENSOR_CHANNEL_PM10)) != 0;
+        upd.has_temperature_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_TEMPERATURE)) != 0;
+        upd.has_humidity_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_HUMIDITY)) != 0;
+        upd.has_pm1_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_PM1_0)) != 0;
+        upd.has_pm25_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_PM2_5)) != 0;
+        upd.has_pm10_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_PM10)) != 0;
+        upd.has_illuminance_channel = (bridgeable_mask & (1u << SENSOR_CHANNEL_ILLUMINANCE)) != 0;
+        upd.declared_sensor_bitmap = bridgeable_mask;
+    } else if (out_mismatched != nullptr && bridgeable_mask != la.declared_sensor_bitmap) {
+        // The same module_uuid's topology-reported sensor set has changed
+        // since this endpoint was created -- see SensorBitmapMismatches()'s
+        // own doc comment. `effective_declared_mask` below (NOT
+        // bridgeable_mask) gates which channels this round is still allowed
+        // to push, so a channel type that only showed up under the NEW
+        // sensor set is never attempted against a cluster this endpoint was
+        // never actually given.
+        *out_mismatched = true;
     }
+
+    // Which channel types this round may actually produce a value for:
+    // for a brand-new endpoint, everything this module currently declares
+    // (bridgeable_mask, which is exactly what upd.has_*_channel above was
+    // just derived from); for an existing one, ONLY what it was originally
+    // created with (la.declared_sensor_bitmap) -- see the mismatch handling
+    // immediately above and SensorBitmapMismatches()'s own doc comment. This
+    // is a no-op for the overwhelmingly common case (an unchanged sensor_bitmap,
+    // where la.declared_sensor_bitmap == bridgeable_mask already).
+    uint16_t effective_declared_mask = is_new ? bridgeable_mask : la.declared_sensor_bitmap;
 
     if (is_new || !la.has_reachable || la.reachable != reachable) {
         upd.reachable = reachable;
@@ -112,6 +148,17 @@ std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &mo
 
     if (reachable && effective->has_sample) {
         for (const auto &ch : effective->last_channels) {
+            if ((effective_declared_mask & (1u << ch.type)) == 0) {
+                // Not part of this endpoint's original declared sensor set
+                // (either genuinely unbridged, e.g. VOC/NOx, or a
+                // development-time sensor swap that hasn't been resolved by
+                // a bridge restart yet) -- never attempt it: the
+                // corresponding Matter cluster was never created for this
+                // endpoint, so pushing it would only ever fail silently and
+                // retry forever (see SensorBitmapMismatches()'s own doc
+                // comment).
+                continue;
+            }
             switch (ch.type) {
             case SENSOR_CHANNEL_TEMPERATURE: {
                 TemperatureCentiC v = ConvertTemperature(ch);
@@ -148,14 +195,22 @@ std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &mo
                 }
                 break;
             }
+            case SENSOR_CHANNEL_ILLUMINANCE: {
+                IlluminanceMeasuredValue v = ConvertIlluminance(ch);
+                if (is_new || !la.has_illuminance || la.illuminance != v) {
+                    upd.illuminance = v;
+                }
+                break;
+            }
             default:
-                break; // BH1750/SGP40/SGP41 channels -- not bridged in this MVP, see docs/matter-bridge.md
+                break; // SGP40/SGP41 channels -- not bridged in this MVP, see docs/matter-bridge.md
             }
         }
     }
 
     bool has_any_field = upd.reachable.has_value() || upd.temperature.has_value() || upd.humidity.has_value() ||
-                          upd.pm1.has_value() || upd.pm25.has_value() || upd.pm10.has_value();
+                          upd.pm1.has_value() || upd.pm25.has_value() || upd.pm10.has_value() ||
+                          upd.illuminance.has_value();
     if (is_new || has_any_field) {
         return upd;
     }
@@ -174,10 +229,15 @@ std::vector<ModuleUpdate> BridgeManager::Reconcile(const std::vector<ingest::Nod
 
     std::vector<ModuleUpdate> updates;
     std::vector<Uuid> still_conflicted;
+    std::vector<Uuid> still_mismatched;
 
     for (const auto &kv : by_module) {
         bool conflicted = false;
-        std::optional<ModuleUpdate> upd = ComputeUpdateForModule(kv.first, kv.second, &conflicted);
+        bool mismatched = false;
+        std::optional<ModuleUpdate> upd = ComputeUpdateForModule(kv.first, kv.second, &conflicted, &mismatched);
+        if (mismatched) {
+            still_mismatched.push_back(kv.first);
+        }
         if (conflicted) {
             still_conflicted.push_back(kv.first);
             continue;
@@ -188,6 +248,7 @@ std::vector<ModuleUpdate> BridgeManager::Reconcile(const std::vector<ingest::Nod
     }
 
     conflicted_ = std::move(still_conflicted);
+    sensor_bitmap_mismatches_ = std::move(still_mismatched);
     return updates;
 }
 
@@ -204,7 +265,13 @@ std::optional<ModuleUpdate> BridgeManager::ReconcileOne(const std::vector<ingest
         return std::nullopt; // no longer (or never) present in this snapshot -- nothing to apply
     }
     bool conflicted = false;
-    std::optional<ModuleUpdate> upd = ComputeUpdateForModule(module_uuid, entries, &conflicted);
+    // No mismatch tracking here -- see this method's own header doc comment:
+    // SensorBitmapMismatches() reflects only the last whole-registry
+    // Reconcile() pass. The channel-gating this triggers (never pushing a
+    // value for a channel outside the endpoint's original declaration)
+    // still applies regardless, since it does not depend on this out
+    // parameter -- see ComputeUpdateForModule()'s own top comment.
+    std::optional<ModuleUpdate> upd = ComputeUpdateForModule(module_uuid, entries, &conflicted, nullptr);
     // Deliberately does NOT touch conflicted_ here -- see this method's own
     // header doc comment: that list reflects only the last whole-registry
     // Reconcile() pass. A conflicted module_uuid simply yields no update.
@@ -228,6 +295,11 @@ void BridgeManager::CommitApplied(const Uuid &module_uuid, const ModuleUpdate &u
             return;
         }
         it = last_applied_.emplace(module_uuid, LastApplied{}).first;
+        // Recorded once, at creation, never touched again -- this IS the
+        // "original declaration" SensorBitmapMismatches() compares future
+        // sensor_bitmap values against (see ModuleUpdate::declared_sensor_bitmap's
+        // own doc comment).
+        it->second.declared_sensor_bitmap = update.declared_sensor_bitmap;
     }
     LastApplied &la = it->second;
 
@@ -254,6 +326,10 @@ void BridgeManager::CommitApplied(const Uuid &module_uuid, const ModuleUpdate &u
     if (outcome.pm10_applied && update.pm10.has_value()) {
         la.has_pm10 = true;
         la.pm10 = *update.pm10;
+    }
+    if (outcome.illuminance_applied && update.illuminance.has_value()) {
+        la.has_illuminance = true;
+        la.illuminance = *update.illuminance;
     }
 }
 
@@ -297,6 +373,11 @@ void BridgeManager::AbortSchedule(const Uuid &module_uuid)
 std::vector<Uuid> BridgeManager::ConflictedModules() const
 {
     return conflicted_;
+}
+
+std::vector<Uuid> BridgeManager::SensorBitmapMismatches() const
+{
+    return sensor_bitmap_mismatches_;
 }
 
 } // namespace matter_bridge

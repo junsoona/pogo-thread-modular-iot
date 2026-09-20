@@ -28,7 +28,10 @@
 //      chip_endpoint.hpp's own top comment) and per ingest/registry.hpp's
 //      own top comment (never call the Matter SDK or do file I/O while
 //      holding the registry's mutex -- wait_for_change()/snapshot() only
-//      ever hold it briefly to copy data out).
+//      ever hold it briefly to copy data out). This thread also logs (once
+//      per module_uuid) any matter_bridge::BridgeManager::SensorBitmapMismatches()
+//      -- see LogNewSensorBitmapMismatches()'s own doc comment and
+//      docs/matter-bridge.md's restart-for-sensor-swap section.
 //
 //      This pass: wait_for_change()'s return value is deliberately no
 //      longer checked to skip re-processing on a timeout -- Reconcile() is
@@ -186,6 +189,40 @@ void ApplyUpdateOnMatterThread(intptr_t context)
     gBridgeManager->EndSchedule(module_uuid);
 }
 
+// Logs a module_uuid the moment matter_bridge::BridgeManager::Reconcile()
+// FIRST reports it via SensorBitmapMismatches() (see that method's own doc
+// comment) -- a real scenario only during development, when the SAME
+// physical module_uuid's sensor hardware is reconfigured (e.g. SHT45 ->
+// BH1750 -> SGP40 on one ESP32-H2 test board) while this bridge process
+// keeps running. Deliberately logs only ONCE per module_uuid (tracked here,
+// never cleared -- this condition does not self-resolve without a bridge
+// restart, so re-logging it every ~250ms poll would just be noise) rather
+// than on every Reconcile() pass it's still present in.
+void LogNewSensorBitmapMismatches(const std::vector<matter_bridge::Uuid> &mismatched)
+{
+    static std::vector<matter_bridge::Uuid> already_logged;
+    for (const auto &uuid : mismatched) {
+        bool seen = false;
+        for (const auto &logged : already_logged) {
+            if (logged == uuid) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        already_logged.push_back(uuid);
+        ChipLogError(NotSpecified,
+                    "pogo_matter_bridge: module_uuid's reported sensor set no longer matches its ALREADY-CREATED "
+                    "Matter endpoint's cluster set -- this only happens if the same physical module was "
+                    "reconfigured with a different sensor while this bridge process kept running (see "
+                    "docs/matter-bridge.md's restart-for-sensor-swap section). Channels outside the endpoint's "
+                    "original declaration are never pushed to Matter; restart pogo_matter_bridge to recreate this "
+                    "endpoint with its current sensor set.");
+    }
+}
+
 void RegistryWatcherThreadMain()
 {
     uint64_t last_seen_generation = 0;
@@ -199,6 +236,7 @@ void RegistryWatcherThreadMain()
 
         std::vector<ingest::NodeState> snapshot = gRegistry.snapshot();
         std::vector<matter_bridge::ModuleUpdate> updates = gBridgeManager->Reconcile(snapshot);
+        LogNewSensorBitmapMismatches(gBridgeManager->SensorBitmapMismatches());
 
         for (auto &update : updates) {
             // Urgent: a brand-new endpoint or a Reachable (online<->offline)
