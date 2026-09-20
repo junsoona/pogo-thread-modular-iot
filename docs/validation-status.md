@@ -176,17 +176,93 @@ the two would overclaim what a passing 3-tier log judgement actually proves.
 
 ## Thread radio multi-hop routing (separate from POGO physical topology depth above)
 
-**Not verified, and not verifiable by the 3-tier POGO test or `tools/validate_three_tier_logs.py`.**
-A passing `topology_depth=2` result (POGO docking order + application-layer provisioning
-ancestry) does NOT by itself prove that a sensor sample's CoAP packet was actually radio-relayed
-through the INTERMEDIATE module's Thread router role to reach the Power Base -- OpenThread's own
-mesh routing could equally have delivered that packet over a direct radio link between the LEAF
-and the Power Base (or via some other router already in range), independent of the POGO chain's
-physical shape.
+**Still not verified on real hardware** -- this pass adds the diagnostic logging needed to judge
+it, not a real-hardware result. A passing `topology_depth=2` result (POGO docking order +
+application-layer provisioning ancestry) does NOT by itself prove that a sensor sample's CoAP
+packet was actually radio-relayed through the INTERMEDIATE module's Thread router role to reach
+the Power Base -- OpenThread's own mesh routing could equally have delivered that packet over a
+direct radio link between the LEAF and the Power Base (or via some other router already in
+range), independent of the POGO chain's physical shape.
+
+### This pass: automatic radio-parent/role logging (code only, not yet run on real hardware)
+
+Investigated the existing OpenThread state-change path first rather than adding a new one:
+`components/thread_manager/thread_manager.c` already registers `ot_state_changed_cb()` via
+`otSetStateChangedCallback()` on every role (Power Base, INTERMEDIATE, LEAF all call
+`thread_manager_init()`), and already reacts to `OT_CHANGED_THREAD_ROLE` -- the correct,
+already-existing hook for "this device's own role/parent just changed," fired only on a real
+transition, never on a timer. This pass extends that SAME callback (new
+`log_role_and_parent()`, called only from inside `ot_state_changed_cb()`, so it still only runs
+on an actual role-change event -- no new polling task, no repeated logging while nothing
+changes) to also log, using the real, unmodified `otLinkGetExtendedAddress()`:
+
+- This device's own Extended Address and `otDeviceRole`, on every role change, for every role
+  (Power Base, INTERMEDIATE, LEAF) -- so a LEAF's reported parent can be matched against an
+  INTERMEDIATE's or Power Base's own log line from a separate real-hardware capture.
+- While (and only while) `otDeviceRole == OT_DEVICE_ROLE_CHILD`, the radio parent's own
+  Extended Address and RLOC16 via the real `otThreadGetParentInfo()` -- this is POGO-independent:
+  it reads OpenThread's own MLE parent record, never `power_base_transport.c`'s
+  application-layer topology report.
+
+Log line (new this pass, `TAG=thread_manager`):
+
+```
+thread radio: role=<n>(<ROLE>) own_ext_addr=xx:xx:xx:xx:xx:xx:xx:xx [parent_ext_addr=xx:xx:xx:xx:xx:xx:xx:xx parent_rloc16=0x----]
+```
+
+(the `parent_*` fields are only present while `role=CHILD`; ROUTER/LEADER/DETACHED/DISABLED log
+only their own address).
+
+Locking: every OpenThread API call added this pass runs from inside `ot_state_changed_cb()`
+itself, which already runs on the OpenThread task -- per the existing rule already documented at
+that callback's own top ("Called back from inside the OpenThread task itself: the API lock must
+NOT be taken again here"), no `esp_openthread_lock_acquire()`/`release()` call was added or
+needed. No POGO protocol byte, sensor measurement period, SED link-mode setting, OTBR Dataset,
+Matter endpoint ID, or Matter pairing/fabric store was touched -- this is logging only.
+
+**Known limitation of this mechanism** (documented, not fixed): it fires on `OT_CHANGED_THREAD_ROLE`,
+which covers a LEAF attaching, detaching, or re-attaching through a `DETACHED` transition (the
+normal Thread MLE behavior for losing and finding a parent) -- it would NOT separately log a
+parent change that somehow never causes `otDeviceRole` to leave `CHILD` even momentarily (an
+edge case OpenThread's own MLE implementation does not appear to produce for a simple parent
+loss/switch, but has not been independently confirmed absent on this project's own real
+hardware).
+
+**Build verification only, no real-hardware run yet**: real ESP-IDF v6.1 `module` and
+`power_base` fullclean-equivalent builds (a touched `thread_manager.c` forcing a real
+recompile of just this file, then full link) both completed with zero warnings.
+`thread_manager.c` remains not host-compilable (real OpenThread/FreeRTOS dependencies), same as
+before this pass -- see other rows in this document for that same pre-existing limitation.
+
+### Judgement criteria for the next real-hardware pass
+
+Do **not** force a particular route, change routing preference, or modify the Dataset to try to
+produce a desired result -- this diagnostic only observes whatever OpenThread itself already
+decided.
+
+Capture the `idf.py monitor` log from all three devices (Power Base, INTERMEDIATE, LEAF) across
+a reboot/(re)join of the LEAF, and read each device's own `thread radio: ...` line(s):
+
+1. **Genuine radio multi-hop through the INTERMEDIATE is confirmed** when ALL of the following
+   hold from the same capture window: (a) the LEAF's `parent_ext_addr` equals the
+   INTERMEDIATE's own logged `own_ext_addr`; (b) the INTERMEDIATE's own line shows
+   `role=ROUTER` (or `LEADER`, though INTERMEDIATE is never expected to be Leader) -- i.e. it is
+   genuinely acting as a Thread router, not merely attached as a child itself; and (c) a LEAF
+   sensor sample is independently confirmed reaching Linux ingest (see "Linux northbound
+   bridge" above) during that same window.
+2. **Only POGO depth=2 is confirmed, radio multi-hop is NOT** when the LEAF's `parent_ext_addr`
+   instead matches the Power Base's own logged `own_ext_addr` (or, under EXTERNAL_OTBR, some
+   other router the OTBR itself exposes) -- the LEAF attached directly over the radio, and the
+   POGO chain's physical docking order is not what carried that CoAP traffic. This is a valid,
+   expected OpenThread outcome, not a bug -- mesh routing is free to pick the best available
+   radio path independent of physical docking order.
+3. Neither outcome should be recorded in the table below as **Verified** until an operator
+   actually runs this capture on real hardware and states which of the two above was observed;
+   this pass adds the instrumentation only.
 
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
-| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | None -- this is a real-RF/radio-path property, not something `idf.py monitor` application logs can establish | Not verified | Requires either (a) OpenThread router/neighbor-table and route diagnostics captured separately from the application log (e.g. `ot router table`/`ot neighbor table` CLI output, or `otThreadGetNextHop()`/`otThreadGetRouterInfo()`, showing the actual next-hop router used for the LEAF's destination), or (b) a dedicated RF test that physically prevents a direct LEAF<->Power-Base radio path (shielding/distance/attenuation) so any observed delivery can only have happened via the INTERMEDIATE module's relay. Neither has been done. |
+| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | The `thread radio: ...` log line above (own Ext Addr + role always; parent Ext Addr + RLOC16 while CHILD) is now emitted automatically on every real role change, on all three roles -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge with the three-point criteria immediately above. Not yet run on real hardware. |
 
 ## Thread join timing (open observation, this pass)
 

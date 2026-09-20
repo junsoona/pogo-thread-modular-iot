@@ -1,5 +1,6 @@
 #include "thread_manager/thread_manager.h"
 
+#include <stdio.h>
 #include <string.h>
 #include "sdkconfig.h"
 #include "soc/soc_caps.h"
@@ -27,12 +28,67 @@ static const char *TAG = "thread_manager";
 
 static QueueHandle_t s_role_change_queue;
 
+/* "xx:xx:xx:xx:xx:xx:xx:xx\0" */
+static void format_ext_addr(const otExtAddress *addr, char out[24])
+{
+    snprintf(out, 24, "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", addr->m8[0], addr->m8[1], addr->m8[2], addr->m8[3],
+             addr->m8[4], addr->m8[5], addr->m8[6], addr->m8[7]);
+}
+
+/*
+ * Thread radio multi-hop diagnostic (see docs/validation-status.md's
+ * "Thread radio multi-hop routing" section for the full judgement
+ * criteria this feeds): logs this device's own Extended Address (so a
+ * LEAF's reported parent can be matched against an INTERMEDIATE's own
+ * log from a separate real-hardware capture) and, only while actually
+ * attached as a Thread CHILD (a LEAF's normal state; an INTERMEDIATE/
+ * Power Base run as ROUTER/LEADER and have no parent to report), the
+ * radio parent's Extended Address via the real otThreadGetParentInfo() --
+ * never POGO/application-layer topology, which `power_base_transport.c`
+ * already logs separately and does not by itself prove which physical
+ * link a CoAP packet actually radio-relayed over.
+ *
+ * Called ONLY from inside ot_state_changed_cb() below, itself only
+ * invoked on an actual OT_CHANGED_THREAD_ROLE event -- never a polling
+ * loop, so this never repeats while nothing has changed.
+ */
+static void log_role_and_parent(otInstance *instance, otDeviceRole role)
+{
+    const otExtAddress *own_ext_addr = otLinkGetExtendedAddress(instance);
+    char own_str[24] = "unknown";
+    if (own_ext_addr != NULL) {
+        format_ext_addr(own_ext_addr, own_str);
+    }
+
+    if (role == OT_DEVICE_ROLE_CHILD) {
+        otRouterInfo parent;
+        if (otThreadGetParentInfo(instance, &parent) == OT_ERROR_NONE) {
+            char parent_str[24];
+            format_ext_addr(&parent.mExtAddress, parent_str);
+            ESP_LOGI(TAG, "thread radio: role=%d(%s) own_ext_addr=%s parent_ext_addr=%s parent_rloc16=0x%04x",
+                     role, thread_manager_role_to_str(role), own_str, parent_str, parent.mRloc16);
+        } else {
+            ESP_LOGW(TAG, "thread radio: role=%d(%s) own_ext_addr=%s -- otThreadGetParentInfo failed while CHILD",
+                     role, thread_manager_role_to_str(role), own_str);
+        }
+    } else {
+        /* ROUTER/LEADER (INTERMEDIATE, Power Base) have no radio parent;
+         * DISABLED/DETACHED have none yet -- own address is still useful
+         * so a later real-hardware comparison has it on record. */
+        ESP_LOGI(TAG, "thread radio: role=%d(%s) own_ext_addr=%s", role, thread_manager_role_to_str(role), own_str);
+    }
+}
+
 static void ot_state_changed_cb(otChangedFlags flags, void *context)
 {
     if (flags & OT_CHANGED_THREAD_ROLE) {
         /* Called back from inside the OpenThread task itself: per
-         * esp_openthread_lock.h, the API lock must NOT be taken again here. */
-        otDeviceRole role = otThreadGetDeviceRole((otInstance *)context);
+         * esp_openthread_lock.h, the API lock must NOT be taken again here --
+         * every OT API call in this function and log_role_and_parent() above
+         * relies on that same already-established rule. */
+        otInstance *instance = (otInstance *)context;
+        otDeviceRole role = otThreadGetDeviceRole(instance);
+        log_role_and_parent(instance, role);
         xQueueSend(s_role_change_queue, &role, 0);
     }
 }
