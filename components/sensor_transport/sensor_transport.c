@@ -166,7 +166,7 @@ esp_err_t sensor_transport_init(bool require_topology_registration)
  * (no blocking wait) if Thread is not currently joined -- see this
  * function's callers for why that matters (section 9: no busy-retry loop
  * while detached). */
-static bool send_one_attempt(const uint8_t *payload, size_t len)
+static bool send_one_attempt(const uint8_t *payload, size_t len, uint32_t sample_seq)
 {
     collector_endpoint_snapshot_t collector;
     if (!collector_endpoint_get(&collector) || !collector.valid) {
@@ -188,6 +188,15 @@ static bool send_one_attempt(const uint8_t *payload, size_t len)
     otInstance *instance = esp_openthread_get_instance();
     otError err = OT_ERROR_NO_BUFS;
     if (esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        /* Thread radio multi-hop diagnostic (see docs/validation-status.md's
+         * "Thread radio multi-hop routing" section): re-checks this
+         * device's CURRENT Thread radio parent right here, inside the SAME
+         * OpenThread lock section already held for the real CoAP send
+         * below -- never a second, independent lock acquisition, so this
+         * adds no extra wait to the actual transmission. See that
+         * function's own header comment for the log/dedup contract. */
+        thread_manager_check_parent_for_sample(instance, sample_seq);
+
         otMessage *message = otCoapNewMessage(instance, NULL);
         if (message != NULL) {
             otCoapMessageInit(message, OT_COAP_TYPE_CONFIRMABLE, OT_COAP_CODE_POST);
@@ -331,18 +340,6 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
                  sample->module_uuid[6], sample->module_uuid[7], (unsigned)sample->sample_seq);
         return;
     }
-    /*
-     * Thread radio multi-hop diagnostic (see docs/validation-status.md's
-     * "Thread radio multi-hop routing" section): re-checks this device's
-     * CURRENT Thread radio parent right at this sample's own transmission
-     * point, not just at join time -- thread_manager's own
-     * OT_CHANGED_THREAD_ROLE hook cannot see a parent change that never
-     * takes otDeviceRole out of CHILD. Logs only on the first observation
-     * or an actual parent change (never once per sample/retry -- see that
-     * function's own header comment), does nothing while not CHILD, and
-     * never affects what gets sent below or this function's own retry
-     * behavior -- diagnostic only. */
-    thread_manager_check_parent_for_sample();
     uint8_t payload[SENSOR_CHANNEL_MAX_WIRE_LEN];
     size_t len = sensor_channel_pack(sample, payload, sizeof(payload));
     if (len == 0) {
@@ -384,7 +381,7 @@ void sensor_transport_send_sample(const sensor_sample_t *sample)
                      (unsigned)sample->sample_seq);
             return;
         }
-        if (send_one_attempt(payload, len)) {
+        if (send_one_attempt(payload, len, sample->sample_seq)) {
             ESP_LOGD(TAG, "sample sent OK (uuid=..%02x%02x seq=%u attempt=%d/%d)", sample->module_uuid[6],
                       sample->module_uuid[7], (unsigned)sample->sample_seq, attempt + 1, SENSOR_TRANSPORT_MAX_ATTEMPTS);
             return; /* success -- no retry state to reset, each call starts fresh */

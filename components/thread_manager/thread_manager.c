@@ -94,51 +94,80 @@ static void ot_state_changed_cb(otChangedFlags flags, void *context)
     }
 }
 
-/* Guards s_parent_known/s_last_logged_parent below -- read-modify-write from
- * whatever task calls thread_manager_check_parent_for_sample() (currently
- * always sensor_transport's own task, but this stays correct even if a
- * second caller is ever added). Same short-critical-section idiom
+/* Guards s_parent_observed/s_last_logged_unknown/s_last_logged_parent below
+ * -- read-modify-write from whatever task calls
+ * thread_manager_check_parent_for_sample() (currently always
+ * sensor_transport's own task, but this stays correct even if a second
+ * caller is ever added). Same short-critical-section idiom
  * sensor_transport.c's own s_send_lock already uses for a comparable
- * "shared between callers, compare-then-write" case. */
+ * "shared between callers, compare-then-write" case. This is a plain
+ * FreeRTOS critical section, NOT the OpenThread API lock -- see this
+ * function's own header comment in thread_manager.h for why THAT lock is
+ * the caller's responsibility, not acquired here. */
 static portMUX_TYPE s_parent_check_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_parent_known;
-static otExtAddress s_last_logged_parent;
+static bool s_parent_observed;     /* true once any observation has ever been logged */
+static bool s_last_logged_unknown; /* true if the last logged observation was "unknown" */
+static otExtAddress s_last_logged_parent; /* only meaningful if !s_last_logged_unknown */
 
-void thread_manager_check_parent_for_sample(void)
+void thread_manager_check_parent_for_sample(otInstance *instance, uint32_t sample_seq)
 {
-    otInstance *instance = esp_openthread_get_instance();
-    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
-        return; /* diagnostic only -- never block or fail the caller's real send */
-    }
+    /* Caller already holds the OpenThread API lock (see header comment) --
+     * no esp_openthread_lock_acquire()/release() here, deliberately: a
+     * second lock acquisition on this path would add its own wait on top
+     * of the real send's, for no reason. */
     otDeviceRole role = otThreadGetDeviceRole(instance);
     if (role != OT_DEVICE_ROLE_CHILD) {
         /* Not a LEAF's normal attached state right now -- nothing to
          * re-check (own address + role on ROUTER/LEADER transitions are
          * already covered by ot_state_changed_cb() above). */
-        esp_openthread_lock_release();
         return;
     }
+
     otRouterInfo parent;
-    otError err = otThreadGetParentInfo(instance, &parent);
-    esp_openthread_lock_release();
-    if (err != OT_ERROR_NONE) {
-        return;
-    }
+    bool have_parent = (otThreadGetParentInfo(instance, &parent) == OT_ERROR_NONE);
 
     bool changed;
     taskENTER_CRITICAL(&s_parent_check_lock);
-    changed = !s_parent_known || memcmp(&parent.mExtAddress, &s_last_logged_parent, sizeof(otExtAddress)) != 0;
+    if (!s_parent_observed) {
+        changed = true;
+    } else if (have_parent) {
+        changed = s_last_logged_unknown || memcmp(&parent.mExtAddress, &s_last_logged_parent, sizeof(otExtAddress)) != 0;
+    } else {
+        changed = !s_last_logged_unknown;
+    }
     if (changed) {
-        s_last_logged_parent = parent.mExtAddress;
-        s_parent_known = true;
+        s_parent_observed = true;
+        s_last_logged_unknown = !have_parent;
+        if (have_parent) {
+            s_last_logged_parent = parent.mExtAddress;
+        }
+        /* else: leave s_last_logged_parent as whatever it was -- it is
+         * ignored while s_last_logged_unknown is true, never read as if it
+         * were still this sample's parent (that is exactly the assumption
+         * this "unknown" state exists to prevent). */
     }
     taskEXIT_CRITICAL(&s_parent_check_lock);
 
-    if (changed) {
+    if (!changed) {
+        return;
+    }
+
+    if (have_parent) {
         char parent_str[24];
         format_ext_addr(&parent.mExtAddress, parent_str);
-        ESP_LOGI(TAG, "thread radio: parent re-check at sample send -- parent_ext_addr=%s parent_rloc16=0x%04x",
-                 parent_str, parent.mRloc16);
+        ESP_LOGI(TAG,
+                 "thread radio: parent re-check at sample send -- sample_seq=%u parent_ext_addr=%s "
+                 "parent_rloc16=0x%04x",
+                 (unsigned)sample_seq, parent_str, parent.mRloc16);
+    } else {
+        /* Explicitly logged, not silently skipped: a missing log line here
+         * would let a later reader wrongly assume the previously-logged
+         * parent is still this sample's parent, when this attempt simply
+         * could not tell. */
+        ESP_LOGW(TAG,
+                 "thread radio: parent re-check at sample send -- sample_seq=%u parent_ext_addr=unknown "
+                 "(otThreadGetParentInfo failed while CHILD)",
+                 (unsigned)sample_seq);
     }
 }
 

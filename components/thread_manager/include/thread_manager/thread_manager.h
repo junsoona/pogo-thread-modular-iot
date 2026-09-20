@@ -205,28 +205,54 @@ const char *thread_manager_role_to_str(otDeviceRole role);
  * thread_manager.c for part 1). Part 1 only logs the radio parent on an
  * actual OT_CHANGED_THREAD_ROLE transition, so it cannot see a parent
  * change that keeps otDeviceRole at CHILD the whole time (a reparent that
- * never passes back through DETACHED). This function closes that gap by
- * re-reading the CURRENT parent right at a LEAF's own sample-transmission
- * point instead of waiting for a role transition.
+ * never passes back through DETACHED), and only captures the parent at
+ * join time, not necessarily who it still is by the time a later sample
+ * is sent. This function closes that gap by re-reading the CURRENT parent
+ * right at a LEAF's own sample-transmission point instead of waiting for
+ * a role transition.
  *
- * Thread-safe (acquires the OpenThread API lock itself -- unlike
- * ot_state_changed_cb(), this is called from the CALLER's own task, never
- * from inside the OpenThread task, so the lock must be taken here). Does
- * nothing (no OT call, no log) unless the current role is actually CHILD
- * -- a LEAF's normal state; INTERMEDIATE/Power Base run as ROUTER/LEADER
- * and already get their own address logged by ot_state_changed_cb() on
- * every real role change.
+ * NOT thread-safe on its own -- unlike ot_state_changed_cb(), this runs on
+ * the CALLER's own task, never inside the OpenThread task, so an OT API
+ * lock is required, but this function does NOT acquire one itself: the
+ * caller (sensor_transport.c's send_one_attempt(), inside the SAME
+ * esp_openthread_lock_acquire()/release() section it already uses to
+ * build and send the real CoAP request) MUST already hold the OpenThread
+ * API lock when calling this. This is deliberate: a second, independent
+ * lock acquisition here would add its own wait (up to OT_LOCK_WAIT) on
+ * the sample-send path for no reason -- reusing the lock the real
+ * transmission already pays for costs nothing extra and never delays
+ * measurement or send timing. `instance` must be the same otInstance the
+ * caller is already using for that send.
  *
- * Logs ONLY the first time this is ever called while CHILD, or when the
- * parent's Extended Address actually differs from the last one this
- * function logged -- an unchanged parent produces no log line at all, no
- * matter how many times (how many samples, how many retries of the same
- * sample) this is called. Intended call site: once per real `/s`
- * transmission attempt (see sensor_transport.c), never a new polling
- * task or timer of its own, and never changes what sensor_transport
- * itself sends or how it retries.
+ * `sample_seq` is the sample this observation belongs to (from
+ * sensor_channel's sensor_sample_t) -- included in every log line this
+ * function emits so a specific parent observation can be tied back to a
+ * specific sample_seq later seen (or not) on Linux ingest.
+ *
+ * Does nothing (no OT call beyond the role read, no log) unless the
+ * current role is actually CHILD -- a LEAF's normal state;
+ * INTERMEDIATE/Power Base run as ROUTER/LEADER and already get their own
+ * address logged by ot_state_changed_cb() on every real role change.
+ *
+ * While CHILD: if otThreadGetParentInfo() itself fails, this is logged as
+ * an explicit `parent_ext_addr=unknown` observation (subject to the same
+ * change-dedup below) rather than silently skipping the call -- silently
+ * skipping would let a later log reader wrongly assume the previously
+ * logged parent is still current for this sample, when in fact this
+ * attempt simply could not tell.
+ *
+ * Logs ONLY the first observation ever made (known address or unknown),
+ * or when this observation actually differs from the last one this
+ * function logged (a real address changing, a real address becoming
+ * unknown, or unknown becoming a real address) -- an unchanged
+ * observation produces no log line at all, no matter how many times (how
+ * many samples, how many retries of the same sample) this is called.
+ * Intended call site: once per real `/s` CoAP transmission attempt, from
+ * inside send_one_attempt()'s existing lock section (see
+ * sensor_transport.c) -- never a new polling task or timer of its own,
+ * and never changes what sensor_transport itself sends, retries, or when.
  */
-void thread_manager_check_parent_for_sample(void);
+void thread_manager_check_parent_for_sample(otInstance *instance, uint32_t sample_seq);
 
 #ifdef __cplusplus
 }

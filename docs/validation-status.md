@@ -216,34 +216,50 @@ still is by the time a LEAF's `/s` sample is actually sent, possibly much later.
 address plus a later, separately-timed Linux reception is not enough to attribute that specific
 sample to a specific radio path.
 
-### Part 2 (this pass): parent re-check at each `/s` sample transmission
+### Part 2 (corrected this pass): parent re-check at each `/s` sample transmission
 
-Closes the gap above without a new polling task or timer: `sensor_transport_send_sample()`
-(`components/sensor_transport/sensor_transport.c`) already runs once per real sample -- this
-pass adds a call to a new `thread_manager_check_parent_for_sample()` right before that function
-packs and sends the payload (after the existing topology-gate early-return, so it only runs when
-a real transmission attempt is actually about to happen). This ties the parent re-check to an
-event that was already going to happen anyway, rather than inventing a new one.
+Closes the gap above without a new polling task or timer, and without adding any new wait to
+the measurement/transmission path: `send_one_attempt()`
+(`components/sensor_transport/sensor_transport.c`) is the actual CoAP transmission path -- it
+already runs once per real `/s` attempt, past the collector-endpoint check, and already acquires
+the OpenThread API lock (`esp_openthread_lock_acquire(OT_LOCK_WAIT)`) to build and send the real
+CoAP request. This pass calls the new `thread_manager_check_parent_for_sample(instance,
+sample_seq)` from INSIDE that same already-held lock section, immediately after it is acquired
+and before the CoAP message is built -- never a second, independent
+`esp_openthread_lock_acquire()`. **A first version of this diagnostic (an earlier pass) instead
+called a self-locking variant from `sensor_transport_send_sample()`, before payload packing --
+its own separate `esp_openthread_lock_acquire(OT_LOCK_WAIT)` (up to 1s) was a real, if usually
+small, source of avoidable delay on the sample path; corrected this pass to reuse the
+transmission's own lock instead.**
 
-`thread_manager_check_parent_for_sample()` (`components/thread_manager/thread_manager.c`):
-acquires the OpenThread API lock itself (unlike part 1's callback, this runs on
-`sensor_transport`'s own task, never the OpenThread task, so -- per the existing locking rule --
-the lock MUST be taken here), reads the current role and, only while `CHILD`, the current parent
-via the same real `otThreadGetParentInfo()`. Logs (`thread radio: parent re-check at sample send
--- parent_ext_addr=... parent_rloc16=...`) **only** on the first observation or when the parent's
-Extended Address actually differs from the last one this function logged (a small critical
-section around a cached last-logged address, same short-critical-section idiom
-`sensor_transport.c`'s own `s_send_lock` already uses) -- an unchanged parent produces no log
-line at all, no matter how many samples or retries call it. Does nothing while not `CHILD`
-(INTERMEDIATE/Power Base already get their own address from part 1).
+`thread_manager_check_parent_for_sample(otInstance *instance, uint32_t sample_seq)`
+(`components/thread_manager/thread_manager.c`): takes no lock itself -- the caller must already
+hold the OpenThread API lock (documented on the function itself). Reads the current role and,
+only while `CHILD`, the current parent via the same real `otThreadGetParentInfo()`. Logs
+(`thread radio: parent re-check at sample send -- sample_seq=<n> parent_ext_addr=...
+parent_rloc16=...`) **only** on the first observation or when the observation actually differs
+from the last one logged (a small FreeRTOS critical section around a cached last-logged value,
+same short-critical-section idiom `sensor_transport.c`'s own `s_send_lock` already uses) -- an
+unchanged parent produces no log line at all, no matter how many samples or retries call it.
+Every log line this function emits includes the `sample_seq` it was observed for. Does nothing
+while not `CHILD` (INTERMEDIATE/Power Base already get their own address from part 1).
+
+**`unknown`, not silent reuse of the last address, when the parent can't be read:** if
+`otThreadGetParentInfo()` itself fails while `CHILD`, this pass logs
+`parent_ext_addr=unknown (otThreadGetParentInfo failed while CHILD)` for that `sample_seq`
+(subject to the same change-dedup as a real address) instead of simply returning without a log
+line. Silently skipping would let a later reader assume the previously-logged parent is still
+this sample's parent, when this attempt actually could not tell -- exactly the wrong inference
+this diagnostic exists to prevent.
 
 Dependency direction: `sensor_transport` gains a one-way `REQUIRES thread_manager`
 (`components/sensor_transport/CMakeLists.txt`) -- consistent with the existing precedent
 (`child_service` already requires both `sensor_service` and `thread_manager`); `thread_manager`
 itself has no dependency back onto `sensor_transport` or anything that depends on it, so this
-introduces no cycle. `sensor_transport_send_sample()`'s own retry loop, backoff schedule, and
-payload are completely unchanged -- the new call is a side-effect-free diagnostic read that
-never affects what gets sent or how many times.
+introduces no cycle. `sensor_transport_send_sample()`/`send_one_attempt()`'s own retry loop,
+backoff schedule, CoAP timing, and payload are completely unchanged -- the new call is a
+side-effect-free diagnostic read, on the same lock the real send already pays for, that never
+affects what gets sent, how many times, or when.
 
 **Build verification only, no real-hardware run yet**: real ESP-IDF v6.1 `module` build
 (`sensor_transport` links against `module` only, not `power_base`) and a real `power_base` build
@@ -263,31 +279,44 @@ to confirm multi-hop** -- the parent may have changed between join and that samp
 gap part 2 above exists to close). Use the parent recorded by part 2's re-check, from the same
 sample-send window as the sample actually being judged:
 
-1. **Genuine radio multi-hop through the INTERMEDIATE is confirmed** for a given sample only
-   when ALL of the following hold together: (a) that sample's own `parent re-check at sample
-   send` line (or the most recent one logged before it, if this particular send didn't trigger a
-   change) shows `parent_ext_addr` equal to the INTERMEDIATE's own logged `own_ext_addr`
-   (from part 1); (b) the INTERMEDIATE's own line shows `role=ROUTER` (or `LEADER`, though
-   INTERMEDIATE is never expected to be Leader) -- i.e. it is genuinely acting as a Thread
-   router, not merely attached as a child itself; and (c) that SAME sample (matched by
-   `sample_seq`) is independently confirmed reaching Linux ingest (see "Linux northbound bridge"
-   above).
+1. **Strong evidence of radio multi-hop through the INTERMEDIATE** for a given sample is: (a)
+   that sample's own `parent re-check at sample send` line for its `sample_seq` (never an
+   `unknown` observation, and never a stale one from a different, earlier `sample_seq`) shows
+   `parent_ext_addr` equal to the INTERMEDIATE's own logged `own_ext_addr` (from part 1); (b) the
+   INTERMEDIATE's own line shows `role=ROUTER` (or `LEADER`, though INTERMEDIATE is never
+   expected to be Leader) -- i.e. it is genuinely acting as a Thread router, not merely attached
+   as a child itself; and (c) that SAME sample (matched by `sample_seq`) is independently
+   confirmed reaching Linux ingest (see "Linux northbound bridge" above). **This is strong
+   evidence, not standalone, definitive proof of the exact radio path at the actual instant of
+   transmission**: the parent re-check and the real CoAP send happen inside the same OpenThread
+   lock section back-to-back, not atomically with the radio transmission itself, and OpenThread's
+   mesh routing is free to change between one CoAP request and the next even if it did not
+   change between this check and this particular send. A conclusive, instant-of-transmission
+   confirmation needs either (i) an RF test bed that physically restricts the LEAF to only reach
+   the INTERMEDIATE (shielding/distance/attenuation preventing any direct LEAF<->Power-Base
+   link), so no other path could have carried that packet, or (ii) packet-level observation (e.g.
+   a sniffer capturing the actual over-the-air frame and its addressing) for that specific
+   transmission -- neither is what this application-log-level diagnostic provides.
 2. **Only POGO depth=2 is confirmed, radio multi-hop is NOT** when the LEAF's parent at
    sample-send time instead matches the Power Base's own logged `own_ext_addr` (or, under
-   EXTERNAL_OTBR, some other router the OTBR itself exposes) -- the LEAF attached directly over
-   the radio for that sample, and the POGO chain's physical docking order is not what carried
-   that CoAP traffic. This is a valid, expected OpenThread outcome, not a bug -- mesh routing is
-   free to pick the best available radio path independent of physical docking order, and is also
-   the correct verdict if the parent seen at join (part 1) differs from the parent seen at
-   sample-send time (part 2) and neither matches the INTERMEDIATE.
+   EXTERNAL_OTBR, some other router the OTBR itself exposes), or the parent observation for that
+   `sample_seq` is `unknown` -- the LEAF attached directly over the radio for that sample (or its
+   radio parent could not be determined at all), and the POGO chain's physical docking order is
+   not what is confirmed to have carried that CoAP traffic. A direct-parent result is a valid,
+   expected OpenThread outcome, not a bug -- mesh routing is free to pick the best available radio
+   path independent of physical docking order, and this is also the correct verdict if the parent
+   seen at join (part 1) differs from the parent seen at sample-send time (part 2) and neither
+   matches the INTERMEDIATE.
 3. Neither outcome should be recorded in the table below as **Verified** until an operator
-   actually runs this capture on real hardware, ties a specific `sample_seq` to a specific
-   parent re-check log line, and states which of the two above was observed; this pass adds the
-   instrumentation only.
+   actually runs this capture on real hardware, ties a specific `sample_seq` to a specific parent
+   re-check log line, and states which of the two above was observed; even then, record item 1's
+   outcome as strong evidence for multi-hop, not as a substitute for the RF-restricted or
+   packet-level confirmation described above if a fully conclusive result is required. This pass
+   adds the instrumentation only.
 
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
-| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | Own Ext Addr + role logged on every real role change (part 1); the LEAF's CURRENT parent Ext Addr additionally re-checked and logged (on change only) at each real `/s` sample send (part 2, this pass) -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge per-sample with the three-point criteria immediately above; a join-time-only match is not sufficient. Not yet run on real hardware. |
+| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | Own Ext Addr + role logged on every real role change (part 1); the LEAF's CURRENT parent Ext Addr additionally re-checked (reusing the CoAP send's own OpenThread lock, no extra wait) and logged with `sample_seq` (on change only, `unknown` if unreadable) at each real `/s` sample send (part 2, corrected this pass) -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge per-sample with the criteria immediately above; a join-time-only match is not sufficient, and even a same-`sample_seq` match is strong evidence, not standalone proof of the exact transmission-instant path (see item 1 above for what would make it conclusive). Not yet run on real hardware. |
 
 ## Thread join timing (open observation, this pass)
 
