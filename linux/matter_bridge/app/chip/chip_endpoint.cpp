@@ -8,6 +8,7 @@
 #include <app/util/af-types.h>
 #include <app/util/endpoint-config-api.h>
 #include <app/util/util.h>
+#include <clusters/AirQuality/Enums.h>
 #include <clusters/Descriptor/Attributes.h>
 #include <clusters/Descriptor/ClusterId.h>
 #include <clusters/Pm10ConcentrationMeasurement/ClusterId.h>
@@ -33,10 +34,11 @@ constexpr int kDescriptorAttributeArraySize = 254;
 
 // Descriptor is this bridge's ONLY ember/DECLARE_DYNAMIC_ATTRIBUTE cluster
 // (see chip_endpoint.hpp's own top comment for why) -- every OTHER cluster
-// on a module endpoint (Bridged Device Basic Information, Temperature
-// Measurement, Relative Humidity Measurement, each PM Concentration
-// Measurement instance) is a modern code-driven ServerCluster, registered
-// directly in C++ below, never declared here.
+// on a module endpoint (Bridged Device Basic Information, Identify,
+// Temperature Measurement, Relative Humidity Measurement, each PM
+// Concentration Measurement instance, Air Quality, Illuminance Measurement)
+// is a modern code-driven ServerCluster, registered directly in C++ below,
+// never declared here.
 DECLARE_DYNAMIC_ATTRIBUTE_LIST_BEGIN(descriptorAttrs)
 DECLARE_DYNAMIC_ATTRIBUTE(Descriptor::Attributes::DeviceTypeList::Id, ARRAY, kDescriptorAttributeArraySize, 0),
     DECLARE_DYNAMIC_ATTRIBUTE(Descriptor::Attributes::ServerList::Id, ARRAY, kDescriptorAttributeArraySize, 0),
@@ -77,14 +79,10 @@ constexpr EmberAfDeviceType kPms5003DeviceTypes[] = {
     {kDeviceTypeBridgedNode, kDeviceVersionDefault},
 };
 // BH1750-only module: Light Sensor (matter-devices.xml requires Identify +
-// Descriptor + Illuminance Measurement -- this bridge, like
-// examples/bridge-app/linux's own bridged temperature/humidity sensors,
-// does not implement an Identify cluster instance on its dynamic endpoints
-// at all; ZAP's "requireCluster"/"requireAttribute" conformance rules are
-// only enforced for STATIC/zap-declared endpoints, never checked at runtime
-// for a dynamic bridge endpoint like this one -- kSht45DeviceTypes/
-// kPms5003DeviceTypes above already establish this exact precedent for the
-// same device-type family).
+// Descriptor + Illuminance Measurement -- Identify is created unconditionally
+// for every endpoint below, see CreateEndpoint(); the nominal "Binding"
+// include on this device type has server="false"/is not required, and is
+// not implemented, same reasoning as every other bridged device type here).
 constexpr EmberAfDeviceType kBh1750DeviceTypes[] = {
     {kDeviceTypeLightSensor, kDeviceVersionDefault},
     {kDeviceTypeBridgedNode, kDeviceVersionDefault},
@@ -102,6 +100,41 @@ BridgedDeviceBasicInformationDelegate gBasicInformationDelegate;
 // instance, exactly like examples/bridge-app/linux/main.cpp's own function-
 // local `static chip::app::DefaultTimerDelegate timerDelegate;`.
 DefaultTimerDelegate gTimerDelegate;
+
+// This bridge's Identify cluster delegate: every module endpoint's
+// underlying device is a battery/USB-powered Thread sensor module with no
+// LED, speaker, or other actuator this bridge can drive to make it
+// physically identify itself -- IdentifyType::kNone (set at construction,
+// see CreateEndpoint()) already declares that honestly, so these callbacks
+// are deliberately no-ops (logged, for operator visibility) rather than a
+// fabricated "something happened" response. This is NOT the same kind of
+// fabrication this bridge avoids elsewhere (e.g. never synthesizing an Air
+// Quality grade from PM concentrations, see CreateEndpoint()'s own comment
+// on AirQualityCluster): an Identify/TriggerEffect command's own effects
+// are spec-defined as advisory hints a device MAY act on, and accepting-
+// but-not-physically-acting is standard, spec-sanctioned behavior for a
+// device with no matching actuator -- it does not misrepresent any
+// measurement or capability. IsTriggerEffectEnabled()==true so
+// TriggerEffect (mandatory per Temperature/Humidity/Light Sensor's own
+// device type, see matter-devices.xml) is actually accepted rather than
+// rejected as UnsupportedCommand. One shared, stateless instance, same
+// reuse pattern as gBasicInformationDelegate above.
+class NoopIdentifyDelegate : public IdentifyDelegate {
+public:
+    void OnIdentifyStart(IdentifyCluster &) override
+    {
+        ChipLogProgress(NotSpecified, "pogo_matter_bridge: Identify started (no physical presentation available "
+                                     "on this bridged Thread sensor module)");
+    }
+    void OnIdentifyStop(IdentifyCluster &) override {}
+    void OnTriggerEffect(IdentifyCluster &) override
+    {
+        ChipLogProgress(NotSpecified, "pogo_matter_bridge: TriggerEffect received (no-op -- no physical actuator "
+                                     "on this bridged Thread sensor module)");
+    }
+    bool IsTriggerEffectEnabled() const override { return true; }
+};
+NoopIdentifyDelegate gIdentifyDelegate;
 
 // module_uuid's own permanent 8 bytes, lowercase-hex-encoded -- this
 // bridge's Matter EndpointUniqueID (chip_enable_endpoint_unique_id, see
@@ -270,6 +303,20 @@ bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
                           });
     LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->basic_info.Registration()));
 
+    // Identify: MANDATORY on every device type this bridge ever declares
+    // (Temperature Sensor, Humidity Sensor, Air Quality Sensor, Light
+    // Sensor -- confirmed against matter-devices.xml in a real v1.6.0.0
+    // checkout this pass, see chip_endpoint.hpp's own top comment), so
+    // created unconditionally rather than gated on any has_*_channel flag.
+    // IdentifyType::kNone is this bridge's own honest declaration -- these
+    // bridged Thread sensor modules have no LED/speaker/actuator this
+    // bridge can drive, so there is no real "visible indicator" or similar
+    // to claim.
+    ep->identify.Create(IdentifyCluster::Config(ep->endpoint_id, gTimerDelegate)
+                            .WithIdentifyType(Identify::IdentifyTypeEnum::kNone)
+                            .WithDelegate(&gIdentifyDelegate));
+    LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->identify.Registration()));
+
     if (update.has_temperature_channel) {
         TemperatureMeasurementCluster::OptionalAttributeSet optional_attrs(0);
         ep->temperature.Create(ep->endpoint_id, optional_attrs,
@@ -300,6 +347,30 @@ bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
     if (update.has_pm10_channel) {
         ep->pm10.Create(ep->endpoint_id, MakePmConfig(Pm10ConcentrationMeasurement::Id));
         LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->pm10.Registration()));
+    }
+
+    if (update.has_pm1_channel || update.has_pm25_channel || update.has_pm10_channel) {
+        // Air Quality Sensor's own MANDATORY cluster (0x005B, serverLocked
+        // in matter-devices.xml) -- this endpoint declared that device type
+        // (kPms5003DeviceTypes below) but, before this pass, never actually
+        // implemented this cluster at all. BitFlags<Feature>() enables NONE
+        // of the optional Fair/Moderate/VeryPoor/ExtremelyPoor gradations
+        // (AirQualityCluster::SetAirQuality() would reject any of them with
+        // ConstraintError otherwise), which restricts every legal value to
+        // Unknown/Good/Poor -- and this bridge never calls SetAirQuality()
+        // at all, leaving it at the class's own default, Unknown, forever.
+        // This bridge has PM1/PM2.5/PM10 concentrations only, no CO/CO2/
+        // NO2/O3/HCHO/TVOC/Radon inputs and no calibrated breakpoint table
+        // validated for this deployment -- inventing a Good/Fair/Moderate/
+        // Poor grade from PM alone would be exactly the kind of ungrounded
+        // classification this bridge's existing SGP40/41 Gas Index policy
+        // already refuses to do (never dress up a partial/uncalibrated
+        // reading as a value it was never designed to produce; see
+        // docs/matter-bridge.md section 3.1). Unknown is itself a fully
+        // spec-legitimate, mandatory-conformance value -- not a placeholder
+        // that then needs replacing.
+        ep->air_quality.Create(ep->endpoint_id, BitFlags<AirQuality::Feature>());
+        LogErrorOnFailure(CodegenDataModelProvider::Instance().Registry().Register(ep->air_quality.Registration()));
     }
 
     if (update.has_illuminance_channel) {

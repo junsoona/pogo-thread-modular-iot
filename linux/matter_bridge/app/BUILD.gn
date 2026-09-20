@@ -68,8 +68,10 @@ executable("pogo_matter_bridge") {
   deps = [
     "bridge-common",
     "${chip_root}/examples/platform/linux:app-main",
+    "${chip_root}/src/app/clusters/air-quality-server",
     "${chip_root}/src/app/clusters/bridged-device-basic-information-server",
     "${chip_root}/src/app/clusters/concentration-measurement-server",
+    "${chip_root}/src/app/clusters/identify-server",
     "${chip_root}/src/app/clusters/illuminance-measurement-server",
     "${chip_root}/src/app/clusters/relative-humidity-measurement-server",
     "${chip_root}/src/app/clusters/temperature-measurement-server",

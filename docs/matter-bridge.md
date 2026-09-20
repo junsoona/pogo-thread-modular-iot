@@ -183,24 +183,93 @@ reading may be stale" without discarding it (see
     code-driven `BridgedDeviceBasicInformationCluster`, constructed and
     registered directly (never ember-declared), `UniqueId` = the
     `module_uuid`'s own lowercase-hex encoding.
+  - **Identify** (every endpoint, added this pass -- see section 5.1) --
+    the modern v1.6.0.0 code-driven `IdentifyCluster`, `IdentifyType::None`
+    (this bridge has no LED/speaker/actuator on the bridged Thread sensor
+    module it could drive), `TriggerEffect` accepted but a no-op.
   - **Temperature Measurement** / **Relative Humidity Measurement**
-    (SHT45), **Pm1/Pm25/Pm10ConcentrationMeasurement** (PMS5003), or
-    **Illuminance Measurement** (BH1750, added this pass) -- whichever the
-    module's `sensor_bitmap` declares, each the modern v1.6.0.0
-    code-driven `ServerCluster` class for that cluster
-    (`TemperatureMeasurementCluster`, `RelativeHumidityMeasurementCluster`,
-    `ConcentrationMeasurementCluster`, `IlluminanceMeasurementCluster`),
-    constructed and registered directly, exactly the same registration
-    mechanism Bridged Device Basic Information uses. A BH1750-only
-    endpoint's `DeviceTypeList` is `{Light Sensor (0x0106), Bridged Node
-    (0x0013)}` (`matter-devices.xml`'s Light Sensor device type also lists
-    Identify as required, but -- exactly like this bridge's existing
-    Temperature/Humidity/Air-Quality-Sensor device types, and
-    `examples/bridge-app/linux`'s own bridged temperature sensors -- no
-    Identify cluster instance is implemented on this dynamic endpoint;
-    ZAP's `requireCluster` conformance is only enforced for STATIC
-    zap-declared endpoints, never checked at runtime for a dynamic bridge
-    endpoint).
+    (SHT45), **Pm1/Pm25/Pm10ConcentrationMeasurement** + **Air Quality**
+    (PMS5003, `AirQuality` cluster added this pass -- see section 5.1), or
+    **Illuminance Measurement** (BH1750) -- whichever the module's
+    `sensor_bitmap` declares, each the modern v1.6.0.0 code-driven
+    `ServerCluster` class for that cluster (`TemperatureMeasurementCluster`,
+    `RelativeHumidityMeasurementCluster`, `ConcentrationMeasurementCluster`,
+    `AirQualityCluster`, `IlluminanceMeasurementCluster`), constructed and
+    registered directly, exactly the same registration mechanism Bridged
+    Device Basic Information uses. A BH1750-only endpoint's `DeviceTypeList`
+    is `{Light Sensor (0x0106), Bridged Node (0x0013)}`.
+
+### 5.1 Device type / mandatory cluster conformance audit (this pass)
+
+Every dynamic endpoint's `DeviceTypeList` was cross-checked against
+`src/app/zap-templates/zcl/data-model/chip/matter-devices.xml` in a real
+`connectedhomeip v1.6.0.0` checkout (cloned fresh this pass specifically
+for this audit, not assumed from a prior pass's notes) for mandatory
+clusters/attributes/commands. Findings and fixes:
+
+- **Identify was missing on every endpoint.** Temperature Sensor (0x0302),
+  Humidity Sensor (0x0307), Air Quality Sensor (0x002C), and Light Sensor
+  (0x0106) all mark Identify `serverLocked="true"` (mandatory, not
+  optional). A prior pass's own comment rationalized this gap by analogy
+  to `examples/bridge-app/linux`'s own bridged temperature sensors (which
+  also omit it) -- that analogy doesn't make it conformant, only common;
+  fixed this pass by creating the real v1.6.0.0 `IdentifyCluster` (a
+  code-driven `ServerCluster`, not an ember/ZAP-declared one) on every
+  module endpoint unconditionally. `IdentifyType` is `None` (an honest
+  declaration -- these bridged Thread sensor modules have no way to
+  visibly/audibly identify themselves) and `TriggerEffect` is accepted
+  (satisfies Temperature/Humidity/Light Sensor's own required-command
+  list) but is a no-op beyond logging, since there is no actuator to
+  drive -- accepting an effect command without a matching actuator is
+  ordinary, spec-sanctioned behavior for `TriggerEffect` (its own
+  identifiers are advisory hints a device MAY act on), not a fabricated
+  capability.
+- **Air Quality Sensor's own mandatory Air Quality cluster (0x005B) was
+  never implemented at all** -- every PMS5003 endpoint declared the Air
+  Quality Sensor device type while only implementing the (optional, per
+  that device type's own cluster list) PM1/PM2.5/PM10 Concentration
+  Measurement clusters. Fixed this pass by creating the real v1.6.0.0
+  `AirQualityCluster` with **zero optional features enabled**
+  (`BitFlags<AirQuality::Feature>()`), which restricts every legal
+  `AirQuality` attribute value to `Unknown`/`Good`/`Poor` (the SDK's own
+  `SetAirQuality()` rejects `Fair`/`Moderate`/`VeryPoor`/`ExtremelyPoor`
+  with `ConstraintError` unless the matching feature bit is set) -- and
+  this bridge never calls `SetAirQuality()` at all, leaving it at the
+  class's own default, `Unknown`, permanently. This is a deliberate
+  choice, not an oversight: PMS5003 provides PM1/PM2.5/PM10 only, with no
+  CO/CO2/NO2/O3/HCHO/TVOC/Radon inputs and no calibrated breakpoint table
+  validated for this deployment, so deriving a Good/Fair/Moderate/Poor
+  grade from PM concentration alone would be exactly the kind of
+  ungrounded classification this bridge's existing SGP40/41 Gas Index
+  policy (section 3.1) already refuses to produce. `Unknown` is itself a
+  fully spec-legitimate, mandatory-conformance attribute value, not a
+  placeholder awaiting a real computation.
+- **`requireCommand IdentifyQuery`**, listed by matter-devices.xml for
+  Temperature Sensor/Humidity Sensor/Light Sensor's own Identify include,
+  is stale ZCL-era XML with **no corresponding command anywhere in this
+  SDK's actual Identify cluster** (`data_model/1.6/clusters/Identify.xml`
+  defines exactly two commands: `Identify` and `TriggerEffect` -- no
+  `IdentifyQuery`). Not implemented because it does not exist in this SDK
+  version, not a remaining gap.
+- **Light Sensor's own nominal `Binding` include** has `server="false"`
+  and is not `requireCluster`-flagged -- genuinely optional, and not
+  implemented, consistent with every other device type here (this
+  bridge's automation logic lives in the controller, never the bridged
+  device itself).
+- **Device type selection itself was re-reviewed and found correct as-is**
+  for all three sensor families: Air Quality Sensor's own cluster list
+  explicitly includes PM1/PM2.5/PM10 Concentration Measurement as
+  legitimate optional members (confirmed in the same real XML), so it
+  remains the right (and only sensible) device type for PMS5003 -- the
+  gap was the missing mandatory Air Quality cluster, never the device
+  type choice. Light Sensor (0x0106) for BH1750 and the
+  Temperature+Humidity Sensor combination for SHT45 were unchanged.
+- No `linux/matter_bridge/app/core` files changed for this audit --
+  Identify's `IdentifyTime`/`TriggerEffect` state and Air Quality's fixed
+  `Unknown` value are both handled entirely within
+  `chip/chip_endpoint.cpp` (created once, at `CreateEndpoint()`, never
+  touched again), so `matter_bridge::BridgeManager`/`ModuleUpdate`/
+  `ApplyOutcome` needed no changes at all.
 
 ## 6. Dynamic-endpoint constraint investigation: no child endpoints needed
 
@@ -579,6 +648,13 @@ chip-tool temperaturemeasurement read measured-value 1 <module endpoint id>
 chip-tool relativehumiditymeasurement read measured-value 1 <module endpoint id>
 chip-tool pm25concentrationmeasurement read measured-value 1 <module endpoint id>
 chip-tool illuminancemeasurement read measured-value 1 <module endpoint id>
+
+# Identify (every endpoint, added this pass -- section 5.1):
+chip-tool identify read identify-type 1 <module endpoint id>   # expect None (0)
+chip-tool identify read identify-time 1 <module endpoint id>   # expect 0 outside an active Identify
+
+# Air Quality (PMS5003 endpoints only, added this pass -- section 5.1):
+chip-tool airquality read air-quality 1 <module endpoint id>   # expect Unknown (0), always
 ```
 
 `illuminancemeasurement read measured-value` returns the CSA log-encoded
@@ -587,6 +663,9 @@ chip-tool illuminancemeasurement read measured-value 1 <module endpoint id>
 "too low to be measured") to sanity-check it against what the module is
 actually seeing. `chip-tool illuminancemeasurement read light-sensor-type
 1 <module endpoint id>` should read back `Photodiode` (0).
+`chip-tool airquality read air-quality` should ALWAYS read back `Unknown`
+(0) -- this bridge never computes any other value (see section 5.1); any
+other reading would itself be evidence of a bug, not a "better" result.
 
 Test Vendor ID/Product ID: this application uses connectedhomeip's own
 standard `config/standalone` **test** VID/PID (`chip::VendorId::TestVendor1`
@@ -783,6 +862,58 @@ run that.
   `core/tests/test_value_mapping.cpp` and
   `core/tests/test_bridge_manager.cpp`, extended this pass -- 133/133
   checks pass, 0 warnings, including under AddressSanitizer.
+
+**Real-hardware confirmation (reported by the operator, a later pass than
+all of the above -- the operator ran the real final Linux build/link and
+`chip-tool` themselves; not reproduced inside any session, none of which
+had physical board or real Linux host access):**
+
+- `tools/build_matter_bridge.sh` completed a real final compile **and
+  link** against the pinned `connectedhomeip v1.6.0.0` SDK on a real Linux
+  host, producing an actual runnable `pogo_matter_bridge` binary -- the
+  first time this exact step (as opposed to `gn gen`/partial `ninja -k` on
+  a non-Linux sandbox, see the passes above) has been confirmed for this
+  application.
+- With that binary running against real BH1750 hardware, `chip-tool
+  illuminancemeasurement read measured-value 1 3` (module endpoint **3**
+  -- the very first ID `EndpointStore::kFirstDynamicEndpointId` ever hands
+  out, confirming that numbering in real use, not just in
+  `core/tests/test_endpoint_store.cpp`) returned values ranging from **0
+  to 22369** as real lighting conditions changed -- `0` correctly
+  reflecting the spec's own "too low to be measured" sentinel (dark/heavily
+  shaded) and `22369` decoding to `10^((22369-1)/10000) ≈ 172.5` lux (a
+  plausible indoor-lighting reading). This confirms, for the first time on
+  real hardware: the final build+link succeeds, `pogo_matter_bridge`
+  actually commissions and serves a real Illuminance Measurement cluster,
+  and `MeasuredValue` genuinely updates from live BH1750 samples through
+  the full pipeline (BH1750 -> Power Base -> Linux ingest ->
+  `ConvertIlluminance()` -> `IlluminanceMeasurementCluster::SetMeasuredValue()`
+  -> `chip-tool` read).
+- **Scope of what this does NOT yet confirm**: this observation predates
+  this pass's own Identify/Air Quality cluster additions (section 5.1) --
+  those are new code this exact pass, not yet exercised by any real build
+  or `chip-tool` read (see immediately below). It also does not by itself
+  confirm the sensor-bitmap-mismatch/restart procedure (section 8.2) --
+  no sensor swap was reported alongside this observation. Apple Home /
+  Google Home rendering remains a separate, still-unconfirmed question
+  (see this document's own note above and `docs/validation-status.md`'s
+  Sensors table) -- not reported either way this round.
+
+**This pass's own device-type/mandatory-cluster conformance audit
+(Identify on every endpoint, Air Quality on PMS5003 endpoints -- section
+5.1): NOT yet build- or real-hardware-verified.** Like the min/max fix
+pass above, this pass added a new GN dependency
+(`identify-server`/`air-quality-server`, `BUILD.gn`) and new constructor
+call shapes in `chip_endpoint.{hpp,cpp}` that were checked line-by-line
+against a real `connectedhomeip v1.6.0.0` checkout's actual
+`IdentifyCluster.h`/`AirQualityCluster.h` source (cloned fresh this pass)
+but never compiled -- this session still has no Linux host, container, or
+CHIP_ROOT of its own (same constraint as every prior pass; see the
+operator confirmation immediately above for why that gap can only be
+closed by the operator's own real Linux host). The recommended next step
+is exactly the same `tools/build_matter_bridge.sh` + `chip-tool` procedure
+that already confirmed the Illuminance Measurement work above, extended
+with the two new `identify`/`airquality` read commands in section 13.
 
 ## 15. Test coverage summary
 

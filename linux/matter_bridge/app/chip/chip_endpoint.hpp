@@ -36,11 +36,13 @@
 //     DescriptorCluster class also exists -- that modern class's only
 //     confirmed integration path in this SDK version is CodegenIntegration
 //     for STATIC/zap-declared endpoints, not dynamic ones).
-//   - Bridged Device Basic Information, Temperature Measurement, Relative
-//     Humidity Measurement, each PM Concentration Measurement instance, and
+//   - Bridged Device Basic Information, Identify (every endpoint), Temperature
+//     Measurement, Relative Humidity Measurement, each PM Concentration
+//     Measurement instance, Air Quality (PM-bearing endpoints only), and
 //     Illuminance Measurement: the modern v1.6.0.0 code-driven ServerCluster
-//     classes (BridgedDeviceBasicInformationCluster, TemperatureMeasurementCluster,
-//     RelativeHumidityMeasurementCluster, ConcentrationMeasurementCluster,
+//     classes (BridgedDeviceBasicInformationCluster, IdentifyCluster,
+//     TemperatureMeasurementCluster, RelativeHumidityMeasurementCluster,
+//     ConcentrationMeasurementCluster, AirQualityCluster,
 //     IlluminanceMeasurementCluster), constructed directly and registered
 //     into CodegenDataModelProvider::Instance().Registry() -- exactly the
 //     same mechanism examples/bridge-app/linux's own
@@ -48,6 +50,26 @@
 //     Basic Information on a dynamic endpoint, extended here to the other
 //     clusters since v1.6.0.0 ships the same kind of class for them too (see
 //     each cluster's own src/app/clusters/*/README.md).
+//
+// Device-type conformance (this pass): every module_uuid's dynamic
+// endpoint's DeviceTypeList is cross-checked against
+// src/app/zap-templates/zcl/data-model/chip/matter-devices.xml in a real
+// v1.6.0.0 checkout (not assumed) for its MANDATORY clusters/attributes/
+// commands. Findings: Temperature Sensor (0x0302), Humidity Sensor
+// (0x0307), Air Quality Sensor (0x002C), and Light Sensor (0x0106) all
+// mandate Identify (hence the unconditional IdentifyCluster above); Air
+// Quality Sensor additionally mandates the Air Quality cluster itself
+// (0x005B), which this bridge's PM-bearing endpoints previously omitted
+// entirely (fixed this pass -- see .cpp's own comment on why its
+// AirQuality attribute is never computed from a measurement). Every
+// device type's own nominal `requireCommand IdentifyQuery` is stale ZCL-era
+// XML with no corresponding command in this SDK's actual Identify cluster
+// (data_model/1.6/clusters/Identify.xml defines only Identify and
+// TriggerEffect) -- not implementable because it does not exist, not a gap
+// in this bridge. Light Sensor's own nominal `include cluster="Binding"`
+// has `server="false"`/not `requireCluster`, i.e. genuinely optional, and
+// is not implemented (irrelevant to a bridge whose automation lives in the
+// controller, not the bridged device).
 #pragma once
 
 #include <array>
@@ -55,8 +77,10 @@
 #include <memory>
 #include <unordered_map>
 
+#include <app/clusters/air-quality-server/AirQualityCluster.h>
 #include <app/clusters/bridged-device-basic-information-server/BridgedDeviceBasicInformationCluster.h>
 #include <app/clusters/concentration-measurement-server/ConcentrationMeasurementCluster.h>
+#include <app/clusters/identify-server/IdentifyCluster.h>
 #include <app/clusters/illuminance-measurement-server/IlluminanceMeasurementCluster.h>
 #include <app/clusters/relative-humidity-measurement-server/RelativeHumidityMeasurementCluster.h>
 #include <app/clusters/temperature-measurement-server/TemperatureMeasurementCluster.h>
@@ -111,6 +135,19 @@ private:
         chip::app::LazyRegisteredServerCluster<chip::app::Clusters::ConcentrationMeasurement::ConcentrationMeasurementCluster>
             pm10;
         chip::app::LazyRegisteredServerCluster<chip::app::Clusters::IlluminanceMeasurementCluster> illuminance;
+
+        // Every module endpoint's device type (Temperature+Humidity Sensor,
+        // Air Quality Sensor, or Light Sensor -- see .cpp) requires Identify
+        // as a MANDATORY cluster (matter-devices.xml, cross-checked against
+        // a real v1.6.0.0 checkout this pass) -- unconditionally created for
+        // every endpoint, unlike the sensor-specific clusters above.
+        chip::app::LazyRegisteredServerCluster<chip::app::Clusters::IdentifyCluster> identify;
+
+        // Air Quality Sensor's own MANDATORY cluster (0x005B) -- only
+        // created for a module with a PM channel (see .cpp's own top
+        // comment on why this is never computed from a measurement, only
+        // ever left at its class default of Unknown).
+        chip::app::LazyRegisteredServerCluster<chip::app::Clusters::AirQualityCluster> air_quality;
     };
 
     // Returns true iff the endpoint itself was actually created
