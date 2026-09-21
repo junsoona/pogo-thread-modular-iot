@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Repository-wide audit for stale, current-tense documentation claims that
-conflict with this correction pass's policy -- required test items 6/7/8 of
-this follow-up's minimum test list: "power_base 실행 경로 로그와 현재형
-문서에 고정 ROOT/Leader 표현이 없음", "현재형 GPIO 문서에 DETECT_IN=GPIO2가
-남아 있지 않음", "과거 기록의 문구가 테스트에 걸리면 명시적인 superseded
-문맥만 허용".
+Repository-wide audit for stale, current-tense documentation claims about
+the power-base role and GPIO policy.  Current documentation must not describe
+the power base as a fixed ROOT/Leader or list GPIO2 as UPSTREAM DETECT_IN.
+Historical wording is accepted only inside an explicitly superseded context.
 
 Scope: every `*.md` file in the repository (README.md + docs/*.md) plus
-`power_base/sdkconfig.defaults` -- the actual "documentation and policy
-description" surface this correction pass's task targets ("문서와 로그
-정합성 전수 검사"). Source-code comments in components/thread_manager/
+`power_base/sdkconfig.defaults`. Source-code comments in components/thread_manager/
 (which legitimately discuss "a fixed Thread ROOT/Leader" in the abstract,
 to explain why thread_manager_start_as_always_on_ftd() exists as a NEUTRAL
 alternative -- never asserting that power_base currently IS one) are
@@ -21,7 +17,7 @@ which greps only power_base/main/app_main.c's real call sites and log
 strings (with comments stripped first).
 
 Two independent ways a match is exempted as "clearly historical/superseded",
-matching this task's "명확한 current-policy 구역을 우선 검증" instruction:
+used by this audit:
 
   1. HEADING INHERITANCE: markdown headings form a hierarchy (# > ## >
      ### > ...). If an ENCLOSING heading (this line's own section, or any

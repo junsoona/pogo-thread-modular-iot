@@ -1,12 +1,13 @@
 {
-  "_comment": "Terminal AUTO-mode module for a permanently-paired Plantower PMS5003. UART1/GPIO0/1 carry the sensor signal (GPIO0=ESP TX->PMS RX, GPIO1=ESP RX<-PMS TX) instead of the downstream POGO face, so downstream_port is deliberately and completely disabled. This module can only be a terminal LEAF.",
-
+  "_comment": "ESP32-H2 SuperMini + PMS5003 terminal LEAF 설정. GPIO0/1의 UART1을 센서가 사용하므로 DOWNSTREAM POGO 포트는 비활성화한다.",
   "schema_version": 2,
   "config_revision": 1,
-
   "driver_id": "PMS5003",
-  "sensor_type_bitmap": ["PM1_0", "PM2_5", "PM10"],
-
+  "sensor_type_bitmap": [
+    "PM1_0",
+    "PM2_5",
+    "PM10"
+  ],
   "bus_type": "UART",
   "bus_number": 1,
   "i2c_sda_gpio": -1,
@@ -22,21 +23,33 @@
   "uart_baud_rate": 9600,
   "uart_mode": "PASSIVE",
   "uart_warmup_ms": 30000,
-  "calibration": [0, 0, 0, 0],
+  "calibration": [
+    0,
+    0,
+    0,
+    0
+  ],
   "measurement_timeout_ms": 3000,
-
   "dev_mode": "AUTO",
-
   "upstream_port": {
-    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
-    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
-    "detect_out_active_low": true, "debounce_ms": 30
+    "uart_num": 0,
+    "tx_gpio": 4,
+    "rx_gpio": 5,
+    "detect_in_gpio": 12,
+    "detect_out_gpio": 2,
+    "base_id_gpio": 14,
+    "detect_out_active_low": true,
+    "debounce_ms": 30
   },
-
-  "_downstream_comment": "Terminal-only invariant: every downstream hardware field is -1. GPIO0/1 and UART1 belong exclusively to PMS5003 on this board.",
+  "_downstream_comment": "terminal 전용 규칙: DOWNSTREAM의 모든 hardware field는 -1이고 UART1/GPIO0/1은 PMS5003만 사용한다.",
   "downstream_port": {
-    "uart_num": -1, "tx_gpio": -1, "rx_gpio": -1,
-    "detect_in_gpio": -1, "detect_out_gpio": -1, "base_id_gpio": -1,
-    "detect_out_active_low": true, "debounce_ms": 30
+    "uart_num": -1,
+    "tx_gpio": -1,
+    "rx_gpio": -1,
+    "detect_in_gpio": -1,
+    "detect_out_gpio": -1,
+    "base_id_gpio": -1,
+    "detect_out_active_low": true,
+    "debounce_ms": 30
   }
 }

@@ -1,1680 +1,312 @@
-# Power base
+# Power Base 설계
 
-This document describes the dedicated power-base project (`power_base/`) added
-by the power-base follow-up spec, and the sensor-module (`module/`) changes
-that go with it. It supersedes the older "passive power-base test jig"
-described in earlier revisions of [`pogo-interface.md`](pogo-interface.md):
-that jig modeled a power base with no MCU at all (BASE_ID tied to GND,
-nothing else). The real product has an ESP32-H2 SuperMini in the power base
-too, running its own firmware, which is what this document covers.
+`power_base/`는 센서 모듈과 별도로 빌드하는 ESP32-H2 프로젝트다. POGO 체인의 시작점,
+downstream 프로비저닝, 토폴로지 등록, 센서 데이터 집계, Linux 전송을 담당한다.
 
-## 1. What changed, in one paragraph
+Power Base라는 이름은 애플리케이션 역할을 뜻한다. Thread 네트워크의 Leader를 고정한다는
+뜻이 아니다. OpenThread는 상황에 따라 Power Base를 CHILD, ROUTER, LEADER 중 하나로
+선택할 수 있고, 세 상태에서 같은 서비스를 실행한다.
 
-Before this follow-up, `role_manager` made a sensor module become
-`MODULE_ROLE_ROOT` the moment its UPSTREAM peer read `POGO_PEER_TYPE_POWER_BASE`
-(BASE_ID low). That is no longer true. **The power base is now the system's
-fixed physical POGO root and downstream provisioning coordinator.** (A
-LATER session -- see section 19 -- further decoupled this fixed
-application role from Thread's own `otDeviceRole`: the power base is never
-described as Thread's "ROOT" or "Leader" either, since it runs as an
-always-on FTD and treats CHILD/ROUTER/LEADER alike as ready.) A sensor
-module's UPSTREAM peer being the power base or another sensor module is
-treated identically by `role_manager`: the module is `LEAF` (nothing docked
-below it) or `INTERMEDIATE` (another module docked below it) -- never
-`ROOT`. See [`role_manager.c`](../components/role_manager/role_manager.c)'s
-`recompute()` and its own comment on this fix.
+## 구성
 
-## 2. Final architecture
+Power Base가 직접 사용하는 주요 컴포넌트는 다음과 같다.
 
-```
-                       power_base/ (ESP32-H2, this project)
-                       - Fixed physical POGO root, Active Dataset owner
-                         (otDeviceRole is Thread's own decision -- CHILD,
-                         ROUTER, and LEADER are all "ready"; see section 19)
-                       - CoAP "/s" (sensor data) + "/t" (topology reports)
-                       - topology_registry (who is attached, at what depth)
-                       - parent_service (reused, unmodified) drives
-                         provisioning of whatever docks below it
-                              |
-                              | POGO (one DOWNSTREAM-shaped port)
-                              v
-                       first sensor module (module/, depth=1, role=LEAF or
-                       INTERMEDIATE -- NEVER ROOT)
-                              |
-                              v
-                       (optional deeper chain: INTERMEDIATE -> ... -> LEAF)
-```
+- `power_base_config`: POGO 포트와 전원 제어 설정
+- `power_base_thread_config`: STANDALONE/EXTERNAL_OTBR Dataset 설정
+- `power_base_bridge_config`: Linux bridge 목적지 설정
+- `thread_manager`: always-on FTD 설정과 Thread 시작
+- `pogo_port`: 첫 센서 모듈과의 물리 연결
+- `parent_service`: downstream 모듈 프로비저닝
+- `power_base_transport`: CoAP `/s`, `/t` 수신
+- `topology_registry`: UUID 기반 노드 상태 저장
+- `sensor_root_aggregator`: 최신 센서 샘플 저장과 중복 제거
+- `linux_bridge_exporter`: Linux OTBR 호스트로 북향 전송
 
-`module/` and `power_base/` are two separate ESP-IDF projects/binaries for
-two different boards -- not two dev-mode images of the same binary. Both
-share the same `components/` tree via `EXTRA_COMPONENT_DIRS`, same as
-`upper`/`lower` already did.
+Power Base에는 센서 드라이버와 `child_service`가 필요하지 않다.
 
-### Component reuse
+## POGO 연결
 
-| Component | Sensor module (`module/`) | Power base (`power_base/`) |
+Power Base의 한 포트는 센서 모듈의 DOWNSTREAM과 같은 핀을 사용한다.
+
+| Power Base | 첫 센서 모듈 UPSTREAM | 용도 |
 |---|---|---|
-| `pogo_port` | both UPSTREAM and DOWNSTREAM instances | ONE instance, wired as `POGO_PORT_DOWNSTREAM`, own peer type `POGO_PEER_TYPE_POWER_BASE` |
-| `role_manager` | used (derives LEAF/INTERMEDIATE/ERROR/UNASSIGNED) | **never used at all** -- the power base's role is a hardcoded fact, not derived |
-| `child_service` | used (UPSTREAM) | **never used** -- no UPSTREAM port exists |
-| `parent_service` | used (DOWNSTREAM), context wired to `role_manager`/`child_service`/`sensor_service` | used UNMODIFIED, context wired to the power base's own always-ready-once-attached (CHILD/ROUTER/LEADER, not LEADER-only -- see section 19) / fixed-depth-0 / efuse-derived identity (see `parent_service.h`'s `parent_service_context_t`) |
-| `thread_manager` | `thread_manager_join_with_dataset()` (INTERMEDIATE/LEAF) | `thread_manager_start_as_always_on_ftd()` (forms or resumes the ONE Active Dataset -- the neutral, non-Leader-claiming name; see section 19) |
-| `module_config` / sensor drivers / `sensor_service` | used | **never used** -- see `power_base_config` instead; no sensor is faked |
-| `power_base_config` | n/a | fixed board config (this project's analogue of `module_config`, no sensor fields at all) |
-| `sensor_root_aggregator` | used by `sensor_service` internally (thin wrapper, unchanged public API) | used directly by `power_base_transport` (no `sensor_service`/`sensor_provider` dependency) |
-| `topology_proto` / `topology_registry` | `topology_proto` only (reporter side) | both (registry lives here) |
-| `topology_reporter` | used -- sends this module's own state to the power base | n/a |
-| `power_base_transport` | n/a | owns the receiving CoAP resources + the registry |
+| GPIO10 TX | GPIO5 RX | UART |
+| GPIO11 RX | GPIO4 TX | UART |
+| GPIO3 DETECT_OUT | GPIO12 DETECT_IN | Power Base가 연결 상태 알림 |
+| GPIO23 DETECT_IN | GPIO2 DETECT_OUT | 센서 모듈이 연결 상태 알림 |
+| GND | GND | 공통 기준 |
+| BASE_ID GND 접점 | GPIO14 | 첫 모듈이 Power Base 연결을 판정 |
 
-No component was duplicated to make this work: `parent_service` is the same
-compiled unit in both projects, `sensor_channel`/`pogo_proto`/`node_calc`/
-`thread_manager` are untouched and shared, and `module_config`'s
-`gpio_profile.h` (the ESP32-H2 pin-usability table) is reused by
-`power_base_config` instead of being retyped.
+DETECT 신호는 open-drain active-low다. GPIO3은 출력 전용이므로 Deep-sleep wake 핀일
+필요가 없다. 센서 모듈의 GPIO12는 UPSTREAM DETECT_IN이며 RTC GPIO 조건을 만족하지만,
+현재 펌웨어에는 Deep-sleep 진입 코드가 없다.
 
-## 3. AUTO-mode sensor-module role determination table (updated)
+## 부팅 순서
 
-| UPSTREAM peer | DOWNSTREAM peer | Role |
-|---|---|---|
-| none / not attached | (any) | `UNASSIGNED` |
-| POWER_BASE or MODULE | none attached | `LEAF` |
-| POWER_BASE or MODULE | MODULE | `INTERMEDIATE` |
-| either port ERROR (incl. a BASE_ID/peer_type conflict) | (any) | `ROLE_ERROR` |
+`power_base/main/app_main.c`의 순서는 다음과 같다.
 
-`MODULE_ROLE_ROOT` is never reached through this table. It still exists as an
-enum value only because `MODULE_DEV_MODE_DEV_ROOT` forces it directly (see
-`role_manager_init()`) -- a pre-power-base bench-test/regression fixture kept
-for `upper`'s old behavior, never mixed with the AUTO path (see
-[`pogo-interface.md`](pogo-interface.md)'s "development compat mode").
+1. reset reason을 기록한다.
+2. NVS와 고정 `power_base_cfg`를 읽는다.
+3. `pb_thread` 설정을 읽어 Dataset 출처를 결정한다.
+4. efuse 기반 영구 UUID를 만든다.
+5. OpenThread를 초기화한다.
+6. Dataset 모드에 따라 Thread를 시작한다.
+7. attach supervisor task를 한 번 만든 뒤 `app_main()`은 반환한다.
+8. supervisor는 200ms 간격으로 역할을 확인한다.
+9. CHILD, ROUTER, LEADER 중 하나가 되면 서비스를 한 번만 시작하고 자신을 삭제한다.
 
-The first sensor module docked on the power base is `LEAF` (or
-`INTERMEDIATE` once something docks below it) at `topology_depth=1` -- it is
-never ROOT, and it receives the Active Dataset from the power base exactly
-like every other module receives it from its own parent.
+30초 안에 attach되지 않아도 영구 정지하지 않는다. 30초 뒤 첫 경고를 남기고 이후에는
+최대 60초 간격으로 경고하면서 계속 기다린다. DETACHED/DISABLED 상태에서는
+provisioning을 허용하지 않으며, attach가 회복되면 다음 확인부터 다시 허용한다.
 
-## 4. POGO wiring: power base <-> first sensor module
+서비스 시작 함수는 아래 항목을 각각 한 번만 만든다.
 
-The power base's one physical port is electrically identical to a sensor
-module's DOWNSTREAM port -- same GPIO numbers as `module/`'s confirmed
-profile (UART1, GPIO10/11, DETECT GPIO3/23). It connects to the first
-sensor module's UPSTREAM port (UART0, GPIO4/5, DETECT GPIO12/2, BASE_ID
-GPIO14):
+- Power Base CoAP transport
+- `parent_service`
+- POGO downstream port와 task
+- topology stale sweep task
+- bridge exporter 설정이 있으면 exporter task
 
-**Updated by the Deep-sleep-ready GPIO follow-up (an earlier session): the
-first module's UPSTREAM DETECT_IN/DETECT_OUT are SWAPPED** from the
-previously documented GPIO2/GPIO12 assignment -- DETECT_IN is now GPIO12
-(an ESP32-H2 RTC GPIO channel, a candidate wake source for a future
-terminal-leaf's Deep-sleep ext1 wakeup -- see section 20 below) and
-DETECT_OUT is now GPIO2. **A real power base + first-module pair already
-wired to that old profile must have these two DETECT wires swapped before
-flashing firmware built from it** -- see README.md's rewiring notice and
-section 20 below; POGO 5V supply is still not implemented (see section 8),
-so 5V OUT/5V IN in the table below remain aspirational, not yet wired on the
-bench.
+치명적인 설정 오류, OpenThread API 실패, task/port 생성 실패는 부팅을 중단한다. 느린 attach는
+치명적인 오류로 보지 않는다.
 
-**Updated by the header-accessibility follow-up (this session): the power
-base's own DETECT_OUT moved from GPIO22 to GPIO3** -- GPIO22 is not a
-convenient header pin on the real ESP32-H2 SuperMini board and required
-direct soldering with board-damage risk; GPIO3 is header-accessible, an
-ordinary non-strapping GPIO, and used only as an open-drain DETECT_OUT
-output (never a Deep-sleep wake source -- see docs/pogo-interface.md's
-"History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3" for the full
-reasoning). The power base's GPIO23 (DETECT_IN) is UNCHANGED. **A real
-power base already wired to the GPIO22 profile must have that one DETECT
-wire moved to GPIO3 before flashing firmware built from this profile** --
-`cfg`-partition-only reflashing is sufficient (no app rebuild needed), see
-README.md's exact commands.
+## Thread 역할
 
-| Power base pin | Direction | First module pin |
-|---|---|---|
-| GPIO10 (UART TX) | ---> | GPIO5 (UART RX) |
-| GPIO11 (UART RX) | <--- | GPIO4 (UART TX) |
-| GPIO3 (DETECT_OUT) | ---> | GPIO12 (DETECT_IN) |
-| GPIO23 (DETECT_IN) | <--- | GPIO2 (DETECT_OUT) |
-| BASE_ID contact (GND, **not a GPIO** -- see below) | ---> | GPIO14 (BASE_ID) |
-| GND | --- | GND |
-| 5V OUT | ---> | 5V IN |
+Power Base는 always-on FTD로 시작한다.
 
-Two facts that are easy to get wrong and must not be:
+- `rx-on-when-idle=true`
+- router eligible
+- Thread 역할은 OpenThread가 결정
+- CHILD, ROUTER, LEADER에서 서비스 가능
+- DETACHED/DISABLED에서는 provisioning과 collector 제공 중지
 
-- **BASE_ID is a GND contact on the power base's connector, not a GPIO the
-  power base's own ESP32-H2 drives or reads.** The power base firmware never
-  configures, reads, or writes any "BASE_ID GPIO" at all -- `power_base_config`
-  has no such field, and `pogo_port_config_t.base_id_gpio` is always passed
-  as `-1` for the power base's own port (see `power_base/main/app_main.c`).
-  The first sensor module's own GPIO14 has a local 3.3V pull-up and reads
-  BASE_ID as Low ONLY when it is physically docked into the power base's
-  connector, where that pin meets the power base's GND contact.
-- **GPIO12 (the first module's DETECT_IN, since this session's swap -- was
-  GPIO2 before it) and GPIO14 (the first module's BASE_ID) are two different
-  signals with two different local pull-ups.** Never tie them together, and
-  never wire either one directly to GND on the module side (only the power
-  base's BASE_ID contact is GND; DETECT_IN is a normal pull-up input driven
-  Low by the peer's open-drain DETECT_OUT, never hard-wired to GND).
+`pb_provisioning_allowed()`와 `pb_get_collector()`는 호출할 때마다 현재 역할을 읽는다.
+역할을 별도로 캐시하거나 watcher task를 추가하지 않았다.
 
-DETECT_OUT on both sides is open-drain, active-low, release-only-High (never
-driven push-pull High) -- see [`pogo-interface.md`](pogo-interface.md)'s
-DETECT_OUT/DETECT_IN contract, unchanged by this follow-up.
-`downstream_port.detect_out_active_low` (both `module_config` and
-`power_base_config`) must be `true`; `pogo_port`'s drive logic is hardcoded
-to that policy regardless of what a config claims (see `module-config.md`).
+## 프로비저닝 순서
 
-Module-to-module (deeper chain) wiring, and the confirmed GPIO profile
-table, are unchanged -- see [`pogo-interface.md`](pogo-interface.md).
+Power Base의 `parent_service`는 첫 센서 모듈에 다음 순서로 정보를 보낸다.
 
-## 5. Power base boot sequence
+1. `PEER_HELLO`
+2. `UUID_REQ`
+3. `ASSIGN_SLOT`
+4. `ASSIGN_PARENT_INFO`
+5. `SENSOR_INFO_REQ`
+6. `POLL_CONFIG`
+7. `SET_COLLECTOR`
+8. `SET_DATASET`
+9. `JOIN_RESULT` 확인과 ACK
 
-**Updated TWICE now -- see section 19 (module/Thread role decoupling) and
-section 19.8 (attach supervisor, this correction pass) for the full
-history.** Current policy: `power_base` never waits for strictly `Leader`,
-and (as of section 19.8) a first attach that takes longer than any fixed
-budget is NOT a fatal error -- there is no `halt_forever()` for "not
-attached yet" anywhere in this firmware any more. The numbered list below
-reflects the CURRENT control flow.
+센서가 `SENSOR_STATUS_CONDITIONING`을 반환해도 PMS5003/SGP41의 정상 예열 과정으로
+보고 프로비저닝을 계속한다. 다른 non-zero 상태는 오류로 처리한다.
 
-`power_base/main/app_main.c`'s `app_main()`:
+응답 timeout은 제한된 횟수만 재시도한다. 세션이 끝나도 peer가 연결된 상태라면 idle ping
+주기 뒤 새 프로비저닝 세션을 시작할 수 있다.
 
-1. `nvs_flash_init()` -- the dynamic `"nvs"` partition (OpenThread's own
-   Active Dataset copy only; the power base has no role_manager/child_service
-   dynamic state to persist).
-2. `power_base_config_load()` -- the fixed `"cfg"` partition. `CONFIG_ERROR`
-   halts here (loops forever, logs once), same policy as `module_config_load()`.
-2b. **(this follow-up, see section 12's "External OTBR Dataset join")**
-   `power_base_thread_config_load()` -- the SAME `"cfg"` partition, separate
-   `pb_thread` namespace. Decides STANDALONE vs. EXTERNAL_OTBR for step 6
-   below. A legacy image with no `pb_thread` namespace/key loads as
-   STANDALONE, not an error; an EXTERNAL_OTBR image with a missing/empty/
-   oversized `active_tlvs` halts here (`CONFIG_ERROR`, fail closed, no
-   standalone fallback). Logs `Thread dataset mode: STANDALONE` or `Thread
-   dataset mode: EXTERNAL_OTBR (N bytes; contents hidden)` -- never the
-   Dataset bytes themselves.
-3. Power rail sequencing (`power_enable_gpio`/`power_enable_active_high`/
-   `power_startup_delay_ms`) -- see section 8 below. A no-op today (no
-   switching hardware decided yet).
-4. `esp_efuse_mac_get_default()` -- this power base's own stable 8-byte
-   identity (its EUI-64), used both as its POGO UUID (for
-   `ASSIGN_PARENT_INFO`/`SET_COLLECTOR`) and its topology-registry key.
-   Never regenerated, never logged in full.
-5. `thread_manager_init()` -- OpenThread FTD stack up, no network yet.
-6. **STANDALONE** (unchanged): `thread_manager_start_as_always_on_ftd()`
-   (**this correction pass**; previously `thread_manager_start_as_root()` --
-   see section 19.8) -- forms or resumes an Active Dataset for this power
-   base. If NVS already holds a commissioned dataset, it is resumed;
-   otherwise a new one is formed from Kconfig defaults. Neither the dataset
-   bytes nor the Network Key are ever logged. Logs as `always-on FTD:`,
-   never `ROOT:` (that log prefix is reserved for `module`'s DEV_ROOT
-   regression fixture, which still calls `thread_manager_start_as_root()` --
-   a thin wrapper around the exact same underlying logic, kept only for that
-   fixture's own unchanged logs/tests -- see `thread_manager.h`).
-   **EXTERNAL_OTBR** (this follow-up, step 2b above): instead calls
-   `thread_manager_start_as_always_on_ftd_with_dataset()` with the
-   `pb_thread:active_tlvs` bytes -- joins the OTBR's existing network
-   instead of forming/resuming one of its own; NEVER falls back to the
-   STANDALONE path on failure. Either way, a failure HERE (a genuine
-   OpenThread API error, or -- EXTERNAL_OTBR only -- a real `otDatasetIsValid()`
-   rejection) halts immediately, `pogo_port_enable()` NEVER having been
-   called. On the EXTERNAL_OTBR success path, the in-RAM copy of
-   `pb_thread:active_tlvs` is explicitly zeroized right after being handed
-   to OpenThread (which keeps its own internal copy, untouched by this) --
-   never logged before or after.
-7. **(This correction pass -- no fixed timeout, no halt)**
-   `attach_supervisor_task()` is started and `app_main()` returns. This task
-   polls `thread_manager_get_role()` (200ms interval, non-busy) for this
-   device's FIRST attach -- `otDeviceRole` becoming `Child`, `Router`, OR
-   `Leader` -- with NO timeout and NO `halt_forever()` for simply "not
-   attached yet": an OTBR or another Thread device that only becomes
-   reachable much later must still work. Once 30s have passed without
-   attaching, ONE rate-limited `ESP_LOGW` appears (`power-base FTD: still
-   not attached after ...ms ... -- not halting`), repeating at most once
-   every 60s thereafter -- never a flood, never a busy loop. The instant this
-   device IS observed attached, `start_services_once()` (steps 8-12 below)
-   runs, and this task deletes itself -- it never runs those steps a second
-   time, regardless of any LATER role change (including dropping back to
-   DISABLED/DETACHED and reattaching) -- see section 19.1/19.8.
-8. `power_base_transport_init()` -- registers the CoAP `"/s"` (sensor data)
-   and `"/t"` (topology report) resources.
-9. `parent_service_init()` -- wired to the power base's own context:
-   `provisioning_allowed()` re-checks LIVE, on every call, whether
-   `otDeviceRole` is currently `Child`/`Router`/`Leader` -- no caching, no
-   separate watcher task, since `parent_service`'s own idle loop already
-   re-checks this every iteration. `get_own_depth()==0`, `get_own_uuid()` =
-   the efuse identity, `is_power_base=true`, `get_collector()` fills the
-   collector endpoint (this power base's own permanent UUID + Thread
-   Mesh-Local EID + CoAP port) whenever attached, and returns false
-   (collector not currently valid) while DISABLED/DETACHED.
-10. `pogo_port_init()` + `pogo_port_enable()` for the one DOWNSTREAM-shaped
-    port -- see section 6 for why this single call is also what activates
-    DETECT_OUT. A failure in this step or step 11 (a genuine resource-
-    creation failure, e.g. `xTaskCreate()` failing) still halts -- this is
-    NOT the same thing as "not attached yet".
-11. A periodic (5s) stale-sweep task calls `power_base_transport_sweep_stale()`,
-    created and CONFIRMED running before step 10's `pogo_port_enable()`.
+## Collector endpoint
 
-## 6. DETECT_OUT gating
+센서 데이터와 topology 보고는 현재 Thread Leader 주소가 아니라 Power Base의 collector
+endpoint로 보낸다. endpoint는 POGO `SET_COLLECTOR` 메시지로 전달한다.
 
-**Updated by this session's attach-supervisor follow-up (section 19.8):**
-`pogo_port_enable()` (and therefore DETECT_OUT) is called from
-`start_services_once()`, invoked exactly once by `attach_supervisor_task()`
-the first time this device is ever observed attached -- CHILD, ROUTER, OR
-LEADER (not "strictly LEADER" -- that policy was already relaxed in section
-19.1, and this section previously described the OLDER strictly-LEADER wording
-verbatim; both are superseded here). There is no separate "now assert
-DETECT_OUT" step to sequence: `pogo_port_enable()` itself drives DETECT_OUT
-active (Low) as the very last part of bringing a port up (see `pogo_port.c`'s
-`set_detect_out(p, true)` call inside it), and `pogo_port_init()` alone never
-touches any GPIO. Simply never calling `pogo_port_enable()` before this
-device's first confirmed attach IS the "DETECT_OUT only activates once
-attached" guarantee -- there is no other place in this firmware image that
-can assert it. `start_services_once()` is itself only ever invoked once per
-boot (guarded by `attach_supervisor_task()` deleting itself immediately
-after calling it), so DETECT_OUT is also activated exactly once per boot,
-regardless of how long the first attach took or how many times
-`otDeviceRole` fluctuates afterward (see `tools/test_power_base_boot_sequencing.c`).
-
-## 7. Parent UUID propagation (`POGO_MSG_ASSIGN_PARENT_INFO`)
-
-A new, purely additive POGO message (`0x11`, see `pogo_proto/pogo_protocol.h`)
-lets a parent (power base or another sensor module) tell a docking child its
-own identity, so the child can name a real `parent_uuid` in its own topology
-reports:
-
-```
-IDENTIFY_REQ/RESP -> ASSIGN_UUID -> ASSIGN_SLOT -> ASSIGN_PARENT_INFO
-    -> SENSOR_HELLO -> POLL_CONFIG -> SET_DATASET -> JOIN_RESULT(_ACK)
-```
-
-`ASSIGN_PARENT_INFO`'s payload is 9 bytes (8-byte `parent_uuid` + 1-byte
-`parent_is_power_base` flag, no multi-byte integers so no endian conversion
-is needed) -- see `pogo_pack_assign_parent_info()`/`pogo_unpack_assign_parent_info()`.
-`child_service` gates it exactly like every other provisioning step (its own
-`CS_STATE_PARENT_INFO_SET`, strict-order NACK, `(type, seq)` dedup) and
-exposes it via `child_service_get_parent_uuid()`/`_get_parent_is_power_base()`.
-Existing message numbers/wire formats are unchanged; `upper`/`lower` never
-send or expect this type, so it is purely additive to that regression
-baseline, the same pattern `JOIN_RESULT_ACK` used before it.
-
-`parent_service` itself no longer reaches into `role_manager`/`child_service`
-directly to compute a child's depth or its own identity -- it takes a small
-`parent_service_context_t` at init instead (`provisioning_allowed`,
-`get_own_depth`, `get_own_uuid`, `role_name`, `is_power_base`,
-`ack_timeout_ms`). `module/main/app_main.c` wires this to
-`role_manager`/`child_service`/`sensor_service`; `power_base/main/app_main.c`
-wires it to the power base's own hardcoded identity. Neither side pretends to
-be the other.
-
-## 8. Power rail
-
-No power-switching GPIO has been decided on the current bench hardware.
-`power_base_config.power_enable_gpio == -1` means the 5V rail is assumed
-**always on** -- this firmware never claims to be able to cut real 5V power
-in that case, and does not simulate doing so. If a future revision adds
-switching hardware, `power_enable_gpio`/`power_enable_active_high`/
-`power_startup_delay_ms` are already wired to drive it (see
-`power_base/main/app_main.c`'s `apply_power_rail_sequencing()`) -- set
-`power_enable_gpio >= 0` in `configs/power_base.json` and repack.
-
-**Safety note for bench testing:** never connect the power base's own 5V OUT
-and a USB 5V source to the same rail without protection. Use ONE of:
-USB data-only cable while the power base's 5V is disconnected; a 5V
-selector jumper/switch; or a proper power-ORing/load-switch circuit. Modules
-receive 5V+GND from the power base over POGO and never have their 3.3V rails
-tied together across modules.
-
-### 8.1 POGO 5V supply circuit requirements (this pass -- documentation only)
-
-**No POGO 5V circuit exists on any bench board today.** This section
-organizes what a future revision's circuit needs to get right before
-`power_enable_gpio` is ever assigned a real pin and `power_startup_delay_ms`
-tuned to a real value -- it does **not** assign a GPIO, does not modify
-`configs/power_base.json`, and does not enable POGO 5V on any board. Every
-board in this project stays independently USB-powered, unchanged, until
-this circuit is built AND the checklist below is actually run on real
-hardware.
-
-**Switch stage.** `power_base_config.power_enable_gpio`/
-`power_enable_active_high` (`power_base/main/app_main.c`'s
-`apply_power_rail_sequencing()`) already assume a single GPIO drives an
-enable line for the whole POGO 5V rail -- this is a **high-side load
-switch**, not a mechanical relay: the enable line should gate a P-channel
-MOSFET (or an integrated load-switch IC, e.g. the general class TI's
-TPS22919/TPS2280x or Diodes AP2280x families belong to -- named here only
-to identify the CATEGORY of part to look for, not as a pre-verified
-selection; the actual part must be chosen and checked against this
-project's real measured current/voltage needs, see the checklist below)
-sitting between the Power Base's own upstream 5V source and the POGO
-connector's 5V pin. **Inrush current is a property of the switch circuit
-itself (its own soft-start ramp and current limit, chosen when the
-component is selected), never something `power_startup_delay_ms` controls
-or shapes** -- the real implementation (`power_base/main/app_main.c`'s
-`apply_power_rail_sequencing()`) only drives the enable GPIO to its
-configured level and then `vTaskDelay(pdMS_TO_TICKS(power_startup_delay_ms))`
-before returning; by the time that delay even starts, whatever inrush
-transient the switch produced has already happened at the hardware level,
-entirely outside this firmware's control. This delay's own real purpose is
-narrower: giving a rail that the CIRCUIT already soft-started time to
-settle to a stable voltage before the MCU proceeds to depend on it (e.g.
-before probing a downstream module over POGO) -- a software wait for
-"is the rail probably up by now", not a current-limiting mechanism.
-Current design intent (per `power_enable_gpio` living only in
-`power_base_config`, never per-module config) is a SINGLE switch point at
-the Power Base feeding the entire downstream POGO chain over the
-connector's own 5V pin -- **this assumption itself needs confirming
-against the actual POGO connector/PCB routing** once a real 5V-carrying
-board exists, since this document does not have independent confirmation
-that 5V is wired straight through every module's pass-through port rather
-than re-switched per module.
-
-**Current limiting.** Whatever switch is chosen must have (a) its own
-integrated current limit (most load-switch ICs do) set with real headroom
-above this project's actual measured worst-case draw (see below -- not
-guessed), and (b) an upstream resettable fuse (PTC) as a second,
-independent layer in case the switch itself fails shorted -- never rely on
-the switch IC's current limit alone as the only protection. Sized only
-after real measurement: an ESP32-H2 module plus one I2C sensor (SHT45/
-BH1750/SGP40/SGP41, each a few mA typ.) or PMS5003 (its fan draws
-meaningfully more than the I2C sensors, per its own datasheet) drawing
-briefly during Thread radio TX peaks, multiplied by however many modules
-this rail is actually expected to carry simultaneously in the chain depths
-this project already exercises (currently up to depth=2, see "POGO
-physical topology depth" in `docs/validation-status.md`) -- this project
-has never measured this current on real hardware, so no specific
-milliamp figure is asserted here.
-
-**Reverse-power / back-feed protection.** The existing safety note above
-(never tie POGO 5V and a module's own USB 5V together unprotected) needs
-an actual circuit answer, not just an operator-discipline rule, once
-modules might legitimately be USB-connected (e.g. for `idf.py monitor`)
-while ALSO docked and receiving POGO 5V: a series ideal-diode/ORing
-controller (or, at minimum, a Schottky diode in series with each power
-source feeding a module's own local rail) so neither source can back-feed
-the other or fight over which one wins. A load-switch IC's own
-integrated reverse-current blocking (many include this) can substitute
-for a discrete diode's own reverse-recovery/drop tradeoffs if the specific
-chosen part actually documents that protection -- this is a per-part
-datasheet check for a future revision, not a claim this document makes for
-an unpicked component.
-
-**Real-hardware verification checklist (all still outstanding -- none of
-this has been run; this is a requirements list, not a report of results):**
-
-1. Inrush current at switch turn-on (with a real oscilloscope/current
-   probe), tuning the switch circuit's OWN soft-start/current-limit
-   configuration (never `power_startup_delay_ms`, which only delays this
-   firmware's own next boot step -- see this section's own note above) so
-   downstream modules never see a brown-out at their own POGO 5V input.
-   Once the circuit's own ramp is characterized, `power_startup_delay_ms`
-   can be set to comfortably exceed it, so the MCU never proceeds before
-   the rail has actually settled.
-2. Steady-state current draw across the deepest real chain this project
-   exercises (Power Base -> INTERMEDIATE -> LEAF, all three actively
-   sampling/transmitting), confirming it stays comfortably under both the
-   switch's current limit and the fuse's rating with real margin.
-3. Voltage droop at the FAR END of the chain (the LEAF's own POGO 5V input,
-   not just at the Power Base) under that same worst-case load --
-   POGO connector contact resistance and cable/trace length both matter
-   here and neither has been characterized.
-4. Thermal check on the switch/fuse under sustained worst-case current
-   (a bench thermal-camera or simple touch-temperature check over a
-   multi-minute soak, not just an instantaneous reading).
-5. Reverse-power fault injection: deliberately power a docked module from
-   its own USB port while the Power Base's POGO 5V is also live, and
-   confirm neither source is damaged and neither rail is back-fed --
-   exactly the scenario the existing "Safety note" above already warns an
-   operator to avoid by discipline; this item is what proves the CIRCUIT
-   itself enforces it too, not just operator care.
-
-Until all five pass on real hardware, `power_enable_gpio` stays `-1` (5V
-rail assumed always-on, current behavior, unchanged by this pass) in every
-real config this project ships.
-
-## 9. Topology reporting
-
-Every sensor module (never the power base itself) sends a fixed-length,
-versioned binary report to the power base's CoAP `"/t"` resource, over
-Thread, via `components/topology_reporter` (module side) and
-`components/topology_proto`+`components/power_base_transport` (wire format +
-power-base receiving side):
-
-```
-payload_version | module_uuid | parent_uuid | topology_depth | role
-| sensor_type_bitmap | boot_session_generation | sequence
-| upstream_connected | downstream_connected | report_type
-```
-(32 bytes total -- see `topology_proto.h` for the exact byte offsets.)
-
-`report_type` is one of `ATTACHED` (first report once settled),
-`UPDATED` (role, or downstream connection state, changed), `DETACHED`
-(best-effort, sent from a cached snapshot since `child_service` may already
-have cleared its own session state for the same detach -- see
-`topology_reporter.c`'s header comment), or `HEARTBEAT` (periodic,
-`CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS`, default 30s). Sent as one
-Confirmable CoAP POST with the same bounded UUID-hash backoff schedule
-`sensor_transport` already uses for sensor samples (1 initial + 3 retries) --
-no infinite retry loop, no busy polling while not Thread-joined.
-
-**Data-plane readiness gate (real-hardware finding, see section 18):** on real
-hardware, a sensor module's first `"/s"` sample can reach the power base
-before its OWN `ATTACHED` report has been accepted into `topology_registry` --
-`sensor_service`'s periodic task and `topology_reporter`'s task run on
-independent schedules. `components/topology_gate` closes this window; see
-section 18 for the full design and section 15 for its host test.
-
-`role` and `topology_depth` reuse `module_role_t`'s exact numeric values
-(`topology_proto.h`'s `topology_role_t` mirrors them by convention, the same
-pattern `sensor_channel_type_t` already uses for `module_config.sensor_type_bitmap`).
-
-## 10. Topology registry (power base)
-
-`components/topology_registry` is a pure, dependency-free, RAM-only,
-UUID-keyed table (`TOPOLOGY_REGISTRY_MAX_NODES = 32`), owned and
-mutex-protected by `components/power_base_transport`. It reconstructs
-connection ORDER from each report's `topology_depth`+`parent_uuid`, never
-from arrival order. `topology_registry_apply_report()` rejects, without
-mutating anything:
-
-- a module naming itself as its own parent (`ERR_SELF_PARENT`);
-- `topology_depth == 0`, or `role` = `UNASSIGNED`/`ROOT` (`ERR_INVALID_DEPTH`
-  -- an AUTO-mode module never has either);
-- `topology_depth == 1` with a `parent_uuid` that isn't the power base's own
-  (`ERR_DEPTH1_BAD_PARENT`);
-- `topology_depth > 1` naming an unknown parent (`ERR_UNKNOWN_PARENT`), or
-  one whose own depth+1 doesn't match (`ERR_PARENT_DEPTH_MISMATCH`);
-- `topology_depth > 1` naming a KNOWN parent that is currently
-  `online == false` and/or `downstream_connected == false`
-  (`ERR_PARENT_OFFLINE` -- real-hardware finding: without this check, a
-  child's own stale HEARTBEAT/UPDATED/ATTACHED -- sent before it notices
-  its parent's link broke -- would flip its entry back online ahead of the
-  parent actually reconnecting; see section 11's detach handling below and
-  `tools/test_topology_registry.c`'s
-  `scenario_parent_offline_rejects_children_then_recovers`);
-- a topology cycle -- the claimed parent chain already contains this module
-  (`ERR_CYCLE`);
-- a report from an older `boot_session_generation` (`ERR_STALE_SESSION`), or
-  a duplicate/reordered `sequence` within the same generation
-  (`ERR_DUPLICATE_SEQ`);
-- a brand-new uuid once the table is full (`ERR_FULL`).
-
-See `tools/test_topology_registry.c` for all of the above, executed against
-the real, unmodified component.
-
-## 11. Detach / reconnect / stale handling
-
-- **Power base's own DOWNSTREAM POGO detaches** (a direct hardware
-  `DETECTED` edge, no Thread involved at all): `power_base/main/app_main.c`'s
-  port dispatcher calls `power_base_transport_on_direct_downstream_detached()`,
-  which marks every currently-online `depth==1` node (and its whole subtree,
-  via `topology_registry_cascade_offline_children()`) offline immediately --
-  no waiting for a stale timeout.
-- **An intermediate module's own DOWNSTREAM detaches**: that module is still
-  reachable (it can still report), so it sends an `UPDATED` report with
-  `downstream_connected=false`. The registry then offlines everything BELOW
-  that node (not the node itself) the moment that report is accepted.
-- **A module's own UPSTREAM is lost** (it is about to go dark itself):
-  `topology_reporter` attempts one best-effort `DETACHED` report from its
-  last cached snapshot before Thread actually goes down. This is inherently
-  unreliable (that is the nature of losing connectivity) -- it is a bonus
-  signal, not the primary detach-detection mechanism.
-- **Ordinary radio loss with nothing physically wrong**: never treated as an
-  immediate detach. `topology_registry_sweep_stale()` (power base's own
-  periodic 5s task, using `power_base_config.topology_stale_timeout_ms`)
-  marks a node offline only once its last accepted report is older than that
-  timeout.
-- **Reconnect**: a later valid report for the SAME uuid revives the SAME
-  entry (`online=true` again) -- it is never deleted, only marked offline, so
-  its history (depth, parent, sensor bitmap) survives a stale/detach window.
-  For a `topology_depth > 1` node, "valid" now also requires its OWN
-  reported parent to currently be `online == true` AND
-  `downstream_connected == true` (`ERR_PARENT_OFFLINE`, section 10) -- a
-  child cannot revive itself ahead of its parent; only once the parent's own
-  report is accepted first can the child's next report succeed.
-- **A rejected child, while its parent stays offline**: `power_base_transport`'s
-  `"/t"` handler maps `ERR_PARENT_OFFLINE` to the same CoAP `4.12
-  Precondition Failed` every other rejection uses (section 14 below), and
-  its `"/s"` sensor-sample handler ALSO returns `4.12` for that same
-  known-but-offline uuid (unchanged, pre-existing "known+offline" response
-  -- section 13). `sensor_transport` reacts to a `4.12` on a sensor sample
-  exactly like the `4.04` power-base-reboot case just above: it closes
-  `topology_gate` and asks `topology_reporter` to re-attach on its very next
-  poll tick. While the parent stays offline that re-ATTACH itself keeps
-  getting rejected as `ERR_PARENT_OFFLINE` too, so the gate simply stays
-  closed and `topology_reporter` retries at its normal bounded poll-tick +
-  backoff pace (never a busy loop) -- see section 18 and
-  `tools/test_topology_gate.c`'s `scenario_parent_offline_recovery`. Once the
-  parent's own report is accepted again, the very next child re-ATTACH
-  succeeds and the gate reopens automatically, resuming sensor sending with
-  no manual intervention.
-- **Power base reboot**: the registry is RAM-only and starts empty. It is
-  repopulated purely by modules' own ordinary `ATTACHED`/`HEARTBEAT` reports
-  arriving into what looks like "an unknown uuid" -- no special "recovery
-  mode" exists or is needed (see `tools/test_topology_registry.c`'s
-  `scenario_base_reboot_registry_repopulated_by_heartbeat`). A module that was
-  already sending sensor samples before the reboot does not just wait for its
-  next scheduled `HEARTBEAT` to notice, though: `power_base_transport`'s `"/s"`
-  handler still returns CoAP 4.04 Not Found for that now-forgotten uuid (an
-  unchanged, pre-existing response), and `sensor_transport` reacts to that
-  specific code by closing `topology_gate` and asking `topology_reporter` to
-  re-attach immediately -- see section 18.
-
-## 12. Dataset ownership
-
-**(Superseded/expanded by a later follow-up -- see "External OTBR Dataset
-join" below for the current, authoritative behavior. This paragraph is kept
-as historical record: it described the ONLY mode that existed at the time,
-now called STANDALONE.)** Historically, the power base was the only device
-that ever formed or resumed its own Active Dataset (via what is now called
-`thread_manager_start_as_always_on_ftd()` -- see section 19's role-decoupling
-work for why this is no longer named/described as "becoming Leader" or
-calling `thread_manager_start_as_root()`, which remains only a differently-
-named wrapper for `module`'s own DEV_ROOT regression fixture). Every sensor
-module only ever calls `thread_manager_join_with_dataset()` with a dataset
-it received via `SET_DATASET` from its own parent -- it never forms one
-itself, and a failed join never falls back to forming a new network (see
-[`state-machine.md`](state-machine.md)'s error table, unchanged, and this
-is still true in both modes below). A power base reboot resumes its
-existing dataset from NVS rather than forming a new one (STANDALONE mode
-only -- see below), so previously-joined modules can simply re-attach once
-their own POGO chain re-establishes (still requiring a fresh POGO handshake
-per module, per the existing "no auto-rejoin from stored dynamic NVS"
-simplification -- unchanged by this follow-up).
-
-### External OTBR Dataset join (this follow-up -- see `docs/otbr-rcp.md`)
-
-The power base can now run in one of two Thread dataset PROVENANCE modes,
-chosen by `components/power_base_thread_config` (a small component separate
-from `power_base_config` above -- see section 14):
-
-- **STANDALONE** (the historical behavior above, unchanged): this power
-  base forms or resumes its OWN Active Dataset via
-  `thread_manager_start_as_always_on_ftd()`.
-- **EXTERNAL_OTBR**: this power base instead joins an EXISTING Thread
-  network formed by a Linux OTBR (+ a separate ESP32-H2 flashed as a Radio
-  Co-Processor, `rcp/` -- see `docs/otbr-rcp.md`), using the OTBR's real
-  Active Dataset TLVs, via `thread_manager_start_as_always_on_ftd_with_dataset()`.
-
-**Roles stay strictly separated, and are unchanged by which mode is
-active:**
-
-- **`rcp/` (the RCP project): Radio Only, owns no Dataset at all.** It is
-  purely a radio relay for the Linux OTBR host's own OpenThread stack --
-  see `docs/otbr-rcp.md` section 1/2.
-- **Linux OTBR: owns the Dataset.** It is the only thing in this whole
-  system that ever GENERATES a Thread Active Dataset when EXTERNAL_OTBR
-  mode is used.
-- **Power base: joins, never generates, in EITHER mode.** Even in
-  STANDALONE mode, "generates" means "forms a network from this firmware's
-  own Kconfig defaults" -- the power base has never had any UI/API for a
-  human to hand-author a Dataset; EXTERNAL_OTBR mode simply adds a second,
-  externally-sourced input for the SAME "join with these TLVs" code path
-  (`thread_manager_join_with_dataset()`/`thread_manager_start_as_always_on_ftd_with_dataset()`
-  share the same underlying OpenThread apply-and-join call,
-  `esp_openthread_auto_start(&tlvs)`).
-- **Sensor modules downstream of the power base: completely unaware of
-  which mode their power base is in.** They still receive the Dataset
-  exactly as before, via the pre-existing POGO `SET_DATASET` step -- the
-  power base hands out whatever `thread_manager_get_active_dataset_tlvs()`
-  reports, which is simply "the Dataset this power base is currently
-  running," regardless of whether it got there by forming/resuming
-  (STANDALONE) or by joining an OTBR's network (EXTERNAL_OTBR). No sensor-
-  module code changed for this follow-up at all.
-
-**Fail-closed policy, no exceptions:** if EXTERNAL_OTBR mode is selected but
-its Dataset is missing, empty, oversized, or fails OpenThread's own
-`otDatasetIsValid()` semantic check, the power base halts (see section 5's
-boot sequence and `power_base/main/app_main.c`'s `halt_forever()` calls) --
-it NEVER falls back to forming a standalone network of its own in that
-case. This is deliberate: silently falling back would put this power base
-(and its whole POGO-chain subtree) onto a DIFFERENT, unintended Thread
-network than the operator configured, with no clear signal that anything
-was wrong beyond a device that mysteriously never talks to the expected
-OTBR.
-
-**Secrecy:** an Active Dataset contains the real Thread Network Key. Neither
-the power base firmware, `components/power_base_thread_config`,
-`components/thread_manager`, nor `tools/pack_power_base_config.py` /
-`tools/gen_power_base_otbr_config.sh` ever log, print, or otherwise surface
-the Dataset's bytes -- only its mode and byte LENGTH ever appear in a log
-line. The dataset hex file and the generated EXTERNAL_OTBR `cfg` image are
-both real secrets and must never be committed (`.gitignore` refuses
-`/secrets/` and any `**/otbr-active-dataset.hex`; the generated image is
-written with file mode `0600`).
-
-**Not yet verified on real hardware** -- see `docs/validation-status.md`'s
-"Linux OTBR external Dataset join" table for the current, authoritative
-per-item status.
-
-### First conversion of a real board from STANDALONE to EXTERNAL_OTBR
-
-In EXTERNAL_OTBR mode, the `cfg` partition's `active_tlvs` ALWAYS takes
-priority at boot -- `power_base/main/app_main.c` applies it via
-`thread_manager_start_as_always_on_ftd_with_dataset()` unconditionally,
-overwriting whatever dataset the dynamic `"nvs"` partition (see
-`power_base/partitions.csv`) may already hold from an earlier STANDALONE
-boot. A board that was previously run in STANDALONE mode may still have a
-self-formed dataset commissioned in that `"nvs"` partition; this does not
-need to be erased for EXTERNAL_OTBR mode to work correctly, since the
-`cfg` partition's Dataset always wins regardless.
-
-For a clean first real-hardware conversion (so a real test unambiguously
-confirms the join came from the EXTERNAL_OTBR Dataset and not a leftover
-STANDALONE-formed one still somehow in play), erase ONLY the dynamic
-`"nvs"` partition before flashing the EXTERNAL_OTBR `cfg` image:
-
-```bash
-python -m esptool --chip esp32h2 -p "$BASE_PORT" \
-    erase-region 0x9000 0x6000
-```
-
-`0x9000`/`0x6000` are this project's `"nvs"` partition's own offset/size
-(see `power_base/partitions.csv`) -- **this command must never be pointed
-at the `"cfg"` partition (`0x187000`) or run as a bare `erase-flash`**,
-either of which would also destroy the fixed board config / EXTERNAL_OTBR
-Dataset image (`cfg`) or the application/bootloader themselves. This
-erases ONLY OpenThread's own dynamic dataset storage and this power base's
-topology-registry-adjacent dynamic state -- nothing else.
-
-## 13. Sensor data reception
-
-The power base registers the SAME `"/s"` CoAP resource `sensor_transport`
-already defines for `module/`'s own DEV_ROOT/passive-power-base fixtures,
-via `power_base_transport` (which unpacks with the unmodified
-`sensor_channel_unpack()`, cross-checks the sample's `module_uuid` against
-the topology registry, and forwards a known uuid to
-`sensor_root_aggregator_record_sample()`). An unknown uuid's sample is
-logged and dropped -- never stored, never a crash (see
-`tools/test_topology_registry.c`'s
-`scenario_sensor_data_uuid_linked_to_topology_entry`, which exercises the
-exact lookup this handler performs). The power base never measures anything
-itself -- it has no sensor driver at all.
-
-## 14. Configuration
-
-`components/power_base_config` (namespace `power_base_cfg`, partition `"cfg"`
-in `power_base/partitions.csv`, distinct from and NOT shared with `module`'s
-own `"cfg"` image -- different boards, different binaries): schema version,
-the one downstream port's UART/GPIO/detect-polarity/debounce, an optional
-`ack_timeout_ms` override for `parent_service`'s own provisioning-step
-timeout (0 = the shared `CONFIG_POGO_ACK_TIMEOUT_MS` Kconfig default),
-`topology_stale_timeout_ms`, `heartbeat_timeout_ms`, and the optional
-`power_enable_gpio`/`power_enable_active_high`/`power_startup_delay_ms`
-triple. Same CRC16 integrity scheme as `module_config` (`pogo_crc16`), same
-"any failure is one `CONFIG_ERROR:` line and a halt" policy. Generate with:
-
-```bash
-source ~/.espressif/v6.1/esp-idf/export.sh
-bash tools/gen_power_base_config.sh build/cfg_images
-# -> build/cfg_images/power_base_config.bin (44-byte blob, verified against
-#    the actual NVS image content, not just the bytes handed to the generator)
-```
-
-`tools/pack_power_base_config.py` reuses `tools/pack_module_config.py`'s GPIO
-reserved-pin classification and CRC16 implementation directly (no duplicated
-table) -- see that script's own docstring.
-
-### `pb_thread` namespace: Thread dataset provenance (this follow-up)
-
-The SAME `"cfg"` NVS partition/image ALSO holds a second, independent
-namespace, `pb_thread` (`components/power_base_thread_config`), owning
-exactly the STANDALONE/EXTERNAL_OTBR mode decision from section 12 above --
-`power_base_config`'s own 44-byte blob format and `schema_version` are
-completely unchanged by this.
-
-```
-namespace: pb_thread
-  key "mode"          u8:   0 = STANDALONE, 1 = EXTERNAL_OTBR
-  key "active_tlvs"   blob: OTBR Active Dataset TLVs -- present ONLY when mode=1
-```
-
-**Compatibility**: an image with no `pb_thread` namespace at all, or the
-namespace present but no `mode` key, loads as STANDALONE -- NOT an error.
-Every pre-existing `power_base_config.bin` (generated before this follow-up
-existed) keeps working completely unchanged. A freshly-generated STANDALONE
-image may also write `mode=0` explicitly (`tools/gen_power_base_config.sh`
-does this).
-
-**Fail-closed for EXTERNAL_OTBR**: `mode=1` with `active_tlvs` missing,
-empty, or larger than `OT_OPERATIONAL_DATASET_MAX_LENGTH` (254 bytes) is a
-`CONFIG_ERROR` that halts the power base at boot -- never a silent
-fallback to STANDALONE (see section 12).
-
-Generate an EXTERNAL_OTBR image with:
-
-```bash
-source ~/.espressif/v6.1/esp-idf/export.sh
-tools/gen_power_base_otbr_config.sh /absolute/path/to/otbr-active-dataset.hex build/cfg_images
-# -> build/cfg_images/power_base_otbr_config.bin (mode 0600 -- a real secret)
-```
-
-`tools/pack_power_base_config.py`'s new `--external-dataset-file <path>`
-flag (a FILE PATH, never a literal Dataset value on the command line) is
-what `gen_power_base_otbr_config.sh` wraps -- see that script's own
-docstring for the exact input validation (rejects empty/non-hex/odd-
-length/oversized/`Done`-or-`Error`-contaminated input) and for how the
-generated image is re-parsed with `nvs_parser.py` to confirm
-`power_base_cfg:blob` is still exactly 44 bytes, `pb_thread:mode=1`, and
-`pb_thread:active_tlvs` matches the input file byte-for-byte -- all without
-ever printing the Dataset's content. See `docs/otbr-rcp.md` section 8 for
-how to obtain the hex file from a real Linux OTBR host in the first place.
-
-## 15. Host tests added by this follow-up
-
-All link against real, unmodified production sources except where noted
-(pogo_port/child_service/parent_service/app_main sequencing logic has no
-ESP-IDF-independent form to link against, so those are mirror models of the
-real control flow, the same convention every pre-existing pogo_port/
-child_service/parent_service test in this repository already uses):
-
-| File | Links against | Covers |
-|---|---|---|
-| `tools/test_topology_proto_pack.c` | real `topology_proto.c` | pack/unpack round trip, short/long packets, bad version, bad role/report_type |
-| `tools/test_topology_registry.c` | real `topology_registry.c` + `topology_proto.c` | depth1/self-parent/cycle/depth-jump rejection, invalid role/depth, duplicate/reordered sequence + generation reset, direct-child-detach subtree offline, intermediate-downstream-detach subtree offline, stale timeout + reconnect, base-reboot repopulation, sensor-uuid<->topology linkage |
-| `tools/test_power_base_peer_hello.c` | real `pogo_proto` pack/unpack (mirrors `pogo_port.c`'s validate/retry logic) | POWER_BASE<->MODULE HELLO, BASE_ID/peer_type match and conflict, silent power base |
-| `tools/test_role_manager_auto_chain.c` | mirrors `role_manager.c`'s fixed `recompute()` | first module never ROOT, 1/2/3-stage chains |
-| `tools/test_power_base_boot_sequencing.c` | mirrors `power_base/main/app_main.c`'s control flow | DETECT_OUT never active before Leader, activated exactly once after |
-| `tools/test_direct_child_depth_and_parent_info.c` | real `pogo_proto` pack/unpack | depth=1 + power-base parent uuid assignment, `ASSIGN_PARENT_INFO` round trip |
-| `tools/test_pogo_port_disable_idempotent.c` | mirrors `pogo_port.c`'s `enabled` guard | `pogo_port_disable()` repeated-call safety, DETECT_OUT release |
-
-**Added by the subsequent code review follow-up** (see section 17):
-
-| File | Links against | Covers |
-|---|---|---|
-| `tools/test_permanent_module_uuid.c` | real `pogo_proto` pack/unpack (`PROPOSE_UUID`/`ASSIGN_UUID`) | permanent efuse-derived uuid stable across 10 reprovisions/base reboot/parent change, different efuse -> different uuid, all-zero/wrong-length rejection |
-| `tools/test_topology_reporter_session.c` | mirrors `topology_reporter.c`'s NVS boot-counter logic | monotonic generation across reboots, NVS-persist failure disables reporting (never "looks successful"), sequence rollover before wraparound |
-| `tools/test_coap_response_semantics.c` | mirrors `power_base_transport.c`/client response handling | registry-result -> CoAP code mapping, sensor online/bitmap validation, stale-callback-after-timeout is ignored (not a crash), a rejected response is never logged "sent OK" |
-| `tools/test_pogo_port_enable_rollback.c` | mirrors `pogo_port.c`'s hardened `pogo_port_enable()` | a failure at every single step fully unwinds (DETECT_OUT released, ISR removed, UART removed, `enabled=false`), a subsequent retry succeeds cleanly, double-enable rejected |
-| `tools/test_power_base_boot_sequencing.c` (extended) | mirrors `power_base/main/app_main.c`'s control flow | added: reaching ROUTER (never LEADER) still halts -- ROUTER alone is no longer sufficient |
-| `tools/test_topology_registry.c` (extended) | real `topology_registry.c` | session transitions no longer assume increasing generation numbers; idempotent same-seq retransmit is `OK_DUPLICATE`, not an error |
-
-All pre-existing 17 host tests (15 C + 2 Python) plus the first round's 7
-power-base tests were re-run and still pass -- see the final report for the
-exact run.
-
-**Added by the real-hardware race fix (this session, section 18):**
-
-| File | Links against | Covers |
-|---|---|---|
-| `tools/test_topology_gate.c` | real `components/topology_gate/topology_gate.c` (FreeRTOS event group shadowed by `tools/host_test_stubs/freertos/`), mirrors `topology_reporter.c`'s ATTACHED/gate state machine and `sensor_transport.c`'s gate check + 4.04 reaction | no send before ATTACHED ack, send allowed after 2.xx, a failing ATTACHED keeps the gate closed and retries (bounded, no busy loop), the gate closes on detach/error/new session, power-base-reboot 4.04 -> immediate re-registration -> 2.xx -> resumed sending, DEV_ROOT/DEV_LEAF (`require_topology_registration=false`) unaffected, a duplicate/late callback never opens the gate early, sample_seq policy unaffected |
-
-All pre-existing 27 host tests (25 C + 2 Python) were re-run and still pass
-alongside this new one -- 30 total (28 C + 2 Python). See the final report for
-the exact run.
-
-**Added by the external OTBR Dataset join follow-up (this pass, see section
-12's "External OTBR Dataset join"):**
-
-| File | Links against | Covers |
-|---|---|---|
-| `tools/test_power_base_thread_config.c` | real `components/power_base_thread_config/power_base_thread_config.c`, linked against a functional in-memory NVS fake (`tools/host_test_stubs/nvs_sim/`) instead of a re-implementation of its decision logic | legacy namespace missing -> STANDALONE, namespace-present-but-no-mode -> STANDALONE, explicit STANDALONE (a stray `active_tlvs` key is ignored), valid EXTERNAL_OTBR (exact byte match, boundary length), EXTERNAL_OTBR with missing/empty/oversized `active_tlvs` -> fail closed, invalid mode value -> fail closed, a genuine NVS/partition init error -> fail closed, `*out` always zeroed on failure (even if poisoned beforehand) |
-| `tools/test_power_base_boot_sequencing.c` (extended again) | mirrors `power_base/main/app_main.c`'s control flow | added: `power_base_thread_config_load()` failure halts before either Thread-start branch runs; EXTERNAL_OTBR success starts every service exactly once for CHILD/ROUTER/LEADER alike; EXTERNAL_OTBR join failure halts and NEVER calls the STANDALONE API as a fallback |
-| `tools/pack_power_base_config.py --external-dataset-file` / `tools/gen_power_base_otbr_config.sh` (manual + scripted verification, not a `tools/test_*` file) | real production generator, re-parsed with `nvs_parser.py` | normal image unchanged (44-byte blob, `pb_thread:mode=STANDALONE`, no `active_tlvs`); external image (`pb_thread:mode=EXTERNAL_OTBR`, `active_tlvs` byte-identical to input); empty/non-hex/odd-length/oversized/`Done`-or-`Error`-contaminated input all rejected; generated image file mode `0600`; stdout/stderr never contain the Dataset's hex/byte content |
-
-`components/thread_manager/thread_manager.c`'s new
-`thread_manager_start_as_always_on_ftd_with_dataset()` is NOT
-host-compilable (same pre-existing limitation as the rest of this file --
-real OpenThread/FreeRTOS calls from its very first include) -- verified
-instead by ESP-IDF real build (ESP-IDF v6.1, `power_base` fullclean build,
-zero warnings) plus `nm power_base.elf` confirming it is actually linked
-into the final binary, plus code review confirming it shares the exact
-same `disable_thread_and_apply_always_on_ftd_link_mode()` helper as the
-pre-existing, already-reviewed `thread_manager_start_as_always_on_ftd()`
-(so the always-on-FTD link mode cannot drift between the two) and calls
-only `esp_openthread_auto_start(&tlvs)` (the join path), never
-`esp_openthread_auto_start(NULL)` (the network-FORMATION path, only
-reachable from the STANDALONE-only code).
-
-All pre-existing 44 host tests (36 C + 8 Python, counting `rcp/`'s own
-`tools/test_rcp_config.py` and every other pre-existing `tools/test_*.py`)
-were re-run and still pass alongside the new
-`tools/test_power_base_thread_config.c` -- 45 total (37 C + 8 Python). See
-the final report for the exact run.
-
-## 16. What is still unverified on real hardware
-
-**Update (this session, see section 18):** a real power base + one real SHT45
-sensor module (depth=1, single hop) has since been wired and exercised.
-Confirmed on that real hardware: the power base reaching `otDeviceRole=4
-(LEADER)`; POGO `PEER_READY` between the two boards; the module's permanent
-efuse-derived uuid being proposed/confirmed; `polling_period_ms=195` delivered
-via `POLL_CONFIG`; a 110-byte Active Dataset delivered and durably stored;
-the module joining Thread as `otDeviceRole=2 (CHILD)`; `JOIN_RESULT_ACK`;
-a topology report applied at the power base; and an SHT45 2-channel sample
-recorded in `sensor_root_aggregator`. Everything below that is not covered by
-that specific run is still unverified exactly as before.
-
-That same run also surfaced a real startup race (a sensor sample reaching
-`"/s"` before this module's own topology `ATTACHED` report had been applied,
-rejected once as CoAP 4.04 -- see section 18) -- fixed in this session via
-`components/topology_gate`, but **the fix itself has not yet been reflashed
-and re-verified on real hardware**; only host tests + clean builds cover it
-so far. This is the single most important thing to reflash and re-check next.
-
-In particular, still needing real hardware:
-
-- **The `topology_gate` fix from section 18 itself** -- reflash both boards
-  and confirm: no sensor sample before the ATTACHED ack; the CoAP-4.04
-  power-base-reboot recovery path re-registers within one poll tick, not a
-  30s heartbeat wait; DEV_ROOT/DEV_LEAF regression images are unaffected.
-- The actual POGO wiring table in section 4 above, on a BH1750 sensor module
-  (only SHT45 has been tried) and on chains of more than one sensor module.
-- `pogo_port`'s BASE_ID/PEER_HELLO cross-check with more than one sensor
-  module attached (only a single depth=1 module has been tried against the
-  real power-base MCU so far).
-- `thread_manager_start_as_always_on_ftd()`'s dataset resume path (this
-  correction pass's name for what was `thread_manager_start_as_root()` when
-  this bullet was first written) across a REAL power cycle of the power-base
-  board.
-- CoAP delivery of both `"/s"` and `"/t"` over a real depth>=2 POGO chain
-  (only a single depth=1 hop has been tried), including the UUID-hash backoff
-  schedule's real timing. Note: even a passing depth=2 POGO chain test only
-  confirms POGO physical/application-layer topology (docking order, depth
-  propagation, provisioning, CoAP reachability) -- it does NOT by itself
-  prove the CoAP packet actually radio-hopped through the INTERMEDIATE
-  module's Thread router role (genuine Thread-mesh multi-hop is a distinct,
-  separately-unverified property; see docs/validation-status.md's "POGO
-  physical topology depth" vs. "Thread radio multi-hop routing" sections).
-- The unbounded, no-halt first-attach wait (`attach_supervisor_task()`,
-  section 19.8) under adverse real radio conditions or a genuinely absent
-  Thread network for an extended period (the one run so far reached LEADER
-  quickly, before this correction pass even existed).
-- Any of section 11's detach/reconnect/stale behaviors under a real physical
-  detach (as opposed to the host-tested pure registry logic) -- the power
-  base reboot / registry-loss path specifically is section 18's concern.
-
-See the final report's "실물 검증 절차" for the exact flash order and
-pass/fail criteria to run next.
-
-## 17. Code review follow-up (this session)
-
-A subsequent code review pass found and fixed seven issues in the
-implementation above. None of these change the architecture described in
-sections 1-16; they correct implementation defects within it. Real hardware
-is still NOT wired -- everything below is verified at the source/build/
-host-test level only, same as the rest of this document.
-
-1. **Permanent module UUID.** `parent_service.c` used to assign each child a
-   fresh `esp_fill_random()` uuid every provisioning session -- a
-   permanently-paired sensor would register as a "new" device every time it
-   redocked. Fixed with two new, purely additive POGO messages:
-   `POGO_MSG_REQUEST_UUID` (parent -> child, empty payload) and
-   `POGO_MSG_PROPOSE_UUID` (child -> parent, its own efuse EUI-64, 8 bytes --
-   see `child_service.c`'s `compute_permanent_uuid()`). `POGO_MSG_ASSIGN_UUID`
-   keeps its exact existing wire format but is now a CONFIRMATION: the
-   parent echoes back exactly what the child proposed, and the child (via
-   `handle_assign_uuid()`) rejects (`POGO_NACK_UUID_MISMATCH`) anything else
-   instead of accepting it. An all-zero efuse read is never treated as a
-   valid identifier, on either side. See `tools/test_permanent_module_uuid.c`.
-
-2. **Session generation, not a random number the registry can't reason
-   about.** `topology_reporter_init()` now derives `boot_session_generation`
-   from an NVS-persisted, monotonically-incrementing-per-boot counter
-   (`load_next_boot_generation()`) instead of `esp_random()`, and rolls the
-   local sequence counter over to a fresh persisted generation before it
-   could ever wrap (`maybe_roll_over_sequence()`). If persisting a
-   generation ever fails, reporting is disabled for the rest of that boot --
-   it never sends with an un-persisted number. Independently,
-   `topology_registry_apply_report()` no longer assumes generation numbers
-   increase: it now tracks each node's `superseded_generation` (the session
-   just left) and rejects only a delayed packet naming THAT exact one,
-   accepting any other different generation as a legitimate new session --
-   see `topology_registry.h`'s top comment for the documented, bounded limit
-   this implies (only the immediately-preceding session is guarded, not
-   arbitrarily old ones). See `tools/test_topology_reporter_session.c` and
-   `tools/test_topology_registry.c`'s session-transition scenarios.
-
-3. **CoAP response codes actually mean something, and clients check them.**
-   `power_base_transport.c` used to ACK every `"/s"`/`"/t"` request with
-   `2.04 Changed` regardless of outcome. It now maps
-   `topology_registry_result_t` (and the sensor-sample validation added by
-   item 4) to a real CoAP code -- see `power_base_transport.h`'s top comment
-   for the exact table. `topology_reporter.c` and `sensor_transport.c`'s
-   send paths now check the ACTUAL response code (not just the OpenThread
-   transport result) before logging "sent OK". Both components' CoAP client
-   callback context is no longer a per-call stack-allocated
-   `SemaphoreHandle_t` (which a late callback -- one that fires after the
-   waiter already timed out and returned -- could touch after it was
-   deleted); it is now one persistent semaphore plus a monotonically
-   incrementing token, so a stale callback recognizes it is stale and does
-   nothing. See `tools/test_coap_response_semantics.c`.
-
-4. **Sensor data checked against the topology registry, not just "is the
-   uuid known".** `power_base_transport.c`'s `"/s"` handler now also
-   requires the reporting node to be `online`, and its `sensor_type_bitmap`
-   to be a subset of (or equal to) that node's own last-reported bitmap --
-   an offline node's data, or a bitmap claiming an unconfigured channel, is
-   rejected (and counted via the registry's new
-   `topology_registry_record_sensor_error()`), not silently stored. See
-   `tools/test_coap_response_semantics.c`.
-
-5. **Power base gates strictly on LEADER (this pass) -- SUPERSEDED by
-   section 19.** At the time of this code-review pass, `pb_provisioning_allowed()`
-   and the boot-time role-wait in `power_base/main/app_main.c` were changed
-   from accepting `LEADER || ROUTER` to strictly `LEADER`, reasoning that
-   ROUTER was never a correct steady state for a node that is the sole
-   former/resumer of this network's dataset. **A later session (section 19)
-   revisited this and relaxed it again -- to `CHILD || ROUTER || LEADER`,
-   the power base's fixed application role never actually depending on
-   Thread Leadership in the first place.** Every log line naming an
-   `otDeviceRole` (here, `child_service.c`, `parent_service.c`) still prints
-   both the numeric value and a name via the shared
-   `thread_manager_role_to_str()`, unaffected by that later change. See
-   `tools/test_power_base_boot_sequencing.c` (rewritten in section 19's
-   session for the new CHILD/ROUTER/LEADER-all-sufficient policy).
-
-6. **Initialization failure/rollback hardening.** `pogo_port_enable()` now
-   checks every `gpio_config`/`gpio_set_level`/`gpio_isr_handler_add`/
-   `xTaskCreate` return value and fully unwinds (DETECT_OUT released, any
-   installed ISR removed, the UART driver removed, `enabled` left false) on
-   any failure, so a retry always starts clean (see
-   `tools/test_pogo_port_enable_rollback.c`); calling it twice without an
-   intervening `pogo_port_disable()` is now rejected outright.
-   `topology_reporter_init()` cleans up its queue/semaphore if task creation
-   fails, instead of leaving them allocated with nothing consuming them.
-   `topology_reporter_on_port_event()`'s `xQueueSend()` failure is now
-   rate-limited-logged AND self-healing -- `topology_reporter_task()` polls
-   `pogo_port_is_attached()`/`pogo_port_get_peer_type()` as ground truth every
-   tick regardless of the event queue, so a dropped event desyncs
-   `downstream_connected` for at most one poll tick, never permanently.
-   `power_base/main/app_main.c`'s stale-sweep task creation failure is now
-   logged loudly and reflected in the final boot-ready log line instead of
-   being silently absorbed into an otherwise-normal boot.
-
-7. **Logs an operator can actually see.** `topology_reporter.c` and
-   `power_base_transport.c` now log ATTACHED/UPDATED/DETACHED at `ESP_LOGI`
-   (was `ESP_LOGD`, invisible on a default INFO-level monitor); routine
-   HEARTBEAT successes stay at `ESP_LOGD` so a healthy, unchanging chain
-   does not flood the log.
-
-All four projects (`module`, `power_base`, `upper`, `lower`) were rebuilt
-from a clean `fullclean` after these fixes and still link with zero
-warnings -- see the final report for the exact build/test results.
-
-## 18. Real-hardware validation and the first-sample/topology race fix (this session)
-
-**Real-hardware result.** A power base + one SHT45 sensor module (depth=1,
-single hop) has been wired and exercised on real hardware. Confirmed:
-`power_base` reaching `otDeviceRole=4 (LEADER)`; POGO `PEER_READY` between the
-two boards; the module's permanent efuse-derived uuid proposed and confirmed;
-`polling_period_ms=195` delivered via `POLL_CONFIG`; a 110-byte Active Dataset
-delivered and durably stored; the module joining Thread as `otDeviceRole=2
-(CHILD)`; `JOIN_RESULT_ACK`; a topology report applied at the power base
-(`role=3`, LEAF); and an SHT45 2-channel sample recorded in
-`sensor_root_aggregator`. This is the first real-hardware confirmation of the
-whole chain described in sections 1-17.
-
-**The race.** The same run also showed this sequence, right after boot:
+wire payload는 다음 30바이트다.
 
 ```text
-power_base_transport: sensor sample from unknown module uuid=..d357 -- dropped, not stored
-sensor_transport: sensor sample rejected by receiver: CoAP 4.04
-power_base_transport: topology report applied: uuid=..d357 ...
-sensor_root_aggregator: sample recorded: uuid=..d357 ...
+power_base_uuid(8) | IPv6 address(16) | port(2) | generation(4)
 ```
 
-`sensor_service`'s periodic sampling task starts measuring the instant it has
-a polling period, and its sample-ready callback (`sensor_transport_send_sample()`)
-was previously gated ONLY on Thread-joined state (`sensor_service_set_thread_joined()`,
-flipped by `child_service` the moment `otDeviceRole` settles). `topology_reporter`
-runs its own, independent `TOPOLOGY_REPORTER_POLL_TICK_MS` (500ms) poll loop and
-only notices `role_manager_is_upstream_ready()` becoming true on its next tick.
-On real hardware, this module's first `"/s"` sample can therefore reach the
-power base before its own `ATTACHED` report has been applied to
-`topology_registry` -- an unknown-uuid rejection (CoAP 4.04, section 13's
-existing, unchanged semantics), recovered a moment later once the `ATTACHED`
-report itself succeeds. One sample lost, not data corruption, but a policy
-violation of "no `"/s"` before this module is actually registered".
+Power Base는 자신의 Mesh-Local EID와 CoAP port 5683을 제공한다. INTERMEDIATE는 받은
+endpoint를 downstream LEAF에 그대로 전달한다. 센서 모듈은 새 프로비저닝 시작,
+DETACHED, upstream 오류에서 캐시를 지운다.
 
-**The fix: `components/topology_gate`.** A small, dependency-free (one
-FreeRTOS event group) component holding two bits: whether this module is
-CURRENTLY registered (data-plane gate), and whether a re-registration has been
-requested. It is the only thing `topology_reporter` (the sole writer of the
-first bit) and `sensor_transport` (the reader of the first bit, and the writer
-of the second) share -- neither gains a direct dependency on the other, so no
-component-dependency cycle is introduced (`topology_reporter` already depends
-on `sensor_service`; `sensor_transport` already depends on `sensor_service`
-too; both simply gain a one-way dependency on this one leaf component).
+이 구조 덕분에 Power Base의 `otDeviceRole`이 바뀌어도 센서의 목적지는 바뀌지 않는다.
 
-- **Where the gate opens:** `topology_reporter_task()`'s `settled &&
-  !has_attached` branch now only sets `has_attached = true` (and calls
-  `topology_gate_open()`) when `send_live_report(TOPOLOGY_REPORT_ATTACHED)`
-  itself returns true -- i.e. a real CoAP 2.xx response, unchanged from the
-  existing "2.xx only" success check `send_one_attempt()` already enforced
-  (code review follow-up section 3, section 17 item 3 above). Previously
-  `has_attached` was set unconditionally, before the send even happened; a
-  failed ATTACHED attempt is now retried on the next poll tick instead of
-  silently giving up on ever registering until the next heartbeat.
-- **Where it closes:** the same task's `!settled && has_attached` branch
-  (upstream DETACHED/ERROR, role settling to UNASSIGNED/ROLE_ERROR, this
-  module's own Thread membership lost, or a fresh provisioning session
-  starting -- `role_manager_is_upstream_ready()`/`role_manager_get_role()`
-  fold all of these into the one `settled` boolean this branch already
-  checked), within at most one `TOPOLOGY_REPORTER_POLL_TICK_MS` -- the same
-  bound `resync_downstream_connected()` already documents for a dropped port
-  event, not a new synchronous cross-task guarantee.
-- **`sensor_transport_send_sample()`** now takes a `require_topology_registration`
-  bool (from `sensor_transport_init()`, true only for the AUTO path against an
-  active power base) and, when true, refuses to even attempt a `"/s"` send
-  while `topology_gate_is_open()` is false -- not a warning every sample
-  period, an `ESP_LOGD` (section 4 of this session's task: "매 주기마다
-  경고를 출력하지 않는다"). `sensor_service`'s own measurement, `sample_seq`
-  increment, and local state updates are all untouched -- only the wireless
-  hand-off is skipped, exactly like the existing Thread-joined gate.
-- **Power base reboot recovery:** its `topology_registry` is RAM-only (section
-  10), so a reboot can make it reject an already-registered module's sample as
-  CoAP 4.04 Not Found -- the ONLY meaning that code has for `"/s"` (section
-  13, unchanged). `sensor_transport`'s `send_one_attempt()` reacts to that
-  specific code (when `require_topology_registration` is true) by calling
-  `topology_gate_close()` and `topology_gate_request_reregister()` right away.
-  `topology_reporter_task()` checks (and atomically clears)
-  `topology_gate_take_reregister_request()` every poll tick; when set, it
-  forces `has_attached = false`, so the very same tick's `settled &&
-  !has_attached` branch retries `ATTACHED` immediately -- bounded by one poll
-  tick, not the up to `CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS` (30s
-  default) a plain heartbeat schedule would otherwise impose.
-- **DEV_ROOT/DEV_LEAF regression is unaffected.** `require_topology_registration`
-  is false for that module-to-module path (`module/main/app_main.c` passes
-  `dev_mode == MODULE_DEV_MODE_AUTO`): DEV_ROOT's peer never runs
-  `power_base_transport` and so has no `"/t"` resource at all, meaning its
-  ATTACHED reports could never succeed -- gating `"/s"` sending on that would
-  have permanently blocked DEV_LEAF's sensor data. `topology_reporter` still
-  runs its ATTACHED-retry loop uniformly for every mode (harmless -- a bounded,
-  rate-limited-logged retry against a peer with no `"/t"` resource), but
-  `sensor_transport` simply never consults the gate in that mode. `upper`/
-  `lower` never call `sensor_transport_init()` at all and are untouched.
-- **No shared semaphores/callback state.** This gate never touches
-  `topology_reporter.c`'s or `sensor_transport.c`'s own token-guarded async
-  CoAP response-handler state (section 17 item 3) -- it only ever reads
-  `send_live_report()`'s/`send_one_attempt()`'s already-finished boolean
-  result or a CoAP response code, after those functions' own stale-callback
-  protection has already resolved.
+## 센서 데이터와 topology
 
-See `components/topology_gate/include/topology_gate/topology_gate.h` for the
-full design comment and `tools/test_topology_gate.c` for the host test
-(section 15). **This fix itself has not yet been reflashed and re-verified on
-real hardware** -- see section 16.
+Power Base는 CoAP resource 두 개를 연다.
 
-## 19. Module/Thread role decoupling and collector provisioning (this session)
+- `/s`: 센서 sample
+- `/t`: topology report
 
-This session's task had five parts: decouple the power base's fixed
-application role from Thread's own `otDeviceRole`; remove the sensor/
-topology data plane's dependency on "the current Thread Leader"; introduce
-a POGO-delivered collector endpoint (in place of that Leader-RLOC
-dependency); swap the UPSTREAM DETECT_IN/DETECT_OUT GPIO assignment for a
-future Deep-sleep wake path; and lay only the groundwork for a future Linux
-OTBR. **None of Linux OTBR, RCP firmware, a Matter Bridge, MCU Deep-sleep, or
-POGO 5V supply were implemented this session** -- see subsection 19.6 below
-for exactly what groundwork exists and what does not.
+sample을 받기 전에 해당 module UUID가 topology registry에 online 상태로 등록되어 있어야
+한다. 등록이 없으면 4.04, 부모 상태가 맞지 않거나 bitmap/세대가 맞지 않으면 4.12를
+반환한다. 저장소가 busy/full이면 5.03을 반환한다.
 
-### 19.1 Fixed application role vs. dynamic Thread role
+aggregator 결과와 CoAP 코드는 다음처럼 연결한다.
 
-The power base's fixed, permanent application role -- the physical root of
-the POGO chain, the downstream provisioning coordinator, the UUID/slot/
-topology registry owner, the sensor-data aggregator, and (in a future
-revision) the POGO 5V supplier and the gateway in front of a Linux Matter
-Bridge -- no longer requires or claims Thread Leadership. `power_base`
-always runs as an always-on FTD (`rx-on-when-idle=true`,
-`router-eligible=true` -- unchanged, `thread_manager_start_as_root()` always
-applied this link mode). `otDeviceRole` is entirely Thread's own decision;
-`CHILD`, `ROUTER`, and `LEADER` are all treated as "attached and ready"
-identically -- only `DISABLED`/`DETACHED` are "not ready". Every log line and
-doc passage claiming "the power base is Thread's one and only Leader" or
-"ROOT is always Leader" describes the OLD (pre-this-session) policy and has
-been superseded (see sections 5 and 17 item 5 above, and README.md).
+| aggregator 결과 | CoAP | bridge export |
+|---|---|---|
+| STORED | 2.04 | 실행 |
+| DUPLICATE | 2.03 | 실행하지 않음 |
+| BUSY/FULL | 5.03 | 실행하지 않음 |
+| INVALID | 4.xx | 실행하지 않음 |
 
-Sensor modules are completely unaffected by this: `role_manager`'s
-`MODULE_ROLE_ROOT`/`INTERMEDIATE`/`LEAF`/`UNASSIGNED`/`ROLE_ERROR` state
-machine (section 1-3 above) is a POGO/role_manager-layer concept, unrelated
-to `otDeviceRole`, and nothing about it changed this session.
+`stored`는 Power Base의 RAM aggregator에 저장됐다는 뜻이다. 플래시 영구 저장을 의미하지
+않는다.
 
-`power_base/main/app_main.c`'s boot sequence (section 5) now waits, once,
-for this device's FIRST attach as ANY of CHILD/ROUTER/LEADER, then runs its
-fixed one-time init (CoAP resources, `parent_service_init()`,
-`pogo_port_init()`+`enable()`, the stale-sweep task) EXACTLY ONCE. None of
-that is ever re-created for a LATER role change: `pb_provisioning_allowed()`
-and `pb_get_collector()` are both pure, stateless functions of the CURRENT
-`otDeviceRole`, re-evaluated fresh on every call (`parent_service`'s own
-idle loop already polls `provisioning_allowed()` every iteration -- no new
-watcher task was needed). Concretely:
+## Topology registry
 
-- A drop to DISABLED/DETACHED makes `pb_provisioning_allowed()` return
-  false (no NEW downstream provisioning session starts) and
-  `pb_get_collector()` return false (collector not currently valid) on
-  their very next call -- no explicit "pause" step.
-- An already-JOINED child's Thread membership is untouched by the power
-  base's own role fluctuation; only a session that happens to be mid-flight
-  at that moment (e.g. about to request SET_COLLECTOR) is abandoned by
-  `parent_service`, the same as any other failed provisioning step, and
-  naturally retried once the peer redocks or the power base reattaches.
-- A reattach (role becomes CHILD/ROUTER/LEADER again) makes both callbacks
-  return true/valid again on their very next call -- no explicit "resume"
-  step, and no busy-retry loop (the existing bounded, non-busy polling
-  `parent_service_task()` already used is unchanged).
+registry key는 module UUID다. 각 entry에는 다음 정보가 있다.
 
-See `tools/test_power_base_boot_sequencing.c` (rewritten this session) for
-the host-tested model of all of the above.
+- module UUID와 parent UUID
+- depth
+- 논리 역할
+- sensor bitmap
+- online/downstream 상태
+- generation과 sequence
+- 마지막 보고 시각
 
-### 19.2 Collector provisioning replaces the Leader-RLOC dependency
+depth 1 노드는 Power Base에 직접 연결된다. depth 2 이상 보고는 부모 UUID가 존재하고,
+부모 depth가 하나 작으며, 부모가 online이고 downstream이 연결된 경우에만 적용한다.
 
-`sensor_transport.c` and `topology_reporter.c` (module side) used to send
-every `"/s"`/`"/t"` request to `thread_manager_get_leader_address()` --
-"the current Leader's RLOC", which happened to always be the power base in
-the old strictly-Leader topology. Both now send to
-`components/collector_endpoint`'s current snapshot instead: a small,
-FreeRTOS-task-safe, per-module cache of the power base's permanent UUID +
-Thread Mesh-Local EID + CoAP port, delivered via a new POGO message
-(`POGO_MSG_SET_COLLECTOR`, `0x14`) rather than derived from Thread role at
-all. Neither component depends on `thread_manager_get_leader_address()` any
-more (that API itself is untouched, left in `components/thread_manager` for
-any other diagnostic use); see `tools/test_no_leader_rloc_dependency.py`.
+Power Base의 POGO 링크가 분리되면 depth 1 노드와 그 subtree를 offline으로 바꾼다.
+분리된 자식의 늦은 heartbeat나 sample이 도착해도 부모가 복구되기 전에는 다시 online으로
+살아날 수 없다. 재연결 뒤에는 부모부터 다시 등록하고 자식이 이어서 등록한다.
 
-This means a sensor module's data destination is now completely independent
-of the power base's OWN Thread role: it stays fixed at whatever Mesh-Local
-EID SET_COLLECTOR delivered, and Thread's own mesh routing (via RLOCs)
-handles multi-hop delivery to that address transparently regardless of
-which node currently holds Leadership.
+stale sweep는 일정 시간 보고가 없는 노드를 offline으로 바꾼다. 다른 UUID의 상태는
+건드리지 않는다.
 
-`components/collector_endpoint` (new leaf component, module-side only --
-the power base does not need one, since it computes its own identity
-directly): `init`/`set`/`clear`/`get` (a full-struct snapshot by value)/
-`is_valid`. `set()` independently validates its inputs (rejects the
-unspecified/multicast/link-local address, port 0, or an all-zero
-`power_base_uuid`) even though its only real caller (`child_service.c`)
-already validated the same fields via `pogo_unpack_set_collector()`/
-`pogo_collector_endpoint_is_valid()` -- defense in depth, not redundant
-trust. See `tools/test_collector_endpoint.c`.
+## Dataset 모드
 
-`thread_manager_get_mesh_local_eid()` (new) wraps
-`otThreadGetMeshLocalEid()` -- confirmed against the real
-`components/openthread/openthread/include/openthread/thread.h` shipped with
-ESP-IDF v6.1 (`const otIp6Address *otThreadGetMeshLocalEid(otInstance
-*aInstance)`), not assumed from memory. Its returned pointer is into
-OpenThread's own internal state and is only valid while the OpenThread API
-lock is held, so the wrapper copies the 16 bytes out before releasing the
-lock, exactly like `thread_manager_get_active_dataset_tlvs()` already does
-for a different OpenThread getter.
+### STANDALONE
 
-### 19.3 Wire format: `POGO_MSG_SET_COLLECTOR`
+기존 동작이다. Power Base가 저장된 Active Dataset을 재사용하거나 새 Dataset으로 Thread
+네트워크를 시작한다.
 
-Purely additive (existing message types/wire formats unchanged) -- 30 bytes:
+### EXTERNAL_OTBR
 
-```
-power_base_uuid(8) | addr(16, IPv6, network byte order) | port(2, big-endian) | generation(4, big-endian)
+Linux OTBR가 소유한 Active Dataset TLV를 `pb_thread` NVS namespace에서 읽고 기존
+Thread 네트워크에 가입한다. 이 모드에서 Power Base는 새 Dataset을 만들지 않는다.
+
+설정이 잘못됐을 때 STANDALONE으로 조용히 돌아가지 않는다. 잘못된 mode, 비어 있는 TLV,
+길이 초과, Dataset 검증 실패는 CONFIG_ERROR로 부팅을 중단한다. Dataset 내용은 로그에
+출력하지 않고 mode와 길이만 남긴다.
+
+센서 모듈에는 두 모드 모두 기존 `SET_DATASET` 단계로 같은 Dataset을 전달한다.
+
+## NVS 설정
+
+`cfg` 파티션 안에 namespace를 나눠 사용한다.
+
+| namespace | 내용 |
+|---|---|
+| `power_base_cfg` | POGO 포트, timeout, 전원 제어 |
+| `pb_thread` | Dataset mode와 external Active TLV |
+| `pb_bridge` | Linux host IPv6 주소와 port |
+
+기존 `power_base_cfg` blob은 44바이트 schema v1을 유지한다. `pb_thread` namespace가
+없으면 STANDALONE으로 동작해 기존 이미지와 호환된다. `pb_bridge`가 없거나
+`enabled=0`이면 exporter만 비활성화하고 나머지 기능은 정상 부팅한다.
+
+bridge가 enabled인데 주소가 unspecified, multicast, link-local이거나 port가 0이면 exporter를
+비활성화하고 명확한 설정 오류를 남긴다. POGO와 Thread 자체는 계속 동작한다.
+
+설정 이미지는 다음 명령으로 만든다.
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+
+bash tools/gen_power_base_config.sh build/cfg_images
+
+bash tools/gen_power_base_otbr_config.sh \
+  "$HOME/otbr-active-dataset.hex" \
+  build/cfg_images
+
+bash tools/gen_power_base_bridge_config.sh \
+  "$OTBR_MLEID" \
+  5684 \
+  build/cfg_images \
+  "$HOME/otbr-active-dataset.hex"
 ```
 
-`addr` is the power base's own Mesh-Local EID; `port` is the CoAP port
-`power_base_transport_init()` bound (`OT_DEFAULT_COAP_PORT`); `generation`
-is an informational provisioning epoch (a random-per-boot value on the
-power base side today -- not read back or relied on for any wire-level
-decision, carried only so a future revision could use it). `pogo_pack_set_collector()`/
-`pogo_unpack_set_collector()` live in `components/pogo_proto` alongside
-every other message codec; `pogo_collector_endpoint_is_valid()` (and the
-lower-level `pogo_ipv6_addr_is_valid_collector()`) are the shared
-length/byte-order/address/port validators both the wire layer and
-`components/collector_endpoint`'s own independent `set()`-time check use.
-See `tools/test_collector_provisioning_pack.c`.
+마지막 명령의 출력은 Dataset 비밀을 포함하므로 파일 권한을 `0600`으로 유지한다.
 
-### 19.4 Provisioning sequence and NVS storage
+## Linux exporter
 
-`child_service.c`'s (module UPSTREAM) state sequence gained one state,
-`CS_STATE_COLLECTOR_SET`, between `POLL_SET` and `JOINING`:
+exporter의 callback은 OpenThread 처리 경로에서 대기하지 않는다.
 
+- TOPOLOGY: bounded queue에 0-tick enqueue
+- SAMPLE: UUID별 pending 표시와 최신값 coalescing
+- HEARTBEAT: exporter task에서 생성
+
+SAMPLE은 기본적으로 UUID당 1000ms에 한 번의 논리 publish만 시작한다. 한 publish 안의
+CoAP retry는 이 횟수에 포함하지 않는다. retry attempt 직전에 aggregator에서 최신 sample을
+다시 읽기 때문에 오래된 sequence를 재전송하지 않는다.
+
+TOPOLOGY는 sample 제한과 별도이며 즉시 전송한다. queue에 오래 머문 이벤트도 전송 직전에
+현재 registry entry를 다시 읽는다. 주기적인 full resync가 topology와 최신 sample을 복구한다.
+
+Linux 응답 처리:
+
+- 2.xx: 성공
+- 4.xx: 명시적인 거부이므로 재시도하지 않음
+- timeout, OpenThread 오류, 5.xx: 초기 1회 + 최대 2회 재시도
+- 모든 transient retry 소진: pending으로 되돌려 다음 허용 시점에 재시도
+
+Linux가 꺼져 있어도 Power Base의 `/s`, `/t` ACK와 내부 aggregator 저장에는 영향을 주지
+않는다.
+
+## 전원 레일
+
+현재 `power_enable_gpio=-1`이며 POGO 5V 공급 회로가 없다. 각 보드는 USB로 따로 전원을
+받는다. 펌웨어는 5V를 차단할 수 있다고 주장하지 않는다.
+
+최종 하드웨어에서는 별도 전원 입력용 USB-C의 5V를 Power Base와 POGO 전원 핀에 분배할
+계획이다. 졸업작품 범위에서 GPIO 제어를 쓰지 않고 항상 켜진 레일로 구성할 수 있지만,
+최소한 다음 보호는 회로에 포함해야 한다.
+
+- 입력 퓨즈 또는 PTC
+- 역극성·역급전 방지
+- 체인 전체 전류에 맞는 배선과 POGO 접점 정격
+- 충분한 bulk/decoupling capacitor
+- USB 데이터 포트와 외부 5V를 동시에 연결할 때 전원 충돌 방지
+
+GPIO로 전원을 제어하려면 단순 MCU 출력이 아니라 high-side load switch를 사용한다.
+`power_enable_gpio`, active level, startup delay는 그 회로가 실제로 생긴 뒤 설정한다.
+
+실물 회로를 만들면 아래 항목을 확인한다.
+
+1. 무부하와 전체 체인 연결 시 돌입 전류
+2. 정상 상태 전류와 load switch/PTC 온도
+3. 마지막 모듈의 5V 전압 강하
+4. 센서 측정과 무선 송신 순간의 brownout 여부
+5. 각 보드 USB 연결 상태에서 POGO 5V 역급전 여부
+
+## Light-sleep 검토
+
+자동 Light-sleep은 구현하지 않았다. ESP-IDF v6.1 예제와 현재 POGO 구조를 비교했을 때
+바로 켜기 어려운 이유가 있다.
+
+- POGO는 UART 프로토콜이다.
+- ESP32-H2에서 peripheral power-down과 UART wake는 함께 사용할 수 없다.
+- UART wake가 발생해도 wake 전에 들어온 프레임 일부를 이미 잃을 수 있다.
+- 현재 센서와 POGO 드라이버는 I2C/UART transaction 동안 `esp_pm_lock`을 사용하지 않는다.
+- Matter에서는 센서가 계속 online으로 보이는 동작을 우선한다.
+
+향후 적용하려면 wake 뒤 전체 POGO 프레임의 CRC가 보존되는지 실물로 확인하고, 손실 시
+재동기화 규칙, PM lock 범위, CoAP/Thread timing, online 표시 정책을 함께 설계해야 한다.
+Thread LEAF의 기존 SED 설정(`mRxOnWhenIdle=false`)은 Light-sleep과 별개로 유지한다.
+
+## 빌드와 플래시
+
+```bash
+source ~/.espressif/v6.1/esp-idf/export.sh
+
+idf.py -C power_base -B ~/esp-builds/pogo_power_base set-target esp32h2
+idf.py -C power_base -B ~/esp-builds/pogo_power_base build
+idf.py -C power_base -B ~/esp-builds/pogo_power_base -p "$BASE_PORT" flash
 ```
-... -> SENSOR_DONE -> POLL_SET -> COLLECTOR_SET -> JOINING (SET_DATASET) -> JOINED
+
+cfg 파티션만 바꿀 때:
+
+```bash
+python -m esptool --chip esp32h2 -p "$BASE_PORT" write-flash \
+  0x187000 build/cfg_images/power_base_config.bin
 ```
 
-`SET_DATASET` now requires `CS_STATE_COLLECTOR_SET` (was `CS_STATE_POLL_SET`)
--- a `SET_DATASET` arriving before `SET_COLLECTOR` has succeeded is NACKed
-`POGO_NACK_BAD_STATE`, so the Thread join (and this module's own periodic
-measurement/reporting once joined) can never start before it knows where
-its data should go. A structurally invalid (wrong length) `SET_COLLECTOR`
-payload is also `POGO_NACK_BAD_STATE`; a well-formed but semantically bad
-endpoint (bad address/port/uuid) is the more specific
-`POGO_NACK_INVALID_COLLECTOR`; an NVS write failure is
-`POGO_NACK_STORAGE_FAILED` and leaves the state machine at `POLL_SET` (the
-Thread join never starts) -- the same three-way split `SET_DATASET` itself
-already used for invalid-dataset/storage-failure.
+STANDALONE 보드를 처음 EXTERNAL_OTBR로 바꿀 때만 동적 Dataset 영역을 지운다.
 
-The collector endpoint is durably written into the SAME runtime `"nvs"` NVS
-namespace (`child_dyn`, alongside the existing dataset TLV record) the
-dynamic Active Dataset already uses -- never the fixed `"cfg"` partition.
-Like the dataset record, it is diagnostic/forward-compatibility only and is
-never read back at boot (the same "no auto-rejoin from stored dynamic NVS"
-simplification `docs/state-machine.md` already documents for the dataset
-applies identically here: a changed upstream parent must not be trusted
-silently, so a fresh, live `SET_COLLECTOR` is always required before
-`components/collector_endpoint`'s in-RAM copy is ever populated).
+```bash
+python -m esptool --chip esp32h2 -p "$BASE_PORT" erase-region 0x9000 0x6000
+```
 
-`clear_provisioning_temporaries()` (shared by `reset_session()` on
-ATTACHED/DETACHED and `begin_new_provisioning_session()` on PEER_READY/a
-fresh IDENTIFY_REQ) now also calls `collector_endpoint_clear()`, and the
-`POGO_PORT_EVENT_ERROR` case in `child_service_task()`'s switch (which does
-not route through either of those) gained its own explicit
-`collector_endpoint_clear()` call. Net effect: a new provisioning session,
-a physical detach, or an UPSTREAM port error all immediately invalidate
-whatever collector endpoint the OLD session had. See
-`tools/test_collector_provisioning_sequence.c`.
-
-`power_base`'s own `parent_service_context_t.get_collector` (`pb_get_collector()`)
-fills this power base's own Mesh-Local EID + CoAP port + permanent UUID
-directly on every call -- it has no `components/collector_endpoint` of its
-own (it IS the collector, never a forwarder). An INTERMEDIATE module's
-`module_parent_get_collector()` forwards the EXACT endpoint it itself
-received from its own upstream (`components/collector_endpoint`'s
-snapshot), completely unmodified -- it never substitutes its own address.
-The `MODULE_DEV_MODE_DEV_ROOT` module-to-module regression fixture (which
-has no power base at all) is the one exception: when `role_manager_get_role()
-== MODULE_ROLE_ROOT`, `module_parent_get_collector()` fills the endpoint
-from THIS module's own Mesh-Local EID instead, mirroring
-`pb_get_collector()` -- this is what lets `DEV_LEAF`'s `sensor_transport`
-keep sending its `"/s"` samples to `DEV_ROOT`, the same destination as
-before this session (previously "the current Leader", always `DEV_ROOT`
-itself in that topology).
-
-### 19.5 Capability negotiation
-
-Since the new provisioning step is mandatory on both sides of every POGO
-link once both `module`/`power_base` are rebuilt from this revision,
-`pogo_peer_hello_t` (the PEER_HELLO_REQ/RESP payload) gained a third byte,
-`capabilities` (a bitmask; `POGO_CAP_COLLECTOR_PROVISIONING` is the only bit
-defined so far). `pogo_port.c`'s `validate_incoming_hello()` now also
-requires the peer's declared `capabilities` include
-`POGO_CAP_COLLECTOR_PROVISIONING`; a peer that predates this field entirely
-(a legacy, still-2-byte HELLO payload -- `pogo_unpack_peer_hello()` now
-requires exactly 3 bytes and fails cleanly on 2) or that declares
-`capabilities=0` is rejected loudly and explicitly at the handshake with a
-new error, `POGO_PORT_ERR_CAPABILITY_MISMATCH` -- never auto-retried (same
-policy as `PEER_TYPE_CONFLICT`/`PROTOCOL_VERSION_ERROR`: this means
-something is actually wrong, not a timing issue). This is deliberately a
-capability bit inside the HELLO PAYLOAD, not a bump of `POGO_FRAME_VERSION`
-(the raw frame-level sync byte): bumping the frame version would make
-`pogo_frame_parser_feed()` silently drop EVERY frame from an old peer at the
-byte level (no diagnosable rejection at all, not even at the handshake),
-whereas this design gives a clear, logged, handshake-stage rejection while
-leaving frame-level backward parseability alone. `upper`/`lower` never use
-`pogo_port`'s PEER_HELLO handshake at all (they hand-roll their own
-provisioning directly over `pogo_transport`), so they are completely
-unaffected either way -- see `tools/test_peer_hello_handshake.c` and
-`tools/test_power_base_peer_hello.c`'s new capability-mismatch scenarios.
-
-### 19.6 GPIO swap and Deep-sleep groundwork (implemented vs. not)
-
-UPSTREAM `DETECT_IN`/`DETECT_OUT` are swapped (GPIO12/GPIO2, was
-GPIO2/GPIO12) -- see section 4 above and README.md's rewiring notice.
-GPIO12 is an ESP32-H2 RTC GPIO channel (`RTCIO_GPIO12_CHANNEL`), a candidate
-`esp_sleep_enable_ext1_wakeup_io()` Deep-sleep wake source for a future
-terminal-leaf module waking on its upstream parent's DETECT_IN edge; GPIO2
-is not. This is verified two ways: a host-testable restatement
-(`components/module_config/deep_sleep_gpio.h`,
-`deep_sleep_wake_gpio_is_capable()`, `tools/test_deep_sleep_gpio.c`) of
-ESP-IDF v6.1's own RTC GPIO channel range (GPIO7..GPIO14, per
-`soc/esp32h2/include/soc/rtc_io_channel.h`), and a compile-time
-`_Static_assert` in `components/module_config/gpio_profile.c` (built for
-every real ESP32-H2 target) against the REAL `RTCIO_GPIO12_CHANNEL` macro,
-so a future ESP-IDF revision that removed/renumbered it would fail the
-build loudly rather than silently invalidate this assumption.
-
-**Explicitly NOT implemented this session** (all deferred to a future
-revision, per this session's own scope limits):
-
-- Deep-sleep entry/exit itself -- no `esp_deep_sleep_start()`/wake-source
-  configuration/RTC-memory retention anywhere in this firmware.
-- Linux OTBR installation, RCP firmware, or any code targeting it.
-- A Matter Bridge.
-- MCU Deep-sleep for the terminal leaf (or Light-sleep for short polling
-  periods via Thread SED).
-- POGO 5V supply -- both dev boards still use independent USB power; only
-  signal lines + GND are wired.
-
-The FUTURE conditions this GPIO choice is meant to support (documented
-here, not implemented): only a terminal LEAF (nothing docked below it) may
-ever Deep-sleep -- an INTERMEDIATE module is always an always-on FTD (it
-must keep routing for whatever is docked below it) and must never
-Deep-sleep. A short polling period should use Thread SED (`mRxOnWhenIdle=false`,
-already what `thread_manager_join_with_dataset(THREAD_MANAGER_ROLE_LEAF, ...)`
-applies today) plus Light-sleep, not Deep-sleep, since Deep-sleep's RAM loss
-would require a full re-join on every wake. Before any future Deep-sleep
-entry: no unsent sensor sample, no in-flight CoAP callback, no pending UART
-transaction, and no sensor measurement may be outstanding. Wake sources:
-a timer PLUS the upstream parent's DETECT_IN edge (GPIO12) via
-`esp_sleep_enable_ext1_wakeup_io()`; a failed/unavailable Deep-sleep
-condition should fall back to Light-sleep rather than staying fully awake.
-
-### 19.7 What is still unverified on real hardware (this session's changes)
-
-Everything in sections 1-18's "still unverified" lists remains exactly as
-unverified as before. Additionally, none of this session's changes have
-been flashed to real hardware yet:
-
-- The relaxed CHILD/ROUTER/LEADER attach policy (section 19.1) -- only
-  host-tested (`tools/test_power_base_boot_sequencing.c`) and clean-built so
-  far.
-- `POGO_MSG_SET_COLLECTOR` end-to-end over a real POGO link (power base ->
-  first module, and first module -> a second, INTERMEDIATE-forwarded hop) --
-  only host-tested (wire format + sequencing) and clean-built.
-- Capability-negotiation rejection of a genuinely mismatched real peer (both
-  real boards in this project are always reflashed together in practice, so
-  this scenario has not been exercised with two ACTUALLY different firmware
-  revisions on real hardware).
-- **The swapped UPSTREAM DETECT_IN/DETECT_OUT GPIO assignment requires
-  physically re-wiring the two DETECT wires on any board previously wired to
-  the old profile before it is flashed with firmware built from this
-  session** -- see README.md for the exact rewiring table and flash/monitor
-  commands to use afterward.
-- `thread_manager_get_mesh_local_eid()` returning a real, on-mesh-reachable
-  address on actual hardware (confirmed only against the ESP-IDF v6.1 header
-  declaration and OpenThread's documented semantics, not yet exercised on a
-  real radio).
-
-## 19.8 Correction pass: neutral Thread API and no permanent halt on a slow first attach (this session)
-
-A follow-up correction pass to section 19 found two remaining problems with
-that session's own work, plus several stale docs/log strings it left behind
-(sections 4-6, 16, 17 above were all corrected in place by this pass -- see
-each for exactly what changed). Neither problem was a regression in
-already-verified real-hardware behavior; both were within section 19's own,
-still-real-hardware-unverified changes.
-
-**Problem 1: `power_base` still called `thread_manager_start_as_root()` and
-logged `ROOT:`.** Despite section 19.1's stated intent ("no longer described
-... as Thread's ROOT or Leader"), the actual boot code still called the
-ROOT-named API and inherited its `ROOT:` log prefix. Fixed with a genuinely
-neutral API, `thread_manager_start_as_always_on_ftd()` (identical underlying
-behavior -- same link mode, same resume-or-form logic -- see
-`thread_manager.h`'s comment on both names) that `power_base` now calls
-instead, logging `always-on FTD:`. `thread_manager_start_as_root()` itself
-is UNCHANGED (same name, same log text, same behavior) and remains in place
-purely for `module`'s `MODULE_DEV_MODE_DEV_ROOT` regression fixture, which
-this correction pass deliberately left untouched (see
-`docs/pogo-interface.md`'s "development compat mode").
-
-**Problem 2: a first attach that legitimately takes longer than 30s
-permanently halted this power base.** The original section 19 boot-sequence
-wait was bounded to 30s and called `halt_forever()` on expiry -- worded as
-"only DISABLED/DETACHED for the whole window is a genuine failure now", but
-in practice this makes a REAL, expected scenario (an OTBR not yet up, or a
-Thread network this power base needs to join not yet reachable) fatal. This
-power base's fixed application role does not actually require attaching
-within any particular time budget -- it should simply keep trying and start
-service the moment it succeeds, however long that takes. Fixed with
-`attach_supervisor_task()` (`power_base/main/app_main.c`): a dedicated task,
-started once from `app_main()`, that polls `thread_manager_get_role()` (200ms
-interval, non-busy) with NO timeout and NO halt for "not attached yet". Once
-30s pass without attaching, ONE rate-limited `ESP_LOGW` appears
-(`ATTACH_WARN_FIRST_MS`), repeating at most once every 60s thereafter
-(`ATTACH_WARN_REPEAT_MS`) -- visible to an operator without flooding the
-log. The moment this device IS observed attached (CHILD, ROUTER, or LEADER),
-`start_services_once()` runs (the exact same steps 8-12 from section 5,
-unchanged) and the supervisor task deletes itself -- it never runs those
-steps again, including across a LATER drop to DISABLED/DETACHED and
-reattach (which needs no supervisor involvement at all: `pb_provisioning_allowed()`/
-`pb_get_collector()` already read `otDeviceRole` live on every call, see
-section 19.1). `start_services_once()` only touches file-scope `static`
-state (`s_cfg`/`s_own_uuid`/`s_collector_generation`/`s_parent_ctx`), never a
-pointer to one of `app_main()`'s own stack locals, so it remains valid for as
-long as the supervisor task runs, independent of `app_main()` itself
-returning (which it now does, immediately after starting the supervisor
-task). A genuine resource-creation failure INSIDE `start_services_once()`
-(CoAP resource registration, `parent_service_init()`, `pogo_port_init()`/
-`enable()`, the stale-sweep task's own `xTaskCreate()`) still halts -- that
-is a real, distinct failure class from "not attached yet", and this
-correction pass did not relax it. Likewise, `thread_manager_start_as_always_on_ftd()`
-itself failing (a genuine OpenThread API error, checked in `app_main()`
-before the supervisor task is even started) still halts immediately.
-
-**Docs/log string audit.** This pass searched the whole repository (not
-just `power_base/`) for now-stale current-tense claims left over from
-section 19's own work and an earlier GPIO-swap follow-up, and corrected
-every one found outside of clearly-marked historical/superseded passages:
-`README.md`'s GPIO tables and pass/fail criteria (which still said
-`UPSTREAM DETECT_IN=GPIO2` and "전원 모듈은 엄격히 LEADER만 허용" in
-current-tense sections), this document's own architecture diagram and
-section 6 (DETECT_OUT gating, which still said "before Thread is confirmed
-strictly LEADER"), `power_base/sdkconfig.defaults`'s top comment, and
-`docs/architecture.md`/`docs/state-machine.md`/`docs/pogo-interface.md`'s
-remaining "one and only Thread ROOT/Leader" phrasing. README's real-hardware
-log block from BEFORE this session's GPIO/role-decoupling/collector changes
-is now explicitly labeled "과거 정책, SUPERSEDED -- 당시 firmware 기준" and
-kept only as a historical record of what that OLDER firmware did; a new,
-clearly-separate "현재 firmware 기대 로그 (이번 세션, 아직 실물 미검증)"
-section describes what THIS firmware is expected to log, not yet verified.
-See `tools/test_no_stale_root_leader_claims.py` (new, this pass) for the
-automated regression check.
-
-**Host tests added this pass:** `tools/test_power_base_boot_sequencing.c`
-gained scenarios for "never attaches within 30s -- does not halt, keeps
-retrying, warns once (rate-limited)", "attaches later (CHILD) -- services
-start exactly once", "further ROUTER/LEADER changes -- no duplicate
-creation", and "`thread_manager_start_as_root()` is never called by
-power_base's own boot path" (a structural/string check, since the host model
-cannot link the real ESP-IDF-dependent `app_main.c`). See the final report
-for the exact scenario list and pass/fail counts.
-
-**Still unverified on real hardware (in addition to everything in section
-19.7):** the unbounded attach-retry behavior itself under a genuinely
-extended DETACHED period (no real OTBR has been tested against this power
-base yet, at any point in this project); the rate-limited warning's actual
-cadence on a real console; confirmation that a real attach arriving well
-after 30s still triggers `start_services_once()` correctly on real hardware
-(only host-tested so far).
-
-## 20. Automatic Light-sleep feasibility review (this pass -- no code changed)
-
-Section 19.6 already named Light-sleep (not Deep-sleep) as the right future
-mechanism for a terminal LEAF's short-polling-period power saving, and
-listed it as "explicitly NOT implemented." This pass reviewed whether it
-could safely become the DEFAULT behavior for such a LEAF now. **Conclusion:
-no code change was made** -- this remains not implemented, the terminal
-LEAF's existing Thread SED configuration (`mRxOnWhenIdle=false`, via
-`thread_manager_join_with_dataset(THREAD_MANAGER_ROLE_LEAF, ...)`) is
-completely unchanged, and INTERMEDIATE/Power Base remain always-on FTD,
-exactly as before. The reasoning follows.
-
-### 20.1 What was actually checked
-
-A real `connectedhomeip`-style verification, not a general-knowledge
-guess: this pass cloned the real `espressif/esp-idf` repository at exactly
-tag `v6.1` (`git describe --tags --exact-match` confirmed -- the same
-ESP-IDF version this project's own `source ~/.espressif/v6.1/esp-idf/export.sh`
-commands already build against) and read the OFFICIAL OpenThread
-sleepy-device example this task asked to cross-check against:
-`examples/openthread/ot_sleepy_device/light_sleep/` (`esp_ot_sleepy_device.c`,
-`README.md`, `sdkconfig.defaults`) -- the exact upstream reference for
-"Thread SED + automatic Light-sleep" on an 802.15.4 SoC including ESP32-H2.
-Also checked: `components/esp_driver_uart/include/driver/uart_wakeup.h`
-and `examples/system/light_sleep/main/uart_wakeup.c` (the general-purpose
-UART-wakeup-from-sleep mechanism, to see whether it could close the gap
-found below).
-
-### 20.2 Required configuration vs. the example's own performance tuning -- kept distinct
-
-Automatic Light-sleep itself needs exactly three settings, and this is all
-`esp_pm_configure()`/tickless idle actually require to function at all:
-`CONFIG_PM_ENABLE`, `CONFIG_FREERTOS_USE_TICKLESS_IDLE`, and (for a Thread
-SED specifically, so the 802.15.4 radio itself can also sleep between
-polls rather than just the CPU) `CONFIG_IEEE802154_SLEEP_ENABLE`.
-
-The official example's own `sdkconfig.defaults` additionally sets
-`CONFIG_FREERTOS_HZ=1000` (bumped from the default 100Hz) -- **this is the
-example's own performance/tuning choice for its own short (3s in its own
-README) poll period, not a requirement of Light-sleep itself.** Its own
-comment says it exists "to lower sleep time threshold": a coarser 100Hz
-tick makes the scheduler's own idle-time estimate too imprecise to bother
-entering Light-sleep for a SHORT idle window, so raising the tick rate
-lets the scheduler recognize shorter idle gaps as worth sleeping through.
-A future revision could instead choose a longer LEAF poll period and/or a
-different light-sleep threshold tuning that keeps this project's current
-`CONFIG_FREERTOS_HZ=100` -- that tradeoff has simply not been made yet,
-and this project's own driver files' tick-vs-millisecond assumptions (see
-`components/sht45/sht45.c`, `components/bh1750/bh1750.c`,
-`components/sgp40/sgp40.c`, `components/sgp41/sgp41.c`'s own "code review
-follow-up (SHT45 wake-reboot fix, item 7)" comments on `pdMS_TO_TICKS()`
-rounding at 100Hz) are a real reason to make that choice deliberately
-rather than copy the example's tick rate along with everything else.
-`CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y` is likewise the example's own
-additional power-saving choice, not a Light-sleep prerequisite.
-
-`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` (also in the example's
-`sdkconfig.defaults`) is the one setting that is NOT just a tuning choice
--- see the next section for why it forecloses the UART wakeup option
-entirely, which is why this section does not suggest enabling both
-together.
-
-### 20.3 The blocking finding: `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` and UART wakeup are MUTUALLY EXCLUSIVE on ESP32-H2, and POGO IS a UART protocol
-
-Confirmed directly from Espressif's own official ESP32-H2 sleep-modes
-documentation (`docs.espressif.com/.../esp32h2/api-reference/system/sleep_modes.html`,
-the v6.1-current page, fetched and read this pass): **"In Light-sleep
-mode, setting Kconfig option `CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP`
-will invalidate UART wakeup."** The same page's own
-`esp_sleep_enable_uart_wakeup()` reference is even more explicit: **"If
-`PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP` is enabled (if target
-supported), this API is unavailable since the UART module is powered down
-during sleep."** This is not a reliability caveat to work around -- it is
-a hard mutual exclusion. **A test plan must pick ONE of the two
-configurations below, never both together:**
-
-- **(A) Maximum power savings** (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=y`,
-  what the official `ot_sleepy_device` example itself ships): UART wakeup
-  is categorically unavailable -- not merely unreliable. Any POGO frame
-  arriving while this device is asleep is entirely missed, and **waking up
-  later on a periodic timer does not by itself recover it** -- the timer
-  wake only lets the CPU resume; it does nothing to make an already-lost
-  frame reappear. Recovery, if it happens at all, depends entirely on TWO
-  things this project has never verified for this specific failure mode:
-  (i) the SENDING peer (the upstream POGO neighbor, whose own UART was
-  never asleep) actually retrying the transmission after not hearing back
-  within its own timeout, and (ii) this device's own POGO port/session
-  state machine (`pogo_port.c`/`child_service.c`/`parent_service.c`)
-  correctly treating that as an ordinary retry rather than a fault --
-  never triggering `DOCK_TIMEOUT`/`LIVENESS_LOST` or a session desync
-  purely because it was asleep, not actually disconnected. This project's
-  existing retry/backoff mechanisms (`components/node_calc`'s UUID-hash
-  backoff, the AUTO-mode hotswap recovery in section "Core POGO /
-  provisioning" of `docs/validation-status.md`) were built and verified
-  around network delay and genuine physical disconnect/reconnect -- a
-  DIFFERENT failure shape from "the physically-still-docked peer's UART
-  was deliberately unpowered for a scheduled window." **Until real
-  hardware proves this specific resend-and-resynchronize path actually
-  recovers a lost frame without tripping a fault path or leaving a stale
-  Matter reading, option (A) must not be presented as a viable candidate
-  for the user's own "stay always-online in Matter" normal-operation
-  requirement** -- it is, today, a way to lose data with no proven
-  recovery, not a power-saving mode with an acceptable, bounded latency
-  cost.
-- **(B) Keep the UART peripheral powered** (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=n`,
-  a deviation from the official example's own settings, not yet evaluated
-  by this project): `esp_sleep_enable_uart_wakeup()` becomes usable. The
-  same docs page lists real ESP32-H2 wakeup modes beyond the simple
-  edge-count one the general-purpose `examples/system/light_sleep` sample
-  uses -- notably Mode 1 (`UART_WK_MODE_FIFO_THRESH`), where "the UART
-  Core clock remains active, the UART RX can still receive data and store
-  it in the RX FIFO," waking only once enough real bytes have
-  accumulated. Because this mode keeps the UART peripheral genuinely
-  receiving (not just detecting edges to trigger a CPU wake), it is the
-  more promising candidate for POGO's own asynchronous, arbitrary-length
-  framed traffic -- **but it is not automatically loss-free either**: the
-  RX FIFO has a fixed, finite depth, and the CPU still takes some real
-  time to actually resume execution after the wake interrupt fires: if
-  the sender keeps transmitting past the configured `rx_fifo_threshold`
-  faster than the FIFO drains once the CPU resumes, or a subsequent frame
-  arrives back-to-back before the driver has fully caught up, bytes can
-  still be dropped to hardware overflow. This project has not implemented
-  or tested this mode, and choosing it means giving up
-  peripheral-power-down's own power savings for whichever UART(s) POGO
-  needs to wake on -- **whether a COMPLETE real POGO frame (header
-  through CRC, at this project's actual baud rate and frame sizes) is
-  reliably received, not just the first few bytes that trigger the wake,
-  must be confirmed on real hardware before this can be trusted either.**
-
-Either way, **POGO's own physical link** (`components/pogo_port`'s UART
-carrying `PEER_HELLO`, capability negotiation, `JOIN_RESULT_ACK`,
-`POGO_MSG_SET_COLLECTOR`/`SET_DATASET`, and depending on wiring,
-onward-relayed topology/sensor traffic through an INTERMEDIATE) receives
-this traffic ASYNCHRONOUSLY and at an unpredictable time relative to this
-device's own sleep/wake schedule -- unlike a Thread SED's own poll, which
-this device itself initiates on its own timer. Option (A) simply cannot
-receive it at all while asleep, with no proven recovery path; option
-(B)'s Mode 1 is the more credible candidate for preserving a frame, but
-"more credible" is not "proven" -- full-frame reception under this
-project's own real traffic has not been demonstrated.
-
-Separately, and true under EITHER option above: **no sensor driver or
-`pogo_port.c` in this codebase currently takes out an `esp_pm_lock` around
-its own I2C/UART transactions** (unlike the official example's own
-`s_cli_pm_lock`, held at CPU-max-freq specifically to keep the CLI UART
-responsive until the device is fully attached). Enabling
-`CONFIG_PM_ENABLE`/automatic Light-sleep today, with no further change,
-would let the scheduler enter Light-sleep in the middle of any I2C
-measurement poll loop (`sht45.c`/`bh1750.c`/`sgp40.c`/`sgp41.c`'s own
-`vTaskDelay()`-based wait) or mid-UART-transaction
-(`pms5003.c`/`pogo_port.c`) regardless of which peripheral-power-down
-choice is made.
-
-### 20.4 Conclusion and what would actually be needed before this is safe to enable
-
-**Not safe to make the default today.** The gap is not "untested," it is
-"the necessary protections do not exist in this codebase yet, the two
-configurations that maximize power savings vs. preserve UART wakeup are
-mutually exclusive on this exact chip (section 20.3), and NEITHER option
-has a proven story for not losing a POGO frame that arrives during the
-sleep window -- option (A) has no recovery path at all pending real
-verification, and option (B)'s FIFO-threshold wakeup can still overflow
-before full-frame reception has actually been demonstrated." Turning this
-on as a default now would risk exactly the class of failure section 9.1
-of `docs/matter-bridge.md` and the "SED CoAP response timing correction"
-work (`docs/state-machine.md`, `docs/validation-status.md`'s own section)
-already spent real effort fixing: a data-loss-shaped symptom that is
-actually a timing/framing artifact. **Deep-sleep for normal operation is
-likewise not applied by this pass or any change in this repository** --
-the user's own requirement is that sensors stay always-online in Matter,
-and neither Light-sleep nor Deep-sleep is enabled as a default anywhere.
-
-Before this could become the default for a terminal LEAF (never for
-INTERMEDIATE or Power Base, which must stay always-on FTD, unchanged):
-
-1. Decide the `CONFIG_FREERTOS_HZ` question deliberately (1000Hz project-wide,
-   or a different, smaller light-sleep threshold tuning that keeps 100Hz) --
-   not as an incidental side effect of copying the example's `sdkconfig.defaults`
-   (see 20.2 -- this is the example's own tuning choice, not a Light-sleep
-   requirement).
-2. Add `esp_pm_lock_acquire()`/`release()` around every I2C transaction in
-   `sht45.c`/`bh1750.c`/`sgp40.c`/`sgp41.c` and every UART transaction in
-   `pms5003.c`/`pogo_port.c` (mirroring the official example's own
-   attach-until-child CLI lock pattern), so Light-sleep can only ever be
-   entered between transactions, never mid-transaction.
-3. Decide between section 20.3's option (A) and (B), deliberately, before
-   any implementation -- note that a MORE FREQUENT periodic wake does NOT
-   by itself fix option (A): the frequency only bounds how long this
-   device stays deaf, it does nothing to make an already-lost frame
-   reappear once it wakes:
-   - (A): before treating this as viable at all, first prove (on real
-     hardware) that the SENDING peer's own existing retry/timeout logic
-     actually resends a message this device missed while asleep, AND that
-     this device's own POGO port/session state machine resynchronizes
-     cleanly afterward -- no spurious `DOCK_TIMEOUT`/`LIVENESS_LOST`, no
-     desync, no stale Matter reading outliving the sleep window by more
-     than that resend's own delay. Until that is demonstrated, do not
-     treat option (A) as a candidate for the user's always-online
-     requirement, regardless of how short the sleep/poll period is tuned.
-   - (B): keep the relevant UART's peripheral power domain on
-     (`CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP=n`) and prototype
-     `esp_sleep_enable_uart_wakeup()` Mode 1 (`UART_WK_MODE_FIFO_THRESH`)
-     specifically, then prove (with a real logic analyzer / real hardware
-     capture) that it reliably preserves an ENTIRE real POGO frame --
-     header through CRC, at this project's actual baud rate and frame
-     sizes, not just the leading bytes that trigger the wake -- with no
-     RX FIFO overflow once the sender keeps going past the configured
-     threshold.
-   Do not test a configuration that combines peripheral power-down with
-   UART wakeup -- section 20.3 confirms that combination cannot work at
-   all.
-4. Real-hardware soak test (after 1-3 above, not instead of them): a
-   terminal LEAF with Light-sleep enabled, under the SAME 3-tier chain
-   this project already validates elsewhere (Power Base -> INTERMEDIATE
-   -> LEAF), confirming no `JOIN_RESULT_ACK` loss, no sensor SAMPLE
-   loss/false-timeout (the exact symptom the SED CoAP timing correction
-   pass already found and fixed once), and no POGO frame CRC/resync
-   errors, over a run long enough to exercise many sleep/wake cycles --
-   none of which has been attempted (no real hardware in this or any
-   prior session that did this specific review).
-
-None of the above was implemented this pass -- this section is the
-"remaining work" list the user asked for, not a partial implementation.
+최신 실물·host 검증 범위는 [`validation-status.md`](validation-status.md)를 기준으로 한다.

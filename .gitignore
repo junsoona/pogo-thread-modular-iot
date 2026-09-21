@@ -28,4 +28,6 @@
 /linux/matter_bridge/app/third_party/connectedhomeip
 /linux/matter_bridge/app/bridge-common/pogo-matter-bridge.zap
 /linux/matter_bridge/app/out/
-EOF
+
+# Local hardware capture. Keep the original outside Git.
+/power-base-bridge.log

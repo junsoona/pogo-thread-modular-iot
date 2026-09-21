@@ -1,13 +1,13 @@
 {
-  "_comment": "Real AUTO-role-detection prototype config for the final ESP32-H2 SuperMini graduation-project hardware (see docs/pogo-interface.md 'confirmed GPIO profile' and README's wiring section). This board's permanently-paired sensor is a Sensirion SHT45 (temperature + humidity). dev_mode=AUTO: ROOT/INTERMEDIATE/LEAF is derived at runtime from real BASE_ID + DETECT_IN/OUT + PEER_HELLO, never forced. Both prototype configs (this file and prototype_bh1750.json) share the EXACT SAME upstream_port/downstream_port block -- the only per-board differences are driver_id, i2c_address, sensor_type_bitmap and calibration, exactly as section 2 of the follow-up spec requires.",
-
+  "_comment": "ESP32-H2 SuperMini + SHT45용 AUTO 설정. 센서 모듈 공통 POGO 핀을 사용하고 온도/습도 채널을 제공한다.",
   "schema_version": 1,
   "config_revision": 2,
-
-  "_driver_comment": "SENSOR_DRIVER_ID_SHT45 (see components/sensor_provider/include/sensor_provider/sensor_provider.h) and the TEMPERATURE/HUMIDITY channel bits (see components/sensor_channel/include/sensor_channel/sensor_channel.h) are resolved by name here -- tools/pack_module_config.py's DRIVER_IDS/CHANNEL_BITS tables mirror those two C headers bit-for-bit, so this file never repeats a magic number by hand.",
+  "_driver_comment": "driver와 channel 이름은 C header의 registry 값으로 변환한다.",
   "driver_id": "SHT45",
-  "sensor_type_bitmap": ["TEMPERATURE", "HUMIDITY"],
-
+  "sensor_type_bitmap": [
+    "TEMPERATURE",
+    "HUMIDITY"
+  ],
   "bus_type": 0,
   "bus_number": 0,
   "i2c_sda_gpio": 0,
@@ -18,23 +18,35 @@
   "spi_sclk_gpio": -1,
   "spi_cs_gpio": -1,
   "spi_clock_hz": 0,
-  "calibration": [0, 0, 0, 0],
-  "_timeout_comment": "SHT45 high-precision measurement takes ~8.2ms max per the datasheet; 200ms leaves generous margin for I2C bus contention/retries without stalling child_service's SENSOR_HELLO handler for long.",
+  "calibration": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "_timeout_comment": "SHT45 high-precision 측정 시간보다 충분히 긴 200ms timeout을 사용한다.",
   "measurement_timeout_ms": 200,
-
   "dev_mode": "AUTO",
-
-  "_upstream_comment": "UART0. Deep-sleep-ready GPIO profile (this follow-up): UPSTREAM DETECT_IN is GPIO12 and DETECT_OUT is GPIO2 -- swapped from the earlier profile (DETECT_IN=2/DETECT_OUT=12) because GPIO12 is an ESP32-H2 RTC GPIO channel (see components/module_config/deep_sleep_gpio.h) usable as a future terminal-leaf Deep-sleep ext1 wake source, while GPIO2 is not. GPIO2 is NOT GPIO13 (documented onboard LED pin, see docs/pogo-interface.md) and NOT GPIO6 (GPIO6/7 are not bonded out on the ESP32-H2 SuperMini/SiP package at all); see docs/pogo-interface.md's 'Confirmed GPIO profile' section for the full history/evidence. IMPORTANT: the real boards are still wired to the OLD profile (DETECT_IN=2/DETECT_OUT=12) -- swap the two DETECT wires before flashing firmware built from this config, see README.md.",
+  "_upstream_comment": "공통 UPSTREAM: UART0 GPIO4/5, DETECT_IN GPIO12, DETECT_OUT GPIO2, BASE_ID GPIO14.",
   "upstream_port": {
-    "uart_num": 0, "tx_gpio": 4, "rx_gpio": 5,
-    "detect_in_gpio": 12, "detect_out_gpio": 2, "base_id_gpio": 14,
-    "detect_out_active_low": true, "debounce_ms": 30
+    "uart_num": 0,
+    "tx_gpio": 4,
+    "rx_gpio": 5,
+    "detect_in_gpio": 12,
+    "detect_out_gpio": 2,
+    "base_id_gpio": 14,
+    "detect_out_active_low": true,
+    "debounce_ms": 30
   },
-
-  "_downstream_comment": "UART1, matches the previous dev-board UART1 pin choice (GPIO10/11) plus real DETECT_IN/OUT. base_id_gpio is always -1 on DOWNSTREAM -- BASE_ID is only ever read on UPSTREAM (see docs/pogo-interface.md). DETECT_OUT=GPIO3 (moved from GPIO22, this follow-up, config_revision bumped 1->2) -- GPIO22 is not a convenient header pin on the real ESP32-H2 SuperMini board and required direct soldering with board-damage risk; GPIO3 is header-accessible, an ordinary non-strapping GPIO already allowed by gpio_profile.c, and used here only as an open-drain DETECT_OUT output (never a Deep-sleep wake source, unlike UPSTREAM DETECT_IN=GPIO12 which is unchanged). See docs/pogo-interface.md's GPIO history section.",
+  "_downstream_comment": "공통 DOWNSTREAM: UART1 GPIO10/11, DETECT_IN GPIO23, DETECT_OUT GPIO3.",
   "downstream_port": {
-    "uart_num": 1, "tx_gpio": 10, "rx_gpio": 11,
-    "detect_in_gpio": 23, "detect_out_gpio": 3, "base_id_gpio": -1,
-    "detect_out_active_low": true, "debounce_ms": 30
+    "uart_num": 1,
+    "tx_gpio": 10,
+    "rx_gpio": 11,
+    "detect_in_gpio": 23,
+    "detect_out_gpio": 3,
+    "base_id_gpio": -1,
+    "detect_out_active_low": true,
+    "debounce_ms": 30
   }
 }

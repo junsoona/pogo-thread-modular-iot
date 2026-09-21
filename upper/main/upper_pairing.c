@@ -15,7 +15,7 @@
 static const char *TAG = "upper_pairing";
 
 /* Single fixed slot in this MVP -- multi-lower-module slot allocation is
- * explicitly out of scope (see CLAUDE-CODE-BOOTSTRAP.md section 8). */
+ * explicitly out of scope (see PROJECT-NOTES.md). */
 #define FIXED_SLOT_ID 1
 
 typedef enum {

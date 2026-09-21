@@ -1,520 +1,217 @@
-# POGO interface
+# POGO 인터페이스
 
-**A dedicated power-base project now exists -- see
-[power-base.md](power-base.md).** The power base's FIXED application role
-(physical POGO root, downstream provisioning coordinator, UUID/slot/topology
-registry owner, sensor-data collector) is decoupled from Thread's own
-`otDeviceRole`: it always runs as an always-on FTD and accepts CHILD,
-ROUTER, or LEADER alike as "attached and ready" (see power-base.md's
-"module/Thread role decoupling and collector provisioning" section) -- it is
-no longer described here or anywhere else as Thread's "one and only ROOT/
-Leader". The ROOT/INTERMEDIATE/LEAF determination table below (an
-AUTO-mode sensor module never becomes `MODULE_ROLE_ROOT` any more -- that is
-a role_manager/POGO-layer concept, unrelated to Thread's own `otDeviceRole`,
-and is unchanged by this update) still applies. The rest of this document
-(POGO frame/port mechanics, BASE_ID/DETECT_IN/DETECT_OUT electrical
-contract, the confirmed GPIO profile -- updated below for the Deep-sleep-
-ready DETECT_IN/DETECT_OUT swap -- dev-compat mode) still applies
-identically to the power base's own one POGO port.
+센서 모듈은 UPSTREAM과 DOWNSTREAM 두 포트를 가진다. Power Base는 센서 모듈의
+DOWNSTREAM과 같은 전기 구성을 가진 포트 하나를 사용한다.
 
-## Final hardware: two physical ports, six signal pins each
+각 POGO 포트는 다음 신호로 구성된다.
 
+- UART TX
+- UART RX
+- DETECT_OUT
+- DETECT_IN
+- GND
+- BASE_ID 또는 전원 접점
+
+현재 프로토타입에서는 POGO 5V를 사용하지 않는다. 전원 접점은 최종 하드웨어 단계에서
+추가하며 각 보드는 USB로 따로 전원을 받는다.
+
+## GPIO
+
+### 센서 모듈
+
+| 기능 | UPSTREAM | DOWNSTREAM |
+|---|---:|---:|
+| UART controller | UART0 | UART1 |
+| TX | GPIO4 | GPIO10 |
+| RX | GPIO5 | GPIO11 |
+| DETECT_IN | GPIO12 | GPIO23 |
+| DETECT_OUT | GPIO2 | GPIO3 |
+| BASE_ID | GPIO14 | -1 |
+
+### Power Base
+
+| 기능 | GPIO |
+|---|---:|
+| UART controller | UART1 |
+| TX | GPIO10 |
+| RX | GPIO11 |
+| DETECT_IN | GPIO23 |
+| DETECT_OUT | GPIO3 |
+
+Power Base에서 첫 모듈로 연결할 때 TX/RX와 DETECT_IN/OUT을 교차한다.
+
+```text
+Power Base GPIO10 TX        -> module GPIO5 RX
+Power Base GPIO11 RX        <- module GPIO4 TX
+Power Base GPIO3 DETECT_OUT -> module GPIO12 DETECT_IN
+Power Base GPIO23 DETECT_IN <- module GPIO2 DETECT_OUT
+GND                         -- GND
+BASE_ID GND contact         -- module GPIO14
 ```
-UPSTREAM port                          DOWNSTREAM port
-(to power base or parent module)       (to a child module)
 
-  1. UART_TX   ---------------------->   UART_RX   (2)
-  2. UART_RX   <----------------------   UART_TX    (1)
-  3. DETECT_OUT ---------------------->  DETECT_IN  (4)
-  4. DETECT_IN <----------------------   DETECT_OUT  (3)
-  5. BASE_ID   (read on UPSTREAM only; a peer only ever DRIVES this
-                from ITS DOWNSTREAM-facing side if it is a power base)
-  6. RESERVED  (future WAKE/INT)
+중간 모듈과 다음 모듈도 같은 방식으로 DOWNSTREAM에서 UPSTREAM으로 교차한다.
+
+## DETECT 신호
+
+`DETECT_OUT`은 open-drain active-low 출력이다.
+
+- 분리 상태: release
+- 연결 상태: low
+- `DETECT_IN`: 내부 pull-up 입력
+- active-high 설정은 config validation에서 거부
+
+ISR은 현재 level을 읽어 queue에 넣는 일만 한다. debounce와 상태 전이는 task에서 처리한다.
+queue overflow나 ISR 누락에 대비해 주기적으로 실제 GPIO level과 내부 상태를 다시 맞춘다.
+
+연결을 감지하면 짧은 settle 시간을 둔 뒤 UART parser를 초기화하고 RX buffer를 flush한
+다음 HELLO를 시작한다. 분리 level이 확인되면 진행 중인 handshake와 cooldown을 즉시
+취소하고 `WAIT_ATTACH`로 돌아간다.
+
+## BASE_ID
+
+BASE_ID는 첫 센서 모듈이 Power Base에 직접 연결됐는지 판단하는 UPSTREAM 전용 입력이다.
+Power Base 커넥터가 GPIO14를 GND에 연결한다.
+
+BASE_ID만으로 역할을 확정하지 않는다. `PEER_HELLO`의 peer type과 함께 확인한다.
+BASE_ID는 Power Base를 뜻하는데 peer가 MODULE이라고 응답하거나 그 반대이면
+`PEER_TYPE_CONFLICT`로 처리한다.
+
+DOWNSTREAM에는 BASE_ID가 없으며 config 값은 항상 `-1`이다.
+
+## PEER_HELLO
+
+체결 뒤 두 포트는 `PEER_HELLO_REQ`와 `PEER_HELLO_RESP`를 교환한다. payload에는
+protocol version, peer type, capability bitmap이 들어 있다.
+
+확인 항목:
+
+- protocol version 일치
+- 상대 peer type이 MODULE 또는 POWER_BASE
+- BASE_ID와 peer type 일치
+- 필수 capability 지원
+
+HELLO가 끝나야 `PEER_READY` event를 보낸다. provisioning service는 UART의 임의 첫
+frame이 아니라 `PEER_READY`부터 시작한다.
+
+## 포트 상태
+
+```text
+DISABLED
+  -> WAIT_ATTACH
+  -> ATTACH_SETTLE
+  -> HANDSHAKE
+  -> PEER_READY
+  -> ERROR / WAIT_ATTACH
 ```
 
-Numbering above matches the implementation spec's default pin list. Final
-GPIO numbers, which UART controller backs which logical port, and the exact
-electrical design of BASE_ID are all deliberately **not** decided here --
-they come from `module_config` (see [module-config.md](module-config.md)),
-never from a compiled-in constant. `components/pogo_port`'s API only ever
-talks about `POGO_PORT_UPSTREAM`/`POGO_PORT_DOWNSTREAM` logical ports, GPIO
-numbers as plain `int`s, and an `active_low`/`debounce_ms` pair -- so a
-change to the real electrical design (e.g. BASE_ID polarity, or moving to a
-third GPIO for detect) never requires touching `pogo_port.c`'s role logic,
-only the numbers in `module_config`.
+### 일시적 오류
 
-### DETECT_OUT / DETECT_IN contract
+- `DOCK_TIMEOUT`
+- `LIVENESS_LOST`
 
-- `DETECT_OUT`: open-drain output. Level 0 = actively asserted ("I am here
-  and powered"), level 1 = released (external pull-up takes the line High).
-  **High-Z until `pogo_port_enable()`** -- `pogo_port_init()` alone touches
-  no GPIO state.
-- `DETECT_IN`: pull-up input, `GPIO_INTR_ANYEDGE`. The ISR
-  (`detect_isr_handler` in `pogo_port.c`) does exactly one thing: read the
-  current level and push `{tick, level}` into a per-port FreeRTOS queue via
-  `xQueueSendFromISR`. It never touches UART, NVS, or any OpenThread API.
-  30ms debounce (configurable via `module_config`) is applied in that port's
-  own task, which commits an ATTACHED/DETACHED transition only once the
-  level has held steady for the whole debounce window, handling both attach
-  and detach edges.
+AUTO 모드에서 DETECT_IN이 계속 연결 상태라면 cooldown 뒤 새 DETECT edge 없이 handshake를
+다시 시작한다. 한 cycle 안에서는 `CONFIG_POGO_MAX_RETRY`만큼 재시도하고, cycle이
+끝나면 cooldown을 둔다. busy loop를 만들지 않는다.
 
-### BASE_ID
+### 영구 오류
 
-Read (not driven) on the UPSTREAM port only. Active-low: a power base drives
-it Low; a normal module does not drive it at all (external pull-up keeps it
-High). **On the real power-base hardware (see [power-base.md](power-base.md)),
-"a power base drives it Low" means a GND contact on the power base's
-connector -- there is no BASE_ID GPIO on the power base's own ESP32-H2 at
-all; its firmware never configures or reads one.** GPIO2 (the module's
-DETECT_IN) and GPIO14 (the module's BASE_ID) are two different signals with
-two different local pull-ups -- never tie them together, and never wire
-either one directly to GND on the module side (only the power base's BASE_ID
-contact is GND). `pogo_port` cross-checks this hardware read against the peer's
-declared `peer_type` (from `HELLO_REQ`/`HELLO_RESP`, see below):
+- `PEER_TYPE_CONFLICT`
+- `PROTOCOL_VERSION_ERROR`
+- `CAPABILITY_MISMATCH`
 
-- both agree -> `POGO_PORT_EVENT_PEER_READY`.
-- they contradict, OR the peer declares a `peer_type` that is neither
-  `MODULE` nor `POWER_BASE` -> `POGO_PORT_EVENT_ERROR` /
-  `POGO_PORT_ERR_PEER_TYPE_CONFLICT` (a stray/garbage value is a protocol
-  error, not "no opinion" -- see `pogo_peer_type_is_valid()`).
-- the peer never answers at all (a passive power base has no UART/MCU to
-  answer with) but BASE_ID reads POWER_BASE -> still `PEER_READY` with
-  `peer_type=POWER_BASE`, since BASE_ID hardware alone is sufficient in
-  that case.
-- the peer never answers and BASE_ID does *not* say POWER_BASE ->
-  `POGO_PORT_ERR_DOCK_TIMEOUT` after `CONFIG_POGO_MAX_RETRY` retries. This is
-  a **transient** error (see "AUTO-mode hotswap recovery" below): in AUTO
-  mode it auto-retries a fresh handshake cycle after a cooldown, as long as
-  DETECT_IN still reads attached; in development compat mode it retries
-  immediately (unchanged from before).
+이 오류는 물리적 detach/reattach 전까지 유지한다. 시간이 지난다고 호환성 문제가
+해결되지는 않기 때문이다.
 
-## AUTO-mode hotswap recovery (real DETECT_IN)
+## PING/PONG liveness
 
-A real dock motion does not guarantee DETECT closes at exactly the same
-instant the UART/GND pogo contacts fully seat -- DETECT can close first,
-with UART/GND landing a few ms (or, in a bad connector, longer) later. The
-first handshake cycle after that DETECT edge can then legitimately time out
-with no HELLO_RESP ever received, even though the module IS physically
-docked and about to be fully connected. `pogo_port.c` classifies its errors
-into two kinds accordingly:
+`PEER_READY` 뒤 유휴 상태에서는 PING/PONG으로 연결 상태를 확인한다. PING/PONG도 같은
+frame parser와 UART 송신 경로를 사용하며 별도 byte parser를 두지 않는다.
 
-- **Transient** (`POGO_PORT_ERR_DOCK_TIMEOUT`, `POGO_PORT_ERR_LIVENESS_LOST`):
-  the wire itself might still be fine, or the peer might simply not have
-  finished booting/seating yet. In AUTO mode, the port enters
-  `PORT_STATE_RECOVER_COOLDOWN` and, as long as DETECT_IN still reads
-  attached, starts a **fresh handshake cycle** after
-  `CONFIG_POGO_HOTSWAP_COOLDOWN_MS` -- no new DETECT_IN edge required. Each
-  cycle still retries internally up to `CONFIG_POGO_MAX_RETRY` times, with
-  the existing bounded `CONFIG_POGO_ACK_TIMEOUT_MS` delay between retries. A
-  detach during the cooldown (`POGO_PORT_EVENT_DETACHED`) cancels the
-  pending retry immediately -- the port falls back to `WAIT_ATTACH`, not a
-  stale cooldown wait. Every fresh cycle flushes leftover UART RX bytes and
-  reinitializes the frame parser first (`begin_handshake()`), so a previous
-  failed session's stray bytes can never desync the next one.
-- **Configuration/compatibility** (`POGO_PORT_ERR_PEER_TYPE_CONFLICT`,
-  `POGO_PORT_ERR_PROTOCOL_VERSION`, `POGO_PORT_ERR_CAPABILITY_MISMATCH`):
-  these mean the peer itself is wrong/incompatible, not merely slow -- they
-  are unchanged from before this follow-up and still require a physical
-  detach/reattach before retrying, in both AUTO and dev-compat modes.
+연속 timeout이 한도를 넘으면 `LIVENESS_LOST`를 발생시킨다. DETECT pin이 연결 상태면
+cooldown 뒤 새 handshake를 시작하고, 분리 상태면 즉시 `WAIT_ATTACH`로 돌아간다.
 
-Two more pieces close the loop for a real dock:
+## frame 형식
 
-- **Attach settle** (`PORT_STATE_ATTACH_SETTLE`, `CONFIG_POGO_ATTACH_SETTLE_MS`):
-  after DETECT_IN debounces attached, the port waits this short, bounded,
-  explicit interval before sending the first `HELLO_REQ`, giving UART/GND a
-  moment to finish seating instead of racing the handshake against
-  still-settling contacts. A detach during this window is handled the same
-  way as during the cooldown above.
-- **DETECT level reconciliation** (`CONFIG_POGO_DETECT_RECONCILE_MS`): a
-  missed GPIO ISR (or a full `detect_queue`, see `detect_isr_drops`) can
-  leave the port's committed DETECT_IN state stale forever, with no future
-  edge to correct it (the level is already where it "should" be, so no new
-  edge ever fires). At this interval, the port task directly re-reads
-  DETECT_IN's raw level and, if it disagrees with what the port currently
-  believes, injects a synthetic edge -- which still has to survive the
-  normal debounce window before being committed, exactly like a real one.
+POGO frame은 SOF, version/type, sequence, payload length, payload, CRC16으로 구성한다.
+parser는 partial input을 누적하고 잘못된 길이 또는 CRC에서 다음 SOF를 찾아 재동기화한다.
 
-See `tools/test_pogo_port_hotswap_recovery.c` for the regression coverage
-(boot-detached-then-attach, DETECT-before-UART timeout with no new edge,
-peer booting late, detach-during-cooldown cancellation, config/compat errors
-never auto-retrying, liveness loss recovering without a reset, missed-ISR
-reconciliation, and bounded/non-flooding repeated recovery) -- it links the
-real, unmodified `pogo_port.c` against an in-memory fake GPIO/UART bank
-(`tools/host_test_stubs/`), not a hand-written model of its logic.
+request retry는 같은 sequence를 사용한다. child service는 write message의 중복 sequence를
+인식해 이미 적용한 동작을 다시 실행하지 않고 캐시한 응답을 보낸다.
 
-## PEER_HELLO_REQ / PEER_HELLO_RESP handshake
+## 역할 판정
 
-This is an explicit request/response pair, **not** "both sides send the same
-message and hope the timing lines up" -- an earlier revision worked that
-way and could fail to complete if both sides weren't in lock step (e.g. one
-board booting 5 seconds after the other). Whichever side attaches/boots
-first is the *initiator*:
+AUTO 센서 모듈은 다음 규칙을 사용한다.
 
-1. After a debounced ATTACHED (or immediately on enable, in development
-   compat mode), the initiator sends `POGO_MSG_PEER_HELLO_REQ` (protocol
-   version + this module's own `peer_type`, normally always
-   `POGO_PEER_TYPE_MODULE`) and waits up to `CONFIG_POGO_ACK_TIMEOUT_MS` for
-   a same-seq `POGO_MSG_PEER_HELLO_RESP`, retrying up to
-   `CONFIG_POGO_MAX_RETRY` times.
-2. **A `HELLO_REQ` is answered with `HELLO_RESP` in any state** -- whether
-   this port is still running its own handshake (simultaneous boot: each
-   side is simultaneously an initiator and a responder; staggered boot: the
-   side that attached first keeps answering the late side's `REQ`s once
-   they start arriving) or already `PEER_READY` (the peer rebooted while
-   still docked and is starting its own handshake fresh -- answering does
-   not reset this side's own `PEER_READY`).
-3. Both message types validate the same way (`validate_incoming_hello()` in
-   `pogo_port.c`): `protocol_version` must match (else
-   `PROTOCOL_VERSION_ERROR`), `peer_type` must be `MODULE` or `POWER_BASE`
-   (else `PEER_TYPE_CONFLICT`), and BASE_ID (if present) must agree.
-
-This is fully internal to `pogo_port` -- higher layers
-(`child_service`/`parent_service`) never see a `HELLO_REQ`/`HELLO_RESP`
-frame; they only ever see `POGO_PORT_EVENT_PEER_READY` and, from then on,
-`POGO_PORT_EVENT_FRAME_RECEIVED` for the actual provisioning messages.
-`upper`/`lower` never used the old single `PEER_HELLO` message type either,
-so replacing it with this REQ/RESP pair is purely additive to the
-regression baseline.
-
-## ROOT / INTERMEDIATE / LEAF determination table (updated -- see docs/power-base.md)
-
-**A dedicated power-base project (`power_base/`) now exists and is always
-the fixed physical root of the POGO chain** (a POGO/role_manager-layer
-concept -- unrelated to, and not requiring, Thread Leadership; see
-[power-base.md](power-base.md)'s "module/Thread role decoupling" section).
-A sensor module in AUTO mode never becomes `MODULE_ROLE_ROOT` any more,
-regardless of what its UPSTREAM peer is -- see
-[power-base.md](power-base.md) for the full rationale, wiring, and the fix
-this required in `role_manager.c`. The table below is current:
-
-| UPSTREAM peer | DOWNSTREAM peer     | Role          |
-|---------------|----------------------|---------------|
-| POWER_BASE or MODULE | none attached | LEAF          |
-| POWER_BASE or MODULE | MODULE        | INTERMEDIATE  |
-| not attached / unknown | (any)       | UNASSIGNED    |
-| either port ERROR       | (any)      | ROLE_ERROR    |
-
-`MODULE_ROLE_ROOT` still exists as an enum value but is reachable ONLY via
-`MODULE_DEV_MODE_DEV_ROOT` (forced directly, bypassing this table entirely --
-see "development compat mode" below), never through AUTO-mode port-event
-derivation.
-
-See `components/role_manager/role_manager.c`'s `recompute()` for the exact
-(deterministic, order-sensitive) implementation, and
-[state-machine.md](state-machine.md) for how a role change propagates into
-`thread_manager`.
-
-**The "ROOT용 passive power-base 시험 지그" bench rig described in earlier
-revisions of this document and of `README.md` (BASE_ID tied directly to GND,
-no MCU on the other end, making a MODULE become ROOT) is now obsolete.** A
-module whose BASE_ID reads POWER_BASE is LEAF/INTERMEDIATE, never ROOT --
-the same table row as any other UPSTREAM peer. To actually test AUTO-mode
-BASE_ID/PEER_HELLO behavior end to end now requires either a real
-`power_base/` board, or `power_base/`'s host-tested mirror logic (see
-`tools/test_power_base_peer_hello.c`); a bare GND jig with no MCU no longer
-demonstrates a meaningfully different code path than the one already
-exercised by module-to-module docking.
-
-## Confirmed GPIO profile (final prototype hardware)
-
-The ESP32-H2 SuperMini development boards ARE the final graduation-project
-prototype hardware -- no separate PCB is planned. Both boards run the exact
-same `pogo_module.bin`, and both use the **exact same** UPSTREAM/DOWNSTREAM
-POGO GPIO assignment (only the permanently-paired sensor's `driver_id`,
-I2C address, and `calibration`/`config_revision` differ between boards --
-see `configs/prototype_sht45.json`/`configs/prototype_bh1750.json` and
-docs/module-config.md).
-
-**Updated by the Deep-sleep-ready GPIO follow-up (this session):** UPSTREAM
-`DETECT_IN` and `DETECT_OUT` are SWAPPED from the previously-confirmed
-profile -- `DETECT_IN` is now GPIO12 and `DETECT_OUT` is now GPIO2 (the
-previous profile had `DETECT_IN`=2/`DETECT_OUT`=12). The reason: GPIO12 is
-an ESP32-H2 RTC GPIO channel (`RTCIO_GPIO12_CHANNEL`, see
-`components/module_config/deep_sleep_gpio.h` and
-`components/module_config/gpio_profile.c`'s compile-time cross-check against
-ESP-IDF v6.1's own `soc/esp32h2/include/soc/rtc_io_channel.h`), usable as a
-future terminal-leaf's `esp_sleep_enable_ext1_wakeup_io()` Deep-sleep wake
-source on its UPSTREAM `DETECT_IN` edge; GPIO2 is not an RTC GPIO channel at
-all. **Deep-sleep itself is NOT implemented in this session** -- this is
-purely a GPIO-assignment change to keep that future option open without
-having to move DETECT again later. DOWNSTREAM `DETECT_IN`/`DETECT_OUT` (23/22)
-and every other pin are unchanged **as of this particular follow-up** --
-DOWNSTREAM `DETECT_OUT` was itself later moved off GPIO22 (to GPIO3) by a
-subsequent follow-up; see "History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now
-3" below and the confirmed-profile table's current DOWNSTREAM DETECT_OUT
-value, which is no longer 22. **IMPORTANT: real boards already wired
-to the previous profile must have their two UPSTREAM DETECT wires swapped
-before flashing firmware built from this profile** -- see README.md's
-rewiring notice.
-
-| Function              | GPIO | Notes |
-|-----------------------|-----:|-------|
-| I2C SDA                |    0 | sensor bus |
-| I2C SCL                |    1 | sensor bus |
-| UPSTREAM UART0 TX      |    4 | |
-| UPSTREAM UART0 RX      |    5 | |
-| UPSTREAM DETECT_IN     |   12 | pull-up input -- RTC GPIO channel, future Deep-sleep wake candidate (swapped from GPIO2, see above) |
-| UPSTREAM DETECT_OUT    |    2 | open-drain, active-low (swapped from GPIO12, see above) -- **not GPIO13, not GPIO6**, see below |
-| UPSTREAM BASE_ID       |   14 | active-low input, local pull-up |
-| DOWNSTREAM UART1 TX    |   10 | |
-| DOWNSTREAM UART1 RX    |   11 | |
-| DOWNSTREAM DETECT_OUT  |    3 | open-drain, active-low (moved from GPIO22, see "History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3" below) |
-| DOWNSTREAM DETECT_IN   |   23 | pull-up input (unchanged) |
-| DOWNSTREAM BASE_ID     |   -1 | BASE_ID is UPSTREAM-only, enforced by module_config validation |
-
-### ESP32-H2 GPIO usability policy (as enforced by `module_config`/`pack_module_config.py`)
-
-| Category | GPIOs | Reason |
+| UPSTREAM | DOWNSTREAM | 결과 |
 |---|---|---|
-| Boot strapping (reject) | 8, 9, 25 | would perturb boot mode if driven the wrong way at reset |
-| Not bonded out on the SuperMini/SiP package (reject) | 6, 7 | the ESP32-H2 SiP flash model does not expose these pins at all, and no SuperMini header pin carries them either -- see the GPIO6 correction below |
-| Internal SPI flash (reject) | 15-21 | wired internally to the SiP's flash die |
-| USB Serial/JTAG (reject) | 26, 27 | native USB D-/D+, also flash/monitor's own transport (see the console change below) |
-| Allowed, ordinary GPIOs | 2, 3, 4, 5 | **not** strapping pins -- freely usable as POGO/sensor GPIOs under this firmware's current configuration (USB-Serial/JTAG console, no external pad JTAG enabled). The one caveat: enabling the chip's separate *external pad* JTAG interface would need some of these pins back -- this firmware never enables pad JTAG and never touches any JTAG-related eFuse, so the caveat is documentation only, not a runtime restriction. |
-| Not chip-restricted, but avoided by this board profile | 13 | documented ESP32-H2 SuperMini onboard LED pin (`components/pogo_proto/Kconfig`) -- a board-level fact, not a chip-level rule, so `module_config`'s validation does NOT reject GPIO13 outright (see the GPIO13/GPIO6 history below) |
+| Power Base 또는 Module에 연결 | Module 연결 | INTERMEDIATE |
+| Power Base 또는 Module에 연결 | 분리 | LEAF |
+| 분리 | 임의 | UNASSIGNED |
+| peer type/BASE_ID 충돌 | 임의 | ROLE_ERROR |
 
-`components/module_config/gpio_profile.c` (`gpio_profile_in_range()`/
-`gpio_profile_reserved_reason()`) is the single source of truth for this
-table; `tools/pack_module_config.py`'s `STRAPPING_GPIOS`/
-`NOT_BONDED_OUT_GPIOS`/`FLASH_GPIOS`/`USB_GPIOS` mirror it exactly, checked
-mechanically by `tools/test_gpio_profile_parity.py` rather than by two
-hand-maintained lists silently drifting apart. `module_config.c`'s
-`validate_config()` additionally rejects a GPIO number outside `[-1, 27]`,
-reusing one GPIO for two functions, or giving an enabled port anything other
-than `uart_num` 0 or 1 -- see docs/module-config.md.
+센서 모듈 AUTO 경로에서 ROOT를 만들지 않는다. Power Base가 POGO 체인의 고정 루트다.
+INTERMEDIATE와 LEAF는 Thread의 ROUTER/CHILD 이름과 별개다.
 
-### History: UPSTREAM DETECT_IN's GPIO -- 13, then 6, now 2
+개발 회귀용 `dev_root.json`, `dev_leaf.json`은 DETECT와 BASE_ID가 없는 단일 UART
+fixture를 위해 남겨 두었다. 실제 최종 프로토타입에는 AUTO 설정을 사용한다.
 
-The follow-up spec's originally proposed profile put UPSTREAM DETECT_IN on
-**GPIO13**. This repository already documented (see
-`components/pogo_proto/Kconfig`'s `POGO_UART_TX_GPIO` help text, predating
-this GPIO-profile work) that GPIO13 is the ESP32-H2 SuperMini's **onboard
-LED** pin -- wiring an external DETECT_IN input there would conflict with
-whatever drives that LED. Per the follow-up spec's own instruction ("남는
-안전한 노출 GPIO로 설정만 변경하고 그 근거를 보고한다"), UPSTREAM DETECT_IN
-was first moved to **GPIO6**.
+## GPIO 선택 기록
 
-That first correction was itself wrong: **GPIO6 and GPIO7 are not bonded out
-at all** on the ESP32-H2 SiP flash package this project uses, and the
-SuperMini board's own header does not expose them either -- there is no
-physical pad to wire a DETECT_IN signal to, regardless of what the firmware
-config claims. This was caught before any board was flashed and is now
-corrected: UPSTREAM DETECT_IN is **GPIO2** (an ordinary, exposed,
-non-strapping GPIO under this firmware's USB-Serial/JTAG console
-configuration -- see the table above). `gpio_profile.c` now rejects GPIO6/7
-outright (`"not bonded out on ESP32-H2 SuperMini/SiP package"`) so this
-specific mistake cannot silently recur in a future config. Every
-config/doc/wiring instruction in this repository used GPIO2, not GPIO6 or
-GPIO13, for UPSTREAM DETECT_IN at that point; BASE_ID stayed on GPIO14
-throughout (never flagged by either piece of evidence).
+초기 시험에서 UPSTREAM DETECT_IN을 GPIO13으로 검토했지만 SuperMini의 onboard LED와
+겹쳐 제외했다. GPIO6도 후보였으나 해당 패키지에서 외부로 나오지 않아 사용할 수 없었다.
 
-**Then, GPIO2, now GPIO12 -- the Deep-sleep-ready follow-up (this
-session).** UPSTREAM DETECT_IN and DETECT_OUT are swapped: DETECT_IN moves
-to GPIO12 (an ESP32-H2 RTC GPIO channel, a candidate wake source for a
-future terminal-leaf's Deep-sleep ext1 wakeup) and DETECT_OUT takes GPIO2
-(not an RTC GPIO channel, so it was never a wake candidate in the first
-place -- fine as an ordinary open-drain output). GPIO2 remains a perfectly
-valid, non-strapping, non-reserved GPIO under this profile either way -- it
-did not stop being usable, it simply changed which DETECT signal it carries.
-See docs/power-base.md's "Deep-sleep 범위" section for the full reasoning
-and what is/is not implemented this session, and README.md for the required
-rewiring of already-built boards.
+그 뒤 GPIO2를 DETECT_IN으로 사용했지만 terminal LEAF의 wake 후보를 남기기 위해 최종적으로
+GPIO12와 GPIO2의 역할을 바꿨다.
 
-### History: DOWNSTREAM DETECT_OUT's GPIO -- 22, now 3
+```text
+현재: DETECT_IN=GPIO12, DETECT_OUT=GPIO2
+```
 
-**Updated by the header-accessibility follow-up (this session):** every
-active DOWNSTREAM port's `DETECT_OUT` moves from **GPIO22** to **GPIO3**
-(`configs/power_base.json`, `configs/module_config.example.json`, and all
-four ordinary I2C prototype configs -- `configs/prototype_sht45.json`,
-`prototype_bh1750.json`, `prototype_sgp40.json`, `prototype_sgp41.json`;
-each file's own `config_revision` was bumped accordingly). GPIO22 was never
-rejected by `gpio_profile.c`'s reserved-pin policy -- it remains an
-ordinary, allowed GPIO -- but on the real ESP32-H2 SuperMini board it is not
-brought out to a convenient header pin, so wiring it required direct
-soldering onto the module, with real risk of board damage. GPIO3 is:
+GPIO12는 ESP32-H2 RTC GPIO 조건을 만족한다. 이 선택은 wake 가능성만 확보한 것이며
+Deep-sleep 코드가 구현됐다는 뜻은 아니다.
 
-- header-accessible on the real board (no soldering required);
-- an ordinary, non-strapping GPIO, already allowed by `gpio_profile.c`
-  (never added to `STRAPPING_GPIOS`/`NOT_BONDED_OUT_GPIOS`/`FLASH_GPIOS`/
-  `USB_GPIOS` -- see the usability policy table above, which already listed
-  GPIO3 among "Allowed, ordinary GPIOs" before this follow-up; it was simply
-  unused until now);
-- not a boot strapping pin. GPIO3 does carry the chip's separate *external
-  pad* JTAG `MTDO` signal, but this firmware never enables pad JTAG and
-  never touches any JTAG-related eFuse (same caveat already noted for
-  GPIO2/4/5 above) -- this firmware's console/debug transport is the native
-  USB Serial/JTAG peripheral (GPIO26/27), never external pad JTAG, so the
-  `MTDO` alternate function is never active;
-- used here only as an open-drain, active-low `DETECT_OUT` **output** --
-  never a Deep-sleep wake source (that role stays fixed on UPSTREAM
-  `DETECT_IN`=GPIO12, unchanged by this follow-up -- see the previous
-  section). GPIO3 is not an ESP32-H2 RTC GPIO channel
-  (`DEEP_SLEEP_WAKE_GPIO_RTC_MIN..MAX` is 7..14, see
-  `components/module_config/deep_sleep_gpio.h`) and does not need to be one,
-  since it is never a wake input.
+DOWNSTREAM DETECT_OUT은 처음 GPIO22였지만 SuperMini header에 나오지 않아 납땜이
+필요했다. 보드 손상 위험과 조립 복잡도를 줄이기 위해 GPIO3으로 옮겼다.
 
-**PMS5003's terminal config is unaffected**: its `downstream_port` stays
-fully disabled (`-1` for every field, including `detect_out_gpio`) both
-before and after this follow-up -- GPIO3 is never assigned to it. UPSTREAM
-`DETECT_IN`=GPIO12/`DETECT_OUT`=GPIO2 and DOWNSTREAM `DETECT_IN`=GPIO23 are
-also unchanged by this follow-up -- only DOWNSTREAM `DETECT_OUT` moves.
-`tools/test_prototype_port_blocks_match.py` mechanically confirms GPIO3 is
-now used by every active final-prototype config's `downstream_port.
-detect_out_gpio` (both source JSON and the actual generated NVS image
-content) and that GPIO22 no longer appears in any of their enabled port
-fields.
+```text
+현재: DOWNSTREAM DETECT_IN=GPIO23, DETECT_OUT=GPIO3
+```
 
-**Real boards already wired to the GPIO22 profile must have their
-DOWNSTREAM `DETECT_OUT` wire moved to GPIO3 before flashing firmware built
-from this profile** -- see README.md's wiring table and rewiring notice.
-`cfg`-partition-only reflashing (no app rebuild) is sufficient for boards
-already running firmware built from an earlier session, since this is a
-config-only change -- see README.md's exact commands.
+GPIO3은 출력 전용으로 사용하며 wake source가 아니다.
 
-### Console moved off UART0
+## GPIO 검증
 
-ESP32-H2 has exactly two UART controllers, and both are now committed to the
-POGO ports above (UPSTREAM=UART0, DOWNSTREAM=UART1) -- there is no UART left
-for a log console. `module/sdkconfig.defaults` sets
-`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (no secondary console): ESP_LOG/printf
-now only ever goes out over the chip's native USB-Serial/JTAG peripheral
-(GPIO26/27, already reserved and never touched by any POGO/sensor config),
-which is also what `idf.py flash`/`monitor` already use. No UART0 byte is
-ever emitted by the application or second-stage bootloader once this
-sdkconfig applies. The one caveat: the ROM's very first-stage boot messages
-(before the second-stage bootloader takes over) are baked into the chip's
-mask ROM and are emitted over UART0 by hardware default at every power-on
-reset, regardless of any `sdkconfig` -- this is a documented ESP32-family
-characteristic, not something an application `sdkconfig` can suppress
-without permanently burning an eFuse (not done here), and is a few bytes at
-the very start of boot, not a sustained console.
+`module_config`와 config packer는 같은 ESP32-H2 정책을 검사한다.
 
-## Development compat mode (dev_root.json / dev_leaf.json, preserved as a regression fixture)
+- 허용 범위: `-1` 또는 GPIO0..27
+- strapping pin 제외
+- flash pin 제외
+- USB Serial/JTAG pin 제외
+- 패키지에서 나오지 않은 pin 제외
+- 같은 GPIO 중복 사용 금지
+- enabled port는 UART0 또는 UART1
+- AUTO port는 DETECT_IN/OUT 필수
+- AUTO UPSTREAM은 BASE_ID 필수
+- DOWNSTREAM BASE_ID는 항상 `-1`
 
-`configs/dev_root.json`/`configs/dev_leaf.json` are kept exactly as they
-were before this GPIO work, as the pre-existing two-board regression
-fixture. They describe a board with exactly **one** physical POGO UART pair
-(UART1, GPIO10=TX, GPIO11=RX, 115200 8N1) and **no** DETECT_IN/DETECT_OUT/
-BASE_ID wiring at all -- this used to be the state of the actual dev boards;
-now that the confirmed GPIO profile above is real, `dev_mode=AUTO` with the
-profile above is what every new board should actually be flashed with (see
-`configs/prototype_sht45.json`/`configs/prototype_bh1750.json`).
-`module_config`'s validation only enforces "an enabled port needs
-DETECT_IN/DETECT_OUT" and "AUTO needs a real UPSTREAM BASE_ID" when
-`dev_mode == AUTO` specifically, so these two files keep validating and
-packing exactly as before.
+정확한 목록은 `components/module_config/gpio_profile.c`에 있고
+`tools/pack_module_config.py`가 같은 값을 사용한다. parity test가 둘의 차이를 검사한다.
 
-To still validate the *same* `pogo_module.bin` on these boards, `module_config`
-carries a small, separate NVS namespace (`dev_cfg`, distinct from the fixed
-sensor pairing's `module_cfg` namespace -- see module-config.md) holding one
-override value:
+## PMS5003 예외
 
-| dev_mode   | Effect                                                          |
-|------------|------------------------------------------------------------------|
-| `AUTO`     | Final behavior: role derived from BASE_ID + PEER_HELLO as above.  |
-| `DEV_ROOT` | The single UART is mapped to DOWNSTREAM only (UPSTREAM port disabled entirely in `module_config`); `role_manager` is forced directly to ROOT instead of deriving it. Reproduces the old `upper` project's behavior. |
-| `DEV_LEAF` | The single UART is mapped to UPSTREAM only (DOWNSTREAM disabled); `role_manager` is forced directly to LEAF. Reproduces the old `lower` project's behavior. |
+PMS5003은 센서 자체가 UART를 사용하므로 terminal LEAF 전용이다.
 
-`dev_mode` is **not** a compile-time firmware choice -- it is one NVS value
-in the same `cfg` partition image, generated per-board by
-`tools/pack_module_config.py` from `configs/dev_root.json` /
-`configs/dev_leaf.json` (see module-config.md for the generation commands).
-A non-`AUTO` value is always logged loudly at boot
-(`module_main: DEVELOPMENT OVERRIDE ACTIVE: dev_mode=...`) so a real-hardware
-log is never mistaken for a dev-compat one.
+- sensor UART1
+- MCU TX GPIO0
+- MCU RX GPIO1
+- 9600 8N1
+- downstream POGO 비활성
 
-Because dev-compat ports have no `DETECT_IN` (`detect_in_gpio == -1`), a
-port is always attached the instant it is enabled and can never learn "the
-peer physically left" the way `AUTO` mode can via a debounced detach. A
-`DOCK_TIMEOUT` (e.g. the peer board hasn't finished booting yet) would
-therefore leave the port wedged in `ERROR` forever under `AUTO`'s policy of
-"wait for the next detach/attach". `pogo_port.c` handles this specifically
-for `detect_in_gpio < 0`: it still logs the failure and fires
-`POGO_PORT_EVENT_ERROR`, then waits `CONFIG_POGO_PING_INTERVAL_MS` (a
-bounded cooldown, not a hot loop) and starts a fresh handshake cycle --
-itself still capped at `CONFIG_POGO_MAX_RETRY` retries. `PEER_TYPE_CONFLICT`
-and `PROTOCOL_VERSION_ERROR` are NOT auto-retried even in dev-compat mode --
-those mean something is actually wrong (config or version mismatch), not
-just "the peer isn't listening yet".
+UPSTREAM POGO는 UART0 GPIO4/5를 그대로 쓴다. GPIO0/1은 다른 I2C 센서의 SDA/SCL 위치와
+맞춰 조립 혼동을 줄였지만, PMS5003 설정에서는 I2C가 아니라 UART로 동작한다.
 
-This was written as a **temporary testing feature** before real DETECT/
-BASE_ID hardware existed; now that it does (the confirmed GPIO profile
-above), `dev_root_config.bin`/`dev_leaf_config.bin` and the
-`MODULE_DEV_MODE_DEV_ROOT`/`DEV_LEAF` code paths are kept only as a bench-test
-fallback / regression fixture -- `configs/prototype_sht45.json`/
-`configs/prototype_bh1750.json` (`dev_mode=AUTO`) are what every real board
-is actually flashed with.
+## 콘솔
 
-## Idle PING/PONG liveness (section 9 of the follow-up spec)
-
-Once `PEER_READY`, a port that has heard nothing (no HELLO, no provisioning
-frame, no PING/PONG) for `CONFIG_POGO_PING_INTERVAL_MS` sends one
-`POGO_MSG_PING` and expects a same-seq `POGO_MSG_PONG` within
-`CONFIG_POGO_ACK_TIMEOUT_MS`. This is entirely internal to `pogo_port` --
-PING/PONG frames are answered/consumed inside `process_peer_ready()` and are
-**never** forwarded up as `POGO_PORT_EVENT_FRAME_RECEIVED`; higher layers
-(`child_service`/`parent_service`) never see them (an earlier revision had
-`child_service` answer PING itself -- that responsibility has moved into
-`pogo_port`, which is the only code that ever reads this port's UART, so
-there is exactly one place deciding "is this byte PING/PONG or a
-provisioning frame" -- see `pogo_port.c`'s `maybe_send_idle_ping()`/
-`process_peer_ready()`).
-
-A run of `CONFIG_POGO_MAX_RETRY` consecutive PING timeouts (same budget as
-every other retry in this codebase) fires `POGO_PORT_EVENT_ERROR` with the
-new `POGO_PORT_ERR_LIVENESS_LOST` code and moves the port to `ERROR` --
-`AUTO` mode then waits for the next physical detach/attach (a liveness loss
-while `DETECT_IN` still reads attached means something is genuinely wrong,
-the same reasoning as `DOCK_TIMEOUT`); dev-compat mode (no `DETECT_IN`)
-auto-retries a fresh handshake after one `CONFIG_POGO_PING_INTERVAL_MS`
-cooldown, mirroring `handle_dock_timeout_or_silent_power_base()`'s recovery
-policy. Any real traffic (a HELLO, a provisioning frame, or a successful
-PING/PONG round trip) resets the idle countdown, so a busy link never sends
-gratuitous PINGs.
-
-For console diagnostics, `pogo_port` logs `WAIT_ATTACH` once on entry and
-then prints one `alive` line every 15 seconds only while in `WAIT_ATTACH` or
-`ERROR`. The line includes the live `DETECT_IN` level, internal port state,
-own peer type, uptime, and cumulative DETECT ISR queue drops. This is a task
-liveness indicator for monitors opened after boot, not a new attach/retry
-mechanism; the handshake and AUTO-mode recovery policy are unchanged.
-
-## PMS5003 (section 11): terminal-only UART transport
-
-PMS5003 is the chain's terminal sensor, so its module never needs a
-DOWNSTREAM POGO face. `configs/prototype_pms5003.json` assigns UART0 and
-GPIO4/5 to UPSTREAM POGO as usual, assigns UART1 and GPIO0/1 to PMS5003
-(GPIO0=ESP TX->PMS RX, GPIO1=ESP RX<-PMS TX) at 9600 8N1, and fully disables
-every downstream port field. Config validation
-rejects any UART-sensor image that also enables downstream, or that collides
-with the upstream UART/GPIOs; this module therefore remains a LEAF and can
-never become INTERMEDIATE.
-
-`components/pms5003` implements ACTIVE and PASSIVE command modes, wake/mode
-selection, bounded UART reads, the datasheet 32-byte frame parser, checksum
-and resynchronization, and PM1.0/PM2.5/PM10 atmospheric values in ug/m3.
-During the configured 30-second fan/laser stabilization period, valid data
-is carried with `SENSOR_CHANNEL_STATUS_CONDITIONING` per channel and
-`SENSOR_STATUS_CONDITIONING` overall (`pms5003.c`'s `ctx->status`, unlike
-SGP40/SGP41 which only mark individual channels and keep their own overall
-status `OK`). `parent_service.c`'s `run_provisioning_session()` explicitly
-allows `SENSOR_INFO_ACK.sensor_status == CONDITIONING` in addition to `OK`
-(logging that the child is still warming up) and continues the full sequence
--- POLL_CONFIG, SET_COLLECTOR, SET_DATASET, and the Thread join -- exactly
-as for `OK`; any OTHER non-zero status still abandons the session as before.
-Once `uart_warmup_ms` has elapsed, `pms5003.c` reports `OK` on its own, with
-no re-provisioning or reboot needed. The prototype config uses PASSIVE mode,
-so each measurement request produces one frame.
-
-See `tools/test_conditioning_provisioning.c` for the regression coverage: it
-links the real, unmodified `child_service.c`, `parent_service.c`,
-`sensor_service.c`, and `pms5003.c` (plus two real `pogo_port.c` instances
-bridged over the fake UART bank) through an actual end-to-end provisioning
-run, confirming the wire really carries `CONDITIONING`, that the parent
-really continues all the way to `JOIN_RESULT_ACK`, that a genuine sensor
-error status is still rejected, and that the ordinary `OK` path (SHT45,
-BH1750, SGP40, SGP41) has no regression. `tools/test_pms5003_driver.c`
-separately covers the UART transport layer itself (wake/mode sequencing,
-PASSIVE mode's READ command, checksum/partial-frame/noise resync, timeout
-and UART error handling, and init-failure cleanup) against the real
-`pms5003.c` + `pms5003_parser.c`.
+POGO가 UART0과 UART1을 모두 사용하므로 일반 UART console을 쓰지 않는다. 개발 로그와
+플래시는 ESP32-H2 USB Serial/JTAG를 사용한다. USB D-/D+ 핀은 POGO나 센서 기능에
+할당하지 않는다.
