@@ -316,7 +316,59 @@ sample-send window as the sample actually being judged:
 
 | Feature | Host test / code review | Real hardware | Notes |
 |---|---|---|---|
-| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | Not verified | Own Ext Addr + role logged on every real role change (part 1); the LEAF's CURRENT parent Ext Addr additionally re-checked (reusing the CoAP send's own OpenThread lock, no extra wait) and logged with `sample_seq` (on change only, `unknown` if unreadable) at each real `/s` sample send (part 2, corrected this pass) -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge per-sample with the criteria immediately above; a join-time-only match is not sufficient, and even a same-`sample_seq` match is strong evidence, not standalone proof of the exact transmission-instant path (see item 1 above for what would make it conclusive). Not yet run on real hardware. |
+| A sensor sample's CoAP packet is actually radio-relayed through the INTERMEDIATE module's router role (genuine Thread-mesh multi-hop, not just POGO depth=2) | Code review this pass -- OK, no bug; real ESP-IDF `module`/`power_base` builds, zero warnings (see above) | **Not verified** (real hardware run this pass observed the direct-path outcome both times, not multi-hop -- see below; this is a valid OpenThread result, not a failure) | Own Ext Addr + role logged on every real role change (part 1); the LEAF's CURRENT parent Ext Addr additionally re-checked (reusing the CoAP send's own OpenThread lock, no extra wait) and logged with `sample_seq` (on change only, `unknown` if unreadable) at each real `/s` sample send (part 2, corrected this pass) -- no manual `ot parent`/`ot router table` CLI diagnostic needed. Judge per-sample with the criteria immediately above; a join-time-only match is not sufficient, and even a same-`sample_seq` match is strong evidence, not standalone proof of the exact transmission-instant path (see item 1 above for what would make it conclusive). **Run on real hardware this pass** (see "Real-hardware run (this pass)" below): both captured samples matched judgement criteria outcome 2 (direct parent, never the INTERMEDIATE) -- multi-hop itself remains neither confirmed nor ruled out. |
+
+### Real-hardware run (this pass): direct-path parent observed twice, not multi-hop through INTERMEDIATE
+
+**Reported by the operator for this pass; not reproduced inside this session, which had no
+physical board or real Linux host access.** An operator ran this diagnostic (part 1 + part 2
+above) on a real topology of Power Base + INTERMEDIATE + PMS5003 LEAF, joined via a real Linux
+OTBR:
+
+- Power Base `own_ext_addr=aa:cc:e5:8a:1b:59:1d:b5`
+- INTERMEDIATE `own_ext_addr=ae:6c:75:ed:46:3f:e0:47`
+- OTBR ext address=`b6:3c:32:f7:ab:e0:a1:ea`
+
+Two sample sends were captured, each matched by `sample_seq` against Linux ingest reception:
+
+1. `sample_seq=1`: the LEAF's parent re-check at send time (part 2) showed
+   `parent_ext_addr=b6:3c:...` -- the OTBR itself, not the INTERMEDIATE. Linux ingest received
+   the same `sample_seq=1`.
+2. After a physical detach and re-join of the LEAF, `sample_seq=3`: the parent re-check showed
+   `parent_ext_addr=aa:cc:...` -- the Power Base itself. Linux ingest again received the matching
+   `sample_seq=3`.
+
+In neither observation did the parent match the INTERMEDIATE's own `own_ext_addr`
+(`ae:6c:...`).
+
+Per the judgement criteria above, both observations are outcome **2** (direct-parent match), not
+outcome **1** (multi-hop through the INTERMEDIATE). **This is a valid, expected OpenThread
+result, not a bug or a diagnostic failure**: OpenThread's own mesh routing chose to attach the
+LEAF directly -- to the OTBR the first time, to the Power Base after the LEAF's reattachment the
+second time -- rather than through the INTERMEDIATE, and the diagnostic correctly observed and
+reported whichever path OpenThread actually picked. No routing preference, Dataset, or code was
+changed to try to force a different result.
+
+**What this run confirms, on real hardware, for the first time together in one capture:**
+
+- The diagnostic itself (part 1's own-address/role logging, part 2's per-sample parent re-check
+  reusing the real send's OpenThread lock) works correctly on real hardware and produces a
+  same-`sample_seq` match against real Linux ingest reception, exactly as designed.
+- POGO depth=2 topology (Power Base -> INTERMEDIATE -> PMS5003 LEAF) continued operating
+  correctly through this run.
+- Data delivery to Linux ingest matched by `sample_seq` in both captured observations.
+- The LEAF's physical detach + re-join recovered correctly -- it resumed sending and its next
+  sample was received on Linux, consistent with the existing detach/reattach recovery rows
+  above.
+
+**What this run does NOT confirm:** actual Thread radio multi-hop through the INTERMEDIATE's
+router role. Both captured samples showed the direct-path outcome instead. This is not evidence
+against multi-hop ever occurring elsewhere -- a direct-parent result is an equally valid
+OpenThread outcome per the judgement criteria above -- it means only that these two particular
+samples did not exercise that path. The multi-hop table row above stays **Not verified** (neither
+confirmed nor ruled out); a future run where the LEAF cannot reach the OTBR/Power Base directly
+(the RF-restricted test bed in judgement criteria item 1) would be needed to actually observe
+outcome 1.
 
 ## Thread join timing (open observation, this pass)
 
