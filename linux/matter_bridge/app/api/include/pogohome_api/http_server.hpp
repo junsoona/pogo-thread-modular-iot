@@ -1,0 +1,127 @@
+// Read-only PogoHome Local API v1 HTTP server -- GET /api/v1/health,
+// GET /api/v1/snapshot, GET /api/v1/events (Server-Sent Events). See
+// docs/pogohome-api-v1.md for the full contract this implements.
+//
+// This is a small, purpose-built HTTP/1.1 subset over plain POSIX sockets
+// (no external HTTP library -- this repo's own follow-up spec: "외부
+// 라이브러리를 새로 설치하지 않는다") -- same "minimal internal parser
+// instead of a real library" choice linux/matter_bridge/ingest/include/ingest/minicoap.hpp
+// already made for CoAP, for the same reason (stay buildable/testable with
+// nothing beyond a C++17 compiler + CMake). Every response is exactly one
+// per connection (`Connection: close`, no keep-alive/pipelining) except
+// GET /api/v1/events, which streams for the connection's whole lifetime.
+//
+// Threading model: one acceptor thread (Start()) that poll()s the listening
+// socket on a short bounded timeout (mirrors
+// linux/matter_bridge/ingest/src/server.cpp's own SO_RCVTIMEO-poll pattern)
+// so it notices Stop() promptly; each accepted connection is handled on its
+// own worker thread, tracked in `workers_` so Stop() can join every one of
+// them within a bounded time (see http_server.cpp's own top comment for the
+// exact bound) -- never a detached, unjoinable thread. A worker thread only
+// ever calls ingest::Registry::snapshot()/wait_for_change() (see
+// registry.hpp's own top comment: safe from any thread other than the CoAP
+// receive thread), and only ever serializes/sends AFTER a snapshot's mutex
+// has already been released -- this API never holds Registry::mutex_ while
+// doing socket I/O or JSON generation.
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "ingest/registry.hpp"
+
+namespace pogohome_api {
+
+struct ServerConfig {
+    // A bare numeric literal (IPv4 or IPv6) to bind to -- see
+    // interface_address.hpp's own ResolveInterfaceAddress(), which is what a
+    // caller uses to turn an interface NAME into this. Never "0.0.0.0"/"::"
+    // -- see this file's own top comment and docs/pogohome-api-v1.md's own
+    // bind policy section.
+    std::string bind_address;
+    int address_family = 0; // AF_INET or AF_INET6, matching bind_address
+    uint16_t port = 0;
+
+    // Bounded resource limits -- see docs/pogohome-api-v1.md's own
+    // concurrency section. max_connections bounds this server's total
+    // worker-thread count at any moment (health/snapshot connections are
+    // normally short-lived, but a burst -- or a client that connects and
+    // stalls -- must still never grow this unboundedly). max_sse_clients is
+    // a SEPARATE, smaller sub-limit specifically on how many of those may be
+    // long-lived GET /api/v1/events streams at once.
+    size_t max_connections = 32;
+    size_t max_sse_clients = 8;
+
+    // GET /api/v1/events tuning -- see docs/pogohome-api-v1.md's own SSE
+    // section for the production defaults (15s heartbeat). Overridable here
+    // ONLY so this library's own host tests don't have to spend 15
+    // real-time seconds proving the heartbeat fires at all -- production
+    // code (linux/matter_bridge/app/chip/main.cpp) never overrides these.
+    std::chrono::milliseconds sse_heartbeat_interval = std::chrono::seconds(15);
+    std::chrono::milliseconds sse_poll_interval = std::chrono::milliseconds(1000);
+};
+
+class Server {
+public:
+    Server(ingest::Registry &registry, ServerConfig config);
+    ~Server();
+
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
+
+    // Binds the listening socket and starts the acceptor thread. Returns
+    // false immediately (after logging a clear reason to stderr) on ANY
+    // startup failure -- socket()/bind()/listen() failing -- same
+    // "refuse to start, never silently degrade" policy as
+    // ingest::run_server() (see ingest/include/ingest/server.hpp). Calling
+    // Start() more than once, or after Stop(), is a programming error (not
+    // defended against -- construct a new Server instead).
+    bool Start();
+
+    // Signals every thread this Server owns to stop, joins all of them
+    // within a bounded total time, and closes the listening socket. Safe to
+    // call even if Start() was never called or already failed. Idempotent:
+    // a second call is a harmless no-op.
+    void Stop();
+
+    // The actual bound port -- equal to config.port unless it was 0 (bind
+    // an ephemeral port), which this test-only path supports so host tests
+    // never need to hardcode a port number that might collide with another
+    // test running concurrently.
+    uint16_t bound_port() const { return bound_port_; }
+
+private:
+    struct Worker {
+        std::thread thread;
+        // Set to false by the worker itself right before it returns --
+        // Stop() (and the acceptor's own periodic reap pass) only ever
+        // joins a thread whose handler has already finished running, never
+        // blocks indefinitely inside a lock waiting for one that hasn't.
+        std::shared_ptr<std::atomic<bool>> running;
+    };
+
+    void AcceptLoop();
+    void ReapFinishedWorkersLocked();
+    void HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> running);
+    void HandleSse(int client_fd);
+
+    ingest::Registry &registry_;
+    ServerConfig config_;
+    int listen_fd_ = -1;
+    uint16_t bound_port_ = 0;
+    std::atomic<bool> should_stop_{false};
+    std::atomic<size_t> sse_clients_{0};
+    std::thread acceptor_thread_;
+    bool started_ = false;
+
+    std::mutex workers_mutex_;
+    std::vector<Worker> workers_;
+};
+
+} // namespace pogohome_api

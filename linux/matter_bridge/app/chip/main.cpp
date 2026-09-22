@@ -61,6 +61,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -74,6 +75,8 @@
 #include "ingest/server.hpp"
 #include "matter_bridge/bridge_manager.hpp"
 #include "matter_bridge/endpoint_store.hpp"
+#include "pogohome_api/http_server.hpp"
+#include "pogohome_api/interface_address.hpp"
 
 using chip::ArgParser::OptionDef;
 using chip::ArgParser::OptionSet;
@@ -85,6 +88,12 @@ struct AppConfig {
     std::string interface;
     uint16_t port = 5684;
     std::string state_dir;
+    // PogoHome Local API v1 (see docs/pogohome-api-v1.md) -- disabled
+    // (empty) by default, same "explicit required interface, never listen
+    // everywhere" policy as `interface` above. api_port only matters if
+    // api_interface is non-empty.
+    std::string api_interface;
+    uint16_t api_port = 8787;
 };
 
 AppConfig gAppConfig;
@@ -92,6 +101,8 @@ AppConfig gAppConfig;
 constexpr uint16_t kOptionInterface = 0xFF10;
 constexpr uint16_t kOptionPort = 0xFF11;
 constexpr uint16_t kOptionStateDir = 0xFF12;
+constexpr uint16_t kOptionApiInterface = 0xFF13;
+constexpr uint16_t kOptionApiPort = 0xFF14;
 
 bool HandlePogoOption(const char *program, OptionSet *, int identifier, const char *name, const char *value)
 {
@@ -111,6 +122,18 @@ bool HandlePogoOption(const char *program, OptionSet *, int identifier, const ch
     case kOptionStateDir:
         gAppConfig.state_dir = value;
         return true;
+    case kOptionApiInterface:
+        gAppConfig.api_interface = value;
+        return true;
+    case kOptionApiPort: {
+        int parsed = atoi(value);
+        if (parsed <= 0 || parsed > 0xFFFF) {
+            PrintArgError("%s: --api-port must be 1..65535\n", program);
+            return false;
+        }
+        gAppConfig.api_port = static_cast<uint16_t>(parsed);
+        return true;
+    }
     default:
         PrintArgError("%s: INTERNAL ERROR: unhandled pogo_matter_bridge option: %s\n", program, name);
         return false;
@@ -121,6 +144,8 @@ OptionDef gPogoOptionDefs[] = {
     {"interface", chip::ArgParser::kArgumentRequired, kOptionInterface},
     {"port", chip::ArgParser::kArgumentRequired, kOptionPort},
     {"state-dir", chip::ArgParser::kArgumentRequired, kOptionStateDir},
+    {"api-interface", chip::ArgParser::kArgumentRequired, kOptionApiInterface},
+    {"api-port", chip::ArgParser::kArgumentRequired, kOptionApiPort},
     {},
 };
 
@@ -136,7 +161,17 @@ OptionSet gPogoOptions = {
     "       REQUIRED. Directory for this bridge's OWN persistent state (the module_uuid -> Matter endpoint id\n"
     "       mapping, see matter_bridge::EndpointStore). Matter's own fabric/operational-credential storage is a\n"
     "       SEPARATE, standard connectedhomeip option (--KVS <path>, see --help below) -- point it at a path\n"
-    "       under this same state-dir so a single directory holds all of this program's persistent state.\n",
+    "       under this same state-dir so a single directory holds all of this program's persistent state.\n"
+    "  --api-interface <ifname>\n"
+    "       OPTIONAL. Enables the read-only PogoHome Local API v1 HTTP server (see docs/pogohome-api-v1.md),\n"
+    "       bound to THIS Linux network interface's own LAN address only (e.g. a Wi-Fi/Ethernet interface such\n"
+    "       as wlp5x0 -- normally NOT the same interface as --interface's Thread interface). Omitted (the\n"
+    "       default): the API server is disabled entirely, and this program behaves exactly as before this\n"
+    "       option existed. If given, this program refuses to start at all if the named interface does not\n"
+    "       exist, has no usable address, or the API server's port cannot be bound.\n"
+    "  --api-port <port>\n"
+    "       TCP port for the PogoHome Local API v1 HTTP server (default: 8787). Only meaningful with\n"
+    "       --api-interface.\n",
 };
 
 ingest::Registry gRegistry;
@@ -148,6 +183,11 @@ matter_bridge::BridgeManager *gBridgeManager = nullptr;
 
 std::thread gIngestThread;
 std::thread gWatcherThread;
+// Null (never constructed) unless --api-interface was given -- see this
+// file's own top comment and docs/pogohome-api-v1.md. Its own acceptor and
+// per-connection worker threads are entirely internal to
+// pogohome_api::Server itself (see http_server.hpp), never tracked here.
+std::unique_ptr<pogohome_api::Server> gApiServer;
 
 // Runs on the Matter event-loop thread via
 // chip::DeviceLayer::PlatformMgr().ScheduleWork() -- see this file's own
@@ -280,6 +320,12 @@ void ApplicationShutdown()
 {
     gStopIngest.store(true, std::memory_order_relaxed);
     gStopWatcher.store(true, std::memory_order_relaxed);
+    // gApiServer is deliberately NOT stopped here -- Stop() blocks (bounded,
+    // but not instant) joining its own internal threads, and this hook's
+    // own contract (see this file's top comment) is to only ever flip
+    // atomics and return immediately; main() stops it, after
+    // ChipLinuxAppMainLoop() returns, the same place it joins gIngestThread/
+    // gWatcherThread.
 }
 
 int main(int argc, char *argv[])
@@ -295,6 +341,39 @@ int main(int argc, char *argv[])
     if (gAppConfig.state_dir.empty()) {
         fprintf(stderr, "%s: --state-dir is required\n", argv[0]);
         return -1;
+    }
+
+    // PogoHome Local API v1 (see docs/pogohome-api-v1.md) -- resolved and
+    // bound here, BEFORE the ingest CoAP server or the registry watcher
+    // thread ever starts, so a bad --api-interface/--api-port fails this
+    // process's startup cleanly with nothing else running yet (this
+    // follow-up spec's own explicit requirement: never silently disable the
+    // API or fall back to "listen everywhere" -- see
+    // pogohome_api::ResolveInterfaceAddress()'s and pogohome_api::Server::
+    // Start()'s own doc comments for the exact failure conditions each
+    // covers). Left entirely unconstructed (gApiServer stays null) when
+    // --api-interface was not given -- this program's behavior is then
+    // byte-for-byte what it was before this option existed.
+    if (!gAppConfig.api_interface.empty()) {
+        pogohome_api::ResolvedAddress resolved;
+        std::string resolve_error;
+        if (!pogohome_api::ResolveInterfaceAddress(gAppConfig.api_interface, resolved, resolve_error)) {
+            fprintf(stderr, "%s: --api-interface: %s\n", argv[0], resolve_error.c_str());
+            return -1;
+        }
+
+        pogohome_api::ServerConfig api_config;
+        api_config.bind_address = resolved.numeric;
+        api_config.address_family = resolved.family;
+        api_config.port = gAppConfig.api_port;
+
+        gApiServer = std::make_unique<pogohome_api::Server>(gRegistry, api_config);
+        if (!gApiServer->Start()) {
+            fprintf(stderr,
+                    "%s: PogoHome Local API v1 server failed to start on interface '%s' -- see the error above\n",
+                    argv[0], gAppConfig.api_interface.c_str());
+            return -1;
+        }
     }
 
     matter_bridge::EndpointStore endpoint_store(gAppConfig.state_dir);
@@ -331,6 +410,14 @@ int main(int argc, char *argv[])
 
     gStopIngest.store(true, std::memory_order_relaxed);
     gStopWatcher.store(true, std::memory_order_relaxed);
+    // Stopped here (main thread, after the Matter event loop itself has
+    // already torn down) rather than in ApplicationShutdown() -- see that
+    // function's own comment. Bounded time (see pogohome_api::Server::
+    // Stop()'s own doc comment), never a no-op if gApiServer is set: joins
+    // every worker thread this API server ever spawned.
+    if (gApiServer) {
+        gApiServer->Stop();
+    }
     if (gIngestThread.joinable()) {
         gIngestThread.join();
     }

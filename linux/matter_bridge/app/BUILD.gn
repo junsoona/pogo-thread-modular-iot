@@ -30,6 +30,16 @@ _ingest_dir = "${_pogo_repo}/linux/matter_bridge/ingest"
 
 executable("pogo_matter_bridge") {
   sources = [
+    "api/include/pogohome_api/hex.hpp",
+    "api/include/pogohome_api/http_server.hpp",
+    "api/include/pogohome_api/interface_address.hpp",
+    "api/include/pogohome_api/json_snapshot.hpp",
+    "api/include/pogohome_api/sensor_kind.hpp",
+    "api/src/hex.cpp",
+    "api/src/http_server.cpp",
+    "api/src/interface_address.cpp",
+    "api/src/json_snapshot.cpp",
+    "api/src/sensor_kind.cpp",
     "chip/chip_endpoint.cpp",
     "chip/chip_endpoint.hpp",
     "chip/main.cpp",
@@ -58,11 +68,13 @@ executable("pogo_matter_bridge") {
   ]
 
   include_dirs = [
+    "api/include",
     "core/include",
     "${_ingest_dir}/include",
     "${_pogo_repo}/components/bridge_export_proto/include",
     "${_pogo_repo}/components/pogo_proto/include",
     "${_pogo_repo}/components/sensor_channel/include",
+    "${_pogo_repo}/components/topology_proto/include",
   ]
 
   deps = [
