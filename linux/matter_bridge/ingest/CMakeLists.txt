@@ -51,19 +51,27 @@ target_include_directories(pogo_wire_formats PUBLIC
     ${REPO_ROOT}/components/pogo_proto/include
 )
 
+find_package(Threads REQUIRED)
+
 add_library(ingest_core STATIC
     src/minicoap.cpp
     src/registry.cpp
     src/session.cpp
 )
 target_include_directories(ingest_core PUBLIC include)
-target_link_libraries(ingest_core PUBLIC pogo_wire_formats)
+# PUBLIC, not PRIVATE: registry.cpp's own bounded stale-timeout sweep thread
+# (see ingest/registry.hpp's "Correction pass 2") makes ingest::Registry
+# itself use std::thread/std::condition_variable now, not just server.cpp's
+# CoAP loop -- every consumer of this library (ingest_server, every test
+# below, and linux/matter_bridge/app's own GN build, which compiles this
+# exact registry.cpp directly) needs pthread linked in on a standard Linux
+# glibc toolchain (glibc >= 2.34 merges it into libc and would link fine
+# either way, but this must not silently depend on that).
+target_link_libraries(ingest_core PUBLIC pogo_wire_formats Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ingest_core PRIVATE -Wall -Wextra)
     target_compile_options(pogo_wire_formats PRIVATE -Wall -Wextra)
 endif()
-
-find_package(Threads REQUIRED)
 
 add_executable(ingest_server src/main.cpp src/server.cpp)
 target_link_libraries(ingest_server PRIVATE ingest_core Threads::Threads)
@@ -73,6 +81,10 @@ enable_testing()
 add_executable(ingest_unit_tests tests/test_registry_and_session.cpp)
 target_link_libraries(ingest_unit_tests PRIVATE ingest_core)
 add_test(NAME ingest_unit_tests COMMAND ingest_unit_tests)
+
+add_executable(ingest_registry_stale_timeout_test tests/test_registry_stale_timeout.cpp)
+target_link_libraries(ingest_registry_stale_timeout_test PRIVATE ingest_core)
+add_test(NAME ingest_registry_stale_timeout_test COMMAND ingest_registry_stale_timeout_test)
 
 add_executable(ingest_registry_snapshot_test tests/test_registry_snapshot.cpp)
 target_link_libraries(ingest_registry_snapshot_test PRIVATE ingest_core Threads::Threads)
