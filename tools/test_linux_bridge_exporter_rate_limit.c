@@ -45,7 +45,7 @@
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -pthread \
- *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs \
+ *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs/nvs_sim -I tools/host_test_stubs \
  *      -I components/linux_bridge_exporter/include -I components/power_base_transport/include \
  *      -I components/power_base_bridge_config/include -I components/bridge_export_proto/include \
  *      -I components/topology_registry/include -I components/topology_proto/include \
@@ -53,12 +53,13 @@
  *      -I components/pogo_proto/include -I components/coap_response_timing/include \
  *      -o /tmp/test_linux_bridge_exporter_rate_limit tools/test_linux_bridge_exporter_rate_limit.c \
  *      components/linux_bridge_exporter/linux_bridge_exporter.c \
+ *      components/linux_bridge_exporter/removed_journal.c \
  *      components/power_base_transport/power_base_transport.c \
  *      components/bridge_export_proto/bridge_export_proto.c \
  *      components/topology_registry/topology_registry.c components/topology_proto/topology_proto.c \
  *      components/sensor_channel/sensor_channel.c components/sensor_root_aggregator/sensor_root_aggregator.c \
  *      components/pogo_proto/pogo_crc16.c components/coap_response_timing/coap_response_timing.c \
- *      tools/host_test_stubs/host_pb_bridge_full_sim.c \
+ *      tools/host_test_stubs/host_pb_bridge_full_sim.c tools/host_test_stubs/nvs_sim/nvs_sim.c \
  *   && /tmp/test_linux_bridge_exporter_rate_limit
  */
 #include <stdio.h>
@@ -265,11 +266,30 @@ static void occupy_exporter_with_blocker(uint8_t tag)
     (void)code;
 }
 
+/* Correction pass (this follow-up, item 6): freezes exporter_task()'s own
+ * full-resync/heartbeat interval clock so neither can EVER fire
+ * spontaneously during this file's run, however much cumulative real
+ * wall-clock time it consumes -- eliminating the pre-existing flakiness a
+ * stray resync tick (resending a SNAPSHOT for every uuid attached so far)
+ * could otherwise cause. This file's own per-uuid SAMPLE_MIN_INTERVAL_MS
+ * rate-limit gate (drain_pending_samples()) is a SEPARATE timer, still on
+ * the real clock, completely unaffected -- see
+ * linux_bridge_exporter_test_set_clock()'s own doc comment. */
+static TickType_t frozen_clock(void)
+{
+    return 1;
+}
+
 int main(void)
 {
     host_pb_bridge_full_sim_reset();
     power_base_transport_init(POWER_BASE_UUID);
 
+    /* Installed BEFORE init() -- see test_linux_bridge_exporter.c's own
+     * comment on why (a race with exporter_task()'s initial
+     * last_resync/last_heartbeat capture otherwise wraps into a bogus
+     * immediate "elapsed" and fires resync right away). */
+    linux_bridge_exporter_test_set_clock(frozen_clock);
     power_base_bridge_config_t cfg = {0};
     cfg.enabled = true;
     memset(cfg.host_addr, 0xFD, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN);
@@ -381,26 +401,45 @@ int main(void)
         sleep_ms(200); /* let the first sample's own export go out, consuming this uuid's window */
 
         /* Still well inside the 1000ms SAMPLE window -- a DETACHED report
-         * must still be exported right away. */
+         * must still be exported right away. Correction pass: a DETACHED
+         * report now ERASES this uuid entirely from topology_registry
+         * (topology_registry_erase()), so on_topology_applied does NOT
+         * fire (there is no entry left to convey) -- only on_node_removed's
+         * own REMOVED tombstone (this uuid's confirmed self-detach) is
+         * exported. Exactly one response is queued. */
         host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED);
         size_t since = host_pb_bridge_full_sim_captured_count();
         send_topology_report_full(node, TOPOLOGY_REPORT_DETACHED, 2, &sent, &code);
         CHECK(code == OT_COAP_CODE_CHANGED, "the DETACHED report itself is applied to the registry immediately");
 
-        bool got_topology = false;
-        for (int tries = 0; tries < 60 && !got_topology; tries++) { /* 60*5ms = 300ms, well under the 1000ms gate */
+        bool got_snapshot = false, got_removed = false;
+        for (int tries = 0; tries < 60 && !got_removed; tries++) { /* 60*5ms = 300ms, well under the 1000ms gate */
             sleep_ms(5);
             size_t total = host_pb_bridge_full_sim_captured_count();
             for (size_t i = since; i < total; i++) {
                 host_pb_bridge_full_sim_sent_t cap;
-                if (host_pb_bridge_full_sim_get_captured(i, &cap) && strcmp(cap.uri_path, "pogo/v1/topology") == 0) {
-                    got_topology = true;
+                if (!host_pb_bridge_full_sim_get_captured(i, &cap) ||
+                    strcmp(cap.uri_path, "pogo/v1/topology") != 0) {
+                    continue;
+                }
+                bridge_export_msg_type_t type;
+                const uint8_t *payload;
+                uint16_t payload_len;
+                if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len)) {
+                    continue;
+                }
+                if (type == BRIDGE_EXPORT_MSG_TOPOLOGY_SNAPSHOT) {
+                    got_snapshot = true;
+                } else if (type == BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED) {
+                    got_removed = true;
                 }
             }
         }
-        CHECK(got_topology, "the OFFLINE/DETACHED topology export is delivered within ~300ms, NOT held back "
-                              "1000ms by this uuid's own still-open SAMPLE rate-limit window -- TOPOLOGY and "
-                              "SAMPLE are gated completely independently");
+        CHECK(!got_snapshot, "correction pass: NO ordinary SNAPSHOT export is ever sent for a self-erasing "
+                               "DETACHED report -- the entry no longer exists for on_topology_applied to convey");
+        CHECK(got_removed, "a REMOVED tombstone for this uuid's own confirmed self-detach is delivered within "
+                             "~300ms, NOT held back 1000ms by this uuid's own still-open SAMPLE rate-limit window "
+                             "-- TOPOLOGY and SAMPLE are gated completely independently");
     }
 
     printf("\n-- scenario (correction pass, test list item 1): while a SAMPLE's first attempt is still a "

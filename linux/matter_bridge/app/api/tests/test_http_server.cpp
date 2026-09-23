@@ -193,6 +193,110 @@ void RunHttpServerTests(int *failures)
         server.Stop();
     }
 
+    printf("\n-- scenario (correction pass, item 8: 필수 회귀 테스트): a removed module_uuid is excluded from "
+           "GET /api/v1/snapshot and GET /api/v1/health's module_count, end to end over a real socket, and "
+           "registry_generation changes -- this is the SAME real ingest::Registry the SSE/HTTP layer reads from, "
+           "so this locks in that http_server.cpp needs NO changes of its own for removal (Registry::snapshot()/"
+           "generation() already exclude/bump it) --\n");
+    {
+        Registry registry;
+        Uuid pb = MakeUuid(0xB0);
+        Uuid mod = MakeUuid(0x09);
+        registry.apply_topology(pb, mod, MakeUuid(0x00), true, 1, 3, 0x0002, false, 1, 1);
+        Server server(registry, FastTestConfig());
+        API_CHECK(server.Start(), "Server::Start() succeeds");
+
+        HttpResponse before_health = SimpleGet(server.bound_port(), "/api/v1/health");
+        API_CHECK(before_health.body.find("\"module_count\":1") != std::string::npos,
+                  "before removal: health reports the one registered module");
+        HttpResponse before_snap = SimpleGet(server.bound_port(), "/api/v1/snapshot");
+        API_CHECK(before_snap.body.find("\"uuid\":\"0909090909090909\"") != std::string::npos,
+                  "before removal: snapshot contains the module's uuid");
+        uint64_t generation_before = registry.generation();
+
+        auto r = registry.apply_removal(pb, mod);
+        API_CHECK(r == ingest::ApplyResult::AppliedNew, "apply_removal() succeeds");
+        API_CHECK(registry.generation() == generation_before + 1,
+                  "registry_generation advances by exactly one for the removal");
+
+        HttpResponse after_health = SimpleGet(server.bound_port(), "/api/v1/health");
+        API_CHECK(after_health.body.find("\"module_count\":0") != std::string::npos,
+                  "after removal: health's module_count drops to 0 over the SAME real socket, with NO server-side "
+                  "change of its own needed");
+        HttpResponse after_snap = SimpleGet(server.bound_port(), "/api/v1/snapshot");
+        API_CHECK(after_snap.body.find("0909090909090909") == std::string::npos,
+                  "after removal: the module's uuid is completely absent from the snapshot body");
+        API_CHECK(after_health.body.find("\"registry_generation\":") != std::string::npos,
+                  "the health response still reports registry_generation (sanity: still well-formed JSON)");
+
+        server.Stop();
+    }
+
+    printf("\n-- scenario: an SSE client watching a stale-offline module sees it disappear once the (post-reboot) "
+           "removal tombstone is applied, and reappear on re-dock --\n");
+    {
+        // Short stale timeout so the module is genuinely offline (not just
+        // idle) when the tombstone arrives -- the Power Base reboot case.
+        Registry registry(std::chrono::milliseconds(100), std::chrono::milliseconds(20));
+        Uuid pb = MakeUuid(0xB0);
+        Uuid mod = MakeUuid(0x0A);
+        registry.apply_topology(pb, mod, MakeUuid(0x00), true, 1, 3, 0x0002, false, 1, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        Server server(registry, FastTestConfig());
+        API_CHECK(server.Start(), "Server::Start() succeeds");
+
+        int fd = ConnectLoopback(server.bound_port(), 3);
+        API_CHECK(fd >= 0, "connected to /api/v1/events");
+        if (fd >= 0) {
+            std::string req = "GET /api/v1/events HTTP/1.1\r\nHost: test\r\n\r\n";
+            send(fd, req.data(), req.size(), 0);
+            // Reads SSE frames until `pred` holds for one complete snapshot
+            // event, or ~2s pass.
+            auto read_until = [fd](auto pred) {
+                std::string buf;
+                for (int i = 0; i < 40; i++) {
+                    char chunk[4096];
+                    ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+                    if (n <= 0) {
+                        break;
+                    }
+                    buf.append(chunk, static_cast<size_t>(n));
+                    size_t start;
+                    while ((start = buf.find("event: snapshot")) != std::string::npos) {
+                        size_t end = buf.find("\n\n", start);
+                        if (end == std::string::npos) {
+                            break;
+                        }
+                        std::string frame = buf.substr(start, end - start);
+                        buf.erase(0, end + 2);
+                        if (pred(frame)) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            API_CHECK(read_until([](const std::string &f) {
+                          return f.find("\"uuid\":\"0a0a0a0a0a0a0a0a\"") != std::string::npos &&
+                                 f.find("\"online\":false") != std::string::npos;
+                      }),
+                      "before the tombstone: the stale module is still listed, online=false");
+
+            registry.apply_removal(pb, mod);
+            API_CHECK(read_until([](const std::string &f) { return f.find("0a0a0a0a0a0a0a0a") == std::string::npos; }),
+                      "after the tombstone: a fresh SSE snapshot no longer contains the module");
+
+            registry.apply_topology(pb, mod, MakeUuid(0x00), true, 1, 3, 0x0002, false, 2, 1);
+            API_CHECK(read_until([](const std::string &f) {
+                          return f.find("\"uuid\":\"0a0a0a0a0a0a0a0a\"") != std::string::npos &&
+                                 f.find("\"online\":true") != std::string::npos;
+                      }),
+                      "after re-dock: a fresh SSE snapshot lists it again, online=true");
+            close(fd);
+        }
+        server.Stop();
+    }
+
     printf("\n-- scenario: an unknown path is 404; a non-GET method on a known path is 405 --\n");
     {
         Registry registry;

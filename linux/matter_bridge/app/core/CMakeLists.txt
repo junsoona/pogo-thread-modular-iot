@@ -60,7 +60,13 @@ add_executable(matter_bridge_core_unit_tests
     tests/test_value_mapping.cpp
     tests/test_endpoint_store.cpp
     tests/test_bridge_manager.cpp
+    tests/test_removal_convergence.cpp
     tests/test_main.cpp
+    # The real ingest::Registry, so test_removal_convergence.cpp drives
+    # BridgeManager from actual registry snapshots (header-only types
+    # otherwise -- matter_bridge_core itself never links it).
+    ${REPO_ROOT}/linux/matter_bridge/ingest/src/registry.cpp
 )
-target_link_libraries(matter_bridge_core_unit_tests PRIVATE matter_bridge_core)
+find_package(Threads REQUIRED) # ingest::Registry runs its own sweep thread
+target_link_libraries(matter_bridge_core_unit_tests PRIVATE matter_bridge_core Threads::Threads)
 add_test(NAME matter_bridge_core_unit_tests COMMAND matter_bridge_core_unit_tests)

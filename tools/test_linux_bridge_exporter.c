@@ -39,7 +39,7 @@
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -pthread \
- *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs \
+ *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs/nvs_sim -I tools/host_test_stubs \
  *      -I components/linux_bridge_exporter/include -I components/power_base_transport/include \
  *      -I components/power_base_bridge_config/include -I components/bridge_export_proto/include \
  *      -I components/topology_registry/include -I components/topology_proto/include \
@@ -47,12 +47,13 @@
  *      -I components/pogo_proto/include -I components/coap_response_timing/include \
  *      -o /tmp/test_linux_bridge_exporter tools/test_linux_bridge_exporter.c \
  *      components/linux_bridge_exporter/linux_bridge_exporter.c \
+ *      components/linux_bridge_exporter/removed_journal.c \
  *      components/power_base_transport/power_base_transport.c \
  *      components/bridge_export_proto/bridge_export_proto.c \
  *      components/topology_registry/topology_registry.c components/topology_proto/topology_proto.c \
  *      components/sensor_channel/sensor_channel.c components/sensor_root_aggregator/sensor_root_aggregator.c \
  *      components/pogo_proto/pogo_crc16.c components/coap_response_timing/coap_response_timing.c \
- *      tools/host_test_stubs/host_pb_bridge_full_sim.c \
+ *      tools/host_test_stubs/host_pb_bridge_full_sim.c tools/host_test_stubs/nvs_sim/nvs_sim.c \
  *   && /tmp/test_linux_bridge_exporter
  */
 #include <stdio.h>
@@ -189,6 +190,65 @@ static bool find_topology_since(size_t since, const uint8_t uuid[TOPOLOGY_UUID_L
     return false;
 }
 
+/* Decodes a captured send at `index` as a TOPOLOGY_REMOVED tombstone (this
+ * follow-up: POGO auto-registration/removal lifecycle) and returns true if
+ * it names `uuid` as its module_uuid. */
+static bool captured_is_removed_for(size_t index, const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    host_pb_bridge_full_sim_sent_t cap;
+    if (!host_pb_bridge_full_sim_get_captured(index, &cap)) {
+        return false;
+    }
+    if (strcmp(cap.uri_path, "pogo/v1/topology") != 0) {
+        return false;
+    }
+    bridge_export_msg_type_t type;
+    const uint8_t *payload;
+    uint16_t payload_len;
+    if (!bridge_export_unpack_envelope(cap.payload, cap.payload_len, &type, &payload, &payload_len)) {
+        return false;
+    }
+    if (type != BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED) {
+        return false;
+    }
+    bridge_export_topology_removed_t rem;
+    if (!bridge_export_unpack_topology_removed(payload, payload_len, &rem)) {
+        return false;
+    }
+    return memcmp(rem.module_uuid, uuid, TOPOLOGY_UUID_LEN) == 0;
+}
+
+/* Scans captured sends in [since, host_pb_bridge_full_sim_captured_count())
+ * for a TOPOLOGY_REMOVED tombstone naming `uuid`. */
+static bool find_removed_since(size_t since, const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    size_t total = host_pb_bridge_full_sim_captured_count();
+    for (size_t i = since; i < total; i++) {
+        if (captured_is_removed_for(i, uuid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Correction pass (this follow-up, item 6): this file's own top comment
+ * already states its intent -- resync/heartbeat TIMERS themselves are not
+ * exercised here at all (see test_linux_bridge_exporter_timers.c for that),
+ * only the reactive SEND LOGIC they'd eventually call. A frozen fake clock
+ * (installed via linux_bridge_exporter_test_set_clock(), always returning
+ * the SAME value) makes that true structurally: (now - last_resync) is
+ * always exactly 0, so a periodic resync/heartbeat tick can NEVER fire
+ * spontaneously here, no matter how much real wall-clock time this
+ * process's cumulative scenario runtime consumes. This is what eliminates
+ * this file's own ~15-20% pre-existing flakiness (an unplanned resync tick
+ * firing near the end of a long run, resending a SNAPSHOT for every uuid
+ * ever attached so far and exhausting a scenario's fixed response queue) --
+ * see this file's own git history for the failure this fixes. */
+static TickType_t frozen_clock(void)
+{
+    return 1;
+}
+
 int main(void)
 {
     host_pb_bridge_full_sim_reset();
@@ -196,6 +256,15 @@ int main(void)
     power_base_transport_bridge_observer_t no_observer = {0};
     (void)no_observer;
 
+    /* Installed BEFORE init() -- linux_bridge_exporter_init() starts
+     * exporter_task() on its own concurrent thread, which captures its
+     * initial last_resync/last_heartbeat via exporter_now_ms() almost
+     * immediately; if the override were installed only AFTER init()
+     * returns, that first capture could race and use the REAL clock while
+     * every later comparison uses the frozen one, and (TickType_t being
+     * unsigned) that mismatch wraps into a huge bogus "elapsed" value that
+     * fires resync immediately -- exactly the bug this ordering avoids. */
+    linux_bridge_exporter_test_set_clock(frozen_clock);
     power_base_bridge_config_t cfg = {0};
     cfg.enabled = true;
     memset(cfg.host_addr, 0xFD, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN); /* fabricated ULA-shaped test address */
@@ -337,7 +406,9 @@ int main(void)
         CHECK(last_seen_seq == 2, "the single exported sample carries the LATEST seq (2), never the stale seq=1");
     }
 
-    printf("\n-- scenario: a DETACHED report cascading a child offline exports BOTH nodes --\n");
+    printf("\n-- scenario (correction pass): a DETACHED report cascading a child ERASES both node_a and node_b "
+           "from the Power Base's own topology_registry (topology_registry_erase()) -- so no ordinary SNAPSHOT "
+           "is ever exported for either; ONLY a REMOVED tombstone for each --\n");
     {
         uint8_t node_b[TOPOLOGY_UUID_LEN];
         make_uuid(node_b, 0xB2);
@@ -357,8 +428,8 @@ int main(void)
         CHECK(wait_for_send_count(base_sends + 1, 2000), "setup: node_b's ATTACHED export settles");
 
         size_t since = host_pb_bridge_full_sim_captured_count();
-        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED); /* for node_b's cascaded export */
-        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED); /* for node_a's own export */
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED); /* node_a's own REMOVED tombstone (on_node_removed) */
+        host_pb_bridge_full_sim_queue_response(OT_ERROR_NONE, OT_COAP_CODE_CHANGED); /* node_b's cascaded REMOVED tombstone (on_node_removed) */
         send_topology_report(node_a, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_DETACHED, 100, 3, false, &sent, &code);
         CHECK(code == OT_COAP_CODE_CHANGED, "the DETACHED report itself is applied (2.04)");
         bool got_both = false;
@@ -368,13 +439,24 @@ int main(void)
                 got_both = true;
             }
         }
-        CHECK(got_both, "both node_a's and node_b's exports arrived within the timeout");
+        CHECK(got_both, "node_a's REMOVED and node_b's REMOVED tombstones both arrived within the timeout");
 
-        bridge_export_topology_node_t a_node, b_node;
-        CHECK(find_topology_since(since, node_a, &a_node), "node_a's own export was captured");
-        CHECK(a_node.online == false, "node_a's exported entry shows online=false (it reported DETACHED)");
-        CHECK(find_topology_since(since, node_b, &b_node), "node_b's cascaded export was captured");
-        CHECK(b_node.online == false, "node_b's exported entry shows online=false (cascaded offline)");
+        CHECK(find_removed_since(since, node_a), "a REMOVED tombstone naming node_a itself was captured (its own "
+                                                   "confirmed self-detach)");
+        CHECK(find_removed_since(since, node_b), "a REMOVED tombstone naming node_b was captured (the cascaded "
+                                                    "child)");
+        bridge_export_topology_node_t a_node_should_not_exist, b_node_should_not_exist;
+        CHECK(!find_topology_since(since, node_a, &a_node_should_not_exist),
+              "node_a never gets an ordinary SNAPSHOT export for this cascade -- it erased itself, so there is "
+              "no entry left for on_topology_applied to convey");
+        CHECK(!find_topology_since(since, node_b, &b_node_should_not_exist),
+              "node_b never gets an ordinary SNAPSHOT export for this cascade either -- only the REMOVED "
+              "tombstone above");
+
+        /* Exactly 2 sends total for this cascade -- never a 3rd (no wasted
+         * SNAPSHOT round trip for the now-erased node_a). */
+        CHECK(host_pb_bridge_full_sim_captured_count() - since == 2,
+              "exactly two exports resulted from this cascade, never three");
     }
 
     printf("\n-- scenario: the simulated Linux host never responding does not affect the Power Base's own CoAP "

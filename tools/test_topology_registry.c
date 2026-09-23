@@ -281,7 +281,8 @@ static void scenario_direct_child_detach_offlines_subtree(void)
 
 static void scenario_intermediate_downstream_detach_offlines_below_only(void)
 {
-    printf("\n-- scenario: an intermediate's downstream loss offlines only what's below it --\n");
+    printf("\n-- scenario: an intermediate's downstream loss removes only what's below it (correction pass: "
+           "ERASED, not merely offlined -- see topology_registry.h's own top comment) --\n");
     topology_registry_t reg;
     topology_registry_init(&reg);
 
@@ -296,7 +297,8 @@ static void scenario_intermediate_downstream_detach_offlines_below_only(void)
     topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0);
 
     /* node1 (still itself online, still reachable through the power base)
-     * reports that ITS OWN downstream just disconnected. */
+     * reports that ITS OWN downstream just disconnected -- a
+     * hardware-confirmed detach of node2, exactly like any other. */
     topology_report_t update = make_report(1, 1, POWER_BASE_UUID, 1, 2, TOPOLOGY_REPORT_UPDATED);
     update.downstream_connected = false;
     topology_registry_result_t r = topology_registry_apply_report(&reg, &update, POWER_BASE_UUID, 100);
@@ -305,7 +307,17 @@ static void scenario_intermediate_downstream_detach_offlines_below_only(void)
     const topology_registry_entry_t *e1 = topology_registry_find(&reg, uuid1);
     const topology_registry_entry_t *e2 = topology_registry_find(&reg, uuid2);
     CHECK(e1 != NULL && e1->online, "node1 itself stays ONLINE -- it successfully reported, only its child is gone");
-    CHECK(e2 != NULL && !e2->online, "node2 (below the broken downstream link) is marked offline");
+    CHECK(e2 == NULL, "node2 (below the broken downstream link) is completely ERASED, not merely offlined");
+    CHECK(topology_registry_count(&reg) == 1, "count reflects the erasure");
+
+    uint8_t drained[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    size_t drained_n = topology_registry_drain_erased(&reg, drained, TOPOLOGY_REGISTRY_MAX_NODES);
+    CHECK(drained_n == 1 && memcmp(drained[0], uuid2, TOPOLOGY_UUID_LEN) == 0,
+          "the erased uuid (node2) is exactly what topology_registry_drain_erased() reports -- this is what a "
+          "caller uses to tombstone it northbound");
+    size_t drained_again = topology_registry_drain_erased(&reg, drained, TOPOLOGY_REGISTRY_MAX_NODES);
+    CHECK(drained_again == 0, "draining again (nothing new erased since) returns zero -- the side-channel is "
+                                "cleared on drain, never re-reports the same erasure twice");
 }
 
 /*
@@ -418,7 +430,9 @@ static void scenario_parent_offline_rejects_children_then_recovers(void)
 static void scenario_intermediate_downstream_loss_rejects_grandchild_reregistration(void)
 {
     printf("\n-- scenario: PARENT_OFFLINE also fires when the parent is online but its OWN downstream_connected "
-           "is false (not just when the parent itself is offline) --\n");
+           "is false (not just when the parent itself is offline); correction pass: node1's downstream loss is "
+           "itself a CONFIRMED detach of node2 (node1's own POGO downstream port lost its physical peer), so "
+           "node2 is ERASED entirely, not merely offlined -- see topology_registry.h's own top comment --\n");
     topology_registry_t reg;
     topology_registry_init(&reg);
 
@@ -431,19 +445,27 @@ static void scenario_intermediate_downstream_loss_rejects_grandchild_reregistrat
     CHECK(topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node1 (depth1) accepted");
     topology_report_t r2 = make_report(2, 2, uuid1, 1, 1, TOPOLOGY_REPORT_ATTACHED);
     CHECK(topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node2 (depth2, parent=node1) accepted");
+    CHECK(topology_registry_count(&reg) == 2, "both nodes are tracked before the downstream loss");
 
     topology_report_t update = make_report(1, 1, POWER_BASE_UUID, 1, 2, TOPOLOGY_REPORT_UPDATED);
     update.downstream_connected = false;
     CHECK(topology_registry_apply_report(&reg, &update, POWER_BASE_UUID, 100) == TOPOLOGY_REGISTRY_OK,
           "node1's downstream-lost UPDATED report is accepted");
     CHECK(topology_registry_find(&reg, uuid1)->online, "node1 itself stays online");
-    CHECK(!topology_registry_find(&reg, uuid2)->online, "node2 is cascaded offline");
+    CHECK(topology_registry_find(&reg, uuid2) == NULL,
+          "node2 is completely ERASED (correction pass) -- not merely offlined -- since node1's own confirmed "
+          "downstream loss means node2's physical POGO connection is gone, exactly like any other confirmed "
+          "detach");
+    CHECK(topology_registry_count(&reg) == 1, "count reflects the erasure (only node1 remains)");
 
     topology_report_t reregister_attempt = make_report(2, 2, uuid1, 1, 2, TOPOLOGY_REPORT_ATTACHED);
     topology_registry_result_t r = topology_registry_apply_report(&reg, &reregister_attempt, POWER_BASE_UUID, 200);
     CHECK(r == TOPOLOGY_REGISTRY_ERR_PARENT_OFFLINE,
-          "node2's re-ATTACHED is rejected as PARENT_OFFLINE while node1 is online but NOT downstream_connected");
-    CHECK(!topology_registry_find(&reg, uuid2)->online, "node2 stays offline -- not resurrected by the rejected re-ATTACHED");
+          "node2's re-ATTACHED is STILL rejected as PARENT_OFFLINE while node1 is online but NOT "
+          "downstream_connected -- this check is evaluated purely from the PARENT's own state, so it holds "
+          "regardless of whether node2 itself has an existing entry or not");
+    CHECK(topology_registry_find(&reg, uuid2) == NULL,
+          "node2 stays erased -- the rejected re-ATTACHED does not resurrect (or re-create) it");
 
     topology_report_t node1_reconnected = make_report(1, 1, POWER_BASE_UUID, 1, 3, TOPOLOGY_REPORT_UPDATED);
     node1_reconnected.downstream_connected = true;
@@ -452,8 +474,10 @@ static void scenario_intermediate_downstream_loss_rejects_grandchild_reregistrat
 
     topology_report_t reregister_ok = make_report(2, 2, uuid1, 1, 2, TOPOLOGY_REPORT_ATTACHED);
     r = topology_registry_apply_report(&reg, &reregister_ok, POWER_BASE_UUID, 400);
-    CHECK(r == TOPOLOGY_REGISTRY_OK, "node2's re-ATTACHED now succeeds once node1 is online AND downstream_connected again");
-    CHECK(topology_registry_find(&reg, uuid2)->online, "node2 is back online");
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "node2's fresh ATTACHED now succeeds once node1 is online AND "
+                                       "downstream_connected again -- a completely NEW first-sighting insert "
+                                       "(its old slot was freed), never a 'resume' of the erased entry");
+    CHECK(topology_registry_find(&reg, uuid2)->online, "node2 is active again");
 }
 
 static void scenario_stale_timeout_and_reconnect(void)
@@ -529,6 +553,112 @@ static void scenario_sensor_data_uuid_linked_to_topology_entry(void)
     CHECK(not_linked == NULL, "a sensor sample's module_uuid that never reported topology is correctly unknown (not a crash)");
 }
 
+/*
+ * Correction pass (this follow-up: POGO removal survives a Linux ingest
+ * restart). Covers topology_registry_erase()/topology_registry_erase_cascade_children()
+ * and TOPOLOGY_REPORT_DETACHED's own erasing behavior directly: a
+ * self-reported DETACHED erases the reporter AND its whole subtree,
+ * drain_erased() reports every erased uuid exactly once, a direct
+ * topology_registry_erase() call on an unknown uuid is a harmless no-op,
+ * and an ordinary offline transition (sweep_stale) is COMPLETELY unaffected
+ * -- it still never erases anything.
+ */
+static void scenario_detached_report_erases_self_and_subtree(void)
+{
+    printf("\n-- scenario (correction pass): a self-reported TOPOLOGY_REPORT_DETACHED erases the reporting node "
+           "itself AND its whole subtree, and topology_registry_drain_erased() reports every erased uuid exactly "
+           "once --\n");
+    topology_registry_t reg;
+    topology_registry_init(&reg);
+
+    uint8_t uuid1[TOPOLOGY_UUID_LEN], uuid2[TOPOLOGY_UUID_LEN], uuid3[TOPOLOGY_UUID_LEN], sibling[TOPOLOGY_UUID_LEN];
+    fill_uuid(uuid1, 1);
+    fill_uuid(uuid2, 2);
+    fill_uuid(uuid3, 3);
+    fill_uuid(sibling, 9);
+
+    topology_report_t r1 = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r1.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node1 accepted");
+    topology_report_t r2 = make_report(2, 2, uuid1, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r2.downstream_connected = true;
+    CHECK(topology_registry_apply_report(&reg, &r2, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node2 accepted");
+    topology_report_t r3 = make_report(3, 3, uuid2, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    CHECK(topology_registry_apply_report(&reg, &r3, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK, "node3 accepted");
+    topology_report_t rs = make_report(9, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    CHECK(topology_registry_apply_report(&reg, &rs, POWER_BASE_UUID, 0) == TOPOLOGY_REGISTRY_OK,
+          "an unrelated sibling (depth1) accepted");
+    CHECK(topology_registry_count(&reg) == 4, "all four nodes tracked");
+
+    /* node1 confirms its OWN detach (best-effort self-report, but content-wise
+     * hardware-confirmed -- see topology_registry.c's own updated comment). */
+    topology_report_t detach = make_report(1, 1, POWER_BASE_UUID, 1, 2, TOPOLOGY_REPORT_DETACHED);
+    topology_registry_result_t r = topology_registry_apply_report(&reg, &detach, POWER_BASE_UUID, 100);
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "the DETACHED report itself is applied");
+
+    CHECK(topology_registry_find(&reg, uuid1) == NULL, "node1 itself is erased");
+    CHECK(topology_registry_find(&reg, uuid2) == NULL, "node2 (child) is erased");
+    CHECK(topology_registry_find(&reg, uuid3) == NULL, "node3 (grandchild) is erased too");
+    CHECK(topology_registry_find(&reg, sibling) != NULL, "the unrelated sibling is completely untouched");
+    CHECK(topology_registry_count(&reg) == 1, "count reflects exactly the one remaining (sibling) node");
+
+    uint8_t drained[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    size_t n = topology_registry_drain_erased(&reg, drained, TOPOLOGY_REGISTRY_MAX_NODES);
+    CHECK(n == 3, "exactly 3 uuids were erased (node1, node2, node3) and reported by drain_erased()");
+    bool saw1 = false, saw2 = false, saw3 = false;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(drained[i], uuid1, TOPOLOGY_UUID_LEN) == 0) saw1 = true;
+        if (memcmp(drained[i], uuid2, TOPOLOGY_UUID_LEN) == 0) saw2 = true;
+        if (memcmp(drained[i], uuid3, TOPOLOGY_UUID_LEN) == 0) saw3 = true;
+    }
+    CHECK(saw1 && saw2 && saw3, "drain_erased() names all three erased uuids");
+
+    /* A fresh ATTACHED for uuid1 afterward is a completely new first-sighting. */
+    topology_report_t reattach = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    r = topology_registry_apply_report(&reg, &reattach, POWER_BASE_UUID, 200);
+    CHECK(r == TOPOLOGY_REGISTRY_OK, "node1 re-attaching is accepted as a fresh sighting");
+    CHECK(topology_registry_find(&reg, uuid1)->online, "node1 is active again");
+}
+
+static void scenario_erase_is_a_no_op_for_unknown_uuid(void)
+{
+    printf("\n-- scenario (correction pass): topology_registry_erase()/erase_cascade_children() for an unknown "
+           "uuid are harmless no-ops --\n");
+    topology_registry_t reg;
+    topology_registry_init(&reg);
+    uint8_t unknown[TOPOLOGY_UUID_LEN];
+    fill_uuid(unknown, 0xEE);
+
+    topology_registry_erase(&reg, unknown);
+    topology_registry_erase_cascade_children(&reg, unknown);
+    CHECK(topology_registry_count(&reg) == 0, "no crash, nothing to erase, count stays 0");
+
+    uint8_t drained[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    CHECK(topology_registry_drain_erased(&reg, drained, TOPOLOGY_REGISTRY_MAX_NODES) == 0,
+          "nothing was erased, so drain_erased() reports zero");
+}
+
+static void scenario_stale_sweep_never_erases(void)
+{
+    printf("\n-- scenario (correction pass -- this follow-up's own explicit requirement: \"stale timeout을 "
+           "removal로 사용하면 안 됨\"): sweep_stale() NEVER erases, however long the timeout has elapsed --\n");
+    topology_registry_t reg;
+    topology_registry_init(&reg);
+    uint8_t uuid1[TOPOLOGY_UUID_LEN];
+    fill_uuid(uuid1, 1);
+    topology_report_t r1 = make_report(1, 1, POWER_BASE_UUID, 1, 1, TOPOLOGY_REPORT_ATTACHED);
+    topology_registry_apply_report(&reg, &r1, POWER_BASE_UUID, 0);
+
+    topology_registry_sweep_stale(&reg, 10000000, 1000);
+    CHECK(topology_registry_find(&reg, uuid1) != NULL, "the stale node is still findable -- never erased");
+    CHECK(!topology_registry_find(&reg, uuid1)->online, "...but it is offline");
+    CHECK(topology_registry_count(&reg) == 1, "count is unaffected by staleness");
+
+    uint8_t drained[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    CHECK(topology_registry_drain_erased(&reg, drained, TOPOLOGY_REGISTRY_MAX_NODES) == 0,
+          "sweep_stale() never populates pending_erased, however long the elapsed time");
+}
+
 int main(void)
 {
     scenario_depth1_parent_and_self_parent();
@@ -543,6 +673,9 @@ int main(void)
     scenario_stale_timeout_and_reconnect();
     scenario_base_reboot_registry_repopulated_by_heartbeat();
     scenario_sensor_data_uuid_linked_to_topology_entry();
+    scenario_detached_report_erases_self_and_subtree();
+    scenario_erase_is_a_no_op_for_unknown_uuid();
+    scenario_stale_sweep_never_erases();
 
     printf("\n");
     if (g_failures == 0) {

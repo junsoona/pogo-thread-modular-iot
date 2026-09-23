@@ -129,6 +129,20 @@ uint8_t handle_topology(Registry &registry, const uint8_t *payload, uint16_t pay
     return result_to_coap_code(result);
 }
 
+uint8_t handle_topology_removed(Registry &registry, const uint8_t *payload, uint16_t payload_len)
+{
+    bridge_export_topology_removed_t rem;
+    if (!bridge_export_unpack_topology_removed(payload, payload_len, &rem)) {
+        std::printf("[topology-removed] malformed payload -- rejected (4.00)\n");
+        return kCoapCodeBadRequest;
+    }
+
+    Uuid pb_uuid = to_uuid(rem.power_base_uuid);
+    Uuid mod_uuid = to_uuid(rem.module_uuid);
+    ApplyResult result = registry.apply_removal(pb_uuid, mod_uuid);
+    return result_to_coap_code(result);
+}
+
 uint8_t handle_heartbeat(Registry &registry, const uint8_t *payload, uint16_t payload_len)
 {
     bridge_export_heartbeat_t hb;
@@ -166,6 +180,13 @@ uint8_t handle_request(Registry &registry, const CoapMessage &req)
         return handle_sample(registry, payload, payload_len);
     }
     if (req.uri_path == "pogo/v1/topology") {
+        // Both an ordinary TOPOLOGY_SNAPSHOT and a TOPOLOGY_REMOVED
+        // tombstone (this follow-up: see bridge_export_proto.h's own doc
+        // comment) share this one resource -- msg_type inside the envelope,
+        // not the URI, is what distinguishes them.
+        if (type == BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED) {
+            return handle_topology_removed(registry, payload, payload_len);
+        }
         if (type != BRIDGE_EXPORT_MSG_TOPOLOGY_SNAPSHOT) {
             std::printf("[topology] wrong msg_type=%d for this resource -- rejected (4.00)\n", (int)type);
             return kCoapCodeBadRequest;

@@ -62,6 +62,15 @@ void host_pb_bridge_full_sim_queue_response(otError transport_result, otCoapCode
 void host_pb_bridge_full_sim_queue_send_failure(otError send_result);
 void host_pb_bridge_full_sim_queue_no_response(void);
 
+/* Outcome for every send made once the explicit queue above is exhausted:
+ * "Linux host reachable, answers response_code" or "Linux host unreachable,
+ * no response at all". Without either call, an exhausted queue aborts (an
+ * under-queued scenario is a test bug) -- used by multi-phase tests
+ * (tools/test_linux_bridge_exporter_reboot_removal.c) where the exact number
+ * of periodic sends per phase is not the point. */
+void host_pb_bridge_full_sim_set_default_response(otCoapCode response_code);
+void host_pb_bridge_full_sim_set_default_no_response(void);
+
 /* How many outgoing otCoapSendRequestWithParameters() calls have actually
  * been made since the last reset. */
 int host_pb_bridge_full_sim_send_count(void);

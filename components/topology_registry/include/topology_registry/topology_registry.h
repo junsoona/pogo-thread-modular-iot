@@ -81,7 +81,32 @@ typedef struct {
 
 typedef struct {
     topology_registry_entry_t nodes[TOPOLOGY_REGISTRY_MAX_NODES];
-    size_t count; /* number of slots ever used (valid==true), not number currently online */
+    /* Number of slots CURRENTLY holding a valid node (valid==true), not
+     * number currently online -- a node the whole time this registry has
+     * run counts here, whether online or offline, UNTIL it is actually
+     * ERASED (see topology_registry_erase()/topology_registry_erase_cascade_children()
+     * below, this correction pass) at which point it is decremented and
+     * the freed slot becomes eligible for ANY future uuid again (never
+     * "ever used", now genuinely "currently used"). Ordinary offline
+     * transitions (topology_registry_mark_offline()/cascade_offline_children()/
+     * sweep_stale) never touch this. */
+    size_t count;
+    /* Correction pass (this follow-up: POGO removal survives a Linux ingest
+     * restart -- see this header's own top comment and
+     * docs/pogo-lifecycle.md): every uuid actually ERASED by the most
+     * recent topology_registry_erase()/topology_registry_erase_cascade_children()
+     * call (via apply_report()'s own two triggers, or a direct caller) --
+     * a caller (power_base_transport.c) drains this via
+     * topology_registry_drain_erased() immediately after each such call,
+     * STILL holding the same lock, to learn which uuids to tombstone to
+     * Linux even though this registry itself now has zero memory of any of
+     * them. This is a bounded side-channel, never a growing list -- see
+     * that function's own doc comment for why apply_report() cannot simply
+     * RETURN this list without breaking its existing topology_registry_result_t
+     * contract (used throughout this codebase and its own test suite).
+     */
+    uint8_t pending_erased[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    size_t pending_erased_count;
 } topology_registry_t;
 
 typedef enum {
@@ -141,13 +166,23 @@ void topology_registry_init(topology_registry_t *reg);
  * last_seen_ms for stale-timeout sweeping.
  *
  * On TOPOLOGY_REGISTRY_OK: the node is inserted/updated and marked online.
- * A TOPOLOGY_REPORT_DETACHED report additionally marks the node itself (and,
- * via topology_registry_cascade_offline_children(), everything below it)
- * offline. A report whose downstream_connected transitions from a
- * previously-stored true to false also cascades an offline to that node's
- * direct children (and their subtrees) -- see this header's top comment:
- * "중간 모듈의 downstream이 끊기면 해당 하위 subtree를 offline". Any other
- * return value leaves the registry completely unchanged (no partial apply).
+ *
+ * Correction pass (this follow-up: POGO removal survives a Linux ingest
+ * restart): a TOPOLOGY_REPORT_DETACHED report is a CONFIRMED detach (see
+ * this header's own top comment) -- it now ERASES the node itself and its
+ * whole subtree entirely (topology_registry_erase(), never merely
+ * "online=false forever" -- that old behavior is now exclusively
+ * sweep_stale()'s). A report whose downstream_connected transitions from a
+ * previously-stored true to false is likewise a confirmed detach of
+ * whatever was below it -- it ERASES that node's direct children (and their
+ * subtrees) via topology_registry_erase_cascade_children(), never merely
+ * offlining them -- see this header's top comment: "중간 모듈의
+ * downstream이 끊기면 해당 하위 subtree를 제거". Every erased uuid (in
+ * either case) is appended to pending_erased -- see
+ * topology_registry_drain_erased()'s own doc comment; the caller MUST drain
+ * it after every apply_report() call that returns TOPOLOGY_REGISTRY_OK, or
+ * a real removal is silently never tombstoned northbound. Any other return
+ * value leaves the registry completely unchanged (no partial apply).
  */
 topology_registry_result_t topology_registry_apply_report(topology_registry_t *reg, const topology_report_t *report,
                                                             const uint8_t power_base_uuid[TOPOLOGY_UUID_LEN],
@@ -178,8 +213,58 @@ void topology_registry_mark_offline(topology_registry_t *reg, const uint8_t uuid
  * subtree's own members independently go stale within the same window, see
  * this header's top comment). Call periodically (e.g. once per heartbeat
  * interval), not on every single report.
+ *
+ * NEVER erases anything (see topology_registry_erase() below) -- a
+ * stale-timeout demotion is, and must stay, an ordinary offline transition:
+ * this correction pass's own explicit requirement ("stale timeout을
+ * removal로 사용하면 안 됨").
  */
 void topology_registry_sweep_stale(topology_registry_t *reg, uint32_t now_ms, uint32_t stale_timeout_ms);
+
+/*
+ * Correction pass (this follow-up: POGO removal survives a Linux ingest
+ * restart -- see topology_registry_t's own pending_erased doc comment for
+ * the full rationale). The ACTUAL-ERASURE counterparts to
+ * cascade_offline_children()/mark_offline() above: instead of merely
+ * setting online=false forever, these FREE the slot(s) entirely (valid
+ * becomes false again, fully zeroed, eligible for reuse by ANY future
+ * uuid) and record every erased uuid into pending_erased for the caller to
+ * drain and tombstone northbound.
+ *
+ * Use ONLY for a CONFIRMED POGO detach -- a hardware-debounced physical
+ * detach (power_base_transport_on_direct_downstream_detached(), or this
+ * node's own pogo_port DETECT_IN edge relayed as a TOPOLOGY_REPORT_DETACHED
+ * self-report) or an intermediate module's own confirmed downstream loss
+ * (a downstream_connected true->false transition in an otherwise-successful
+ * report) -- see apply_report()'s own updated doc comment for exactly
+ * where these are called from internally. NEVER for sweep_stale.
+ */
+void topology_registry_erase_cascade_children(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN]);
+
+/*
+ * Erases `uuid` itself (if known) AND its whole subtree, via
+ * topology_registry_erase_cascade_children() -- the erasing counterpart to
+ * topology_registry_mark_offline(). Safe to call for an unknown uuid (a
+ * no-op for that uuid itself; still cascades in case it is somehow known as
+ * SOME node's parent despite not being a node itself, which cannot happen
+ * in practice but is handled the same defensive way mark_offline() already
+ * is).
+ */
+void topology_registry_erase(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN]);
+
+/*
+ * Drains (copies out and clears) every uuid topology_registry_erase()/
+ * topology_registry_erase_cascade_children() -- via a direct call, or via
+ * apply_report()'s own two internal triggers -- have appended to
+ * pending_erased since the last drain. Returns the number of uuids copied
+ * into out (bounded by out_capacity; every real caller sizes this to
+ * TOPOLOGY_REGISTRY_MAX_NODES, the true upper bound, so truncation cannot
+ * happen in practice). The caller (power_base_transport.c) must call this
+ * IMMEDIATELY after each apply_report()/mark_offline()-replacing erase
+ * call, still holding the same lock that call was made under, so no
+ * concurrent erase can interleave and be silently dropped.
+ */
+size_t topology_registry_drain_erased(topology_registry_t *reg, uint8_t out[][TOPOLOGY_UUID_LEN], size_t out_capacity);
 
 /*
  * Increments a KNOWN node's sensor_error_count (a sensor-data delivery

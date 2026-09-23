@@ -160,7 +160,14 @@ Matter SDK는 connectedhomeip v1.6.0.0으로 고정했다. module UUID마다 동
 | PMS5003 Air Quality | SDK 의존 | `AirQuality: 0` 확인 |
 | Reachable 반영 | 확인 | 서비스 재시작 복구 확인 |
 | 센서 bitmap 변경 감지 | 확인 | 실물 교체 절차는 미확인 |
+| 확정 분리 시 endpoint 삭제, 재도킹 시 같은 endpoint ID 복원 | 확인 | 미확인, v1.6.0.0 빌드 미확인 |
+| 미전달 삭제의 Power Base 재부팅 후 수렴 | 확인 | 미확인 |
 | Matter 인증 | 해당 없음 | 미수행 |
+
+분리·재도킹 수명주기는 [`pogo-lifecycle.md`](pogo-lifecycle.md)에 정리했다.
+`ChipEndpointManager::RemoveEndpoint()`는 v1.6.0.0 헤더(`ServerClusterInterfaceRegistry::Unregister`,
+`emberAfClearDynamicEndpoint`)와 대조해 수정했지만 Linux 호스트 빌드·링크와 chip-tool/Apple Home
+실물 확인은 아직 하지 않았다.
 
 BH1750 실물 시험에서 endpoint 3의 UniqueID가 module UUID `744dbdfffe65d357`과 일치했고,
 센서를 가리고 밝히는 동안 `MeasuredValue`가 0~22369 범위에서 변했다. PMS5003 endpoint

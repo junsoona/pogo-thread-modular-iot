@@ -104,6 +104,18 @@ size_t bridge_export_pack_heartbeat(const bridge_export_heartbeat_t *in, uint8_t
     return build_envelope(BRIDGE_EXPORT_MSG_HEARTBEAT, payload, BRIDGE_EXPORT_HEARTBEAT_PAYLOAD_LEN, out, out_size);
 }
 
+size_t bridge_export_pack_topology_removed(const bridge_export_topology_removed_t *in, uint8_t *out, size_t out_size)
+{
+    if (in == NULL) {
+        return 0;
+    }
+    uint8_t payload[BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN];
+    memcpy(payload + 0, in->power_base_uuid, BRIDGE_EXPORT_UUID_LEN);
+    memcpy(payload + 8, in->module_uuid, BRIDGE_EXPORT_UUID_LEN);
+    return build_envelope(BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED, payload, BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN, out,
+                           out_size);
+}
+
 bool bridge_export_unpack_envelope(const uint8_t *data, size_t len, bridge_export_msg_type_t *out_type,
                                     const uint8_t **out_payload, uint16_t *out_payload_len)
 {
@@ -121,7 +133,7 @@ bool bridge_export_unpack_envelope(const uint8_t *data, size_t len, bridge_expor
     }
     uint8_t type = data[1];
     if (type != BRIDGE_EXPORT_MSG_SAMPLE && type != BRIDGE_EXPORT_MSG_TOPOLOGY_SNAPSHOT &&
-        type != BRIDGE_EXPORT_MSG_HEARTBEAT) {
+        type != BRIDGE_EXPORT_MSG_HEARTBEAT && type != BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED) {
         return false;
     }
     uint16_t payload_len = rd_u16(data + 2);
@@ -209,5 +221,20 @@ bool bridge_export_unpack_heartbeat(const uint8_t *payload, uint16_t payload_len
     memcpy(out->power_base_uuid, payload + 0, BRIDGE_EXPORT_UUID_LEN);
     out->uptime_ms = rd_u32(payload + 8);
     out->node_count = rd_u16(payload + 12);
+    return true;
+}
+
+bool bridge_export_unpack_topology_removed(const uint8_t *payload, uint16_t payload_len,
+                                            bridge_export_topology_removed_t *out)
+{
+    if (payload == NULL || out == NULL) {
+        return false;
+    }
+    if (payload_len != BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    memcpy(out->power_base_uuid, payload + 0, BRIDGE_EXPORT_UUID_LEN);
+    memcpy(out->module_uuid, payload + 8, BRIDGE_EXPORT_UUID_LEN);
     return true;
 }

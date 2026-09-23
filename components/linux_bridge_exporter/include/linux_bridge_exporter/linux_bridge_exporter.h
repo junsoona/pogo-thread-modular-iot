@@ -46,6 +46,8 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "power_base_bridge_config/power_base_bridge_config.h"
 #include "power_base_transport/power_base_transport.h"
 
@@ -77,6 +79,33 @@ extern "C" {
  */
 esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID_LEN],
                                       const power_base_bridge_config_t *cfg);
+
+/*
+ * Correction pass (this follow-up, item 6: exporter timing host tests must
+ * not depend on real wall-clock elapsed time -- see this header's own top
+ * comment on exporter_task()'s periodic resync/heartbeat). TEST-ONLY: never
+ * called by production code (module/power_base main.c never references
+ * this symbol). Installs `now_ms_fn` as the source exporter_task() reads
+ * instead of the real xTaskGetTickCount() for its own full-resync/heartbeat
+ * interval comparisons ONLY -- NOT drain_pending_samples()'s separate, much
+ * shorter per-uuid SAMPLE_MIN_INTERVAL_MS rate-limit gate (existing tests
+ * exercise that one opening/closing over genuinely elapsed real time by
+ * design), and not send timeouts/retry backoff (real blocking waits on
+ * real synchronization primitives, not simple elapsed-time comparisons,
+ * and not the source of the flakiness this fixes). Passing NULL (the
+ * default, and the only thing production ever
+ * implicitly has) restores the real clock -- so a host binary that never
+ * calls this function is BYTE-FOR-BYTE the same as before this hook
+ * existed. A test installs a fully test-controlled fake clock (e.g. an
+ * atomic counter it bumps forward directly) to make a resync/heartbeat
+ * interval elapse deterministically, on demand, regardless of how much
+ * cumulative real wall-clock time the rest of the test process has used --
+ * exporter_task() itself still polls on its own bounded, real ~200ms tick
+ * (EXPORTER_POLL_TICK_MS), so a test only ever waits a bounded ~200ms of
+ * real time for the NEXT poll to notice the fake clock has advanced, never
+ * the real interval's own full duration.
+ */
+void linux_bridge_exporter_test_set_clock(TickType_t (*now_ms_fn)(void));
 
 #ifdef __cplusplus
 }

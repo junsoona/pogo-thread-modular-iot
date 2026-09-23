@@ -32,7 +32,7 @@
  *
  * Build & run (from the repo root):
  *   cc -Wall -Wextra -pthread \
- *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs \
+ *      -I tools/host_test_stubs/pogo_fast -I tools/host_test_stubs/nvs_sim -I tools/host_test_stubs \
  *      -I components/linux_bridge_exporter/include -I components/power_base_transport/include \
  *      -I components/power_base_bridge_config/include -I components/bridge_export_proto/include \
  *      -I components/topology_registry/include -I components/topology_proto/include \
@@ -40,12 +40,13 @@
  *      -I components/pogo_proto/include -I components/coap_response_timing/include \
  *      -o /tmp/test_linux_bridge_exporter_retry_exhaustion tools/test_linux_bridge_exporter_retry_exhaustion.c \
  *      components/linux_bridge_exporter/linux_bridge_exporter.c \
+ *      components/linux_bridge_exporter/removed_journal.c \
  *      components/power_base_transport/power_base_transport.c \
  *      components/bridge_export_proto/bridge_export_proto.c \
  *      components/topology_registry/topology_registry.c components/topology_proto/topology_proto.c \
  *      components/sensor_channel/sensor_channel.c components/sensor_root_aggregator/sensor_root_aggregator.c \
  *      components/pogo_proto/pogo_crc16.c components/coap_response_timing/coap_response_timing.c \
- *      tools/host_test_stubs/host_pb_bridge_full_sim.c \
+ *      tools/host_test_stubs/host_pb_bridge_full_sim.c tools/host_test_stubs/nvs_sim/nvs_sim.c \
  *   && /tmp/test_linux_bridge_exporter_retry_exhaustion
  */
 #include <stdio.h>
@@ -174,11 +175,24 @@ static int count_sample_attempts(size_t since, const uint8_t uuid[SENSOR_UUID_LE
     return collect_sample_attempts(since, uuid, tmp, 16);
 }
 
+/* Correction pass (this follow-up, item 6): freezes exporter_task()'s own
+ * full-resync/heartbeat interval clock so neither can EVER fire
+ * spontaneously during this file's run -- see
+ * test_linux_bridge_exporter.c's own identical comment for the full
+ * rationale. */
+static TickType_t frozen_clock(void)
+{
+    return 1;
+}
+
 int main(void)
 {
     host_pb_bridge_full_sim_reset();
     power_base_transport_init(POWER_BASE_UUID);
 
+    /* Installed BEFORE init() -- see test_linux_bridge_exporter.c's own
+     * comment on why. */
+    linux_bridge_exporter_test_set_clock(frozen_clock);
     power_base_bridge_config_t cfg = {0};
     cfg.enabled = true;
     memset(cfg.host_addr, 0xFD, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN);

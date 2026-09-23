@@ -104,8 +104,78 @@ static std::vector<uint8_t> pack_topology_wire(uint8_t uuid_tag, bool online, ui
     return std::vector<uint8_t>(wire, wire + wlen);
 }
 
+static std::vector<uint8_t> pack_removed_wire(uint8_t uuid_tag)
+{
+    bridge_export_topology_removed_t rem;
+    std::memset(&rem, 0, sizeof(rem));
+    std::memset(rem.power_base_uuid, 0xB0, BRIDGE_EXPORT_UUID_LEN);
+    std::memset(rem.module_uuid, uuid_tag, BRIDGE_EXPORT_UUID_LEN);
+
+    uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+    size_t wlen = bridge_export_pack_topology_removed(&rem, wire, sizeof(wire));
+    return std::vector<uint8_t>(wire, wire + wlen);
+}
+
 int main()
 {
+    printf("\n-- scenario: a TOPOLOGY_REMOVED tombstone over CoAP removes the node (2.04), and a duplicate is "
+           "idempotent (2.03) -- this follow-up's POGO removal lifecycle, dispatched through handle_request() "
+           "exactly like every other message type --\n");
+    {
+        Registry reg;
+        ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 1, 1)));
+        CHECK(reg.node_count() == 1, "the node is active before removal");
+
+        uint8_t code1 = ingest::handle_request(reg, make_request("pogo/v1/topology", pack_removed_wire(0x01)));
+        CHECK(code1 == ingest::kCoapCodeChanged, "the first TOPOLOGY_REMOVED for this uuid is 2.04 Changed");
+        CHECK(reg.node_count() == 0, "the node is gone immediately");
+
+        uint8_t code2 = ingest::handle_request(reg, make_request("pogo/v1/topology", pack_removed_wire(0x01)));
+        CHECK(code2 == ingest::kCoapCodeValid, "a duplicate TOPOLOGY_REMOVED (e.g. the firmware's own retry) is "
+                                                 "2.03 Valid, not re-applied");
+
+        printf("\n-- and: a stray SAMPLE for the now-removed uuid is rejected 4.04, never silently applied --\n");
+        uint8_t sample_code = ingest::handle_request(reg, make_request("pogo/v1/sample", pack_sample_wire(0x01, 1, 100)));
+        CHECK(sample_code == ingest::kCoapCodeNotFound, "a sample for a removed uuid is rejected exactly like a "
+                                                          "never-seen uuid (4.04) -- it is not in the registry at all");
+
+        printf("\n-- and: a stray online=false topology resync for the removed uuid is rejected 4.12, never "
+               "resurrecting it --\n");
+        uint8_t stale_resync_code =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, false, 1, 1, 2)));
+        CHECK(stale_resync_code == ingest::kCoapCodePreconditionFailed,
+              "an offline resync of the removed uuid is rejected, not treated as a new sighting");
+        CHECK(reg.node_count() == 0, "still removed");
+
+        printf("\n-- and: the module's LAST sample re-sent byte-for-byte (what an older Power Base's periodic sample "
+               "resync did after a detach) is rejected and never recreates it --\n");
+        {
+            Registry reg2;
+            ingest::handle_request(reg2, make_request("pogo/v1/topology", pack_topology_wire(0x02, true, 1, 1, 1)));
+            std::vector<uint8_t> last_sample = pack_sample_wire(0x02, 7, 700);
+            CHECK(ingest::handle_request(reg2, make_request("pogo/v1/sample", last_sample)) == ingest::kCoapCodeChanged,
+                  "the sample applies while the module is registered");
+            CHECK(ingest::handle_request(reg2, make_request("pogo/v1/sample", last_sample)) == ingest::kCoapCodeValid,
+                  "(before removal an identical resend is a 2.03 duplicate -- it counts as liveness)");
+            ingest::handle_request(reg2, make_request("pogo/v1/topology", pack_removed_wire(0x02)));
+            uint64_t gen = reg2.generation();
+            bool all_rejected = true;
+            for (int i = 0; i < 5; i++) {
+                all_rejected = all_rejected && ingest::handle_request(reg2, make_request("pogo/v1/sample", last_sample)) ==
+                                                   ingest::kCoapCodeNotFound;
+            }
+            CHECK(all_rejected, "after removal every identical resend is 4.04");
+            CHECK(reg2.node_count() == 0 && reg2.snapshot().empty(), "the module stays absent from every reader");
+            CHECK(reg2.generation() == gen, "registry_generation does not move (no SSE/Matter churn)");
+        }
+
+        printf("\n-- and: re-docking (a fresh online=true report) automatically re-approves and re-registers --\n");
+        uint8_t reattach_code =
+            ingest::handle_request(reg, make_request("pogo/v1/topology", pack_topology_wire(0x01, true, 1, 2, 1)));
+        CHECK(reattach_code == ingest::kCoapCodeChanged, "the re-attach report applies as a fresh 2.04 Changed");
+        CHECK(reg.node_count() == 1, "the module is active again after re-docking");
+    }
+
     printf("\n-- scenario: a SAMPLE with no topology at all is rejected 4.04 (correction pass) --\n");
     {
         Registry reg;

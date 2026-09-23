@@ -23,15 +23,20 @@
  *     response code the sender sees (still 2.04 either way, per
  *     power_base_transport.h's own documented table)
  *   - a DETACHED report on a depth=1 parent that cascades a depth=2 child
- *     offline fires on_topology_applied ONCE for the parent (conveying its
- *     own online=false) and on_node_offline ONCE for the child (never for
- *     the parent itself, since on_topology_applied already covers it)
+ *     fires on_topology_applied ONCE for the parent (conveying its own
+ *     online=false), on_node_removed ONCE for the parent itself (its own
+ *     confirmed self-detach) and ONCE for the cascaded child -- NEVER
+ *     on_node_offline for either (this follow-up: POGO auto-registration/
+ *     removal lifecycle -- a confirmed detach is a removal, never a mere
+ *     offline transition)
  *   - power_base_transport_on_direct_downstream_detached() (a hardware
- *     detach, not a report) fires on_node_offline for the directly-detached
- *     node AND its cascaded child, with no skip exception
- *   - power_base_transport_sweep_stale() fires on_node_offline only for the
- *     node that actually goes stale, never for a node whose last_seen_ms is
- *     still within the timeout
+ *     detach, not a report) fires on_node_removed for the directly-detached
+ *     node AND its cascaded child, with no skip exception -- never
+ *     on_node_offline
+ *   - power_base_transport_sweep_stale() fires on_node_offline ONLY (never
+ *     on_node_removed) for the node that actually goes stale, never for a
+ *     node whose last_seen_ms is still within the timeout -- this is the
+ *     one path that stays "offline", not "removed"
  *   - a rejected topology report (unknown parent) and a rejected sample
  *     (unknown uuid) fire NEITHER callback
  *   - registering no observer at all (the default) is a complete no-op --
@@ -88,12 +93,17 @@ static topology_registry_entry_t s_last_applied_entry;
 static int s_node_offline_count;
 static uint8_t s_offline_uuids[MAX_RECORDED][TOPOLOGY_UUID_LEN];
 
+static int s_node_removed_count;
+static uint8_t s_removed_uuids[MAX_RECORDED][TOPOLOGY_UUID_LEN];
+
 static void reset_observer_recording(void)
 {
     s_sample_stored_count = 0;
     s_topology_applied_count = 0;
     s_node_offline_count = 0;
     memset(s_offline_uuids, 0, sizeof(s_offline_uuids));
+    s_node_removed_count = 0;
+    memset(s_removed_uuids, 0, sizeof(s_removed_uuids));
 }
 
 static void on_sample_stored(const sensor_sample_t *sample, void *ctx)
@@ -124,6 +134,26 @@ static bool offline_recorded_for(const uint8_t uuid[TOPOLOGY_UUID_LEN])
     int n = s_node_offline_count < MAX_RECORDED ? s_node_offline_count : MAX_RECORDED;
     for (int i = 0; i < n; i++) {
         if (memcmp(s_offline_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void on_node_removed(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
+{
+    (void)ctx;
+    if (s_node_removed_count < MAX_RECORDED) {
+        memcpy(s_removed_uuids[s_node_removed_count], uuid, TOPOLOGY_UUID_LEN);
+    }
+    s_node_removed_count++;
+}
+
+static bool removed_recorded_for(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    int n = s_node_removed_count < MAX_RECORDED ? s_node_removed_count : MAX_RECORDED;
+    for (int i = 0; i < n; i++) {
+        if (memcmp(s_removed_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
             return true;
         }
     }
@@ -192,6 +222,7 @@ int main(void)
         .on_sample_stored = on_sample_stored,
         .on_topology_applied = on_topology_applied,
         .on_node_offline = on_node_offline,
+        .on_node_removed = on_node_removed,
     };
     power_base_transport_set_bridge_observer(&observer);
 
@@ -279,8 +310,11 @@ int main(void)
         CHECK(s_sample_stored_count == 0, "on_sample_stored does NOT fire when the aggregator reports FULL");
     }
 
-    printf("\n-- scenario: a DETACHED report cascading a child offline fires on_topology_applied ONCE for the "
-           "parent and on_node_offline ONCE for the child (never for the parent itself) --\n");
+    printf("\n-- scenario (correction pass): a DETACHED report cascading a child ERASES both NODE_A itself and "
+           "NODE_B entirely (topology_registry_erase(), see topology_registry.h's own top comment) -- "
+           "on_topology_applied does NOT fire at all (NODE_A's entry no longer exists to convey), and "
+           "on_node_removed fires for BOTH NODE_A (its own confirmed self-detach) and NODE_B (the cascaded "
+           "child) -- NEVER on_node_offline --\n");
     {
         fresh_transport();
         reset_observer_recording();
@@ -294,19 +328,24 @@ int main(void)
         reset_observer_recording();
         send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_DETACHED, 300, 2, false, &sent, &code);
         CHECK(code == OT_COAP_CODE_CHANGED, "the DETACHED report itself is applied (2.04)");
-        CHECK(s_topology_applied_count == 1, "on_topology_applied fires exactly once (for NODE_A, the reporter)");
-        CHECK(memcmp(s_last_applied_entry.module_uuid, NODE_A_UUID, TOPOLOGY_UUID_LEN) == 0,
-              "on_topology_applied's entry is NODE_A itself");
-        CHECK(s_last_applied_entry.online == false, "NODE_A's conveyed entry shows online=false");
-        CHECK(s_node_offline_count == 1, "on_node_offline fires exactly once (only for the cascaded child)");
-        CHECK(offline_recorded_for(NODE_B_UUID), "on_node_offline names NODE_B (the cascaded child)");
-        CHECK(!offline_recorded_for(NODE_A_UUID),
-              "on_node_offline is NEVER fired for NODE_A itself -- its own on_topology_applied already conveyed "
-              "this");
+        CHECK(s_topology_applied_count == 0, "on_topology_applied does NOT fire -- NODE_A erased itself, so there "
+                                               "is no entry left to convey (its removal is fully conveyed via "
+                                               "on_node_removed instead)");
+        CHECK(s_node_offline_count == 0, "on_node_offline NEVER fires for a confirmed DETACHED report's cascade -- "
+                                          "see on_node_removed below");
+        CHECK(s_node_removed_count == 2, "on_node_removed fires exactly twice: NODE_A (its own self-detach) and "
+                                          "NODE_B (the cascaded child)");
+        CHECK(removed_recorded_for(NODE_A_UUID), "on_node_removed names NODE_A itself (its own confirmed detach)");
+        CHECK(removed_recorded_for(NODE_B_UUID), "on_node_removed names NODE_B (the cascaded child)");
+
+        CHECK(power_base_transport_get_node_count() == 0,
+              "correction pass: NEITHER NODE_A NOR NODE_B remain findable in the Power Base's own "
+              "topology_registry at all -- this is what makes 'removed' survive a Linux ingest restart (periodic "
+              "full resync can never resend either of them again)");
     }
 
-    printf("\n-- scenario: a direct DOWNSTREAM POGO detach (hardware event, not a report) fires on_node_offline "
-           "for the directly-detached node AND its cascaded child --\n");
+    printf("\n-- scenario: a direct DOWNSTREAM POGO detach (hardware event, not a report) fires on_node_removed "
+           "for the directly-detached node AND its cascaded child -- never on_node_offline --\n");
     {
         fresh_transport();
         bool sent;
@@ -316,17 +355,18 @@ int main(void)
 
         reset_observer_recording();
         power_base_transport_on_direct_downstream_detached();
-        CHECK(s_node_offline_count == 2, "both NODE_A (the direct child) and NODE_B (its cascaded subtree) fire "
-                                          "on_node_offline");
-        CHECK(offline_recorded_for(NODE_A_UUID), "on_node_offline names NODE_A");
-        CHECK(offline_recorded_for(NODE_B_UUID), "on_node_offline names NODE_B");
+        CHECK(s_node_removed_count == 2, "both NODE_A (the direct child) and NODE_B (its cascaded subtree) fire "
+                                          "on_node_removed");
+        CHECK(removed_recorded_for(NODE_A_UUID), "on_node_removed names NODE_A");
+        CHECK(removed_recorded_for(NODE_B_UUID), "on_node_removed names NODE_B");
+        CHECK(s_node_offline_count == 0, "on_node_offline never fires for a hardware detach -- this is a removal");
         CHECK(s_topology_applied_count == 0, "on_topology_applied never fires for a hardware detach (no report was "
                                               "involved)");
 
         printf("\n-- calling the direct-detach handler AGAIN (already offline) fires nothing further --\n");
         reset_observer_recording();
         power_base_transport_on_direct_downstream_detached();
-        CHECK(s_node_offline_count == 0, "no further on_node_offline calls once every node is already offline");
+        CHECK(s_node_removed_count == 0, "no further on_node_removed calls once every node is already offline");
     }
 
     printf("\n-- scenario: sweep_stale() fires on_node_offline only for the node that actually goes stale --\n");
@@ -355,6 +395,8 @@ int main(void)
                                           "stale");
         CHECK(offline_recorded_for(NODE_A_UUID) && offline_recorded_for(NODE_B_UUID),
               "on_node_offline names both nodes");
+        CHECK(s_node_removed_count == 0, "a stale-timeout sweep NEVER fires on_node_removed (this follow-up: "
+                                          "timeout/comms-loss is offline, never a removal)");
     }
 
     printf("\n-- scenario: a rejected report/sample fires NEITHER callback --\n");
@@ -369,6 +411,7 @@ int main(void)
                                                           "behavior");
         CHECK(s_topology_applied_count == 0, "on_topology_applied does not fire for a rejected report");
         CHECK(s_node_offline_count == 0, "on_node_offline does not fire for a rejected report");
+        CHECK(s_node_removed_count == 0, "on_node_removed does not fire for a rejected report either");
 
         reset_observer_recording();
         send_sensor_sample(NODE_A_UUID, 1, &sent, &code); /* NODE_A was never reported to this fresh registry */
@@ -389,6 +432,89 @@ int main(void)
         CHECK(s_topology_applied_count == 0, "no observer means on_topology_applied never fires");
         /* Restore for anything appended after this block in the future. */
         power_base_transport_set_bridge_observer(&observer);
+    }
+
+    printf("\n-- scenario (correction pass -- restart-survival bug, this follow-up's item 1): after a CONFIRMED "
+           "detach, the Power Base's OWN topology_registry must no longer include this uuid AT ALL, so periodic "
+           "full topology resync (linux_bridge_exporter's do_full_topology_resync(), simulated here by directly "
+           "walking power_base_transport_get_node_count()/get_node() exactly as it does) can never again resend "
+           "a stale online=false snapshot that a FRESH/restarted Linux ingest::Registry (whose RAM-only removed_ "
+           "denylist reset to empty) would otherwise re-insert as an ordinary, non-removed node --\n");
+    {
+        fresh_transport();
+        bool sent;
+        otCoapCode code;
+        send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 800, 1, false, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "setup: NODE_A attaches");
+
+        send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_DETACHED, 800, 2, false, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "NODE_A's confirmed self-detach is applied");
+
+        bool found_after_removal = false;
+        size_t count = power_base_transport_get_node_count();
+        for (size_t i = 0; i < count; i++) {
+            topology_registry_entry_t e;
+            if (power_base_transport_get_node(i, &e) && memcmp(e.module_uuid, NODE_A_UUID, TOPOLOGY_UUID_LEN) == 0) {
+                found_after_removal = true;
+            }
+        }
+        CHECK(!found_after_removal, "a confirmed-detached uuid is COMPLETELY ABSENT from the Power Base's own "
+                                      "topology_registry (never merely online=false) -- this is what makes "
+                                      "'removed' survive a Linux ingest restart: Linux never receives anything "
+                                      "to resurrect it with in the first place, regardless of its own denylist "
+                                      "state");
+    }
+
+    printf("\n-- scenario (correction pass, item 1 continued): the SAME guarantee holds for a cascaded child "
+           "(an intermediate module's own confirmed downstream detach), and for the power base's own direct "
+           "hardware detach path -- neither the detached node NOR its subtree remain findable --\n");
+    {
+        fresh_transport();
+        bool sent;
+        otCoapCode code;
+        send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 810, 1, true, &sent, &code);
+        send_topology_report(NODE_B_UUID, NODE_A_UUID, 2, TOPOLOGY_REPORT_ATTACHED, 811, 1, false, &sent, &code);
+
+        send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_UPDATED, 810, 2, false, &sent, &code);
+        CHECK(code == OT_COAP_CODE_CHANGED, "NODE_A reports its own downstream (NODE_B) just detached");
+
+        bool node_a_found = false, node_b_found = false;
+        size_t count = power_base_transport_get_node_count();
+        for (size_t i = 0; i < count; i++) {
+            topology_registry_entry_t e;
+            if (!power_base_transport_get_node(i, &e)) {
+                continue;
+            }
+            if (memcmp(e.module_uuid, NODE_A_UUID, TOPOLOGY_UUID_LEN) == 0) {
+                node_a_found = true;
+            }
+            if (memcmp(e.module_uuid, NODE_B_UUID, TOPOLOGY_UUID_LEN) == 0) {
+                node_b_found = true;
+            }
+        }
+        CHECK(node_a_found, "NODE_A itself is UNCHANGED (still online, still reachable) -- only its child was "
+                              "confirmed detached");
+        CHECK(!node_b_found, "NODE_B (the cascaded, confirmed-detached child) is completely absent -- not merely "
+                               "offline");
+
+        printf("\n-- and: the power base's own direct hardware downstream detach path erases too --\n");
+        fresh_transport();
+        send_topology_report(NODE_A_UUID, POWER_BASE_UUID, 1, TOPOLOGY_REPORT_ATTACHED, 820, 1, true, &sent, &code);
+        send_topology_report(NODE_B_UUID, NODE_A_UUID, 2, TOPOLOGY_REPORT_ATTACHED, 821, 1, false, &sent, &code);
+        power_base_transport_on_direct_downstream_detached();
+
+        bool any_found = false;
+        count = power_base_transport_get_node_count();
+        for (size_t i = 0; i < count; i++) {
+            topology_registry_entry_t e;
+            if (power_base_transport_get_node(i, &e) &&
+                (memcmp(e.module_uuid, NODE_A_UUID, TOPOLOGY_UUID_LEN) == 0 ||
+                 memcmp(e.module_uuid, NODE_B_UUID, TOPOLOGY_UUID_LEN) == 0)) {
+                any_found = true;
+            }
+        }
+        CHECK(!any_found, "after a direct hardware downstream detach, neither NODE_A nor NODE_B remain findable "
+                            "at all");
     }
 
     printf("\n%d failures\n", g_failures);

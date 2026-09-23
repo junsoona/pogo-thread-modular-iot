@@ -79,6 +79,24 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
                                       std::chrono::steady_clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    auto removed_it = std::find(removed_.begin(), removed_.end(), module_uuid);
+    if (removed_it != removed_.end()) {
+        if (!online) {
+            // A stale resync of the long-offline entry the Power Base's own
+            // topology_registry never forgot, or any other non-reattach
+            // report -- see apply_topology()'s own doc comment. Rejected
+            // outright: nodes_ is never touched, generation() is never
+            // bumped, this module_uuid stays excluded from every reader.
+            return ApplyResult::PreconditionFailed;
+        }
+        // online==true: a genuine re-approval (see this method's own doc
+        // comment) -- clear the removed marker and fall through to the
+        // normal apply below, which (module_uuid cannot be in nodes_ while
+        // removed) always takes the brand-new-sighting path just below.
+        removed_.erase(removed_it);
+    }
+
     NodeState *n = find_locked(power_base_uuid, module_uuid);
     if (n == nullptr) {
         if (nodes_.size() >= kMaxNodes) {
@@ -166,6 +184,50 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
     n->downstream_connected = downstream_connected;
     n->last_seq = last_seq;
     n->last_seen_at = now;
+    note_applied_locked();
+    return ApplyResult::AppliedNew;
+}
+
+ApplyResult Registry::apply_removal(const Uuid &power_base_uuid, const Uuid &module_uuid,
+                                     std::chrono::steady_clock::time_point now)
+{
+    (void)now; // no liveness bookkeeping for a removal -- see this method's own doc comment
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (std::find(removed_.begin(), removed_.end(), module_uuid) != removed_.end()) {
+        // Idempotent duplicate -- see this method's own doc comment: no
+        // second erase, no second generation() bump.
+        std::printf("[topology-removed] ");
+        print_uuid_suffix("pb", power_base_uuid);
+        std::printf(" ");
+        print_uuid_suffix("mod", module_uuid);
+        std::printf(" duplicate (already removed)\n");
+        return ApplyResult::DuplicateExact;
+    }
+    if (removed_.size() >= kMaxNodes) {
+        // Evict the oldest marker rather than refusing (5.03): the Power
+        // Base keeps an unconfirmed tombstone in flash and retries it until
+        // it gets a 2.xx, so a refusal here would leave the module on Linux
+        // forever. The marker only guards against a stray offline report
+        // for a long-removed uuid, which current firmware never sends (it
+        // erases the registry entry on a confirmed detach).
+        removed_.erase(removed_.begin());
+    }
+
+    // Erase EVERY node matching this module_uuid, regardless of which
+    // power_base_uuid it was stored under -- "removed" is a property of the
+    // module itself, not of a specific (power_base_uuid, module_uuid) pair
+    // (see this header's own top comment).
+    nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(),
+                                 [&module_uuid](const NodeState &n) { return n.module_uuid == module_uuid; }),
+                 nodes_.end());
+    removed_.push_back(module_uuid);
+
+    std::printf("[topology-removed] ");
+    print_uuid_suffix("pb", power_base_uuid);
+    std::printf(" ");
+    print_uuid_suffix("mod", module_uuid);
+    std::printf(" removed (confirmed POGO detach)\n");
     note_applied_locked();
     return ApplyResult::AppliedNew;
 }

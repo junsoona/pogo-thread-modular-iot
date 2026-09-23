@@ -5,7 +5,7 @@
  * sensor_channel.c (the embedded SAMPLE body's real wire format) and
  * pogo_crc16.c (the reused CRC16 implementation) -- no mirrored logic.
  *
- * Covers: round-trip pack/unpack for all three message types, endian
+ * Covers: round-trip pack/unpack for all four message types, endian
  * correctness (spot-checked byte offsets), CRC-mismatch rejection, wrong
  * protocol version rejection, unknown msg_type rejection, truncated and
  * trailing-garbage payload rejection, and that a SAMPLE message's embedded
@@ -158,6 +158,48 @@ int main(void)
         bridge_export_heartbeat_t out;
         CHECK(bridge_export_unpack_heartbeat(payload, payload_len, &out), "heartbeat payload unpacks OK");
         CHECK(memcmp(&out, &in, sizeof(in)) == 0, "every heartbeat field round-trips exactly");
+    }
+
+    printf("\n-- scenario: TOPOLOGY_REMOVED round-trip (this follow-up: a confirmed-detach tombstone, distinct from "
+           "an ordinary online=false TOPOLOGY_SNAPSHOT) --\n");
+    {
+        bridge_export_topology_removed_t in = {0};
+        memset(in.power_base_uuid, 0x77, BRIDGE_EXPORT_UUID_LEN);
+        memset(in.module_uuid, 0x88, BRIDGE_EXPORT_UUID_LEN);
+
+        uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+        size_t wlen = bridge_export_pack_topology_removed(&in, wire, sizeof(wire));
+        CHECK(wlen == BRIDGE_EXPORT_ENVELOPE_HEADER_LEN + BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN +
+                          BRIDGE_EXPORT_CRC_LEN,
+              "packed TOPOLOGY_REMOVED length is exactly header+fixed-payload+crc");
+        CHECK(wire[1] == BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED, "msg_type byte is TOPOLOGY_REMOVED (4)");
+
+        bridge_export_msg_type_t type;
+        const uint8_t *payload;
+        uint16_t payload_len;
+        CHECK(bridge_export_unpack_envelope(wire, wlen, &type, &payload, &payload_len), "envelope unpacks OK");
+        CHECK(type == BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED, "unpacked type is TOPOLOGY_REMOVED");
+
+        bridge_export_topology_removed_t out;
+        CHECK(bridge_export_unpack_topology_removed(payload, payload_len, &out), "removed payload unpacks OK");
+        CHECK(memcmp(&out, &in, sizeof(in)) == 0, "every removed field round-trips exactly");
+
+        CHECK(!bridge_export_unpack_topology_removed(payload, (uint16_t)(payload_len - 1), &out),
+              "a short (truncated) TOPOLOGY_REMOVED payload is rejected");
+
+        /* Version-compatibility check (this follow-up's own explicit
+         * requirement: an OLD ingest program must keep parsing every
+         * pre-existing msg_type unchanged) -- a decoder that only knows
+         * msg_type 1..3 would reject this NEW msg_type 4 outright at the
+         * envelope layer, never misinterpret it as something else; the
+         * three OLD message types above are unaffected by this addition
+         * (still exactly the same wire layout, verified by their own
+         * round-trip scenarios above). */
+        uint8_t old_bad_type[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+        memcpy(old_bad_type, wire, wlen);
+        old_bad_type[1] = 0x7E; /* simulate an even-newer, still-unknown msg_type */
+        CHECK(!bridge_export_unpack_envelope(old_bad_type, wlen, &type, &payload, &payload_len),
+              "a still-unknown future msg_type is rejected, never guessed at");
     }
 
     printf("\n-- scenario: malformed-envelope rejection --\n");

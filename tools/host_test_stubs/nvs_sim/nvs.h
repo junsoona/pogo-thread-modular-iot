@@ -50,6 +50,17 @@ esp_err_t nvs_get_u16(nvs_handle_t handle, const char *key, uint16_t *out_value)
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *out_value, size_t *length);
 void nvs_close(nvs_handle_t handle);
 
+/* Write path (added for components/linux_bridge_exporter's removed-tombstone
+ * journal and its reboot test, tools/test_linux_bridge_exporter_reboot_removal.c).
+ * nvs_open() opens a namespace in the default "nvs" partition, creating it
+ * for NVS_READWRITE exactly like ESP-IDF does. A value written with
+ * nvs_set_blob()/nvs_erase_key() only becomes durable (survives a simulated
+ * reboot, see nvs_sim_set_backing_file()) once nvs_commit() succeeds. */
+esp_err_t nvs_open(const char *namespace_name, nvs_open_mode_t open_mode, nvs_handle_t *out_handle);
+esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, size_t length);
+esp_err_t nvs_erase_key(nvs_handle_t handle, const char *key);
+esp_err_t nvs_commit(nvs_handle_t handle);
+
 #ifdef __cplusplus
 }
 #endif

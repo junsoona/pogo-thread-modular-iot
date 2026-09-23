@@ -43,6 +43,7 @@ Thread 네트워크에 가입해 측정값을 전원 모듈로 보내는 졸업�
 - [`docs/pogo-interface.md`](docs/pogo-interface.md): POGO 신호, GPIO, 체결 감지
 - [`docs/module-config.md`](docs/module-config.md): 센서 모듈 설정 이미지 형식
 - [`docs/state-machine.md`](docs/state-machine.md): POGO·프로비저닝·Thread 상태 머신
+- [`docs/pogo-lifecycle.md`](docs/pogo-lifecycle.md): 모듈 자동 등록·삭제와 offline 구분
 - [`docs/power-base.md`](docs/power-base.md): 전원 모듈, 토폴로지, Dataset, 전원 회로 계획
 - [`docs/otbr-rcp.md`](docs/otbr-rcp.md): RCP 빌드, OTBR 연결, USB 복구 설계
 - [`docs/matter-bridge.md`](docs/matter-bridge.md): Linux Matter Bridge 구조와 검증 방법

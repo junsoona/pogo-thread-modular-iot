@@ -129,7 +129,8 @@ SGP40/41의 VOC_INDEX, NOX_INDEX는 0~500 범위의 Sensirion Gas Index다. 실�
 
 channel status가 `OK`가 아니면 마지막 숫자를 새 측정값처럼 다시 쓰지 않고 Matter
 attribute를 null로 만든다. topology가 offline으로 바뀌면 endpoint를 삭제하지 않고
-Bridged Device Basic Information의 `Reachable=false`만 적용한다.
+Bridged Device Basic Information의 `Reachable=false`만 적용한다. endpoint는 확정된 POGO
+분리(`TOPOLOGY_REMOVED`)에서만 삭제한다. [`pogo-lifecycle.md`](pogo-lifecycle.md) 참고.
 
 ## Device type과 필수 cluster
 

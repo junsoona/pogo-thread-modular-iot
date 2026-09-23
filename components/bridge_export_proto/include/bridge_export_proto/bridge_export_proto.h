@@ -85,6 +85,22 @@
  *           the periodic TOPOLOGY_SNAPSHOT resync is what actually
  *           reconciles Linux-side state)
  *   = 14 bytes
+ *
+ * TOPOLOGY_REMOVED payload (BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN bytes,
+ * fixed) -- an explicit tombstone for a module_uuid whose POGO detach was
+ * just CONFIRMED (a hardware-debounced physical detach, or that module's own
+ * best-effort self-report of the same -- see components/power_base_transport's
+ * on_node_removed bridge observer callback), as opposed to an ordinary
+ * TOPOLOGY_SNAPSHOT carrying online=false (a stale-timeout/comms-loss offline,
+ * which is never a removal -- see docs/pogo-lifecycle.md). This is a NEW
+ * message type (this follow-up); a Linux ingest program that predates it
+ * simply never receives it (old firmware never sends msg_type 4), and this
+ * follow-up's Linux ingest continues to parse every OLD msg_type (1..3)
+ * completely unchanged -- see this header's own top comment on the version
+ * policy:
+ *   0   8  power_base_uuid
+ *   8   8  module_uuid
+ *   = 16 bytes
  */
 #pragma once
 
@@ -103,6 +119,10 @@ typedef enum {
     BRIDGE_EXPORT_MSG_SAMPLE = 1,
     BRIDGE_EXPORT_MSG_TOPOLOGY_SNAPSHOT = 2,
     BRIDGE_EXPORT_MSG_HEARTBEAT = 3,
+    /* Additive (this follow-up): a confirmed-detach tombstone, distinct from
+     * an ordinary TOPOLOGY_SNAPSHOT's online=false -- see this header's own
+     * top comment's "TOPOLOGY_REMOVED payload" section. */
+    BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED = 4,
 } bridge_export_msg_type_t;
 
 #define BRIDGE_EXPORT_ENVELOPE_HEADER_LEN 4u
@@ -117,6 +137,7 @@ typedef enum {
 
 #define BRIDGE_EXPORT_TOPOLOGY_PAYLOAD_LEN 38u
 #define BRIDGE_EXPORT_HEARTBEAT_PAYLOAD_LEN 14u
+#define BRIDGE_EXPORT_TOPOLOGY_REMOVED_PAYLOAD_LEN 16u
 
 /* Comfortably below the IPv6 minimum MTU (1280 bytes) even after every
  * CoAP/UDP/IPv6 header -- see this header's top comment. */
@@ -149,6 +170,11 @@ typedef struct {
     uint16_t node_count;
 } bridge_export_heartbeat_t;
 
+typedef struct {
+    uint8_t  power_base_uuid[BRIDGE_EXPORT_UUID_LEN];
+    uint8_t  module_uuid[BRIDGE_EXPORT_UUID_LEN];
+} bridge_export_topology_removed_t;
+
 /*
  * Each pack function serializes `in` as a complete, CRC-covered envelope
  * into `out` (capacity out_size). Returns the total number of bytes
@@ -159,6 +185,7 @@ typedef struct {
 size_t bridge_export_pack_sample(const bridge_export_sample_t *in, uint8_t *out, size_t out_size);
 size_t bridge_export_pack_topology_node(const bridge_export_topology_node_t *in, uint8_t *out, size_t out_size);
 size_t bridge_export_pack_heartbeat(const bridge_export_heartbeat_t *in, uint8_t *out, size_t out_size);
+size_t bridge_export_pack_topology_removed(const bridge_export_topology_removed_t *in, uint8_t *out, size_t out_size);
 
 /*
  * Validates and strips the envelope only -- see this header's top comment
@@ -184,6 +211,8 @@ bool bridge_export_unpack_sample(const uint8_t *payload, uint16_t payload_len, b
 bool bridge_export_unpack_topology_node(const uint8_t *payload, uint16_t payload_len,
                                          bridge_export_topology_node_t *out);
 bool bridge_export_unpack_heartbeat(const uint8_t *payload, uint16_t payload_len, bridge_export_heartbeat_t *out);
+bool bridge_export_unpack_topology_removed(const uint8_t *payload, uint16_t payload_len,
+                                            bridge_export_topology_removed_t *out);
 
 #ifdef __cplusplus
 }

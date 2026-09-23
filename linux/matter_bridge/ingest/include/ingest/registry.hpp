@@ -118,7 +118,10 @@ enum class ApplyResult {
     DuplicateExact,       // byte-for-byte identical to what's already stored (2.03 Valid)
     StorageFull,          // a brand-new (power_base_uuid, module_uuid) pair, but the table is full (5.03)
     TopologyUnknown,      // apply_sample only: no topology at all for this (power_base_uuid, module_uuid) (4.04)
-    PreconditionFailed,   // apply_sample only: known topology but offline, or a bitmap mismatch (4.12)
+    PreconditionFailed,   // apply_sample only: known topology but offline, or a bitmap mismatch (4.12); also
+                           // apply_topology, only while module_uuid is on the removed list (see apply_removal())
+                           // and this report does not itself carry online=true -- see that method's own doc
+                           // comment
     StaleSession,         // apply_topology only: an old-generation/reordered-seq snapshot, rejected (4.12)
 };
 
@@ -177,10 +180,57 @@ public:
     Registry(const Registry &) = delete;
     Registry &operator=(const Registry &) = delete;
 
+    // While module_uuid is on the removed list (see apply_removal() below),
+    // this rejects the report as PreconditionFailed UNLESS it carries
+    // online==true -- see apply_removal()'s own doc comment for why an
+    // online==true report is the one signal treated as a genuine, automatic
+    // re-approval (POGO auto-pairing already only ever produces one after a
+    // real physical re-dock; see docs/pogo-lifecycle.md), clearing the
+    // removed marker and falling through to the normal first-sighting apply
+    // below (a fresh AppliedNew, same as any other brand-new module_uuid).
+    // An online==false report for a removed module_uuid is exactly what a
+    // stale firmware-side periodic topology resync of the long-since-offline
+    // entry looks like (the Power Base's own topology_registry never forgets
+    // a slot -- see that component's own header) -- rejecting it, rather
+    // than resurrecting the node, is what keeps a removed module excluded
+    // from snapshot()/HTTP/SSE until it is ACTUALLY re-approved.
     ApplyResult apply_topology(const Uuid &power_base_uuid, const Uuid &module_uuid, const Uuid &parent_uuid,
                                 bool online, uint8_t depth, uint8_t role, uint16_t sensor_bitmap,
                                 bool downstream_connected, uint32_t boot_session_generation, uint32_t last_seq,
                                 std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+
+    // Applies a confirmed-detach tombstone for module_uuid (see
+    // BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED's own wire-format doc comment) --
+    // NEVER for an ordinary offline/stale-timeout transition, which stays
+    // online=false within nodes_ and must never reach this method (see this
+    // header's own top comment: "online=false와 removed를 혼용하지 마라").
+    //
+    // Erases module_uuid's node from nodes_ entirely (regardless of which
+    // power_base_uuid(s) it was ever seen under) if present -- so
+    // node_count()/get_node()/snapshot() (and therefore the HTTP/SSE API)
+    // exclude it from the very next read, with no separate "removed" flag
+    // for a consumer to have to check. Adds module_uuid to a bounded removed
+    // list that apply_topology()/apply_sample() consult so a stray wireless
+    // report for it is never silently re-applied before a genuine
+    // re-approval (see apply_topology()'s own doc comment).
+    //
+    // Idempotent: a SECOND apply_removal() for a module_uuid already on the
+    // removed list is a DuplicateExact no-op (no second erase, no second
+    // generation() bump) -- this is what makes a retried/duplicate tombstone
+    // (e.g. the firmware side's own bounded retry, or two independent
+    // confirmation paths for the same physical event) safe to apply more
+    // than once. Returns AppliedNew (bumping generation() exactly once) the
+    // first time this module_uuid is newly added to the removed list --
+    // this is true even if module_uuid had no active node in nodes_ at all
+    // (e.g. Linux never saw a topology report for it before the tombstone
+    // arrived): the removed list itself is the durable fact being recorded,
+    // independent of whatever nodes_ happened to already contain. The
+    // removed list is bounded at kMaxNodes distinct entries; when full, the
+    // OLDEST marker is evicted -- never a StorageFull refusal, which the
+    // Power Base would retry forever while Linux kept the module (see
+    // registry.cpp).
+    ApplyResult apply_removal(const Uuid &power_base_uuid, const Uuid &module_uuid,
+                               std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     // sample_seq/uptime_ms/channels are this sample's own decoded fields
     // (via the real sensor_channel_unpack(), never reinterpreted here).
@@ -249,6 +299,13 @@ private:
     mutable std::mutex mutex_;
     mutable std::condition_variable cv_;
     std::vector<NodeState> nodes_;
+    // Bounded set of module_uuids a confirmed apply_removal() tombstone has
+    // been applied for and that have not yet been re-approved by a fresh
+    // online==true apply_topology() -- see both methods' own doc comments.
+    // Deliberately separate from nodes_ (which never holds a removed
+    // module_uuid at all): a removed module_uuid must keep being rejected
+    // even though it has no entry in nodes_ to check against.
+    std::vector<Uuid> removed_;
     uint64_t generation_ = 0;
     std::chrono::milliseconds stale_timeout_;
     std::chrono::milliseconds sweep_interval_;

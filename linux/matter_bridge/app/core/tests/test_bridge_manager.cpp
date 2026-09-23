@@ -62,6 +62,7 @@ void commit_success(BridgeManager &mgr, const ModuleUpdate &u)
 {
     ApplyOutcome outcome;
     outcome.endpoint_created = u.is_new_endpoint;
+    outcome.endpoint_removed = u.remove_endpoint;
     outcome.reachable_applied = u.reachable.has_value();
     outcome.temperature_applied = u.temperature.has_value();
     outcome.humidity_applied = u.humidity.has_value();
@@ -241,6 +242,10 @@ void RunBridgeManagerTests(int *failures)
                                                               "endpoint's last-known reading is simply left alone, "
                                                               "per docs/matter-bridge.md)");
         MB_CHECK(detach_update[0].endpoint_id == ep, "the endpoint id survives a detach");
+        MB_CHECK(!detach_update[0].remove_endpoint, "an ordinary offline transition (still present in the snapshot) "
+                                                       "is NEVER remove_endpoint -- only ingest::Registry::apply_removal() "
+                                                       "erasing the module from the snapshot entirely is (this "
+                                                       "follow-up's own POGO lifecycle policy)");
         commit_all_success(mgr, detach_update);
 
         auto reattach = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
@@ -566,5 +571,93 @@ void RunBridgeManagerTests(int *failures)
         Uuid gone = make_uuid(0x7B);
         auto none = mgr.ReconcileOne({offline_node}, gone);
         MB_CHECK(!none.has_value(), "ReconcileOne() for a uuid absent from the given snapshot returns no update");
+    }
+
+    printf("\n-- scenario (this follow-up: POGO auto-registration/removal lifecycle): a module_uuid with a "
+           "confirmed endpoint that vanishes from the snapshot ENTIRELY (ingest::Registry::apply_removal()) gets "
+           "a remove_endpoint update, distinct from an ordinary offline transition -- and a CONFIRMED removal "
+           "erases BridgeManager's own dedup state so a later re-attach is treated as a fresh endpoint again --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        auto online = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
+        auto first = mgr.Reconcile({online});
+        uint16_t ep = first[0].endpoint_id;
+        commit_all_success(mgr, first);
+
+        // The module_uuid is now COMPLETELY ABSENT from the snapshot --
+        // this is what ingest::Registry::apply_removal() erasing it from
+        // nodes_ looks like from BridgeManager's point of view (never a
+        // node with online=false still present, see the offline scenario
+        // above).
+        auto removed_updates = mgr.Reconcile({});
+        MB_CHECK(removed_updates.size() == 1, "the vanished module_uuid produces exactly one update");
+        MB_CHECK(removed_updates[0].remove_endpoint, "it is marked remove_endpoint");
+        MB_CHECK(!removed_updates[0].is_new_endpoint, "never simultaneously is_new_endpoint");
+        MB_CHECK(!removed_updates[0].reachable.has_value(), "no reachable/channel fields on a remove_endpoint update");
+        MB_CHECK(removed_updates[0].endpoint_id == ep, "the remove_endpoint update names the SAME endpoint_id that "
+                                                          "was created (from EndpointStore's own reservation, not "
+                                                          "guessed)");
+
+        printf("\n-- a FAILED removal (the Matter SDK teardown itself failed) leaves BridgeManager's dedup state "
+               "untouched, so the NEXT Reconcile() pass retries remove_endpoint again --\n");
+        ApplyOutcome failed_removal;
+        failed_removal.endpoint_removed = false;
+        mgr.CommitApplied(removed_updates[0].module_uuid, removed_updates[0], failed_removal);
+        auto retry = mgr.Reconcile({});
+        MB_CHECK(retry.size() == 1 && retry[0].remove_endpoint,
+                 "remove_endpoint is re-emitted after a failed removal attempt -- never silently dropped");
+        MB_CHECK(retry[0].endpoint_id == ep, "the retry still names the same endpoint_id");
+
+        printf("\n-- once the removal is CONFIRMED, re-attaching the SAME module_uuid is treated as a fresh "
+               "endpoint again, but reuses the SAME EndpointStore-reserved endpoint_id (test list item 7: "
+               "재도킹 시 재승인·동일 endpoint ID 복구) --\n");
+        ApplyOutcome confirmed_removal;
+        confirmed_removal.endpoint_removed = true;
+        mgr.CommitApplied(retry[0].module_uuid, retry[0], confirmed_removal);
+
+        auto after_removal = mgr.Reconcile({});
+        MB_CHECK(after_removal.empty(), "once confirmed, nothing is absent-but-tracked any more -- no further "
+                                          "remove_endpoint updates for a module_uuid that has no last_applied_ "
+                                          "entry left at all");
+
+        auto reattached = make_node(0xB0, 0x01, true, sht45_bitmap(), true, {temp_channel(21456)});
+        auto reattach_updates = mgr.Reconcile({reattached});
+        MB_CHECK(reattach_updates.size() == 1, "the re-attach produces exactly one update");
+        MB_CHECK(reattach_updates[0].is_new_endpoint, "it is treated as a completely fresh endpoint -- "
+                                                         "BridgeManager's own dedup state has no memory of the "
+                                                         "removed module_uuid any more");
+        MB_CHECK(reattach_updates[0].endpoint_id == ep, "EndpointStore's own persisted uuid->endpoint_id "
+                                                           "reservation is untouched by removal -- the SAME "
+                                                           "physical module_uuid gets the SAME Matter endpoint id "
+                                                           "back, never a newly-assigned one");
+    }
+
+    printf("\n-- scenario: ReconcileOne() detects the same kind of removal for a single module_uuid whose entries "
+           "vanished from the snapshot it is given at execution time --\n");
+    {
+        std::string dir = make_temp_dir();
+        EndpointStore store(dir);
+        store.load();
+        BridgeManager mgr(store);
+
+        Uuid u = make_uuid(0x8C);
+        auto online_node = make_node(0xB0, 0x8C, true, bh1750_bitmap(), true, {illuminance_channel(1000)});
+        auto first = mgr.Reconcile({online_node});
+        uint16_t ep = first[0].endpoint_id;
+        commit_all_success(mgr, first);
+
+        // A DIFFERENT, unrelated module_uuid is all that's left in the
+        // fresh snapshot ReconcileOne() is given at "execution time" --
+        // module_uuid `u` itself is gone entirely.
+        auto other_node = make_node(0xB0, 0x99, true, bh1750_bitmap(), true, {illuminance_channel(500)});
+        auto removal = mgr.ReconcileOne({other_node}, u);
+        MB_CHECK(removal.has_value(), "ReconcileOne() detects the removal even though a DIFFERENT module_uuid is "
+                                        "present in the given snapshot");
+        MB_CHECK(removal->remove_endpoint, "marked remove_endpoint");
+        MB_CHECK(removal->endpoint_id == ep, "names the correct (removed module's own) endpoint_id");
     }
 }

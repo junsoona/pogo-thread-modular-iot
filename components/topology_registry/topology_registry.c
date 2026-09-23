@@ -190,15 +190,95 @@ topology_registry_result_t topology_registry_apply_report(topology_registry_t *r
     }
 
     if (report->report_type == TOPOLOGY_REPORT_DETACHED) {
-        topology_registry_cascade_offline_children(reg, report->module_uuid);
+        /* Correction pass: erases the reporting node itself (the entry just
+         * inserted/updated above) AND its whole subtree -- see this
+         * header's own top comment: a self-reported DETACHED is itself a
+         * hardware-confirmed detach (pogo_port's own debounced DETECT_IN
+         * signal on this module's own upstream port) -- "best-effort"
+         * describes only its unreliable DELIVERY (it may never arrive if
+         * power is lost too fast), never the signal's own reliability. */
+        topology_registry_erase(reg, report->module_uuid);
     } else if (was_downstream_connected && !report->downstream_connected) {
         /* This node itself is still online (it successfully reported!), but
          * whatever WAS docked below it just lost its physical link -- see
-         * this header's top comment. */
-        topology_registry_cascade_offline_children(reg, report->module_uuid);
+         * this header's top comment. Erases the child subtree entirely
+         * (correction pass), never merely offlines it. */
+        topology_registry_erase_cascade_children(reg, report->module_uuid);
     }
 
     return TOPOLOGY_REGISTRY_OK;
+}
+
+/* Caller must hold whatever lock the caller itself uses (this component has
+ * none of its own, see this header's own top comment) -- appends `uuid` to
+ * pending_erased, silently dropping it (bounded, never grows unboundedly)
+ * if already at TOPOLOGY_REGISTRY_MAX_NODES capacity, which cannot happen
+ * in practice since at most that many uuids can ever exist to erase in the
+ * first place. */
+static void record_erased(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    if (reg->pending_erased_count < TOPOLOGY_REGISTRY_MAX_NODES) {
+        memcpy(reg->pending_erased[reg->pending_erased_count], uuid, TOPOLOGY_UUID_LEN);
+        reg->pending_erased_count++;
+    }
+}
+
+void topology_registry_erase_cascade_children(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    if (reg == NULL || uuid == NULL) {
+        return;
+    }
+    /* Mirrors topology_registry_cascade_offline_children()'s own recursive
+     * shape exactly, but ERASES instead of merely flipping online=false --
+     * see this header's own top comment. Erasing children AS THEY ARE
+     * FOUND (rather than collecting a list first) is safe: this loop only
+     * ever inspects OTHER slots' parent_uuid, never re-visits a slot it
+     * already erased (that slot's own valid becomes false, so a later
+     * iteration of this SAME loop simply will not match it again), and a
+     * freed slot is never reused mid-loop (nothing here ever inserts). */
+    for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) {
+        if (reg->nodes[i].valid && uuid_eq(reg->nodes[i].parent_uuid, uuid)) {
+            uint8_t child_uuid[TOPOLOGY_UUID_LEN];
+            memcpy(child_uuid, reg->nodes[i].module_uuid, TOPOLOGY_UUID_LEN);
+            /* Recurse into the child's OWN children first (post-order,
+             * same as cascade_offline_children()), then erase the child
+             * itself below. */
+            topology_registry_erase_cascade_children(reg, child_uuid);
+            record_erased(reg, child_uuid);
+            memset(&reg->nodes[i], 0, sizeof(reg->nodes[i]));
+            reg->count--;
+        }
+    }
+}
+
+void topology_registry_erase(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    if (reg == NULL || uuid == NULL) {
+        return;
+    }
+    topology_registry_erase_cascade_children(reg, uuid);
+    int idx = find_index(reg, uuid);
+    if (idx >= 0) {
+        record_erased(reg, uuid);
+        memset(&reg->nodes[idx], 0, sizeof(reg->nodes[idx]));
+        reg->count--;
+    }
+}
+
+size_t topology_registry_drain_erased(topology_registry_t *reg, uint8_t out[][TOPOLOGY_UUID_LEN], size_t out_capacity)
+{
+    if (reg == NULL || out == NULL) {
+        return 0;
+    }
+    size_t n = reg->pending_erased_count;
+    if (n > out_capacity) {
+        n = out_capacity; /* cannot happen with any real caller -- see this function's own header doc comment */
+    }
+    for (size_t i = 0; i < n; i++) {
+        memcpy(out[i], reg->pending_erased[i], TOPOLOGY_UUID_LEN);
+    }
+    reg->pending_erased_count = 0;
+    return n;
 }
 
 void topology_registry_cascade_offline_children(topology_registry_t *reg, const uint8_t uuid[TOPOLOGY_UUID_LEN])

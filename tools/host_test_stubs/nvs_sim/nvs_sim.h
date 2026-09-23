@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -39,6 +40,19 @@ void nvs_sim_put_blob(const char *partition, const char *ns, const char *key, co
  * ESP_OK, then auto-clears (one-shot) -- models a genuine NVS/partition
  * read error, distinct from "namespace/key simply absent". */
 void nvs_sim_force_next_init_error(esp_err_t err);
+
+/* Makes the NEXT nvs_commit() call return `err` without persisting
+ * anything, then auto-clears (one-shot) -- models a flash write failure. */
+void nvs_sim_force_next_commit_error(esp_err_t err);
+
+/* Simulated flash for multi-boot tests: loads the whole store from `path`
+ * (an empty store if the file does not exist yet) and makes every later
+ * successful nvs_commit() rewrite that file atomically. A test models a
+ * reboot/power loss by running each boot in a fresh child process that
+ * calls this with the same path -- everything that was only in RAM
+ * (including values set but never committed) is gone, exactly like a real
+ * power cycle. Returns false if the file exists but cannot be read. */
+bool nvs_sim_set_backing_file(const char *path);
 
 #ifdef __cplusplus
 }

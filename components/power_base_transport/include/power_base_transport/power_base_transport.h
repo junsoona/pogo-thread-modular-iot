@@ -102,14 +102,43 @@ typedef struct {
      * OK_DUPLICATE or any ERR_* value) -- `entry` is a snapshot of that
      * node's own registry entry immediately after the apply. */
     void (*on_topology_applied)(const topology_registry_entry_t *entry, void *ctx);
-    /* A node's online flag flipped from true to false for a reason OTHER
-     * than that node's own topology report (a direct DOWNSTREAM POGO detach
-     * cascade, a report elsewhere in the tree cascading this node's subtree
-     * offline, or a stale-timeout sweep). Fired once per affected uuid.
-     * NOT fired for the reporting node of a DETACHED/offline-transitioning
-     * report itself -- that node's own on_topology_applied callback already
-     * conveys its new online=false state. */
+    /* A node's online flag flipped from true to false via a stale-timeout
+     * sweep ONLY (power_base_transport_sweep_stale() -- no fresh message at
+     * all, a comms/reboot/transient-radio-loss condition). Fired once per
+     * affected uuid. This is genuinely "offline", NEVER "removed" -- see
+     * on_node_removed below and this header's own POGO lifecycle note: a
+     * consumer (linux_bridge_exporter) must keep treating this uuid as a
+     * normal, still-registered node (mirrored to Linux with online=false,
+     * never a removal tombstone).
+     *
+     * NOT fired for the reporting node of an offline-transitioning report
+     * itself -- that node's own on_topology_applied callback already conveys
+     * its new online=false state. Also NOT fired for any uuid a cascade
+     * (direct DOWNSTREAM POGO detach, or a report elsewhere in the tree
+     * cascading a subtree offline) affects -- see on_node_removed below,
+     * which now owns that case exclusively (this follow-up: "online=false와
+     * removed를 혼용하지 마라"). */
     void (*on_node_offline)(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx);
+    /* A node's own POGO detach was just CONFIRMED (this follow-up: POGO
+     * auto-registration/removal lifecycle) -- fired once per affected uuid
+     * for exactly these cases, and no others:
+     *   1. power_base_transport_on_direct_downstream_detached() -- this
+     *      power base's own hardware-debounced DOWNSTREAM POGO port
+     *      detached: the direct child AND its whole cascaded subtree.
+     *   2. A topology report with report_type==TOPOLOGY_REPORT_DETACHED --
+     *      the reporting module's own best-effort self-report of its
+     *      upstream detaching: that module itself, AND (via the same
+     *      cascade) its whole subtree.
+     *   3. A topology report whose downstream_connected transitions from a
+     *      previously-stored true to false -- an intermediate module, still
+     *      powered and reachable, reporting that ITS OWN child just
+     *      physically detached: that child's whole subtree (NOT the
+     *      reporting module itself, which is still online).
+     * Deliberately NEVER fired for power_base_transport_sweep_stale() (see
+     * on_node_offline above) -- a stale-timeout demotion carries no hardware
+     * confirmation at all, only elapsed silence, and must never be treated
+     * as a removal. */
+    void (*on_node_removed)(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx);
 } power_base_transport_bridge_observer_t;
 
 /* Registers (or, passing NULL, clears) the bridge observer -- see this
@@ -144,7 +173,12 @@ void power_base_transport_on_direct_downstream_detached(void);
  */
 void power_base_transport_sweep_stale(uint32_t now_ms, uint32_t stale_timeout_ms);
 
+/* Number of nodes currently registered. NOT an upper bound for
+ * power_base_transport_get_node()'s index: a confirmed detach frees slots
+ * without compacting, so a live node can sit above a freed one. */
 size_t power_base_transport_get_node_count(void);
+/* `index` is a registry SLOT (0..TOPOLOGY_REGISTRY_MAX_NODES-1); returns
+ * false for a free slot. Walk every slot to enumerate the registry. */
 bool power_base_transport_get_node(size_t index, topology_registry_entry_t *out);
 
 #ifdef __cplusplus

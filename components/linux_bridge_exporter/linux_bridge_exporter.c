@@ -178,6 +178,7 @@
 #include "sensor_channel/sensor_channel.h"
 #include "sensor_root_aggregator/sensor_root_aggregator.h"
 #include "coap_response_timing/coap_response_timing.h"
+#include "removed_journal.h"
 
 static const char *TAG = "linux_bridge_exporter";
 
@@ -226,37 +227,101 @@ typedef enum {
  * so a backlog of stale queued events can never cause an outdated
  * generation/last_seq/online/depth/downstream state to be sent, regardless
  * of how long it sat in the queue.
+ *
+ * `kind` (this follow-up: POGO auto-registration/removal lifecycle)
+ * distinguishes an ordinary topology re-sync (SNAPSHOT -- re-resolved
+ * against the CURRENT registry entry at drain time, exactly as above) from
+ * a confirmed-detach tombstone (REMOVED -- see
+ * power_base_transport_bridge_observer_t::on_node_removed and
+ * BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED's own doc comment). A REMOVED event
+ * carries no registry entry to re-resolve at all -- the removal is the
+ * whole fact being conveyed, independent of whatever nodes_/registry state
+ * this uuid is (or is not) in by drain time -- so it must never be
+ * reinterpreted as a SNAPSHOT re-sync.
  */
+typedef enum {
+    TOPOLOGY_EVT_SNAPSHOT = 0,
+    TOPOLOGY_EVT_REMOVED = 1,
+} topology_evt_kind_t;
+
 typedef struct {
     uint8_t uuid[TOPOLOGY_UUID_LEN];
+    topology_evt_kind_t kind;
 } topo_evt_payload_t;
 
 /*
- * Bounded set of module_uuids currently enqueued in s_topology_queue, used
- * only to COALESCE duplicate-uuid TOPOLOGY events before they ever reach
- * xQueueSend() -- since handle_topology_event() always re-reads the CURRENT
- * registry entry for a uuid at drain time regardless of which of that
- * uuid's queued events is being drained, a second event for a uuid already
- * pending would just cause the same current state to be sent twice; skipping
- * the duplicate instead saves a queue slot for some OTHER uuid's event
- * during a burst (e.g. a flapping link) -- see this file's own top comment.
- * Sized to TOPOLOGY_REGISTRY_MAX_NODES, the true upper bound on how many
- * distinct module_uuids the registry (and therefore this set) can ever need
- * to track at once, so this can never need to reject a legitimate new uuid
+ * Bounded set of (module_uuid, kind) pairs currently enqueued in
+ * s_topology_queue, used only to COALESCE duplicate (uuid, kind) TOPOLOGY
+ * events before they ever reach xQueueSend() -- since handle_topology_event()
+ * always re-reads the CURRENT registry entry for a SNAPSHOT uuid at drain
+ * time regardless of which of that uuid's queued SNAPSHOT events is being
+ * drained, a second SNAPSHOT event for a uuid already pending would just
+ * cause the same current state to be sent twice; skipping the duplicate
+ * instead saves a queue slot for some OTHER uuid's event during a burst
+ * (e.g. a flapping link) -- see this file's own top comment. Keyed by
+ * (uuid, kind) rather than uuid alone (this follow-up) so a pending REMOVED
+ * tombstone for a uuid can never coalesce away (or be coalesced away by) an
+ * unrelated, independently-meaningful SNAPSHOT event for that SAME uuid --
+ * e.g. a removal immediately followed by a genuine re-attach SNAPSHOT for
+ * the same module_uuid must both still reach the queue, in that same
+ * chronological order (a single FIFO queue preserves that order; see
+ * exporter_task()'s own single-consumer drain loop). Sized to
+ * TOPOLOGY_REGISTRY_MAX_NODES, the true upper bound on how many distinct
+ * module_uuids the registry (and therefore this set) can ever need to track
+ * at once per kind, so this can never need to reject a legitimate new uuid
  * the registry itself would still have room for (same sizing rationale as
  * s_pending_samples/PENDING_SAMPLES_MAX above).
  *
  * Touched from BOTH the OT task (producer, via observer_on_topology_applied/
- * observer_on_node_offline) and the exporter task (consumer, draining
- * s_topology_queue) -- protected by a short critical section
- * (s_topology_pending_lock), the same cheap-spinlock pattern this file
- * already uses for s_send_lock, never a blocking wait: the OT-task callback
- * must never block (see this file's own top comment).
+ * observer_on_node_offline/observer_on_node_removed) and the exporter task
+ * (consumer, draining s_topology_queue) -- protected by a short critical
+ * section (s_topology_pending_lock), the same cheap-spinlock pattern this
+ * file already uses for s_send_lock, never a blocking wait: the OT-task
+ * callback must never block (see this file's own top comment).
  */
 #define TOPOLOGY_PENDING_MAX TOPOLOGY_REGISTRY_MAX_NODES
 static portMUX_TYPE s_topology_pending_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_topology_pending_valid[TOPOLOGY_PENDING_MAX];
 static uint8_t s_topology_pending_uuids[TOPOLOGY_PENDING_MAX][TOPOLOGY_UUID_LEN];
+static topology_evt_kind_t s_topology_pending_kind[TOPOLOGY_PENDING_MAX];
+
+/*
+ * Bounded, uuid-keyed set of REMOVED tombstones not yet CONFIRMED delivered
+ * (a 2.xx response) -- the retry counterpart to s_topology_pending_*
+ * above (this follow-up). Unlike an ordinary SNAPSHOT (whose "current
+ * state" to resend always still exists, for free, in
+ * power_base_transport's own topology_registry -- see
+ * do_full_topology_resync()), a REMOVED tombstone conveys a one-shot fact:
+ * the confirmed detach already ERASED the uuid from topology_registry, so
+ * nothing else remembers that Linux still has to be told. This table is
+ * that fact, and it is mirrored to flash (removed_journal.c, written by
+ * persist_removed_journal_if_dirty() from the exporter task whenever
+ * s_pending_removed_dirty is set) and reloaded by
+ * linux_bridge_exporter_init() -- so a removal that never reached Linux
+ * survives a Power Base reboot instead of leaving the module on Linux
+ * forever (where its own stale timeout could only ever mark it offline).
+ * do_full_removed_resync() below
+ * re-enqueues every entry still marked here on every periodic resync tick,
+ * so a removal that failed to deliver (Linux host unreachable, exhausted
+ * retry budget) keeps being retried indefinitely -- not just the initial
+ * 1+EXPORTER_MAX_RETRIES burst -- until Linux actually confirms it (see
+ * handle_removed_event()'s own doc comment), giving the SAME "periodic
+ * resync converges regardless of any single delivery failure" guarantee
+ * every other export path in this file already has. Sized to
+ * TOPOLOGY_REGISTRY_MAX_NODES for the same reason as every other bounded
+ * table in this file.
+ */
+#define PENDING_REMOVED_MAX TOPOLOGY_REGISTRY_MAX_NODES
+static portMUX_TYPE s_pending_removed_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pending_removed_valid[PENDING_REMOVED_MAX];
+static uint8_t s_pending_removed_uuids[PENDING_REMOVED_MAX][TOPOLOGY_UUID_LEN];
+/* Outcome of the last delivery attempt per slot, only so a failure is
+ * logged when it CHANGES rather than on every resync retry: 0 = not
+ * attempted yet, REMOVED_OUTCOME_NO_RESPONSE, else the CoAP response code. */
+#define REMOVED_OUTCOME_NO_RESPONSE 0xFFu
+static uint8_t s_pending_removed_last_outcome[PENDING_REMOVED_MAX];
+/* The set above differs from what removed_journal last committed. */
+static bool s_pending_removed_dirty;
 
 /*
  * Bounded, uuid-keyed, always-coalescing table of samples still waiting to
@@ -313,6 +378,29 @@ static SemaphoreHandle_t s_pending_samples_mutex;
 static pending_sample_slot_t s_pending_samples[PENDING_SAMPLES_MAX];
 static TickType_t s_last_send_fail_warn_tick;
 
+/* Correction pass (this follow-up, item 6): TEST-ONLY clock override -- see
+ * linux_bridge_exporter_test_set_clock()'s own doc comment. NULL (the
+ * default) means "use the real xTaskGetTickCount()"; production code never
+ * calls the setter, so exporter_now_ms() is byte-for-byte
+ * xTaskGetTickCount() in every real build. Used ONLY for exporter_task()'s
+ * own full-resync/heartbeat interval comparisons -- deliberately NOT for
+ * drain_pending_samples()'s per-uuid SAMPLE_MIN_INTERVAL_MS rate-limit gate
+ * (a separate, much shorter timer existing tests exercise opening and
+ * closing over genuinely elapsed real time by design -- see that
+ * function's own comment), and never for send timeouts or retry backoff
+ * (real blocking waits, not simple elapsed-time comparisons). */
+static TickType_t (*s_test_clock_fn)(void) = NULL;
+
+static TickType_t exporter_now_ms(void)
+{
+    return (s_test_clock_fn != NULL) ? s_test_clock_fn() : xTaskGetTickCount();
+}
+
+void linux_bridge_exporter_test_set_clock(TickType_t (*now_ms_fn)(void))
+{
+    s_test_clock_fn = now_ms_fn;
+}
+
 /* See this file's own top comment: same token-staleness guard pattern as
  * sensor_transport.c/topology_reporter.c. */
 static SemaphoreHandle_t s_send_done_sem;
@@ -360,8 +448,17 @@ static void coap_response_handler(void *ctx_v, otMessage *message, const otMessa
  * and (this follow-up's correction pass) returning an explicit
  * export_send_result_t instead of a bare bool -- see this file's own top
  * comment and export_send_result_t's own doc comment. */
+static void persist_removed_journal_if_dirty(void);
+
 static export_send_result_t send_one_attempt(const char *uri_path, const uint8_t *payload, size_t len)
 {
+    /* Every CoAP attempt, not only once per exporter_task() iteration: with
+     * Linux unreachable one iteration (e.g. a full resync of every node,
+     * each exhausting its timeouts/backoff) can block for many seconds, and
+     * a detach confirmed meanwhile must not stay RAM-only that long. This
+     * bounds it to one attempt plus one backoff. */
+    persist_removed_journal_if_dirty();
+
     otIp6Address dest_addr;
     memcpy(dest_addr.mFields.m8, s_host_addr, sizeof(dest_addr.mFields.m8));
 
@@ -518,6 +615,96 @@ static void send_topology_entry(const topology_registry_entry_t *e)
                           "retry every node's current state)");
 }
 
+/* Forward declarations -- defined further down, but handle_removed_event()
+ * right below needs both first. */
+static bool clear_removed_pending(const uint8_t uuid[TOPOLOGY_UUID_LEN]);
+static uint8_t swap_removed_outcome(const uint8_t uuid[TOPOLOGY_UUID_LEN], uint8_t outcome);
+static bool find_current_topology_entry(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_registry_entry_t *out);
+
+/* Sends one BRIDGE_EXPORT_MSG_TOPOLOGY_REMOVED tombstone for module_uuid (see
+ * that message type's own wire-format doc comment) to the SAME
+ * URI_TOPOLOGY resource an ordinary SNAPSHOT uses -- msg_type inside the
+ * envelope, not the URI, is what Linux ingest's own handle_request()
+ * dispatches on (see linux/matter_bridge/ingest/src/session.cpp). Clears
+ * this uuid's s_pending_removed mark ONLY on a confirmed 2.xx delivery --
+ * see s_pending_removed_*'s own doc comment: any other outcome leaves it
+ * pending for do_full_removed_resync() to retry, since resending an
+ * already-applied removal is always a harmless, idempotent no-op on the
+ * Linux side (registry.hpp's own apply_removal() doc comment) -- unlike an
+ * ordinary SNAPSHOT's 4.12 stale_session, there is no "this payload can
+ * only ever be rejected again" case to short-circuit here. */
+static void handle_removed_event(const uint8_t module_uuid[TOPOLOGY_UUID_LEN])
+{
+    /* Correction pass (this follow-up, item 2: rapid detach/reattach race)
+     * -- the AUTHORITATIVE backstop, re-checked at the exact moment of
+     * drain/send, regardless of how this event reached here (the reactive
+     * fast path, or a later do_full_removed_resync() retry) and regardless
+     * of whether observer_on_topology_applied()'s own proactive cancel
+     * (above) already fired for it. If module_uuid is CURRENTLY findable
+     * in the Power Base's own topology_registry, a genuine re-attach has
+     * happened since this REMOVED event was produced -- sending the
+     * tombstone now would be actively WRONG (it would delete the
+     * just-reattached module on Linux), not merely redundant. Skipped, and
+     * the (by now definitely stale) pending mark is cleared too so
+     * do_full_removed_resync() never retries it again either. */
+    topology_registry_entry_t current;
+    if (find_current_topology_entry(module_uuid, &current)) {
+        if (clear_removed_pending(module_uuid)) {
+            ESP_LOGI(TAG, "removal ..%02x%02x: tombstone cancelled before sending -- the module is registered "
+                          "again (re-attached)",
+                     module_uuid[6], module_uuid[7]);
+        }
+        return;
+    }
+
+    bridge_export_topology_removed_t rem = {0};
+    memcpy(rem.power_base_uuid, s_power_base_uuid, BRIDGE_EXPORT_UUID_LEN);
+    memcpy(rem.module_uuid, module_uuid, BRIDGE_EXPORT_UUID_LEN);
+
+    uint8_t wire[BRIDGE_EXPORT_MAX_MESSAGE_LEN];
+    size_t wlen = bridge_export_pack_topology_removed(&rem, wire, sizeof(wire));
+    if (wlen == 0) {
+        ESP_LOGW(TAG, "failed to pack a topology-removed export message -- dropped (still pending -- the next "
+                      "periodic resync retries it)");
+        return;
+    }
+    export_send_result_t result = transmit(URI_TOPOLOGY, wire, wlen);
+
+    uint8_t code = REMOVED_OUTCOME_NO_RESPONSE;
+    taskENTER_CRITICAL(&s_send_lock);
+    if (s_send_got_message) {
+        code = (uint8_t)s_send_response_code;
+    }
+    taskEXIT_CRITICAL(&s_send_lock);
+
+    /* Logged per uuid, but only on a transition: delivery (once), or a
+     * failure whose outcome differs from the previous attempt's -- never
+     * once per periodic retry. A 4.xx is a WARN, not a DEBUG: Linux refusing
+     * a removal leaves the module on the Linux API indefinitely. */
+    if (result == EXPORT_SEND_DELIVERED_2XX) {
+        clear_removed_pending(module_uuid);
+        ESP_LOGI(TAG, "removal ..%02x%02x: delivered, Linux answered %u.%02u", module_uuid[6], module_uuid[7],
+                 (unsigned)(code >> 5), (unsigned)(code & 0x1F));
+        return;
+    }
+    if (swap_removed_outcome(module_uuid, code) == code) {
+        return; /* same failure as last time -- already logged */
+    }
+    if (code == REMOVED_OUTCOME_NO_RESPONSE) {
+        ESP_LOGW(TAG, "removal ..%02x%02x: no response from Linux after %d attempts -- kept pending (and on "
+                      "flash), retried every resync",
+                 module_uuid[6], module_uuid[7], EXPORTER_MAX_ATTEMPTS);
+    } else if (result == EXPORT_SEND_REJECTED_4XX) {
+        ESP_LOGW(TAG, "removal ..%02x%02x: REJECTED by Linux with %u.%02u -- kept pending, retried every resync "
+                      "(4.00 usually means the Linux ingest predates TOPOLOGY_REMOVED msg_type 4: rebuild/redeploy "
+                      "pogo_matter_bridge)",
+                 module_uuid[6], module_uuid[7], (unsigned)(code >> 5), (unsigned)(code & 0x1F));
+    } else {
+        ESP_LOGW(TAG, "removal ..%02x%02x: Linux answered %u.%02u -- kept pending, retried every resync",
+                 module_uuid[6], module_uuid[7], (unsigned)(code >> 5), (unsigned)(code & 0x1F));
+    }
+}
+
 /* Packs `sample` into a SAMPLE export wire message. Returns 0 (and logs) on
  * a packing failure -- shared by transmit_sample() below, called fresh
  * immediately before every single CoAP attempt (see this file's own top
@@ -564,6 +751,19 @@ static bool find_current_aggregator_sample(const uint8_t module_uuid[SENSOR_UUID
     return false;
 }
 
+/* True while module_uuid is in the Power Base's topology registry. A SAMPLE
+ * is exported only then: sensor_root_aggregator keeps a module's last sample
+ * forever, so without this gate every periodic resync kept re-sending the
+ * last sample of a module a confirmed POGO detach had already erased. On a
+ * Linux ingest that had not applied the removal, each of those identical
+ * resends counted as fresh liveness (DuplicateExact refreshes last_seen_at),
+ * pinning the module online:true with a frozen sample_seq. */
+static bool module_is_registered(const uint8_t module_uuid[SENSOR_UUID_LEN])
+{
+    topology_registry_entry_t e;
+    return find_current_topology_entry(module_uuid, &e);
+}
+
 /*
  * One bounded SAMPLE publish attempt sequence for `module_uuid` -- this
  * file's own transmit()'s SAMPLE-specific sibling. Deliberately NOT
@@ -588,7 +788,7 @@ static export_send_result_t transmit_sample(const uint8_t module_uuid[SENSOR_UUI
             vTaskDelay(pdMS_TO_TICKS(s_retry_backoff_ms[attempt]));
         }
         sensor_sample_t sample;
-        if (!find_current_aggregator_sample(module_uuid, &sample)) {
+        if (!module_is_registered(module_uuid) || !find_current_aggregator_sample(module_uuid, &sample)) {
             /* Nothing valid left to send for this uuid -- should not
              * happen (see this function's own doc comment), but stop this
              * attempt cycle cleanly rather than sending garbage. Leaves
@@ -636,7 +836,13 @@ static void mark_sample_pending(const uint8_t module_uuid[SENSOR_UUID_LEN], Tick
  */
 static void handle_sample_event(const uint8_t module_uuid[SENSOR_UUID_LEN])
 {
+    if (!module_is_registered(module_uuid)) {
+        return; /* removed since it was marked pending -- see module_is_registered() */
+    }
     export_send_result_t result = transmit_sample(module_uuid);
+    if (!module_is_registered(module_uuid)) {
+        return; /* removed while the attempt was in flight: nothing to retry or warn about */
+    }
     report_export_result(result, "sample",
                           "sample export delivery unconfirmed (Linux OTBR host unreachable? -- the sensor sample "
                           "itself is already stored in the Power Base aggregator regardless)");
@@ -651,8 +857,9 @@ static void handle_sample_event(const uint8_t module_uuid[SENSOR_UUID_LEN])
  * TOPOLOGY_REGISTRY_MAX_NODES (32) either way. */
 static bool find_current_topology_entry(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_registry_entry_t *out)
 {
-    size_t count = power_base_transport_get_node_count();
-    for (size_t i = 0; i < count; i++) {
+    /* Every slot, not 0..count-1: an erase frees a slot without compacting
+     * (see power_base_transport_get_node()'s doc comment). */
+    for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) {
         topology_registry_entry_t e;
         if (power_base_transport_get_node(i, &e) && memcmp(e.module_uuid, uuid, TOPOLOGY_UUID_LEN) == 0) {
             *out = e;
@@ -662,19 +869,22 @@ static bool find_current_topology_entry(const uint8_t uuid[TOPOLOGY_UUID_LEN], t
     return false;
 }
 
-/* Returns true (and marks `uuid` pending) iff a fresh xQueueSend() for this
- * uuid should proceed -- false means `uuid` is already pending (a queued
- * event for it will still be drained, always against its CURRENT registry
- * state, so this duplicate is redundant -- see s_topology_pending_* 's own
- * doc comment). A short, bounded critical section, never a blocking wait --
- * called only from the OT-task's own observer callbacks below. */
-static bool topology_pending_try_mark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+/* Returns true (and marks (uuid, kind) pending) iff a fresh xQueueSend() for
+ * this (uuid, kind) pair should proceed -- false means it is already
+ * pending (a queued event for it will still be drained, so this duplicate
+ * is redundant -- see s_topology_pending_*'s own doc comment on why `kind`
+ * is part of the key: a pending REMOVED for a uuid never blocks a fresh
+ * SNAPSHOT event for that SAME uuid, or vice versa). A short, bounded
+ * critical section, never a blocking wait -- called only from the OT-task's
+ * own observer callbacks below. */
+static bool topology_pending_try_mark(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_evt_kind_t kind)
 {
     bool should_enqueue = true;
     int free_slot = -1;
     taskENTER_CRITICAL(&s_topology_pending_lock);
     for (int i = 0; i < TOPOLOGY_PENDING_MAX; i++) {
-        if (s_topology_pending_valid[i] && memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+        if (s_topology_pending_valid[i] && s_topology_pending_kind[i] == kind &&
+            memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
             should_enqueue = false;
             break;
         }
@@ -685,24 +895,26 @@ static bool topology_pending_try_mark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
     /* free_slot < 0 here (the set is full) cannot happen in practice -- see
      * TOPOLOGY_PENDING_MAX's own sizing comment -- but if it ever did, fail
      * OPEN (still enqueue) rather than silently and permanently refusing to
-     * ever mark this uuid pending again. */
+     * ever mark this (uuid, kind) pending again. */
     if (should_enqueue && free_slot >= 0) {
         s_topology_pending_valid[free_slot] = true;
         memcpy(s_topology_pending_uuids[free_slot], uuid, TOPOLOGY_UUID_LEN);
+        s_topology_pending_kind[free_slot] = kind;
     }
     taskEXIT_CRITICAL(&s_topology_pending_lock);
     return should_enqueue;
 }
 
-/* Clears `uuid`'s pending mark, if any -- called once a queued event for it
- * has actually been dequeued (exporter_task()) or once an enqueue attempt
- * for it failed (enqueue_topology_event() below), either way freeing it to
- * be marked pending again by a future event. */
-static void topology_pending_unmark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+/* Clears (uuid, kind)'s pending mark, if any -- called once a queued event
+ * for it has actually been dequeued (exporter_task()) or once an enqueue
+ * attempt for it failed (enqueue_topology_event() below), either way
+ * freeing it to be marked pending again by a future event. */
+static void topology_pending_unmark(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_evt_kind_t kind)
 {
     taskENTER_CRITICAL(&s_topology_pending_lock);
     for (int i = 0; i < TOPOLOGY_PENDING_MAX; i++) {
-        if (s_topology_pending_valid[i] && memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+        if (s_topology_pending_valid[i] && s_topology_pending_kind[i] == kind &&
+            memcmp(s_topology_pending_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
             s_topology_pending_valid[i] = false;
             break;
         }
@@ -710,22 +922,134 @@ static void topology_pending_unmark(const uint8_t uuid[TOPOLOGY_UUID_LEN])
     taskEXIT_CRITICAL(&s_topology_pending_lock);
 }
 
-/* Shared by observer_on_topology_applied()/observer_on_node_offline() --
- * both enqueue nothing but a uuid now (see topo_evt_payload_t's own doc
- * comment), coalesced via s_topology_pending_* before ever reaching
- * xQueueSend(). Still strictly non-blocking (xQueueSend(..., 0)) -- never
- * anything that could block the calling OT task (this file's own top
- * comment). */
-static void enqueue_topology_event(const uint8_t uuid[TOPOLOGY_UUID_LEN], const char *drop_log_msg)
+/* Shared by observer_on_topology_applied()/observer_on_node_offline()/
+ * observer_on_node_removed() -- each enqueues nothing but a (uuid, kind)
+ * pair now (see topo_evt_payload_t's own doc comment), coalesced via
+ * s_topology_pending_* before ever reaching xQueueSend(). Still strictly
+ * non-blocking (xQueueSend(..., 0)) -- never anything that could block the
+ * calling OT task (this file's own top comment). */
+static void enqueue_topology_event(const uint8_t uuid[TOPOLOGY_UUID_LEN], topology_evt_kind_t kind,
+                                    const char *drop_log_msg)
 {
-    if (!topology_pending_try_mark(uuid)) {
-        return; /* a fresh event for this uuid is already queued -- coalesced away */
+    if (!topology_pending_try_mark(uuid, kind)) {
+        return; /* a fresh event for this (uuid, kind) is already queued -- coalesced away */
     }
     topo_evt_payload_t evt;
     memcpy(evt.uuid, uuid, TOPOLOGY_UUID_LEN);
+    evt.kind = kind;
     if (xQueueSend(s_topology_queue, &evt, 0) != pdTRUE) {
-        topology_pending_unmark(uuid); /* enqueue failed -- let a future event for this uuid try again */
+        topology_pending_unmark(uuid, kind); /* enqueue failed -- let a future event for this pair try again */
         warn_rate_limited(drop_log_msg);
+    }
+}
+
+/* ---- REMOVED-tombstone pending table (this follow-up) -- see
+ * s_pending_removed_*'s own doc comment. Both a short, bounded critical
+ * section, never a blocking wait -- safe to call from the OT task
+ * (mark_removed_pending(), via observer_on_node_removed()) or the exporter
+ * task (clear_removed_pending()/do_full_removed_resync()). ---- */
+
+/* Returns true iff uuid was newly added. */
+static bool mark_removed_pending(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    taskENTER_CRITICAL(&s_pending_removed_lock);
+    int free_slot = -1;
+    bool already = false;
+    for (int i = 0; i < PENDING_REMOVED_MAX; i++) {
+        if (s_pending_removed_valid[i] && memcmp(s_pending_removed_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            already = true;
+            break;
+        }
+        if (!s_pending_removed_valid[i] && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (!already && free_slot >= 0) {
+        s_pending_removed_valid[free_slot] = true;
+        memcpy(s_pending_removed_uuids[free_slot], uuid, TOPOLOGY_UUID_LEN);
+        s_pending_removed_last_outcome[free_slot] = 0;
+        s_pending_removed_dirty = true;
+    }
+    /* free_slot < 0 (table full) or already-present: nothing further to do
+     * either way -- see PENDING_REMOVED_MAX's own sizing comment for why
+     * "full" cannot happen in practice; a duplicate on-node-removed for a
+     * uuid already pending is a harmless, idempotent no-op here. */
+    taskEXIT_CRITICAL(&s_pending_removed_lock);
+    return !already && free_slot >= 0;
+}
+
+/* Returns true iff uuid was pending (and is now cleared). */
+static bool clear_removed_pending(const uint8_t uuid[TOPOLOGY_UUID_LEN])
+{
+    bool cleared = false;
+    taskENTER_CRITICAL(&s_pending_removed_lock);
+    for (int i = 0; i < PENDING_REMOVED_MAX; i++) {
+        if (s_pending_removed_valid[i] && memcmp(s_pending_removed_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            s_pending_removed_valid[i] = false;
+            s_pending_removed_dirty = true;
+            cleared = true;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_pending_removed_lock);
+    return cleared;
+}
+
+/* Records `outcome` for a still-pending uuid and returns the previous one
+ * (0 if none, or if uuid is no longer pending). */
+static uint8_t swap_removed_outcome(const uint8_t uuid[TOPOLOGY_UUID_LEN], uint8_t outcome)
+{
+    uint8_t prev = 0;
+    taskENTER_CRITICAL(&s_pending_removed_lock);
+    for (int i = 0; i < PENDING_REMOVED_MAX; i++) {
+        if (s_pending_removed_valid[i] && memcmp(s_pending_removed_uuids[i], uuid, TOPOLOGY_UUID_LEN) == 0) {
+            prev = s_pending_removed_last_outcome[i];
+            s_pending_removed_last_outcome[i] = outcome;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_pending_removed_lock);
+    return prev;
+}
+
+/* Exporter task only (blocking flash write). Commits the current pending
+ * set if it changed since the last successful commit. Called at the top of
+ * every exporter_task() iteration and before every CoAP attempt
+ * (send_one_attempt()), so a fresh
+ * tombstone is on flash before its first (possibly long, retried) CoAP
+ * attempt, and a re-attach's cancel is on flash before the re-attach's own
+ * SNAPSHOT goes out. A failed write re-marks the set dirty and is retried
+ * on the next iteration (<= EXPORTER_POLL_TICK_MS later). A set that
+ * changes again while the write is in flight is simply marked dirty again
+ * by mark/clear and written on the next iteration. */
+static void persist_removed_journal_if_dirty(void)
+{
+    uint8_t pending[PENDING_REMOVED_MAX][TOPOLOGY_UUID_LEN];
+    size_t pending_count = 0;
+
+    taskENTER_CRITICAL(&s_pending_removed_lock);
+    if (!s_pending_removed_dirty) {
+        taskEXIT_CRITICAL(&s_pending_removed_lock);
+        return;
+    }
+    s_pending_removed_dirty = false;
+    for (int i = 0; i < PENDING_REMOVED_MAX; i++) {
+        if (s_pending_removed_valid[i]) {
+            memcpy(pending[pending_count], s_pending_removed_uuids[i], TOPOLOGY_UUID_LEN);
+            pending_count++;
+        }
+    }
+    taskEXIT_CRITICAL(&s_pending_removed_lock);
+
+    esp_err_t err = removed_journal_save(pending, pending_count);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "removal journal: %u undelivered tombstone(s) now on flash", (unsigned)pending_count);
+    } else {
+        taskENTER_CRITICAL(&s_pending_removed_lock);
+        s_pending_removed_dirty = true;
+        taskEXIT_CRITICAL(&s_pending_removed_lock);
+        warn_rate_limited("removed-tombstone journal write failed -- retrying; until it succeeds an undelivered "
+                          "removal would not survive a Power Base reboot");
     }
 }
 
@@ -740,6 +1064,10 @@ static void enqueue_topology_event(const uint8_t uuid[TOPOLOGY_UUID_LEN], const 
  * skipped; the periodic full resync would not find it either. */
 static void handle_topology_event(const topo_evt_payload_t *p)
 {
+    if (p->kind == TOPOLOGY_EVT_REMOVED) {
+        handle_removed_event(p->uuid);
+        return;
+    }
     topology_registry_entry_t e;
     if (find_current_topology_entry(p->uuid, &e)) {
         send_topology_entry(&e);
@@ -750,12 +1078,40 @@ static void handle_topology_event(const topo_evt_payload_t *p)
 
 static void do_full_topology_resync(void)
 {
-    size_t count = power_base_transport_get_node_count();
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) { /* every slot -- see find_current_topology_entry() */
         topology_registry_entry_t e;
         if (power_base_transport_get_node(i, &e)) {
             send_topology_entry(&e);
         }
+    }
+}
+
+/* Re-enqueues every still-pending REMOVED tombstone (see
+ * s_pending_removed_*'s own doc comment) on every periodic resync tick --
+ * this component's own convergence guarantee for a removal, mirroring
+ * do_full_topology_resync()/do_full_sample_resync()'s existing role for
+ * their own export kinds. Copies the pending uuid list out under the short
+ * critical section, then enqueues each OUTSIDE it (enqueue_topology_event()
+ * does its own locking) -- never holds s_pending_removed_lock across the
+ * queue operation. */
+static void do_full_removed_resync(void)
+{
+    uint8_t pending[PENDING_REMOVED_MAX][TOPOLOGY_UUID_LEN];
+    int pending_count = 0;
+
+    taskENTER_CRITICAL(&s_pending_removed_lock);
+    for (int i = 0; i < PENDING_REMOVED_MAX; i++) {
+        if (s_pending_removed_valid[i]) {
+            memcpy(pending[pending_count], s_pending_removed_uuids[i], TOPOLOGY_UUID_LEN);
+            pending_count++;
+        }
+    }
+    taskEXIT_CRITICAL(&s_pending_removed_lock);
+
+    for (int i = 0; i < pending_count; i++) {
+        enqueue_topology_event(pending[i], TOPOLOGY_EVT_REMOVED,
+                                "topology queue full -- dropped one REMOVED resync retry (still pending -- the "
+                                "NEXT resync tick tries again)");
     }
 }
 
@@ -775,7 +1131,7 @@ static void do_full_sample_resync(void)
     size_t count = sensor_root_aggregator_get_node_count();
     for (size_t i = 0; i < count; i++) {
         sensor_root_aggregator_node_t node;
-        if (sensor_root_aggregator_get_node(i, &node) && node.has_sample) {
+        if (sensor_root_aggregator_get_node(i, &node) && node.has_sample && module_is_registered(node.module_uuid)) {
             /* Bounded (not 0-tick) wait -- called from exporter_task()'s
              * own context, not the OT callback, so it can afford to
              * briefly wait for a lock the reactive callback (0-tick) might
@@ -879,6 +1235,13 @@ static void mark_sample_pending(const uint8_t module_uuid[SENSOR_UUID_LEN], Tick
  */
 static void drain_pending_samples(void)
 {
+    /* Deliberately the REAL clock, never exporter_now_ms()'s test override
+     * -- this gate is the per-uuid SAMPLE_MIN_INTERVAL_MS rate limit (a
+     * SEPARATE, much shorter timer from the full resync/heartbeat interval
+     * exporter_now_ms() exists to let tests control -- see that function's
+     * own doc comment), and existing tests
+     * (tools/test_linux_bridge_exporter_rate_limit.c) exercise it opening
+     * and closing over genuinely elapsed real time by design. */
     TickType_t now = xTaskGetTickCount();
     TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS);
     for (int i = 0; i < PENDING_SAMPLES_MAX; i++) {
@@ -926,12 +1289,16 @@ static void send_heartbeat(void)
 static void exporter_task(void *arg)
 {
     (void)arg;
-    TickType_t last_resync = xTaskGetTickCount();
-    TickType_t last_heartbeat = xTaskGetTickCount();
+    TickType_t last_resync = exporter_now_ms();
+    TickType_t last_heartbeat = exporter_now_ms();
 
     while (1) {
         topo_evt_payload_t evt;
-        if (xQueueReceive(s_topology_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE) {
+        bool have_evt = xQueueReceive(s_topology_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE;
+        /* Before anything below can send -- see this function's own doc
+         * comment. */
+        persist_removed_journal_if_dirty();
+        if (have_evt) {
             /* This event is no longer "pending" from the coalescing set's
              * point of view as of right now -- a NEW on_topology_applied/
              * on_node_offline for this same uuid arriving while
@@ -939,7 +1306,7 @@ static void exporter_task(void *arg)
              * retrying a transient failure) is correctly treated as a fresh
              * event to enqueue, not folded into the one already being
              * processed. */
-            topology_pending_unmark(evt.uuid);
+            topology_pending_unmark(evt.uuid, evt.kind);
             handle_topology_event(&evt);
         }
         /* Runs every loop iteration regardless of whether a topology event
@@ -947,10 +1314,11 @@ static void exporter_task(void *arg)
          * meaningfully lengthens the loop when nothing is dirty. */
         drain_pending_samples();
 
-        TickType_t now = xTaskGetTickCount();
+        TickType_t now = exporter_now_ms();
         if ((now - last_resync) >= pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS)) {
             do_full_topology_resync();
             do_full_sample_resync();
+            do_full_removed_resync();
             last_resync = now;
         }
         if ((now - last_heartbeat) >= pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_HEARTBEAT_INTERVAL_MS)) {
@@ -972,7 +1340,29 @@ static void observer_on_sample_stored(const sensor_sample_t *sample, void *ctx)
 static void observer_on_topology_applied(const topology_registry_entry_t *entry, void *ctx)
 {
     (void)ctx;
-    enqueue_topology_event(entry->module_uuid,
+    /* Correction pass (this follow-up, item 2: rapid detach/reattach race).
+     * A real, successful topology_registry_apply_report() for this
+     * module_uuid is, unconditionally, proof that it is CURRENTLY present
+     * in the Power Base's own topology_registry -- the one and only
+     * authoritative source of truth for "does this uuid still exist" (see
+     * this file's own top comment and topology_registry.h's). If a REMOVED
+     * tombstone for this SAME uuid is still pending (queued, mid-retry, or
+     * awaiting the next resync retry) from an EARLIER detach, it is now
+     * unconditionally stale -- cancelled here, proactively, the moment the
+     * fresh attach is known, rather than waiting for handle_removed_event()'s
+     * own drain-time re-check (below) to catch it whenever it happens to
+     * run. Together the two form the "belt and suspenders" this correction
+     * pass's own design note calls for: this proactive cancel closes the
+     * window as early as possible; the drain-time re-check is the
+     * authoritative backstop for whatever this cancel's own timing might
+     * still miss (e.g. a REMOVED event already dequeued and mid-flight in
+     * transmit() when this fires -- see handle_removed_event()'s own doc
+     * comment). A harmless no-op if nothing was pending. */
+    if (clear_removed_pending(entry->module_uuid)) {
+        ESP_LOGI(TAG, "removal ..%02x%02x: pending tombstone cancelled -- re-attached before Linux confirmed it",
+                 entry->module_uuid[6], entry->module_uuid[7]);
+    }
+    enqueue_topology_event(entry->module_uuid, TOPOLOGY_EVT_SNAPSHOT,
                             "topology queue full -- dropped one TOPOLOGY export event (the next periodic full "
                             "resync recovers it)");
 }
@@ -980,8 +1370,27 @@ static void observer_on_topology_applied(const topology_registry_entry_t *entry,
 static void observer_on_node_offline(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
 {
     (void)ctx;
-    enqueue_topology_event(uuid, "topology queue full -- dropped one TOPOLOGY (offline) export event (the next "
-                                   "periodic full resync recovers it)");
+    enqueue_topology_event(uuid, TOPOLOGY_EVT_SNAPSHOT,
+                            "topology queue full -- dropped one TOPOLOGY (offline) export event (the next "
+                            "periodic full resync recovers it)");
+}
+
+/* This follow-up: POGO auto-registration/removal lifecycle. Marks
+ * module_uuid durably pending FIRST (mark_removed_pending() -- survives
+ * even if the reactive enqueue immediately below is itself dropped, e.g. a
+ * momentarily-full s_topology_queue) and only then attempts the reactive
+ * fast-path enqueue -- see s_pending_removed_*'s own doc comment for why
+ * this uuid keeps being retried by do_full_removed_resync() regardless of
+ * whether this immediate attempt succeeds. */
+static void observer_on_node_removed(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
+{
+    (void)ctx;
+    if (mark_removed_pending(uuid)) {
+        ESP_LOGI(TAG, "removal ..%02x%02x: tombstone pending for Linux", uuid[6], uuid[7]);
+    }
+    enqueue_topology_event(uuid, TOPOLOGY_EVT_REMOVED,
+                            "topology queue full -- dropped one REMOVED export event's reactive fast path (still "
+                            "pending -- the next periodic resync retries it)");
 }
 
 esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID_LEN],
@@ -1004,6 +1413,23 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     s_last_send_fail_warn_tick = 0;
     memset(s_pending_samples, 0, sizeof(s_pending_samples));
     memset(s_topology_pending_valid, 0, sizeof(s_topology_pending_valid));
+    memset(s_pending_removed_valid, 0, sizeof(s_pending_removed_valid));
+    memset(s_pending_removed_last_outcome, 0, sizeof(s_pending_removed_last_outcome));
+    s_pending_removed_dirty = false;
+    /* Tombstones a previous boot never got confirmed (see
+     * s_pending_removed_*'s own doc comment). They go out on the first
+     * periodic resync, after modules still docked have had a moment to
+     * re-register; handle_removed_event() skips (and clears) any uuid that
+     * is back in the registry by then. */
+    size_t restored = removed_journal_load(s_pending_removed_uuids, PENDING_REMOVED_MAX);
+    for (size_t i = 0; i < restored; i++) {
+        s_pending_removed_valid[i] = true;
+        ESP_LOGI(TAG, "removal ..%02x%02x: undelivered tombstone restored from flash", s_pending_removed_uuids[i][6],
+                 s_pending_removed_uuids[i][7]);
+    }
+    if (restored > 0) {
+        ESP_LOGI(TAG, "restored %u undelivered topology-removed tombstone(s) from flash", (unsigned)restored);
+    }
 
     s_send_done_sem = xSemaphoreCreateBinary();
     if (s_send_done_sem == NULL) {
@@ -1041,6 +1467,7 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
         .on_sample_stored = observer_on_sample_stored,
         .on_topology_applied = observer_on_topology_applied,
         .on_node_offline = observer_on_node_offline,
+        .on_node_removed = observer_on_node_removed,
     };
     power_base_transport_set_bridge_observer(&observer);
 

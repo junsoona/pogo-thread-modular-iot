@@ -1,5 +1,6 @@
 /* Implementation of the fake in-memory NVS store declared across nvs.h/
  * nvs_flash.h/nvs_sim.h in this directory. See nvs.h's top comment. */
+#include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include "nvs.h"
@@ -31,11 +32,15 @@ typedef struct {
 
 static sim_namespace_t s_namespaces[SIM_MAX_NAMESPACES];
 static esp_err_t s_forced_init_error = ESP_OK;
+static esp_err_t s_forced_commit_error = ESP_OK;
+static char s_backing_file[512];
 
 void nvs_sim_reset(void)
 {
     memset(s_namespaces, 0, sizeof(s_namespaces));
     s_forced_init_error = ESP_OK;
+    s_forced_commit_error = ESP_OK;
+    s_backing_file[0] = '\0';
 }
 
 static sim_namespace_t *find_ns(const char *partition, const char *ns, bool create)
@@ -117,6 +122,46 @@ void nvs_sim_force_next_init_error(esp_err_t err)
     s_forced_init_error = err;
 }
 
+void nvs_sim_force_next_commit_error(esp_err_t err)
+{
+    s_forced_commit_error = err;
+}
+
+bool nvs_sim_set_backing_file(const char *path)
+{
+    memset(s_namespaces, 0, sizeof(s_namespaces));
+    strncpy(s_backing_file, path, sizeof(s_backing_file) - 1);
+    s_backing_file[sizeof(s_backing_file) - 1] = '\0';
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return true; /* never committed yet -- blank flash */
+    }
+    bool ok = fread(s_namespaces, sizeof(s_namespaces), 1, f) == 1;
+    fclose(f);
+    if (!ok) {
+        memset(s_namespaces, 0, sizeof(s_namespaces));
+    }
+    return ok;
+}
+
+/* Rewrites the backing file via temp + rename so a test process killed
+ * mid-write can only ever leave the old or the new image behind. */
+static bool persist_backing_file(void)
+{
+    if (s_backing_file[0] == '\0') {
+        return true;
+    }
+    char tmp[sizeof(s_backing_file) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", s_backing_file);
+    FILE *f = fopen(tmp, "wb");
+    if (f == NULL) {
+        return false;
+    }
+    bool ok = fwrite(s_namespaces, sizeof(s_namespaces), 1, f) == 1;
+    ok = (fclose(f) == 0) && ok;
+    return ok && rename(tmp, s_backing_file) == 0;
+}
+
 esp_err_t nvs_flash_init_partition(const char *partition_name)
 {
     (void)partition_name;
@@ -196,4 +241,56 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *out_value, si
 void nvs_close(nvs_handle_t handle)
 {
     (void)handle;
+}
+
+esp_err_t nvs_open(const char *namespace_name, nvs_open_mode_t open_mode, nvs_handle_t *out_handle)
+{
+    sim_namespace_t *n = find_ns("nvs", namespace_name, open_mode == NVS_READWRITE);
+    if (n == NULL) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    *out_handle = (nvs_handle_t)(n - s_namespaces) + 1;
+    return ESP_OK;
+}
+
+esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, size_t length)
+{
+    if (handle == 0 || handle > SIM_MAX_NAMESPACES || !s_namespaces[handle - 1].used) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (length > SIM_MAX_BLOB_LEN) {
+        return ESP_ERR_NVS_INVALID_LENGTH;
+    }
+    sim_entry_t *e = find_or_create_entry(&s_namespaces[handle - 1], key);
+    if (e == NULL) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    e->is_blob = true;
+    e->is_u16 = false;
+    e->blob_len = length;
+    if (length > 0) {
+        memcpy(e->blob, value, length);
+    }
+    return ESP_OK;
+}
+
+esp_err_t nvs_erase_key(nvs_handle_t handle, const char *key)
+{
+    sim_entry_t *e = lookup_entry(handle, key);
+    if (e == NULL) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    memset(e, 0, sizeof(*e));
+    return ESP_OK;
+}
+
+esp_err_t nvs_commit(nvs_handle_t handle)
+{
+    (void)handle;
+    esp_err_t err = s_forced_commit_error;
+    s_forced_commit_error = ESP_OK; /* one-shot */
+    if (err != ESP_OK) {
+        return err;
+    }
+    return persist_backing_file() ? ESP_OK : ESP_FAIL;
 }

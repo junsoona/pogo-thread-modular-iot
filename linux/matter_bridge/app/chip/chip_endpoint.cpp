@@ -17,6 +17,7 @@
 #include <data-model-providers/codegen/CodegenDataModelProvider.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
+#include <platform/CHIPDeviceConfig.h>
 #include <platform/DefaultTimerDelegate.h>
 
 using namespace chip;
@@ -256,11 +257,33 @@ void ChipEndpointManager::Init()
     aggregator_endpoint_id_ = 1;
 }
 
+uint16_t ChipEndpointManager::AllocateEmberIndex() const
+{
+    for (uint16_t index = 0; index < CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT; index++) {
+        bool in_use = false;
+        for (const auto &kv : modules_) {
+            if (kv.second->ember_index == index) {
+                in_use = true;
+                break;
+            }
+        }
+        if (!in_use) {
+            return index;
+        }
+    }
+    return kEmberInvalidEndpointIndex;
+}
+
 bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &update)
 {
     auto ep = std::make_unique<ModuleEndpoint>();
     ep->endpoint_id = update.endpoint_id;
-    ep->ember_index = next_ember_index_++;
+    ep->ember_index = AllocateEmberIndex();
+    if (ep->ember_index == kEmberInvalidEndpointIndex) {
+        ChipLogError(NotSpecified, "pogo_matter_bridge: no free dynamic endpoint slot for endpoint %u (%u in use)",
+                     (unsigned) ep->endpoint_id, (unsigned) modules_.size());
+        return false;
+    }
 
     Span<const EmberAfDeviceType> device_types;
     if (update.has_temperature_channel || update.has_humidity_channel) {
@@ -395,9 +418,107 @@ bool ChipEndpointManager::CreateEndpoint(const matter_bridge::ModuleUpdate &upda
     return true;
 }
 
+namespace {
+
+// Unregisters one lazily-created cluster from the codegen registry and
+// destroys it, exactly like examples/bridge-app/linux's Device::Unregister()
+// in v1.6.0.0. That SDK's ServerClusterInterfaceRegistry::Unregister() takes
+// the ServerClusterInterface* (not the registration) and returns
+// CHIP_ERROR_NOT_FOUND when the cluster is not registered -- treated as
+// already done, so neither a retry after a partial failure nor a cluster
+// whose Register() failed back in CreateEndpoint() can wedge the removal.
+// Returns false only for any other error, leaving the cluster constructed
+// (and registered) so the next attempt retries just this one. The default
+// kClusterShutdown (not kPermanentRemove) is deliberate: the same module_uuid
+// re-docking gets the same endpoint id back, and state a controller wrote
+// for it (BridgedDeviceBasicInformation's persisted NodeLabel/DeviceLocation,
+// keyed by endpoint id) must still be there.
+template <typename T>
+bool UnregisterAndDestroy(LazyRegisteredServerCluster<T> &cluster)
+{
+    if (!cluster.IsConstructed()) {
+        return true;
+    }
+    CHIP_ERROR err = CodegenDataModelProvider::Instance().Registry().Unregister(&cluster.Cluster());
+    if (err != CHIP_NO_ERROR && err != CHIP_ERROR_NOT_FOUND) {
+        LogErrorOnFailure(err);
+        return false;
+    }
+    cluster.Destroy();
+    return true;
+}
+
+} // namespace
+
+bool ChipEndpointManager::RemoveEndpoint(uint16_t endpoint_id)
+{
+    auto it = modules_.find(endpoint_id);
+    if (it == modules_.end()) {
+        // Already gone (an earlier attempt finished) or never created
+        // (CreateEndpoint() failed before inserting it): there is nothing
+        // left to tear down, so the removal is complete. Reporting failure
+        // here would make BridgeManager retry remove_endpoint forever.
+        return true;
+    }
+    ModuleEndpoint &ep = *it->second;
+
+    // Reverse of CreateEndpoint()'s registration order. A cluster that was
+    // never created for this module (no PM channel -> no pm*/air_quality)
+    // is skipped by UnregisterAndDestroy() itself.
+    bool all_ok = true;
+    all_ok = UnregisterAndDestroy(ep.illuminance) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.air_quality) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.pm10) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.pm25) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.pm1) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.humidity) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.temperature) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.identify) && all_ok;
+    all_ok = UnregisterAndDestroy(ep.basic_info) && all_ok;
+    if (!all_ok) {
+        // Keep the ember endpoint and the ModuleEndpoint (which still owns
+        // the clusters that remain registered): BridgeManager does not
+        // commit the removal, and the next pass retries only what is left.
+        ChipLogError(NotSpecified,
+                     "pogo_matter_bridge: failed to unregister some clusters of dynamic endpoint %u -- will retry",
+                     (unsigned) endpoint_id);
+        return false;
+    }
+
+    // v1.6.0.0 returns the EndpointId that was cleared, or 0 when the slot
+    // held no enabled endpoint (e.g. an earlier attempt already cleared it).
+    // Success is judged by the end state: endpoint_id no longer occupies any
+    // dynamic slot.
+    EndpointId cleared = emberAfClearDynamicEndpoint(ep.ember_index, MatterClusterShutdownType::kClusterShutdown);
+    if (emberAfGetDynamicIndexFromEndpoint(ep.endpoint_id) != kEmberInvalidEndpointIndex) {
+        ChipLogError(NotSpecified,
+                     "pogo_matter_bridge: dynamic endpoint %u still present after clearing ember index %u "
+                     "(cleared=%u) -- will retry",
+                     (unsigned) endpoint_id, (unsigned) ep.ember_index, (unsigned) cleared);
+        return false;
+    }
+
+    // EndpointStore's durable module_uuid -> endpoint_id reservation is not
+    // touched here, so a re-dock of the same module_uuid gets the same
+    // endpoint id (and, via AllocateEmberIndex(), may reuse this ember slot).
+    modules_.erase(it);
+    ChipLogProgress(NotSpecified, "pogo_matter_bridge: removed dynamic endpoint %u", (unsigned) endpoint_id);
+    return true;
+}
+
 matter_bridge::ApplyOutcome ChipEndpointManager::Apply(const matter_bridge::ModuleUpdate &update)
 {
     matter_bridge::ApplyOutcome outcome;
+
+    // This follow-up (POGO auto-registration/removal lifecycle): mutually
+    // exclusive with everything else in ModuleUpdate (see that field's own
+    // doc comment) -- a remove_endpoint update tears the endpoint down and
+    // is done, never falling through to the is_new_endpoint/field-push logic
+    // below.
+    if (update.remove_endpoint) {
+        outcome.endpoint_removed = RemoveEndpoint(update.endpoint_id);
+        return outcome;
+    }
 
     if (update.is_new_endpoint) {
         outcome.endpoint_created = CreateEndpoint(update);

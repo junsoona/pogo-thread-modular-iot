@@ -50,6 +50,11 @@ static outcome_entry_t s_queue[MAX_QUEUED];
 static int s_queue_len;
 static int s_queue_pos;
 static int s_send_count;
+/* Used only once the explicit queue is exhausted -- see
+ * host_pb_bridge_full_sim_set_default_*() in the header. OUTCOME kind -1
+ * (the default) keeps the original "under-queued is a test bug" abort. */
+static volatile int s_default_kind = -1;
+static volatile otCoapCode s_default_code;
 
 static host_pb_bridge_full_sim_sent_t s_captured[HOST_PB_BRIDGE_FULL_SIM_MAX_CAPTURED];
 static size_t s_captured_count;
@@ -63,6 +68,7 @@ void host_pb_bridge_full_sim_reset(void)
     s_queue_len = 0;
     s_queue_pos = 0;
     s_send_count = 0;
+    s_default_kind = -1;
     s_captured_count = 0;
     memset(s_captured, 0, sizeof(s_captured));
 }
@@ -130,6 +136,17 @@ void host_pb_bridge_full_sim_queue_send_failure(otError send_result)
     outcome_entry_t *e = push_outcome();
     e->kind = OUTCOME_SEND_FAILURE;
     e->err = send_result;
+}
+
+void host_pb_bridge_full_sim_set_default_response(otCoapCode response_code)
+{
+    s_default_code = response_code;
+    s_default_kind = OUTCOME_IMMEDIATE_RESPONSE;
+}
+
+void host_pb_bridge_full_sim_set_default_no_response(void)
+{
+    s_default_kind = OUTCOME_NO_RESPONSE;
 }
 
 void host_pb_bridge_full_sim_queue_no_response(void)
@@ -329,13 +346,21 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
     memcpy(cap->payload, message->payload, message->payload_len);
     cap->payload_len = message->payload_len;
 
-    if (s_queue_pos >= s_queue_len) {
+    outcome_entry_t default_entry = {0};
+    outcome_entry_t *e;
+    if (s_queue_pos < s_queue_len) {
+        e = &s_queue[s_queue_pos++];
+    } else if (s_default_kind >= 0) {
+        default_entry.kind = (outcome_kind_t)s_default_kind;
+        default_entry.err = OT_ERROR_NONE;
+        default_entry.code = s_default_code;
+        e = &default_entry;
+    } else {
         fprintf(stderr, "host_pb_bridge_full_sim: otCoapSendRequestWithParameters() call #%d with no queued "
                         "outcome -- the test scenario under-queued responses\n",
                 s_send_count);
         abort();
     }
-    outcome_entry_t *e = &s_queue[s_queue_pos++];
 
     if (e->kind == OUTCOME_SEND_FAILURE) {
         return e->err; /* caller (send_one_attempt()) frees the message itself on this path */

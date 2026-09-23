@@ -156,8 +156,25 @@ private:
     // comment for how this feeds matter_bridge::ApplyOutcome::endpoint_created.
     bool CreateEndpoint(const matter_bridge::ModuleUpdate &update);
 
+    // Mirror image of CreateEndpoint(): unregisters and destroys every
+    // cluster it created (reverse order), then clears the ember dynamic
+    // endpoint slot. Checked against connectedhomeip v1.6.0.0's
+    // ServerClusterInterfaceRegistry::Unregister(ServerClusterInterface *)
+    // -> CHIP_ERROR (CHIP_ERROR_NOT_FOUND if not registered) and
+    // emberAfClearDynamicEndpoint(uint16_t, MatterClusterShutdownType)
+    // -> EndpointId. Returns true once the endpoint is fully gone (including
+    // when endpoint_id is no longer tracked at all -- an already-finished
+    // removal); false leaves whatever is still registered in place for the
+    // next attempt (see the .cpp).
+    bool RemoveEndpoint(uint16_t endpoint_id);
+
+    // Lowest dynamic ember index (0..CHIP_DEVICE_CONFIG_DYNAMIC_ENDPOINT_COUNT-1)
+    // not held by a live ModuleEndpoint, or kEmberInvalidEndpointIndex. A
+    // removed module's slot is reused, so repeated detach/re-dock cycles
+    // never exhaust the dynamic endpoint table.
+    uint16_t AllocateEmberIndex() const;
+
     std::unordered_map<uint16_t, std::unique_ptr<ModuleEndpoint>> modules_; // keyed by chip::EndpointId
-    uint16_t next_ember_index_ = 0;
     chip::EndpointId aggregator_endpoint_id_ = chip::kInvalidEndpointId;
 };
 

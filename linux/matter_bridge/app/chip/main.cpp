@@ -279,11 +279,14 @@ void RegistryWatcherThreadMain()
         LogNewSensorBitmapMismatches(gBridgeManager->SensorBitmapMismatches());
 
         for (auto &update : updates) {
-            // Urgent: a brand-new endpoint or a Reachable (online<->offline)
-            // transition -- never held back by the SAMPLE-only rate limit
-            // (see matter_bridge::BridgeManager::TryBeginSchedule()'s own
-            // doc comment).
-            bool urgent = update.is_new_endpoint || update.reachable.has_value();
+            // Urgent: a brand-new endpoint, a Reachable (online<->offline)
+            // transition, or a confirmed removal (this follow-up: POGO
+            // auto-registration/removal lifecycle -- a removed module_uuid
+            // must have its Matter endpoint torn down promptly, never held
+            // back behind the SAMPLE-only rate limit) -- see
+            // matter_bridge::BridgeManager::TryBeginSchedule()'s own doc
+            // comment.
+            bool urgent = update.is_new_endpoint || update.reachable.has_value() || update.remove_endpoint;
             if (!gBridgeManager->TryBeginSchedule(update.module_uuid, urgent)) {
                 // Rate-limited (non-urgent, too soon since this uuid's last
                 // schedule) or a work item for this uuid is already in

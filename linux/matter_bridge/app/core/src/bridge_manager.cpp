@@ -217,6 +217,27 @@ std::optional<ModuleUpdate> BridgeManager::ComputeUpdateForModule(const Uuid &mo
     return std::nullopt;
 }
 
+// This follow-up: builds a remove_endpoint ModuleUpdate for module_uuid, or
+// std::nullopt if EndpointStore has no reservation for it at all (should not
+// happen for a uuid that has a last_applied_ entry -- an endpoint is never
+// created without one -- but handled defensively rather than asserted, same
+// policy as every other "should not happen" case in this class). A pure
+// in-memory EndpointStore::lookup() -- never file I/O -- so this is safe to
+// call from Reconcile()/ReconcileOne() without the "never while holding
+// mutex_" restriction get_or_assign() has.
+std::optional<ModuleUpdate> BridgeManager::MakeRemoveUpdate(const Uuid &module_uuid)
+{
+    std::optional<uint16_t> ep_id = endpoint_store_.lookup(module_uuid);
+    if (!ep_id.has_value()) {
+        return std::nullopt;
+    }
+    ModuleUpdate upd;
+    upd.module_uuid = module_uuid;
+    upd.endpoint_id = *ep_id;
+    upd.remove_endpoint = true;
+    return upd;
+}
+
 std::vector<ModuleUpdate> BridgeManager::Reconcile(const std::vector<ingest::NodeState> &snapshot)
 {
     std::unordered_map<Uuid, std::vector<const ingest::NodeState *>, UuidHash> by_module;
@@ -247,6 +268,29 @@ std::vector<ModuleUpdate> BridgeManager::Reconcile(const std::vector<ingest::Nod
         }
     }
 
+    // This follow-up (POGO auto-registration/removal lifecycle): any
+    // module_uuid with a confirmed endpoint (last_applied_) that is no
+    // longer present in `snapshot` AT ALL -- ingest::Registry::apply_removal()
+    // erased it -- gets a remove_endpoint update. Collected under mutex_
+    // (last_applied_ is only ever touched under it), but MakeRemoveUpdate()
+    // itself (EndpointStore::lookup(), pure in-memory) is called OUTSIDE the
+    // lock below, same discipline as get_or_assign() elsewhere in this class.
+    std::vector<Uuid> removed_uuids;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &kv : last_applied_) {
+            if (by_module.find(kv.first) == by_module.end()) {
+                removed_uuids.push_back(kv.first);
+            }
+        }
+    }
+    for (const auto &uuid : removed_uuids) {
+        std::optional<ModuleUpdate> upd = MakeRemoveUpdate(uuid);
+        if (upd.has_value()) {
+            updates.push_back(std::move(*upd));
+        }
+    }
+
     conflicted_ = std::move(still_conflicted);
     sensor_bitmap_mismatches_ = std::move(still_mismatched);
     return updates;
@@ -262,7 +306,22 @@ std::optional<ModuleUpdate> BridgeManager::ReconcileOne(const std::vector<ingest
         }
     }
     if (entries.empty()) {
-        return std::nullopt; // no longer (or never) present in this snapshot -- nothing to apply
+        // Not (or no longer) present in this snapshot. This follow-up: if
+        // this module_uuid HAD a confirmed endpoint, that absence is a real
+        // removal (ingest::Registry::apply_removal() erased it since this
+        // work item was scheduled) -- emit remove_endpoint instead of
+        // nothing. A module_uuid that never had an endpoint at all (no
+        // last_applied_ entry) still yields std::nullopt -- there is
+        // nothing to tear down.
+        bool had_endpoint;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            had_endpoint = last_applied_.find(module_uuid) != last_applied_.end();
+        }
+        if (!had_endpoint) {
+            return std::nullopt;
+        }
+        return MakeRemoveUpdate(module_uuid);
     }
     bool conflicted = false;
     // No mismatch tracking here -- see this method's own header doc comment:
@@ -284,6 +343,21 @@ std::optional<ModuleUpdate> BridgeManager::ReconcileOne(const std::vector<ingest
 void BridgeManager::CommitApplied(const Uuid &module_uuid, const ModuleUpdate &update, const ApplyOutcome &outcome)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (update.remove_endpoint) {
+        // See ModuleUpdate::remove_endpoint's own doc comment: only a
+        // CONFIRMED removal erases the entry; a failed one leaves it
+        // exactly as-is so the next Reconcile()/ReconcileOne() pass retries.
+        // schedule_state_ is deliberately left alone here (harmless if this
+        // uuid is ever re-attached: TryBeginSchedule() only ever reads
+        // in_flight/has_scheduled/last_scheduled, none of which needs
+        // resetting for a fresh module_uuid to schedule correctly again).
+        if (outcome.endpoint_removed) {
+            last_applied_.erase(module_uuid);
+        }
+        return;
+    }
+
     auto it = last_applied_.find(module_uuid);
     if (it == last_applied_.end()) {
         if (!(update.is_new_endpoint && outcome.endpoint_created)) {

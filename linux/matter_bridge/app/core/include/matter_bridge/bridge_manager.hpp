@@ -62,6 +62,26 @@ struct ModuleUpdate {
     // this struct.
     bool is_new_endpoint = false;
 
+    // This follow-up (POGO auto-registration/removal lifecycle): true iff
+    // this module_uuid HAD an endpoint (a confirmed last_applied_ entry) but
+    // is no longer present in the registry snapshot at all -- i.e.
+    // ingest::Registry::apply_removal() erased it (see that method's own doc
+    // comment), NEVER a mere online<->offline transition (an offline module
+    // stays in the snapshot and simply gets `reachable = false` above,
+    // exactly as before this follow-up). Mutually exclusive with
+    // is_new_endpoint and every has_*_channel/value field below, which are
+    // all left at their defaults on a remove_endpoint update -- the caller
+    // must tear the Matter dynamic endpoint down and nothing else. See
+    // BridgeManager::Reconcile()/ReconcileOne()'s own doc comments for
+    // exactly when this is emitted, and CommitApplied()'s own doc comment
+    // for how a confirmed removal is committed (erasing the last_applied_
+    // entry entirely, so a later re-attach is treated as a fresh
+    // is_new_endpoint again -- EndpointStore's own uuid->endpoint_id
+    // reservation is a COMPLETELY SEPARATE, durable mapping that this bridge
+    // never touches on removal, which is what makes the SAME module_uuid
+    // re-docking later get the SAME endpoint_id back, see endpoint_store.hpp).
+    bool remove_endpoint = false;
+
     // This module's fixed capability set for its ENTIRE lifetime (derived
     // from topology's sensor_bitmap the first time this module_uuid was
     // ever seen) -- which clusters the endpoint has at all. Only
@@ -109,6 +129,16 @@ struct ModuleUpdate {
 // (see chip/chip_endpoint.hpp's own ApplyOutcome-producing Apply()).
 struct ApplyOutcome {
     bool endpoint_created = false;
+    // This follow-up: set true iff a remove_endpoint update's Matter dynamic
+    // endpoint teardown genuinely succeeded -- see
+    // BridgeManager::CommitApplied()'s own doc comment: only then is the
+    // last_applied_ entry actually erased; a failed removal leaves it
+    // exactly as-is so the NEXT Reconcile()/ReconcileOne() pass (the
+    // module_uuid is still absent from the snapshot, still present in
+    // last_applied_) re-emits remove_endpoint for another attempt, the same
+    // retry-until-confirmed pattern every other field in this struct already
+    // has.
+    bool endpoint_removed = false;
     bool reachable_applied = false;
     bool temperature_applied = false;
     bool humidity_applied = false;
@@ -142,9 +172,24 @@ public:
     // with nothing new to say (already fully reflected in Matter, not newly
     // conflicted or resolved) never appears in the returned vector at all.
     //
+    // This follow-up (POGO auto-registration/removal lifecycle): ALSO
+    // compares last_applied_'s own keys against every module_uuid actually
+    // present in `snapshot` -- any module_uuid with a confirmed endpoint
+    // (last_applied_ entry) that is no longer present in `snapshot` AT ALL
+    // gets a remove_endpoint ModuleUpdate (see that field's own doc
+    // comment). This is exactly what a real ingest::Registry::apply_removal()
+    // looks like from this class's point of view: the uuid simply vanishes
+    // from the snapshot, never a lingering entry with reachable=false (that
+    // remains the ordinary offline case, unaffected by this).
+    //
     // Never calls into the Matter SDK. Does call EndpointStore::get_or_assign()
     // (file I/O) for a module_uuid seen for the first time -- never while
-    // holding mutex_, see this header's own top comment.
+    // holding mutex_, see this header's own top comment. A remove_endpoint
+    // update's endpoint_id comes from EndpointStore::lookup() instead (a
+    // pure in-memory read, never file I/O -- see that method's own doc
+    // comment) -- removal never touches EndpointStore's own persisted
+    // uuid->endpoint_id mapping at all (see ModuleUpdate::remove_endpoint's
+    // own doc comment on why that reservation must survive).
     std::vector<ModuleUpdate> Reconcile(const std::vector<ingest::NodeState> &snapshot);
 
     // Single-module_uuid variant of Reconcile(), same rules (including the
@@ -157,6 +202,12 @@ public:
     // registry's latest snapshot at the moment a scheduled work item
     // actually executes" true, rather than reusing a possibly-now-stale
     // snapshot from whenever ScheduleWork() was originally called.
+    //
+    // This follow-up: if module_uuid has no entries in `snapshot` at all
+    // (removed since this work item was scheduled) but DOES have a
+    // last_applied_ entry, this returns a remove_endpoint update instead of
+    // std::nullopt -- same removal detection as Reconcile(), just scoped to
+    // one module_uuid (see that method's own doc comment).
     std::optional<ModuleUpdate> ReconcileOne(const std::vector<ingest::NodeState> &snapshot, const Uuid &module_uuid);
 
     // Commits `update`'s fields into this bridge's own last-applied dedup
@@ -173,6 +224,18 @@ public:
     // failed ScheduleWork()/attribute setter -- see this header's own top
     // comment on why this used to happen (unconditionally, inside
     // Reconcile() itself) and no longer does.
+    //
+    // This follow-up: update.remove_endpoint with outcome.endpoint_removed
+    // == true ERASES the module_uuid's ENTIRE last_applied_ entry (the
+    // mirror image of a confirmed endpoint creation above) -- a later
+    // re-attach is then treated as a completely fresh is_new_endpoint,
+    // exactly as if this module_uuid had never been seen before (except
+    // EndpointStore's own separate, durable uuid->endpoint_id reservation,
+    // untouched either way, so it gets the SAME endpoint_id back). A FAILED
+    // removal (outcome.endpoint_removed == false) leaves last_applied_
+    // completely untouched, so the next Reconcile()/ReconcileOne() pass
+    // (module_uuid still absent from the snapshot, still in last_applied_)
+    // re-emits remove_endpoint for another attempt.
     void CommitApplied(const Uuid &module_uuid, const ModuleUpdate &update, const ApplyOutcome &outcome);
 
     // Returns true iff the caller (chip/main.cpp's registry watcher thread)
@@ -296,6 +359,11 @@ private:
     std::optional<ModuleUpdate> ComputeUpdateForModule(const Uuid &module_uuid,
                                                          const std::vector<const ingest::NodeState *> &entries,
                                                          bool *out_conflicted, bool *out_mismatched);
+
+    // This follow-up: builds a remove_endpoint ModuleUpdate for module_uuid
+    // from EndpointStore's own reservation -- see this method's own .cpp
+    // doc comment.
+    std::optional<ModuleUpdate> MakeRemoveUpdate(const Uuid &module_uuid);
 
     EndpointStore &endpoint_store_;
     mutable std::mutex mutex_;

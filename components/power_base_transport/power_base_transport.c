@@ -41,11 +41,16 @@ void power_base_transport_set_bridge_observer(const power_base_transport_bridge_
 
 /* A point-in-time (uuid, online) snapshot of every currently-valid registry
  * slot -- used to detect exactly which nodes' online flags flip false
- * across a mutating call (apply_report's internal cascade, a direct
- * downstream detach, or a stale sweep), so power_base_transport_bridge_observer_t's
- * on_node_offline can fire once per AFFECTED node without power_base_transport
- * needing topology_registry.c itself to report that list (which this
- * follow-up's own ground rules forbid modifying). */
+ * across power_base_transport_sweep_stale()'s own mutating call, so
+ * power_base_transport_bridge_observer_t's on_node_offline can fire once
+ * per AFFECTED node. Correction pass (this follow-up): the CONFIRMED-detach
+ * paths (a report-driven cascade, or a direct downstream detach) no longer
+ * use this diff technique at all -- they now call
+ * topology_registry_erase()/topology_registry_erase_cascade_children() and
+ * drain the exact affected-uuid list via topology_registry_drain_erased()
+ * instead (a before/after diff cannot work for an erase: an erased uuid is
+ * simply ABSENT from the "after" snapshot, not present-with-online=false).
+ * sweep_stale() is the ONLY remaining user of this snapshot-diff. */
 typedef struct {
     uint8_t uuid[TOPOLOGY_UUID_LEN];
     bool online;
@@ -284,6 +289,31 @@ static otCoapCode topology_result_to_coap_code(topology_registry_result_t r)
     }
 }
 
+/* Logs every uuid a confirmed detach just erased (one line each -- a rare
+ * transition) and hands it to the bridge observer. `reporter` is the node
+ * whose own topology report caused the erase, or NULL for this power base's
+ * own DOWNSTREAM detach. Called outside s_registry_mutex. */
+static void notify_removed(const uint8_t uuids[][TOPOLOGY_UUID_LEN], size_t n, const uint8_t *reporter)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (reporter == NULL) {
+            ESP_LOGW(TAG, "removed uuid=..%02x%02x (power base DOWNSTREAM detach cascade)", uuids[i][6], uuids[i][7]);
+        } else {
+            ESP_LOGW(TAG, "removed uuid=..%02x%02x (confirmed detach reported by ..%02x%02x)", uuids[i][6],
+                     uuids[i][7], reporter[6], reporter[7]);
+        }
+        if (s_observer.on_node_removed != NULL) {
+            s_observer.on_node_removed(uuids[i], s_observer.ctx);
+        }
+    }
+    if (n > 0 && s_observer.on_node_removed == NULL) {
+        ESP_LOGW(TAG, "no bridge observer registered -- %u removal(s) will NOT be reported to Linux "
+                      "(linux_bridge_exporter disabled or not started)",
+                 (unsigned)n);
+    }
+}
+
+
 static void coap_topology_handler(void *ctx, otMessage *message, const otMessageInfo *message_info)
 {
     (void)ctx;
@@ -296,37 +326,42 @@ static void coap_topology_handler(void *ctx, otMessage *message, const otMessage
         topology_report_t report;
         if (read == len && topology_report_unpack(buf, len, &report)) {
             uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            /* Snapshotted/fired OUTSIDE the mutex below -- see
-             * notify_newly_offline()'s own comment. Declared here (rather
-             * than only inside the `if (xSemaphoreTake(...))` block) so they
-             * stay in scope for the observer calls after that block ends. */
-            online_snapshot_entry_t before[TOPOLOGY_REGISTRY_MAX_NODES];
-            online_snapshot_entry_t after[TOPOLOGY_REGISTRY_MAX_NODES];
-            size_t before_n = 0, after_n = 0;
-            bool have_snapshots = false;
             topology_registry_entry_t applied_entry;
             bool have_applied_entry = false;
+            /* Correction pass (this follow-up: POGO removal survives a
+             * Linux ingest restart): topology_registry_apply_report() now
+             * ERASES (never merely offlines) a confirmed detach's target(s)
+             * -- see topology_registry.h's own top comment -- and records
+             * every erased uuid into its own pending_erased side-channel,
+             * drained here (still under s_registry_mutex, so nothing
+             * erased by this call is ever lost between the apply and the
+             * drain). This entirely replaces the old before/after
+             * online-snapshot diff (notify_newly_removed()), which depended
+             * on erased entries still being findable afterward -- they
+             * no longer are, by design. */
+            uint8_t erased_uuids[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+            size_t erased_n = 0;
+            bool have_erased = false;
             topology_registry_result_t result = TOPOLOGY_REGISTRY_ERR_FULL; /* only used if the mutex is acquired */
 
             if (xSemaphoreTake(s_registry_mutex, REGISTRY_MUTEX_WAIT) == pdTRUE) {
-                /* Captured BEFORE apply_report() so any cascade it triggers
-                 * internally (a DETACHED report, or downstream_connected
-                 * transitioning true->false -- see topology_registry.h's own
-                 * top comment) can be detected below, without
-                 * topology_registry.c itself needing to report the affected
-                 * list (this follow-up's own ground rules forbid modifying
-                 * it). */
-                before_n = snapshot_online_states(before);
                 result = topology_registry_apply_report(&s_registry, &report, s_power_base_uuid, now_ms);
                 if (result == TOPOLOGY_REGISTRY_OK) {
+                    /* NULL here exactly when report.report_type ==
+                     * TOPOLOGY_REPORT_DETACHED (the reporting node erased
+                     * itself) -- on_topology_applied simply does not fire
+                     * for that case; its own removal is fully conveyed via
+                     * on_node_removed below instead (see erased_uuids,
+                     * which always includes the reporter itself for a
+                     * DETACHED report). */
                     const topology_registry_entry_t *e = topology_registry_find(&s_registry, report.module_uuid);
                     if (e != NULL) {
                         applied_entry = *e;
                         have_applied_entry = true;
                     }
                 }
-                after_n = snapshot_online_states(after);
-                have_snapshots = true;
+                erased_n = topology_registry_drain_erased(&s_registry, erased_uuids, TOPOLOGY_REGISTRY_MAX_NODES);
+                have_erased = true;
                 xSemaphoreGive(s_registry_mutex);
                 code = topology_result_to_coap_code(result);
                 if (!topology_registry_result_is_ok(result)) {
@@ -355,11 +390,11 @@ static void coap_topology_handler(void *ctx, otMessage *message, const otMessage
             /* Bridge observer notifications -- entirely outside the mutex,
              * see power_base_transport.h's own doc comment on when these
              * fire. */
-            if (have_snapshots) {
-                notify_newly_offline(before, before_n, after, after_n, report.module_uuid);
-            }
             if (have_applied_entry && s_observer.on_topology_applied != NULL) {
                 s_observer.on_topology_applied(&applied_entry, s_observer.ctx);
+            }
+            if (have_erased) {
+                notify_removed(erased_uuids, erased_n, report.module_uuid);
             }
         } else {
             ESP_LOGW(TAG, "malformed topology report payload (len=%u) -- dropped", (unsigned)len);
@@ -430,23 +465,27 @@ void power_base_transport_on_direct_downstream_detached(void)
     if (s_registry_mutex == NULL || xSemaphoreTake(s_registry_mutex, REGISTRY_MUTEX_WAIT) != pdTRUE) {
         return;
     }
-    online_snapshot_entry_t before[TOPOLOGY_REGISTRY_MAX_NODES];
-    online_snapshot_entry_t after[TOPOLOGY_REGISTRY_MAX_NODES];
-    size_t before_n = snapshot_online_states(before);
     for (size_t i = 0; i < TOPOLOGY_REGISTRY_MAX_NODES; i++) {
         topology_registry_entry_t e;
         if (topology_registry_get(&s_registry, i, &e) && e.depth == 1 && e.online) {
-            topology_registry_mark_offline(&s_registry, e.module_uuid);
+            /* Correction pass (this follow-up: POGO removal survives a
+             * Linux ingest restart): ERASES this node and its whole
+             * subtree entirely (topology_registry_erase(), never merely
+             * topology_registry_mark_offline()'s old "online=false
+             * forever") -- this power base's own hardware-debounced
+             * DETECT_IN edge on its DOWNSTREAM port is an unambiguous,
+             * confirmed physical POGO detach, never a stale-sweep
+             * artifact. */
+            topology_registry_erase(&s_registry, e.module_uuid);
         }
     }
-    size_t after_n = snapshot_online_states(after);
+    uint8_t erased_uuids[TOPOLOGY_REGISTRY_MAX_NODES][TOPOLOGY_UUID_LEN];
+    size_t erased_n = topology_registry_drain_erased(&s_registry, erased_uuids, TOPOLOGY_REGISTRY_MAX_NODES);
     xSemaphoreGive(s_registry_mutex);
-    ESP_LOGW(TAG, "direct DOWNSTREAM POGO detach -- depth=1 node(s) and their whole subtree marked offline");
-    /* NULL skip_uuid: unlike coap_topology_handler's report-driven path,
-     * there is no single "reporting node" to exclude here -- every node
-     * that actually flipped offline (the direct child(ren) themselves AND
-     * their whole cascaded subtree) is a bridge-observer event. */
-    notify_newly_offline(before, before_n, after, after_n, NULL);
+    if (erased_n > 0) {
+        ESP_LOGW(TAG, "direct DOWNSTREAM POGO detach -- depth=1 node(s) and their whole subtree REMOVED (erased)");
+    }
+    notify_removed(erased_uuids, erased_n, NULL);
 }
 
 void power_base_transport_sweep_stale(uint32_t now_ms, uint32_t stale_timeout_ms)
