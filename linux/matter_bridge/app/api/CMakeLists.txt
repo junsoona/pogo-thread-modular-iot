@@ -48,6 +48,8 @@ add_library(pogohome_api STATIC
     src/json_snapshot.cpp
     src/interface_address.cpp
     src/http_server.cpp
+    src/hub_identity.cpp
+    src/mdns_advertiser.cpp
     ${REPO_ROOT}/linux/matter_bridge/ingest/src/registry.cpp
 )
 target_include_directories(pogohome_api PUBLIC
@@ -61,7 +63,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(pogohome_api PUBLIC Threads::Threads)
+target_link_libraries(pogohome_api PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 enable_testing()
 
@@ -70,6 +72,9 @@ add_executable(pogohome_api_unit_tests
     tests/test_json_snapshot.cpp
     tests/test_interface_address.cpp
     tests/test_http_server.cpp
+    tests/test_multi_power_base.cpp
+    tests/test_hub_identity.cpp
+    tests/test_mdns_advertiser.cpp
     tests/test_main.cpp
 )
 target_link_libraries(pogohome_api_unit_tests PRIVATE pogohome_api)

@@ -94,6 +94,10 @@ add_executable(ingest_registry_removal_test tests/test_registry_removal.cpp)
 target_link_libraries(ingest_registry_removal_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_registry_removal_test COMMAND ingest_registry_removal_test)
 
+add_executable(ingest_registry_multi_power_base_test tests/test_registry_multi_power_base.cpp src/server.cpp)
+target_link_libraries(ingest_registry_multi_power_base_test PRIVATE ingest_core Threads::Threads)
+add_test(NAME ingest_registry_multi_power_base_test COMMAND ingest_registry_multi_power_base_test)
+
 add_executable(ingest_loopback_test tests/test_loopback.cpp src/server.cpp)
 target_link_libraries(ingest_loopback_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_loopback_test COMMAND ingest_loopback_test)

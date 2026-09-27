@@ -49,6 +49,7 @@ as it always has if `--api-interface` is omitted):
 ```text
 --api-interface <ifname>   Linux network interface to bind the API server to (e.g. wlp5s0). Disabled if omitted.
 --api-port <port>          TCP port, 1..65535 (default: 8787). Only meaningful with --api-interface.
+--api-no-advertise         Do not announce the API over Bonjour (see "Bonjour" below). Advertised by default.
 ```
 
 `8787` was chosen because it collides with neither the ingest CoAP port
@@ -89,14 +90,32 @@ unknown path is `404 Not Found`.
   "schema_version": 1,
   "service": "pogohome",
   "registry_generation": 42,
-  "module_count": 2
+  "module_count": 2,
+  "power_base_count": 1,
+  "hub_id": "3f0c9a4e8b1d4c2a9e7f6b5a4d3c2b1a"
 }
 ```
 
+`hub_id` (Bonjour revision, additive) is this hub's stable identity: 32
+lowercase hex digits generated once from `/dev/urandom` and kept in
+`<--state-dir>/hub_id` (mode 0600, next to `endpoint_map.bin`). It survives
+restarts and never depends on the IP address, port, host name or Bonjour
+service name. A client compares it with the `hub_id` of the Bonjour
+announcement it followed (or the one it remembers) and refuses to connect
+when they differ. A `hub_id` file that exists but is malformed stops the
+bridge at startup instead of being replaced, like a damaged
+`endpoint_map.bin`: a new id would make every client that remembers the hub
+stop recognizing it. Deleting the file on purpose gives the hub a new
+identity, which clients treat as a different hub.
+
 `registry_generation` is `ingest::Registry::generation()` -- a counter bumped
 once per genuinely-new topology/sample applied (never for a duplicate or
-rejected report). `module_count` counts modules the Registry currently has
-topology for (regardless of online/offline).
+rejected report), and once when a Power Base is first heard from or changes
+between online and offline (see "Power Bases" below). `module_count` counts
+distinct modules the Registry currently has topology for (regardless of
+online/offline) -- the same set `/api/v1/snapshot` lists. `power_base_count`
+(multi-Power-Base revision) counts the Power Bases in the snapshot's
+`power_bases` array.
 
 ### `GET /api/v1/snapshot`
 
@@ -107,9 +126,14 @@ The full current state in one response:
   "schema_version": 1,
   "generated_at_unix_ms": 1732000000000,
   "registry_generation": 42,
+  "power_bases": [
+    {"uuid": "744dbdfffe650a00", "online": true, "module_count": 1, "online_module_count": 1}
+  ],
   "modules": [
     {
       "uuid": "744dbdfffe65d357",
+      "power_base_uuid": "744dbdfffe650a00",
+      "parent_uuid": "744dbdfffe650a00",
       "online": true,
       "depth": 1,
       "role": "intermediate",
@@ -141,6 +165,8 @@ one, and this API never fabricates one for an individual reading.
 | field           | source (`ingest::NodeState`)         | notes |
 |-----------------|---------------------------------------|-------|
 | `uuid`          | `module_uuid`                         | full 8 bytes, lowercase hex, 16 characters -- never truncated |
+| `power_base_uuid` | `power_base_uuid`                   | the Power Base this module is docked under (multi-Power-Base revision) -- see "Power Bases" |
+| `parent_uuid`   | `parent_uuid`                         | the module's POGO parent: equal to `power_base_uuid` for a module docked directly on the Base (depth 1), otherwise the upstream module's `uuid` (multi-Power-Base revision) |
 | `online`        | `online`                              | |
 | `depth`         | `depth`                               | hops from the power base; the power base's direct child reports `1` |
 | `role`          | `role` (`topology_role_t`)            | `unassigned` \| `root` \| `intermediate` \| `leaf` \| `error` |
@@ -156,6 +182,69 @@ object here always has a valid `uuid`/`online`/`depth`/`role`/`sensor_bitmap`/
 Linux Registry at all** -- this API does not invent them; a future milestone
 that adds user-assigned names will add those fields once there is a real
 place to read them from.
+
+#### Power Bases (multi-Power-Base revision)
+
+One Linux bridge instance receives from any number of Power Bases: the ingest
+CoAP server answers every datagram on its interface/port regardless of
+sender, and every `bridge_export_proto` message (SAMPLE, TOPOLOGY_SNAPSHOT,
+HEARTBEAT, TOPOLOGY_REMOVED) has always carried the sending Base's
+`power_base_uuid` -- the Base's own eFuse EUI-64
+(`power_base/main/app_main.c`). No firmware or wire-format change was needed.
+
+**Where module membership comes from.** A module belongs to the Base whose
+`topology_registry` accepted its `/t` report and exported it. The module only
+sends to the collector it was given over the POGO wire (`SET_COLLECTOR`,
+which carries that Base's UUID and Mesh-Local EID), and the Base's registry
+rejects a depth-1 report whose `parent_uuid` is not the Base itself
+(`TOPOLOGY_REGISTRY_ERR_DEPTH1_BAD_PARENT`). The API never infers membership
+from `depth` or from the module UUID.
+
+`power_bases` lists every Base the Registry has heard from since the bridge
+started, in first-heard order (order carries no meaning):
+
+| field                 | notes |
+|-----------------------|-------|
+| `uuid`                | the Base's EUI-64, 16 lowercase hex characters |
+| `online`              | a HEARTBEAT (every 10 s) or any accepted message from this Base within the Registry's stale timeout (120 s, the same bound as modules) |
+| `module_count`        | modules in this snapshot's `modules` whose `power_base_uuid` is this Base |
+| `online_module_count` | how many of those are `online` |
+
+A Base appears as soon as its first HEARTBEAT arrives, before any module is
+docked. Bases are not removed while the bridge runs (there is no Base
+tombstone); after a bridge restart a Base reappears on its next heartbeat.
+The Registry tracks at most 16 Bases; a new Base evicts the oldest offline
+Base that has no modules left. If none can be evicted, the Base is not tracked,
+but its modules are still applied, and the API derives its `power_bases` entry
+from them. That entry is `online` exactly when one of its modules is online, since
+an online module means the bridge accepted that Base's message within the
+timeout.
+
+**When a Base goes silent.** The Base, and each of its modules, turn
+`online:false` when nothing has been heard for the stale timeout, both through
+the same background sweep, so SSE sends one new snapshot. Nothing is removed
+and module names and rooms are untouched. A module is offline *because of its
+Base* when its own `online` is false and its Base's `online` is false. The
+bridge cannot know more than that (modules report to their Base, not to
+Linux). When the Base's link comes back, its unchanged periodic resync
+(same session and sequence, `online:true`) now restores those modules to
+online immediately. Before this revision they stayed offline until the module
+sent a report with a new sequence.
+
+**One module, one entry.** The Registry keys nodes by (Base, module). A module
+physically moved from Base A to Base B is briefly listed by both, because A
+reports it offline only after its own sweep or detach tombstone. The API lists each
+`uuid` exactly once: the online entry wins over an offline one, and between
+two online (or two offline) entries the most recent physical attach wins.
+The Registry stamps an increasing `attach_order` whenever a report brings a node online.
+A detach tombstone from Base A now removes only A's entry. Before this
+revision it removed the module under every Base, so a late tombstone from the
+old Base briefly deleted a module already docked on the new one. With a single
+Base both rules behave exactly as before.
+
+The Matter bridge is unchanged: endpoint IDs stay keyed by module UUID only
+(`endpoint_map.bin`), so a module keeps its endpoint across Bases, and
+`BridgeManager` still withholds updates while two Bases both report it online.
 
 #### Reading fields
 
@@ -212,6 +301,72 @@ reconstructs the original integer exactly:
   decimal digits (e.g. `23400` -> `23.400`).
 - `scale == 2` (MICRO): `value = raw_value / 1000000`, printed with exactly
   6 decimal digits.
+
+### Compatibility and versioning policy
+
+- `schema_version` changes only for a **breaking** change (a field removed,
+  renamed, or its meaning/type changed). Clients must reject a
+  `schema_version` they don't know.
+- Adding fields is **not** breaking and keeps `schema_version`. Clients must
+  ignore unknown fields. The Bonjour revision's health `hub_id` is such an
+  additive change; without a hub_id the served health JSON is byte-for-byte
+  the previous shape (host test `test_hub_identity.cpp`). The multi-Power-Base revision is such an additive
+  change: `power_bases`, module `power_base_uuid`/`parent_uuid`, and health
+  `power_base_count`. Every pre-existing field keeps its name, type, value, and
+  position. A host test (`app/api/tests/test_multi_power_base.cpp`) removes
+  only the added fields from a single-Base snapshot and compares the rest
+  byte for byte with the pre-revision output.
+- A client detects the revision by the presence of `power_bases`. Absent means
+  "this bridge does not report Power Bases", not "no Power Bases". PogoHome
+  iOS decodes all three fields as optional and keeps working against an older
+  bridge.
+- Old clients keep working against a new bridge. The one observable
+  difference is that a module moved between Bases is now always listed once. An older
+  bridge could list the same `uuid` twice in that window, and
+  PogoHome iOS rejects a snapshot with duplicate module UUIDs.
+
+### Example: two Power Bases
+
+Real output of this server (`BuildSnapshotJson` via `pogohome_api::Server`)
+fed by two simulated Bases over the real UDP/CoAP ingest path on loopback,
+only the first reading of each module kept (`...`). Base `..0a00` has an SHT45 module with a PMS5003 behind it.
+Base `..0b00` has the same two sensor kinds:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at_unix_ms": 1790154064727,
+  "registry_generation": 72,
+  "power_bases": [
+    {"uuid": "744dbdfffe650a00", "online": true, "module_count": 2, "online_module_count": 2},
+    {"uuid": "744dbdfffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
+  ],
+  "modules": [
+    {"uuid": "744dbdfffe650a01", "power_base_uuid": "744dbdfffe650a00", "parent_uuid": "744dbdfffe650a00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
+     "readings": [{"kind": "temperature", "raw_value": 22270, "scale": 1, "value": 22.270, "unit": "celsius", "status": "ok", "sample_seq": 27}, ...]},
+    {"uuid": "744dbdfffe650a02", "power_base_uuid": "744dbdfffe650a00", "parent_uuid": "744dbdfffe650a01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
+     "readings": [{"kind": "pm1", "raw_value": 4, "scale": 3, "value": 4, "unit": "ug/m3", "status": "ok", "sample_seq": 27}, ...]},
+    {"uuid": "744dbdfffe650b01", "power_base_uuid": "744dbdfffe650b00", "parent_uuid": "744dbdfffe650b00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
+     "readings": [{"kind": "temperature", "raw_value": 22060, "scale": 1, "value": 22.060, "unit": "celsius", "status": "ok", "sample_seq": 6}, ...]},
+    {"uuid": "744dbdfffe650b02", "power_base_uuid": "744dbdfffe650b00", "parent_uuid": "744dbdfffe650b01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
+     "readings": [{"kind": "pm1", "raw_value": 4, "scale": 3, "value": 4, "unit": "ug/m3", "status": "ok", "sample_seq": 6}, ...]}
+  ]
+}
+```
+
+Once Base `..0a00` has been silent for the stale timeout (120 s in
+production), the next SSE snapshot carries the following. This is the shape asserted by the
+host test `test_multi_power_base.cpp`:
+
+```json
+"power_bases": [
+  {"uuid": "744dbdfffe650a00", "online": false, "module_count": 2, "online_module_count": 0},
+  {"uuid": "744dbdfffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
+]
+```
+
+and both `..0a0x` modules have `"online": false`, with their readings kept as
+the last values received.
 
 ### `GET /api/v1/events` (Server-Sent Events)
 
@@ -285,11 +440,68 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<LAN-address>:8787/no-such-path 
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://<LAN-address>:8787/api/v1/health  # 405
 ```
 
+## Bonjour
+
+While the API is enabled, `pogo_matter_bridge` announces it over DNS-SD/mDNS
+so a client on the same LAN can find the hub without its address
+(implementation: `app/api/include/pogohome_api/mdns_advertiser.hpp`).
+
+| | |
+|---|---|
+| service type | `_jogakbo._tcp` (project-specific; this is the Linux sensor hub's HTTP API only -- never a Power Base or a sensor module) |
+| instance name | `Jogakbo Hub (<short host name>)`; avahi's alternative name (`... #2`) after a name conflict. Display only. |
+| port | the API's real bound port (`--api-port`) |
+| interface | `--api-interface` only (its interface index), IPv4 or IPv6 to match the API's bound address |
+| TXT | `txtvers=1`, `api=1` (the API major version = `schema_version`), `path=/api/v1`, `hub_id=<hub_id>` |
+
+How it is published: through the host's existing **avahi-daemon**, the same
+daemon connectedhomeip's Linux platform mDNS uses, as one entry group on a
+separate avahi client connection. That group only holds this one service: the
+bridge does not register a host name and never touches the Matter
+(`_matter._tcp`, `_matterc._udp`) or OTBR (`_meshcop._udp`, SRP) records.
+`libavahi-client.so.3` is loaded with `dlopen()`, so there is no new build
+dependency (no Avahi headers), and a host without Avahi still runs the bridge
+and its API unadvertised (a `Bonjour: not advertising (...)` line on stderr).
+
+When it is announced:
+
+- only after the API server is listening, and only while it can take
+  requests: the acceptor is running and the bound address is still on
+  `--api-interface` (re-checked every 5 s). Otherwise the record is withdrawn
+  and it comes back when both hold again;
+- on shutdown (SIGINT/SIGTERM) the record is withdrawn before the API server
+  stops. If the process dies without that, avahi-daemon drops the record when
+  its D-Bus connection closes, so a dead bridge never stays announced;
+- avahi-daemon restarting (or not running yet) is survived: the record is
+  registered again when the daemon is back, without restarting the bridge;
+- a name conflict renames the instance; clients identify the hub by `hub_id`,
+  never by the name.
+
+Announcing does not change the trust boundary above: the API was already
+reachable by anyone on the LAN; Bonjour only tells them where it is. It is
+still never announced beyond the one `--api-interface`.
+
+There is no child process (`avahi-publish`), no systemd `.service` file under
+`/etc/avahi/services` and no configuration change. `--api-no-advertise` turns
+the announcement off.
+
+Checking it on the Linux host:
+
+```sh
+avahi-browse -rt _jogakbo._tcp          # needs avahi-utils
+journalctl -u pogo-matter-bridge -o cat | grep -E 'hub_id|Bonjour'
+curl -s http://<LAN-address>:8787/api/v1/health   # hub_id equals the TXT hub_id
+```
+
+From a Mac on the same network: `dns-sd -B _jogakbo._tcp` and
+`dns-sd -L "<instance name>" _jogakbo._tcp`.
+
 ## Future work
 
-- Bonjour/mDNS advertisement (`_pogohome._tcp`) so a client never needs to be
-  told the LAN address by hand.
 - Authentication (this API has none today -- see "Trust boundary" above).
+- Registering a Power Base from a client. The API is read-only. A Base is
+  registered by flashing its firmware and `cfg` image (see
+  [`power-base.md`](power-base.md) "여러 Power Base 추가").
 - The PogoHome iOS app (`pogo-sensor-ios`, a separate repository) connecting
   to this API is its own, later milestone -- this follow-up only implements
   and documents the server side.

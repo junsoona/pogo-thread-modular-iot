@@ -48,9 +48,21 @@ void Registry::sweep_thread_main()
 
 void Registry::sweep_stale_locked(std::chrono::steady_clock::time_point now)
 {
+    bool base_demoted = false;
+    for (auto &b : power_bases_) {
+        if (b.online && (now - b.last_seen_at > stale_timeout_)) {
+            b.online = false;
+            base_demoted = true;
+            std::printf("[power-base] ");
+            print_uuid_suffix("pb", b.power_base_uuid);
+            std::printf(" online=0 -- stale: nothing heard in over %lldms\n", (long long)stale_timeout_.count());
+        }
+    }
+    bool node_demoted = false;
     for (auto &n : nodes_) {
         if (n.online && (now - n.last_seen_at > stale_timeout_)) {
             n.online = false;
+            n.stale_demoted = true;
             std::printf("[topology] ");
             print_uuid_suffix("pb", n.power_base_uuid);
             std::printf(" ");
@@ -58,8 +70,14 @@ void Registry::sweep_stale_locked(std::chrono::steady_clock::time_point now)
             std::printf(" online=0 -- stale: no accepted message in over %lldms (bound=%lldms)\n",
                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - n.last_seen_at).count(),
                         (long long)stale_timeout_.count());
+            node_demoted = true;
             note_applied_locked();
         }
+    }
+    if (base_demoted && !node_demoted) {
+        // A Base with no (still-online) nodes went quiet: one bump for the
+        // pass. When nodes went offline too, their bumps already cover it.
+        note_applied_locked();
     }
 }
 
@@ -80,7 +98,7 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto removed_it = std::find(removed_.begin(), removed_.end(), module_uuid);
+    auto removed_it = std::find(removed_.begin(), removed_.end(), std::make_pair(power_base_uuid, module_uuid));
     if (removed_it != removed_.end()) {
         if (!online) {
             // A stale resync of the long-offline entry the Power Base's own
@@ -116,6 +134,10 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
         n->has_topology = true;
         n->parent_uuid = parent_uuid;
         n->online = online;
+        n->stale_demoted = false;
+        if (online) {
+            n->attach_order = ++attach_counter_;
+        }
         n->depth = depth;
         n->role = role;
         n->sensor_bitmap = sensor_bitmap;
@@ -124,6 +146,7 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
         n->last_seq = last_seq;
         n->has_superseded_generation = false;
         n->last_seen_at = now;
+        (void)note_power_base_seen_locked(power_base_uuid, now); // covered by the bump below
         note_applied_locked();
         return ApplyResult::AppliedNew;
     }
@@ -141,19 +164,37 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
             // re-sending unchanged state) -- refresh liveness even though
             // nothing else about the stored state changes.
             n->last_seen_at = now;
+            bool base_changed = note_power_base_seen_locked(power_base_uuid, now);
+            if (n->stale_demoted && online) {
+                // Only this host's own timeout had turned it offline; the
+                // Power Base still reports the same online state, so its
+                // link to this host is back (see NodeState::stale_demoted).
+                n->online = true;
+                n->stale_demoted = false;
+                note_applied_locked();
+                return ApplyResult::AppliedNew;
+            }
+            if (base_changed) {
+                note_applied_locked();
+            }
             return ApplyResult::DuplicateExact;
         }
         if (last_seq < n->last_seq) {
             return ApplyResult::StaleSession;
         }
+        if (online && !n->online && !n->stale_demoted) {
+            n->attach_order = ++attach_counter_;
+        }
         n->parent_uuid = parent_uuid;
         n->online = online;
+        n->stale_demoted = false;
         n->depth = depth;
         n->role = role;
         n->sensor_bitmap = sensor_bitmap;
         n->downstream_connected = downstream_connected;
         n->last_seq = last_seq;
         n->last_seen_at = now;
+        (void)note_power_base_seen_locked(power_base_uuid, now); // covered by the bump below
         note_applied_locked();
         return ApplyResult::AppliedNew;
     }
@@ -176,14 +217,19 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
     n->superseded_generation = n->boot_session_generation;
     n->has_superseded_generation = true;
     n->boot_session_generation = boot_session_generation;
+    if (online) {
+        n->attach_order = ++attach_counter_;
+    }
     n->parent_uuid = parent_uuid;
     n->online = online;
+    n->stale_demoted = false;
     n->depth = depth;
     n->role = role;
     n->sensor_bitmap = sensor_bitmap;
     n->downstream_connected = downstream_connected;
     n->last_seq = last_seq;
     n->last_seen_at = now;
+    (void)note_power_base_seen_locked(power_base_uuid, now); // covered by the bump below
     note_applied_locked();
     return ApplyResult::AppliedNew;
 }
@@ -191,10 +237,16 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
 ApplyResult Registry::apply_removal(const Uuid &power_base_uuid, const Uuid &module_uuid,
                                      std::chrono::steady_clock::time_point now)
 {
-    (void)now; // no liveness bookkeeping for a removal -- see this method's own doc comment
     std::lock_guard<std::mutex> lock(mutex_);
+    // The tombstone proves its Power Base is alive; it says nothing about the
+    // removed module's own liveness.
+    bool base_changed = note_power_base_seen_locked(power_base_uuid, now);
 
-    if (std::find(removed_.begin(), removed_.end(), module_uuid) != removed_.end()) {
+    const auto key = std::make_pair(power_base_uuid, module_uuid);
+    if (std::find(removed_.begin(), removed_.end(), key) != removed_.end()) {
+        if (base_changed) {
+            note_applied_locked();
+        }
         // Idempotent duplicate -- see this method's own doc comment: no
         // second erase, no second generation() bump.
         std::printf("[topology-removed] ");
@@ -214,14 +266,16 @@ ApplyResult Registry::apply_removal(const Uuid &power_base_uuid, const Uuid &mod
         removed_.erase(removed_.begin());
     }
 
-    // Erase EVERY node matching this module_uuid, regardless of which
-    // power_base_uuid it was stored under -- "removed" is a property of the
-    // module itself, not of a specific (power_base_uuid, module_uuid) pair
-    // (see this header's own top comment).
+    // Erase only this Power Base's node for module_uuid: a detach confirmed
+    // by one Base must not remove the same module already docked to another
+    // (see apply_removal()'s own doc comment). With a single Base this is
+    // the same set of nodes the earlier module-wide erase removed.
     nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(),
-                                 [&module_uuid](const NodeState &n) { return n.module_uuid == module_uuid; }),
+                                 [&](const NodeState &n) {
+                                     return n.power_base_uuid == power_base_uuid && n.module_uuid == module_uuid;
+                                 }),
                  nodes_.end());
-    removed_.push_back(module_uuid);
+    removed_.push_back(key);
 
     std::printf("[topology-removed] ");
     print_uuid_suffix("pb", power_base_uuid);
@@ -275,6 +329,9 @@ ApplyResult Registry::apply_sample(const Uuid &power_base_uuid, const Uuid &modu
         // Same rationale as apply_topology()'s own DuplicateExact branch:
         // still a real, just-received message proving liveness now.
         n->last_seen_at = now;
+        if (note_power_base_seen_locked(power_base_uuid, now)) {
+            note_applied_locked();
+        }
         return ApplyResult::DuplicateExact;
     }
 
@@ -283,19 +340,66 @@ ApplyResult Registry::apply_sample(const Uuid &power_base_uuid, const Uuid &modu
     n->last_sample_uptime_ms = uptime_ms;
     n->last_channels = channels;
     n->last_seen_at = now;
+    (void)note_power_base_seen_locked(power_base_uuid, now); // covered by the bump below
     note_applied_locked();
     return ApplyResult::AppliedNew;
 }
 
-void Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms*/, uint16_t /*node_count*/)
+void Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms*/, uint16_t /*node_count*/,
+                               std::chrono::steady_clock::time_point now)
 {
-    // Deliberately a no-op on node state today (see this header's own doc
-    // comment: never authoritative) -- kept as an explicit method rather
-    // than silently dropping HEARTBEAT messages at the call site, so a
-    // future revision that wants to track "Power Base last-heard-from" has
-    // one obvious place to add it. power_base_uuid is intentionally unused
-    // for now.
-    (void)power_base_uuid;
+    // Still never touches node state (see this header's own doc comment:
+    // never authoritative for modules) -- only the Power Base's own record.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (note_power_base_seen_locked(power_base_uuid, now)) {
+        note_applied_locked();
+    }
+}
+
+bool Registry::note_power_base_seen_locked(const Uuid &power_base_uuid, std::chrono::steady_clock::time_point now)
+{
+    for (auto &b : power_bases_) {
+        if (b.power_base_uuid == power_base_uuid) {
+            b.last_seen_at = now;
+            if (!b.online) {
+                b.online = true;
+                std::printf("[power-base] ");
+                print_uuid_suffix("pb", power_base_uuid);
+                std::printf(" online=1 -- heard from again\n");
+                return true;
+            }
+            return false;
+        }
+    }
+
+    if (power_bases_.size() >= kMaxPowerBases) {
+        auto has_nodes = [this](const Uuid &pb) {
+            return std::any_of(nodes_.begin(), nodes_.end(),
+                               [&pb](const NodeState &n) { return n.power_base_uuid == pb; });
+        };
+        auto victim = power_bases_.end();
+        for (auto it = power_bases_.begin(); it != power_bases_.end(); ++it) {
+            if (!with_staleness_applied(*it, now).online && !has_nodes(it->power_base_uuid) &&
+                (victim == power_bases_.end() || it->last_seen_at < victim->last_seen_at)) {
+                victim = it;
+            }
+        }
+        if (victim == power_bases_.end()) {
+            return false; // see kMaxPowerBases' own doc comment
+        }
+        power_bases_.erase(victim);
+    }
+
+    PowerBaseState b;
+    b.power_base_uuid = power_base_uuid;
+    b.online = true;
+    b.first_seen_at = now;
+    b.last_seen_at = now;
+    power_bases_.push_back(b);
+    std::printf("[power-base] ");
+    print_uuid_suffix("pb", power_base_uuid);
+    std::printf(" first seen (%zu Power Base(s) known)\n", power_bases_.size());
+    return true;
 }
 
 size_t Registry::node_count() const
@@ -322,6 +426,14 @@ NodeState Registry::with_staleness_applied(NodeState n, std::chrono::steady_cloc
     return n;
 }
 
+PowerBaseState Registry::with_staleness_applied(PowerBaseState b, std::chrono::steady_clock::time_point now) const
+{
+    if (b.online && (now - b.last_seen_at > stale_timeout_)) {
+        b.online = false;
+    }
+    return b;
+}
+
 void Registry::note_applied_locked()
 {
     generation_++;
@@ -343,6 +455,21 @@ std::vector<NodeState> Registry::snapshot(std::chrono::steady_clock::time_point 
         out.push_back(with_staleness_applied(n, now));
     }
     return out;
+}
+
+RegistryView Registry::view(std::chrono::steady_clock::time_point now) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    RegistryView v;
+    v.nodes.reserve(nodes_.size());
+    for (const auto &n : nodes_) {
+        v.nodes.push_back(with_staleness_applied(n, now));
+    }
+    v.power_bases.reserve(power_bases_.size());
+    for (const auto &b : power_bases_) {
+        v.power_bases.push_back(with_staleness_applied(b, now));
+    }
+    return v;
 }
 
 bool Registry::wait_for_change(uint64_t *last_seen_generation, std::chrono::milliseconds timeout) const

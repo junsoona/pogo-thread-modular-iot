@@ -21,8 +21,27 @@ namespace pogohome_api {
 
 constexpr int kSchemaVersion = 1;
 
-// GET /api/v1/health's body.
+// GET /api/v1/health's body. The three-argument form (what http_server.cpp
+// serves) adds `power_base_count`; the two-argument form is the original
+// shape, kept for existing callers.
 std::string BuildHealthJson(uint64_t registry_generation, size_t module_count);
+std::string BuildHealthJson(uint64_t registry_generation, size_t module_count, size_t power_base_count);
+// The Bonjour revision appends `hub_id` (see hub_identity.hpp) after every
+// earlier field, so a client can check that the hub answering at an address
+// is the one it discovered or remembered. An empty `hub_id` leaves the
+// three-argument shape unchanged.
+std::string BuildHealthJson(uint64_t registry_generation, size_t module_count, size_t power_base_count,
+                            const std::string &hub_id);
+
+// Exactly one entry per module_uuid, in first-appearance order. The Registry
+// keys nodes by (power_base_uuid, module_uuid), so a module moved between
+// Power Bases is briefly present under both until the old Base reports it
+// offline. The owner is the online entry with the largest attach_order (the
+// most recent physical attach); with no online entry, the entry with the
+// largest attach_order (ties: the first seen). With a single Power Base
+// every module has one entry and this returns `nodes` unchanged (minus
+// has_topology == false entries).
+std::vector<ingest::NodeState> ResolveModuleOwners(const std::vector<ingest::NodeState> &nodes);
 
 // GET /api/v1/snapshot's body, and the SSE `event: snapshot` `data:` payload
 // (see http_server.cpp) -- identical shape either way. `nodes` is rendered
@@ -33,6 +52,17 @@ std::string BuildHealthJson(uint64_t registry_generation, size_t module_count);
 // never fabricates topology fields for a node this API cannot honestly
 // describe).
 std::string BuildSnapshotJson(const std::vector<ingest::NodeState> &nodes, uint64_t registry_generation,
+                               int64_t generated_at_unix_ms);
+
+// The full v1 snapshot (what http_server.cpp serves): modules pass through
+// ResolveModuleOwners() and carry power_base_uuid/parent_uuid, and a
+// top-level `power_bases` array lists every Power Base in `view` plus any
+// Base a module names that the Registry is not tracking (see
+// ingest::Registry::kMaxPowerBases) -- that derived entry is online exactly
+// when one of its modules is, since an online module means this host
+// accepted a message from that Base within the stale timeout. The nodes-only
+// overload above is this with no tracked Power Bases.
+std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
                                int64_t generated_at_unix_ms);
 
 } // namespace pogohome_api

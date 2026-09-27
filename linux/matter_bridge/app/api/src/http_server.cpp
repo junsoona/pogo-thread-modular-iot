@@ -243,12 +243,14 @@ bool Server::Start()
     std::fprintf(stdout, "pogohome_api: listening on http://%s:%u\n", display_host.c_str(), (unsigned)bound_port_);
 
     started_ = true;
+    accepting_.store(true, std::memory_order_relaxed);
     acceptor_thread_ = std::thread([this] { AcceptLoop(); });
     return true;
 }
 
 void Server::Stop()
 {
+    accepting_.store(false, std::memory_order_relaxed);
     if (should_stop_.exchange(true)) {
         return; // already stopped/stopping
     }
@@ -305,6 +307,9 @@ void Server::AcceptLoop()
             if (errno == EINTR) {
                 continue;
             }
+            std::fprintf(stderr, "pogohome_api: poll() on the listening socket failed: %s -- no longer accepting\n",
+                         std::strerror(errno));
+            accepting_.store(false, std::memory_order_relaxed);
             break;
         }
         if (rc == 0 || !(pfd.revents & POLLIN)) {
@@ -374,15 +379,13 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
             SendJsonResponse(client_fd, 405, "Method Not Allowed", "{\"error\":\"method_not_allowed\"}");
             return;
         }
-        std::vector<ingest::NodeState> nodes = registry_.snapshot();
+        ingest::RegistryView view = registry_.view();
         uint64_t generation = registry_.generation();
-        size_t module_count = 0;
-        for (const auto &n : nodes) {
-            if (n.has_topology) {
-                module_count++;
-            }
-        }
-        SendJsonResponse(client_fd, 200, "OK", BuildHealthJson(generation, module_count));
+        // Distinct modules, the same set /api/v1/snapshot lists (a module
+        // briefly present under two Power Bases counts once).
+        size_t module_count = ResolveModuleOwners(view.nodes).size();
+        SendJsonResponse(client_fd, 200, "OK",
+                         BuildHealthJson(generation, module_count, view.power_bases.size(), config_.hub_id));
         return;
     }
 
@@ -391,9 +394,9 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
             SendJsonResponse(client_fd, 405, "Method Not Allowed", "{\"error\":\"method_not_allowed\"}");
             return;
         }
-        std::vector<ingest::NodeState> nodes = registry_.snapshot();
+        ingest::RegistryView view = registry_.view();
         uint64_t generation = registry_.generation();
-        SendJsonResponse(client_fd, 200, "OK", BuildSnapshotJson(nodes, generation, CurrentUnixMillis()));
+        SendJsonResponse(client_fd, 200, "OK", BuildSnapshotJson(view, generation, CurrentUnixMillis()));
         return;
     }
 
@@ -435,8 +438,8 @@ void Server::HandleSse(int client_fd)
     // generation() would make last_seen look newer than what was actually
     // captured, and that change would never trigger a wakeup on its own).
     uint64_t last_seen = registry_.generation();
-    std::vector<ingest::NodeState> nodes = registry_.snapshot();
-    if (!SendSseEvent(client_fd, "snapshot", BuildSnapshotJson(nodes, last_seen, CurrentUnixMillis()))) {
+    ingest::RegistryView view = registry_.view();
+    if (!SendSseEvent(client_fd, "snapshot", BuildSnapshotJson(view, last_seen, CurrentUnixMillis()))) {
         return;
     }
     auto last_activity = std::chrono::steady_clock::now();
@@ -447,7 +450,7 @@ void Server::HandleSse(int client_fd)
             return;
         }
         if (changed) {
-            std::vector<ingest::NodeState> latest = registry_.snapshot();
+            ingest::RegistryView latest = registry_.view();
             if (!SendSseEvent(client_fd, "snapshot", BuildSnapshotJson(latest, last_seen, CurrentUnixMillis()))) {
                 return;
             }

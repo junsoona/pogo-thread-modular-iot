@@ -39,10 +39,19 @@ sample을 계속 보관하므로, exporter는 topology registry에 있는 UUID�
 받아들여져 `online:true`와 멈춘 `sample_seq`가 계속 유지된다. 삭제가 적용된 Linux에서는 같은
 sample이 와도 4.04로 거부되고 모듈이 다시 생기지 않는다.
 
-Linux `ingest::Registry`의 removed marker는 최대 64개이며, 가득 차면 가장 오래된 marker를
+Linux `ingest::Registry`의 removed marker는 (Power Base UUID, module UUID) 쌍으로 기록한다.
+tombstone은 그 tombstone을 보낸 Power Base 아래의 항목만 지운다. 모듈을 Power Base A에서 떼어
+B에 붙인 뒤 A의 tombstone이 늦게 도착해도 B 아래의 같은 모듈은 지워지지 않는다. Power Base가
+하나일 때는 이전과 같다. removed marker는 최대 64개이며, 가득 차면 가장 오래된 marker를
 버린다. 5.03으로 거절하면 Power Base가 영원히 재시도하고 모듈은 Linux에 남기 때문이다.
 
 ## 재도킹과 교차
+
+- 다른 Power Base로 옮긴 모듈은 새 Base의 `online=true` 보고로 등록된다. 옛 Base가 stale
+  sweep이나 tombstone으로 정리하기 전까지 Linux registry에는 두 Base 아래에 잠시 함께 있다.
+  API는 UUID마다 한 항목만 보여 준다. online인 항목을 우선하고, 둘 다 online이면 가장 최근에
+  online으로 보고된 쪽(`attach_order`)을 쓴다. 이름·방·Matter endpoint ID는 module UUID
+  기준이라 Base를 옮겨도 유지된다.
 
 - 재도킹 보고(`online=true`)는 removed marker를 지우고 새 모듈처럼 등록한다.
 - endpoint ID는 `endpoint_map.bin`의 UUID 예약을 그대로 쓰므로 같은 UUID는 같은 endpoint를

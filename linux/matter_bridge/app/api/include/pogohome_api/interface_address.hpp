@@ -38,4 +38,11 @@ struct ResolvedAddress {
 // own SECURITY NOTE).
 bool ResolveInterfaceAddress(const std::string &ifname, ResolvedAddress &out, std::string &error);
 
+// Whether `ifname` currently carries `address` (a ResolvedAddress's numeric
+// form, of `family`). The API server stays bound to the address it resolved at
+// startup; once that address leaves the interface (DHCP renumbering, the link
+// going away) the server can no longer be reached there, which is what the
+// Bonjour advertiser uses this for (see mdns_advertiser.hpp).
+bool InterfaceHasAddress(const std::string &ifname, const std::string &address, int family);
+
 } // namespace pogohome_api

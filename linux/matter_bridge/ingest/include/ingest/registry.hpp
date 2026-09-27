@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -111,6 +112,45 @@ struct NodeState {
     // exists as a second, independent line of defense rather than relying
     // solely on the firmware's own topology_registry_sweep_stale().
     std::chrono::steady_clock::time_point last_seen_at{};
+
+    // Multi-Power-Base milestone. True only while `online` is false because
+    // the stale sweep (sweep_stale_locked()) demoted it -- never because a
+    // report itself said online=false. Lets an unchanged periodic resync
+    // (same generation+seq, online=true -- DuplicateExact) restore online
+    // once that Power Base's link to this host comes back; without it such a
+    // node stayed offline until the module happened to send a report with a
+    // new seq.
+    bool stale_demoted = false;
+
+    // Multi-Power-Base milestone. Registry-wide counter value taken when this
+    // node last became online *by a report* (first sighting with online=true,
+    // an online=false -> online=true report, or a new boot session reporting
+    // online=true) -- never by recovering from stale_demoted. 0 until then.
+    // A module moved from one Power Base to another is briefly present under
+    // both (the old Base only reports it offline after its own stale sweep);
+    // a reader that needs exactly one owner per module_uuid picks the online
+    // entry with the largest attach_order, i.e. the most recent physical
+    // attach. See docs/pogohome-api-v1.md "Power Base ownership".
+    uint64_t attach_order = 0;
+};
+
+// Multi-Power-Base milestone: what this host knows about one Power Base
+// itself, independent of its modules. power_base_uuid is the Base's own
+// eFuse EUI-64 (power_base/main/app_main.c), which every bridge_export_proto
+// message already carries -- no new wire field.
+struct PowerBaseState {
+    Uuid power_base_uuid{};
+    // Heard from (heartbeat or any accepted topology/sample/removal) within
+    // the Registry's stale timeout. Demoted by the same sweep as nodes.
+    bool online = false;
+    std::chrono::steady_clock::time_point first_seen_at{};
+    std::chrono::steady_clock::time_point last_seen_at{};
+};
+
+// One consistent copy of nodes and Power Bases taken under a single lock.
+struct RegistryView {
+    std::vector<NodeState> nodes;
+    std::vector<PowerBaseState> power_bases;
 };
 
 enum class ApplyResult {
@@ -131,6 +171,11 @@ enum class ApplyResult {
 class Registry {
 public:
     static constexpr size_t kMaxNodes = 64;
+    // Bounded like nodes_. When full, a new Base evicts the oldest offline
+    // Base that has no nodes left; if there is none, the new Base is simply
+    // not tracked (its nodes are still applied -- the API then derives that
+    // Base's entry from its modules, see pogohome_api::BuildSnapshotJson()).
+    static constexpr size_t kMaxPowerBases = 16;
 
     // Default bounded timeout used to demote a node's reported `online`
     // to false, purely from elapsed wall-clock time since the last message
@@ -180,7 +225,8 @@ public:
     Registry(const Registry &) = delete;
     Registry &operator=(const Registry &) = delete;
 
-    // While module_uuid is on the removed list (see apply_removal() below),
+    // While (power_base_uuid, module_uuid) is on the removed list (see
+    // apply_removal() below),
     // this rejects the report as PreconditionFailed UNLESS it carries
     // online==true -- see apply_removal()'s own doc comment for why an
     // online==true report is the one signal treated as a genuine, automatic
@@ -205,14 +251,17 @@ public:
     // online=false within nodes_ and must never reach this method (see this
     // header's own top comment: "online=false와 removed를 혼용하지 마라").
     //
-    // Erases module_uuid's node from nodes_ entirely (regardless of which
-    // power_base_uuid(s) it was ever seen under) if present -- so
+    // Erases the (power_base_uuid, module_uuid) node from nodes_ if present
+    // -- scoped to the reporting Power Base since the multi-Power-Base
+    // milestone: a detach confirmed by Base A says nothing about the same
+    // module now docked to Base B (with a single Base this is identical to
+    // the earlier module-wide behavior) -- so
     // node_count()/get_node()/snapshot() (and therefore the HTTP/SSE API)
     // exclude it from the very next read, with no separate "removed" flag
-    // for a consumer to have to check. Adds module_uuid to a bounded removed
-    // list that apply_topology()/apply_sample() consult so a stray wireless
-    // report for it is never silently re-applied before a genuine
-    // re-approval (see apply_topology()'s own doc comment).
+    // for a consumer to have to check. Adds (power_base_uuid, module_uuid)
+    // to a bounded removed list that apply_topology() consults so a stray
+    // report for it from that same Base is never silently re-applied before
+    // a genuine re-approval (see apply_topology()'s own doc comment).
     //
     // Idempotent: a SECOND apply_removal() for a module_uuid already on the
     // removed list is a DuplicateExact no-op (no second erase, no second
@@ -243,10 +292,13 @@ public:
                               std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     // Heartbeats are pure liveness signals with no meaningful "duplicate"
-    // concept (this follow-up's own design: never authoritative) -- always
-    // AppliedNew, and updates node_count-adjacent bookkeeping only if the
-    // power_base_uuid is already known from at least one topology node.
-    void apply_heartbeat(const Uuid &power_base_uuid, uint32_t uptime_ms, uint16_t node_count);
+    // concept -- never authoritative for any module. Since the
+    // multi-Power-Base milestone they mark the Power Base itself as heard
+    // from (see PowerBaseState), so a Base with no modules docked yet is
+    // still visible. generation() advances only when that Base is first seen
+    // or comes back online -- a steady 10 s heartbeat never wakes SSE.
+    void apply_heartbeat(const Uuid &power_base_uuid, uint32_t uptime_ms, uint16_t node_count,
+                         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     size_t node_count() const;
     // `now` lets a caller (or a test) evaluate staleness at a specific
@@ -280,6 +332,11 @@ public:
     // is the timeout-corrected EFFECTIVE value, not the raw stored flag.
     std::vector<NodeState> snapshot(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
+    // Nodes (exactly as snapshot() returns them) plus every tracked Power
+    // Base, both taken under one mutex_ acquisition, with the same read-time
+    // staleness correction applied to both.
+    RegistryView view(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
     // Blocks the calling thread until generation() differs from
     // `last_seen_generation` or `timeout` elapses -- a condition_variable
     // wait, never a busy/polling loop. On a real change, updates
@@ -305,7 +362,9 @@ private:
     // Deliberately separate from nodes_ (which never holds a removed
     // module_uuid at all): a removed module_uuid must keep being rejected
     // even though it has no entry in nodes_ to check against.
-    std::vector<Uuid> removed_;
+    std::vector<std::pair<Uuid, Uuid>> removed_; // (power_base_uuid, module_uuid)
+    std::vector<PowerBaseState> power_bases_;
+    uint64_t attach_counter_ = 0;
     uint64_t generation_ = 0;
     std::chrono::milliseconds stale_timeout_;
     std::chrono::milliseconds sweep_interval_;
@@ -322,6 +381,14 @@ private:
     // Caller must hold mutex_. Returns nullptr if not found.
     NodeState *find_locked(const Uuid &power_base_uuid, const Uuid &module_uuid);
 
+    // Caller must hold mutex_. Records that power_base_uuid was just heard
+    // from. Returns true if that Base is new or was offline -- a visible
+    // change the caller must cover with note_applied_locked(), folded into
+    // the same single bump when the message also changed a node, so one
+    // received message never advances generation() twice. See
+    // kMaxPowerBases for the full-table policy.
+    bool note_power_base_seen_locked(const Uuid &power_base_uuid, std::chrono::steady_clock::time_point now);
+
     // Caller must hold mutex_. Bumps generation_ and wakes every
     // wait_for_change() waiter -- called exactly once per AppliedNew return,
     // from inside the same critical section that just applied the change
@@ -337,6 +404,7 @@ private:
     // get_node()/snapshot()'s own returned copy as a safety net between
     // sweep_thread_ ticks -- see this header's own top comment.
     NodeState with_staleness_applied(NodeState n, std::chrono::steady_clock::time_point now) const;
+    PowerBaseState with_staleness_applied(PowerBaseState b, std::chrono::steady_clock::time_point now) const;
 
     // Caller must hold mutex_. Mutates any currently-online node whose
     // stale_timeout_ has elapsed since last_seen_at to `online = false`,

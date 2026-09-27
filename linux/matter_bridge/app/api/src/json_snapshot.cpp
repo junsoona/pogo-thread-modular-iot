@@ -1,5 +1,6 @@
 #include "pogohome_api/json_snapshot.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 #include "pogohome_api/hex.hpp"
@@ -105,6 +106,10 @@ void AppendModuleJson(std::string &out, const ingest::NodeState &n)
     out += '{';
     out += "\"uuid\":";
     AppendJsonString(out, FormatUuidHex(n.module_uuid));
+    out += ",\"power_base_uuid\":";
+    AppendJsonString(out, FormatUuidHex(n.power_base_uuid));
+    out += ",\"parent_uuid\":";
+    AppendJsonString(out, FormatUuidHex(n.parent_uuid));
     out += ",\"online\":";
     out += n.online ? "true" : "false";
     out += ",\"depth\":";
@@ -154,9 +159,91 @@ std::string BuildHealthJson(uint64_t registry_generation, size_t module_count)
     return out;
 }
 
+std::string BuildHealthJson(uint64_t registry_generation, size_t module_count, size_t power_base_count)
+{
+    std::string out = BuildHealthJson(registry_generation, module_count);
+    out.pop_back(); // the closing '}'
+    out += ",\"power_base_count\":";
+    out += std::to_string(power_base_count);
+    out += '}';
+    return out;
+}
+
+std::string BuildHealthJson(uint64_t registry_generation, size_t module_count, size_t power_base_count,
+                            const std::string &hub_id)
+{
+    std::string out = BuildHealthJson(registry_generation, module_count, power_base_count);
+    if (hub_id.empty()) {
+        return out;
+    }
+    out.pop_back(); // the closing '}'
+    out += ",\"hub_id\":";
+    AppendJsonString(out, hub_id);
+    out += '}';
+    return out;
+}
+
+std::vector<ingest::NodeState> ResolveModuleOwners(const std::vector<ingest::NodeState> &nodes)
+{
+    std::vector<ingest::NodeState> out;
+    out.reserve(nodes.size());
+    for (const auto &n : nodes) {
+        if (!n.has_topology) {
+            continue; // see this file's own header comment
+        }
+        auto existing = std::find_if(out.begin(), out.end(), [&n](const ingest::NodeState &o) {
+            return o.module_uuid == n.module_uuid;
+        });
+        if (existing == out.end()) {
+            out.push_back(n);
+            continue;
+        }
+        bool better = (n.online != existing->online) ? n.online : n.attach_order > existing->attach_order;
+        if (better) {
+            *existing = n;
+        }
+    }
+    return out;
+}
+
 std::string BuildSnapshotJson(const std::vector<ingest::NodeState> &nodes, uint64_t registry_generation,
                                int64_t generated_at_unix_ms)
 {
+    return BuildSnapshotJson(ingest::RegistryView{nodes, {}}, registry_generation, generated_at_unix_ms);
+}
+
+std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
+                               int64_t generated_at_unix_ms)
+{
+    const std::vector<ingest::NodeState> modules = ResolveModuleOwners(view.nodes);
+
+    struct BaseEntry {
+        ingest::Uuid uuid;
+        bool online;
+        bool tracked;
+        unsigned module_count = 0;
+        unsigned online_module_count = 0;
+    };
+    std::vector<BaseEntry> bases;
+    for (const auto &b : view.power_bases) {
+        bases.push_back(BaseEntry{b.power_base_uuid, b.online, true});
+    }
+    for (const auto &m : modules) {
+        auto it = std::find_if(bases.begin(), bases.end(),
+                               [&m](const BaseEntry &b) { return b.uuid == m.power_base_uuid; });
+        if (it == bases.end()) {
+            bases.push_back(BaseEntry{m.power_base_uuid, false, false});
+            it = bases.end() - 1;
+        }
+        it->module_count++;
+        if (m.online) {
+            it->online_module_count++;
+            if (!it->tracked) {
+                it->online = true;
+            }
+        }
+    }
+
     std::string out;
     out += "{\"schema_version\":";
     out += std::to_string(kSchemaVersion);
@@ -164,12 +251,24 @@ std::string BuildSnapshotJson(const std::vector<ingest::NodeState> &nodes, uint6
     out += std::to_string(generated_at_unix_ms);
     out += ",\"registry_generation\":";
     out += std::to_string(registry_generation);
-    out += ",\"modules\":[";
-    bool first = true;
-    for (const auto &n : nodes) {
-        if (!n.has_topology) {
-            continue; // see this file's own header comment
+    out += ",\"power_bases\":[";
+    for (size_t i = 0; i < bases.size(); i++) {
+        if (i != 0) {
+            out += ',';
         }
+        out += "{\"uuid\":";
+        AppendJsonString(out, FormatUuidHex(bases[i].uuid));
+        out += ",\"online\":";
+        out += bases[i].online ? "true" : "false";
+        out += ",\"module_count\":";
+        out += std::to_string(bases[i].module_count);
+        out += ",\"online_module_count\":";
+        out += std::to_string(bases[i].online_module_count);
+        out += '}';
+    }
+    out += "],\"modules\":[";
+    bool first = true;
+    for (const auto &n : modules) {
         if (!first) {
             out += ',';
         }

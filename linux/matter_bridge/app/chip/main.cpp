@@ -66,6 +66,9 @@
 #include <thread>
 #include <vector>
 
+#include <net/if.h>
+#include <unistd.h>
+
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
 #include <platform/CHIPDeviceLayer.h>
@@ -76,7 +79,9 @@
 #include "matter_bridge/bridge_manager.hpp"
 #include "matter_bridge/endpoint_store.hpp"
 #include "pogohome_api/http_server.hpp"
+#include "pogohome_api/hub_identity.hpp"
 #include "pogohome_api/interface_address.hpp"
+#include "pogohome_api/mdns_advertiser.hpp"
 
 using chip::ArgParser::OptionDef;
 using chip::ArgParser::OptionSet;
@@ -94,6 +99,10 @@ struct AppConfig {
     // api_interface is non-empty.
     std::string api_interface;
     uint16_t api_port = 8787;
+    // Bonjour `_jogakbo._tcp` advertisement of the API (see
+    // pogohome_api/mdns_advertiser.hpp) -- on whenever the API is, unless
+    // --api-no-advertise.
+    bool api_advertise = true;
 };
 
 AppConfig gAppConfig;
@@ -103,6 +112,7 @@ constexpr uint16_t kOptionPort = 0xFF11;
 constexpr uint16_t kOptionStateDir = 0xFF12;
 constexpr uint16_t kOptionApiInterface = 0xFF13;
 constexpr uint16_t kOptionApiPort = 0xFF14;
+constexpr uint16_t kOptionApiNoAdvertise = 0xFF15;
 
 bool HandlePogoOption(const char *program, OptionSet *, int identifier, const char *name, const char *value)
 {
@@ -134,6 +144,9 @@ bool HandlePogoOption(const char *program, OptionSet *, int identifier, const ch
         gAppConfig.api_port = static_cast<uint16_t>(parsed);
         return true;
     }
+    case kOptionApiNoAdvertise:
+        gAppConfig.api_advertise = false;
+        return true;
     default:
         PrintArgError("%s: INTERNAL ERROR: unhandled pogo_matter_bridge option: %s\n", program, name);
         return false;
@@ -146,6 +159,7 @@ OptionDef gPogoOptionDefs[] = {
     {"state-dir", chip::ArgParser::kArgumentRequired, kOptionStateDir},
     {"api-interface", chip::ArgParser::kArgumentRequired, kOptionApiInterface},
     {"api-port", chip::ArgParser::kArgumentRequired, kOptionApiPort},
+    {"api-no-advertise", chip::ArgParser::kNoArgument, kOptionApiNoAdvertise},
     {},
 };
 
@@ -171,7 +185,11 @@ OptionSet gPogoOptions = {
     "       exist, has no usable address, or the API server's port cannot be bound.\n"
     "  --api-port <port>\n"
     "       TCP port for the PogoHome Local API v1 HTTP server (default: 8787). Only meaningful with\n"
-    "       --api-interface.\n",
+    "       --api-interface.\n"
+    "  --api-no-advertise\n"
+    "       Do not announce the API over Bonjour/mDNS. By default an enabled API is advertised as _jogakbo._tcp\n"
+    "       on --api-interface through the host's avahi-daemon while it can take requests (see\n"
+    "       docs/pogohome-api-v1.md). Without avahi the API still runs, unadvertised.\n",
 };
 
 ingest::Registry gRegistry;
@@ -188,6 +206,10 @@ std::thread gWatcherThread;
 // per-connection worker threads are entirely internal to
 // pogohome_api::Server itself (see http_server.hpp), never tracked here.
 std::unique_ptr<pogohome_api::Server> gApiServer;
+// Null unless the API is enabled, advertising was not turned off and
+// libavahi-client could be loaded. Declared after gApiServer so that, on any
+// exit path, it is destroyed (and withdraws the record) before the server.
+std::unique_ptr<pogohome_api::MdnsAdvertiser> gApiAdvertiser;
 
 // Runs on the Matter event-loop thread via
 // chip::DeviceLayer::PlatformMgr().ScheduleWork() -- see this file's own
@@ -365,10 +387,26 @@ int main(int argc, char *argv[])
             return -1;
         }
 
+        // The hub's stable identity, served by /api/v1/health and in the
+        // Bonjour TXT record (see pogohome_api/hub_identity.hpp). A damaged
+        // file stops startup, like a damaged endpoint_map.bin below: a new id
+        // would make every client that remembers this hub stop recognizing it.
+        std::string hub_id;
+        std::string hub_id_error;
+        pogohome_api::HubIdLoadResult hub_id_result =
+            pogohome_api::LoadOrCreateHubId(gAppConfig.state_dir, hub_id, hub_id_error);
+        if (hub_id_result == pogohome_api::HubIdLoadResult::Error) {
+            fprintf(stderr, "%s: hub_id: %s\n", argv[0], hub_id_error.c_str());
+            return -1;
+        }
+        fprintf(stdout, "pogohome_api: hub_id %s (%s)\n", hub_id.c_str(),
+                hub_id_result == pogohome_api::HubIdLoadResult::Created ? "created" : "loaded");
+
         pogohome_api::ServerConfig api_config;
         api_config.bind_address = resolved.numeric;
         api_config.address_family = resolved.family;
         api_config.port = gAppConfig.api_port;
+        api_config.hub_id = hub_id;
 
         gApiServer = std::make_unique<pogohome_api::Server>(gRegistry, api_config);
         if (!gApiServer->Start()) {
@@ -376,6 +414,39 @@ int main(int argc, char *argv[])
                     "%s: PogoHome Local API v1 server failed to start on interface '%s' -- see the error above\n",
                     argv[0], gAppConfig.api_interface.c_str());
             return -1;
+        }
+
+        // Advertised only now that the server is listening; see
+        // pogohome_api/mdns_advertiser.hpp for when it is withdrawn again.
+        if (gAppConfig.api_advertise) {
+            pogohome_api::AvahiApi avahi;
+            std::string avahi_error;
+            if (!pogohome_api::LoadSystemAvahiApi(avahi, avahi_error)) {
+                fprintf(stderr, "pogohome_api: Bonjour: not advertising (%s); the API is reachable by address only\n",
+                        avahi_error.c_str());
+            } else {
+                char hostname[256] = {};
+                gethostname(hostname, sizeof(hostname) - 1);
+
+                pogohome_api::AdvertiserConfig advert;
+                advert.interface_name = gAppConfig.api_interface;
+                advert.address_family = resolved.family;
+                advert.port = gApiServer->bound_port();
+                advert.service_name = pogohome_api::DefaultBonjourServiceName(hostname);
+                advert.txt = pogohome_api::BuildBonjourTxt(hub_id);
+                const std::string ifname = gAppConfig.api_interface;
+                const pogohome_api::ResolvedAddress bound = resolved;
+                advert.available = [ifname, bound]() {
+                    return gApiServer && gApiServer->accepting() &&
+                           pogohome_api::InterfaceHasAddress(ifname, bound.numeric, bound.family);
+                };
+                advert.interface_index = [ifname]() { return if_nametoindex(ifname.c_str()); };
+
+                gApiAdvertiser = std::make_unique<pogohome_api::MdnsAdvertiser>(avahi, advert);
+                if (!gApiAdvertiser->Start()) {
+                    gApiAdvertiser.reset();
+                }
+            }
         }
     }
 
@@ -418,6 +489,11 @@ int main(int argc, char *argv[])
     // function's own comment. Bounded time (see pogohome_api::Server::
     // Stop()'s own doc comment), never a no-op if gApiServer is set: joins
     // every worker thread this API server ever spawned.
+    // Withdraw the Bonjour record first, so nothing announces a server that
+    // is about to stop answering.
+    if (gApiAdvertiser) {
+        gApiAdvertiser->Stop();
+    }
     if (gApiServer) {
         gApiServer->Stop();
     }

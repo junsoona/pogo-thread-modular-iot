@@ -40,6 +40,7 @@ run_cmake_project() {
 
 run_cmake_project "$REPO_ROOT/linux/matter_bridge/ingest"
 run_cmake_project "$REPO_ROOT/linux/matter_bridge/app/core"
+run_cmake_project "$REPO_ROOT/linux/matter_bridge/app/api"
 
 echo
 echo "==> All CHIP_ROOT-independent tests passed."

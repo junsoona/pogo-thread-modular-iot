@@ -70,4 +70,31 @@ bool ResolveInterfaceAddress(const std::string &ifname, ResolvedAddress &out, st
     return false;
 }
 
+bool InterfaceHasAddress(const std::string &ifname, const std::string &address, int family)
+{
+    if (ifname.empty() || address.empty() || if_nametoindex(ifname.c_str()) == 0) {
+        return false;
+    }
+    struct ifaddrs *addrs = nullptr;
+    if (getifaddrs(&addrs) != 0) {
+        return false;
+    }
+    bool found = false;
+    for (struct ifaddrs *a = addrs; a != nullptr && !found; a = a->ifa_next) {
+        if (a->ifa_addr == nullptr || a->ifa_name == nullptr || ifname != a->ifa_name ||
+            a->ifa_addr->sa_family != family) {
+            continue;
+        }
+        char buf[INET6_ADDRSTRLEN];
+        const void *raw = family == AF_INET
+                              ? static_cast<const void *>(&reinterpret_cast<const struct sockaddr_in *>(a->ifa_addr)->sin_addr)
+                              : static_cast<const void *>(&reinterpret_cast<const struct sockaddr_in6 *>(a->ifa_addr)->sin6_addr);
+        if (inet_ntop(family, raw, buf, sizeof(buf)) != nullptr && address == buf) {
+            found = true;
+        }
+    }
+    freeifaddrs(addrs);
+    return found;
+}
+
 } // namespace pogohome_api

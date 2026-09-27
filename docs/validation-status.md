@@ -143,6 +143,36 @@ host test와 Linux loopback test를 통과했다. 실제 Power Base에서 Linux 
 SHT45, BH1750, SGP40, SGP41, PMS5003 데이터를 수신했다. retry 소진이나 queue overflow를
 실물에서 의도적으로 만든 시험은 없다.
 
+### 여러 Power Base (2026-09-23)
+
+| 항목 | 코드/host | 실물 | 메모 |
+|---|---|---|---|
+| 한 ingest 인스턴스가 두 Base의 CoAP를 각자 수신 | host 확인 | 미확인 | UDP loopback, 서로 다른 source port |
+| HEARTBEAT만으로 Base 표시, 반복 heartbeat는 generation 불변 | host 확인 | 미확인 | |
+| 같은 종류 센서가 있는 두 Base의 모듈 분리 | host 확인 | 미확인 | 다른 Base의 모듈로 가는 sample은 4.04 |
+| 한 Base만 stale → Base·모듈 offline, 다른 Base 유지 | host 확인 | 미확인 | background sweep, SSE 이벤트 |
+| stale 뒤 변경 없는 resync로 online 복구 | host 확인 | 미확인 | 이전에는 새 seq 전까지 offline 유지 |
+| tombstone을 Base 단위로 적용 | host 확인 | 미확인 | Base를 옮긴 모듈 보존 |
+| 옮긴 모듈을 API에 한 번만 표시 | host 확인 | 미확인 | online 우선, 다음 `attach_order` |
+| 단일 Base JSON 호환 | host 확인 | 미확인 | 추가 필드를 뺀 결과가 이전 출력과 바이트 단위로 같음 |
+| 두 번째 Power Base 실물 가입 | - | 미확인 | 두 번째 보드 시험 전 |
+| Matter endpoint(두 Base 모듈 동시) | host 확인(기존) | 미확인 | `BridgeManager` 변경 없음 |
+
+### Bonjour 허브 광고와 hub_id (2026-09-27)
+
+| 항목 | 코드/host | 실물 | 메모 |
+|---|---|---|---|
+| `hub_id` 최초 생성·재시작 유지·손상 파일 거부 | host 확인 | 미확인 | `--state-dir/hub_id`, 0600, link(2)로 원자적 생성 |
+| `/api/v1/health`의 `hub_id` 추가 | host 확인 | 미확인 | 기존 필드 뒤에만 추가, hub_id가 없으면 이전 출력과 동일 |
+| `_jogakbo._tcp` 등록(API 인터페이스·실제 포트·TXT) | host 확인(가짜 Avahi) | 미확인 | `txtvers`, `api`, `path`, `hub_id` |
+| API 불가·주소 사라짐 → 광고 철회, 복구 → 재광고 | host 확인(가짜 Avahi) | 미확인 | 5초마다 재확인 |
+| avahi-daemon 부재·재시작, 호스트 이름 재등록 | host 확인(가짜 Avahi) | 미확인 | `AVAHI_CLIENT_NO_FAIL` |
+| 서비스 이름 충돌(LAN·같은 호스트) | host 확인(가짜 Avahi) | 미확인 | avahi 대체 이름, hub_id는 그대로 |
+| 종료 시 광고 해제, 스레드 join | host 확인(가짜 Avahi) | 미확인 | 비정상 종료는 D-Bus 연결 종료로 daemon이 제거 |
+| `libavahi-client.so.3` dlopen과 실제 mDNS 패킷 | - | 미확인 | Mac에서는 라이브러리가 없어 확인 불가 |
+| CHIP 링크 빌드(`pogo_matter_bridge`) | stub 헤더로 문법 확인 | 미확인 | Linux 호스트에서 `tools/build_matter_bridge.sh` 필요 |
+| iPhone·iPad·Mac의 실제 허브 검색 | 앱 단위 테스트(가짜 브라우저) | 미확인 | 로컬 네트워크 권한 포함 |
+
 ## Linux Matter Bridge
 
 Matter SDK는 connectedhomeip v1.6.0.0으로 고정했다. module UUID마다 동적 endpoint 하나를

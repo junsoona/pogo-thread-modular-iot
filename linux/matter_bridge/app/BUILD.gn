@@ -32,13 +32,17 @@ executable("pogo_matter_bridge") {
   sources = [
     "api/include/pogohome_api/hex.hpp",
     "api/include/pogohome_api/http_server.hpp",
+    "api/include/pogohome_api/hub_identity.hpp",
     "api/include/pogohome_api/interface_address.hpp",
     "api/include/pogohome_api/json_snapshot.hpp",
+    "api/include/pogohome_api/mdns_advertiser.hpp",
     "api/include/pogohome_api/sensor_kind.hpp",
     "api/src/hex.cpp",
     "api/src/http_server.cpp",
+    "api/src/hub_identity.cpp",
     "api/src/interface_address.cpp",
     "api/src/json_snapshot.cpp",
+    "api/src/mdns_advertiser.cpp",
     "api/src/sensor_kind.cpp",
     "chip/chip_endpoint.cpp",
     "chip/chip_endpoint.hpp",
@@ -91,6 +95,11 @@ executable("pogo_matter_bridge") {
   ]
 
   cflags = [ "-Wall" ]
+
+  # dlopen() of libavahi-client.so.3 for the Bonjour advertisement (see
+  # api/include/pogohome_api/mdns_advertiser.hpp) -- no Avahi headers or
+  # link-time dependency.
+  libs = [ "dl" ]
 
   output_dir = root_out_dir
 }

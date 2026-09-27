@@ -18,7 +18,7 @@
 // own worker thread, tracked in `workers_` so Stop() can join every one of
 // them within a bounded time (see http_server.cpp's own top comment for the
 // exact bound) -- never a detached, unjoinable thread. A worker thread only
-// ever calls ingest::Registry::snapshot()/wait_for_change() (see
+// ever calls ingest::Registry::view()/wait_for_change() (see
 // registry.hpp's own top comment: safe from any thread other than the CoAP
 // receive thread), and only ever serializes/sends AFTER a snapshot's mutex
 // has already been released -- this API never holds Registry::mutex_ while
@@ -65,6 +65,10 @@ struct ServerConfig {
     // code (linux/matter_bridge/app/chip/main.cpp) never overrides these.
     std::chrono::milliseconds sse_heartbeat_interval = std::chrono::seconds(15);
     std::chrono::milliseconds sse_poll_interval = std::chrono::milliseconds(1000);
+
+    // Served as GET /api/v1/health's `hub_id` (see hub_identity.hpp); empty
+    // omits the field.
+    std::string hub_id;
 };
 
 class Server {
@@ -96,6 +100,12 @@ public:
     // test running concurrently.
     uint16_t bound_port() const { return bound_port_; }
 
+    // True from a successful Start() until Stop() -- or until the acceptor
+    // thread gives up on the listening socket (a poll() error), after which
+    // no new request can be answered. What the Bonjour advertiser checks
+    // before (and while) announcing this server (see mdns_advertiser.hpp).
+    bool accepting() const { return accepting_.load(std::memory_order_relaxed); }
+
 private:
     struct Worker {
         std::thread thread;
@@ -116,6 +126,7 @@ private:
     int listen_fd_ = -1;
     uint16_t bound_port_ = 0;
     std::atomic<bool> should_stop_{false};
+    std::atomic<bool> accepting_{false};
     std::atomic<size_t> sse_clients_{0};
     std::thread acceptor_thread_;
     bool started_ = false;

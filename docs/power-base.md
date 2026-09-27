@@ -286,6 +286,45 @@ GPIO로 전원을 제어하려면 단순 MCU 출력이 아니라 high-side load 
 재동기화 규칙, PM lock 범위, CoAP/Thread timing, online 표시 정책을 함께 설계해야 한다.
 Thread LEAF의 기존 SED 설정(`mRxOnWhenIdle=false`)은 Light-sleep과 별개로 유지한다.
 
+## 여러 Power Base 추가
+
+Power Base를 둘 이상 쓸 때는 모두 같은 Linux OTBR Thread 네트워크에 EXTERNAL_OTBR 모드로
+가입해야 한다. STANDALONE Base는 각자 Thread 네트워크를 새로 만들어 Linux Bridge에 닿지 않는다.
+Linux Bridge 한 인스턴스가 모든 Base의 CoAP 메시지를 같은 포트(기본 5684)에서 받는다.
+
+- Base 식별자는 칩 eFuse의 EUI-64다. `cfg` 이미지에 Base별 값이 없으므로 첫 Base에 쓴
+  `power_base_otbr_bridge_config.bin`을 두 번째 Base에도 그대로 쓸 수 있다.
+- 모듈의 소속 Base는 POGO 유선 `SET_COLLECTOR`로 정해진다. 모듈은 그 Base의 Mesh-Local EID로만
+  보고하므로, 같은 종류의 센서가 두 Base에 있어도 섞이지 않는다.
+- PogoHome 앱과 Linux API는 Base를 등록하지 못한다(API는 읽기 전용). BLE·QR 커미셔닝,
+  앱에서 Dataset 전달 같은 연결 수단은 아직 없다.
+
+절차:
+
+```bash
+# 1) Linux OTBR 호스트
+(umask 077; sudo ot-ctl dataset active -x | grep -v '^Done' > ~/otbr-active-dataset.hex)  # 비밀값: 저장소 밖, 0600
+# 첫 Base 때 만든 파일이 있으면 그대로 쓴다. "Done" 줄이 남아 있으면 생성기가 거부한다.
+sudo ot-ctl ipaddr mleid                                   # OTBR_MLEID
+
+# 2) 개발 PC: cfg 이미지 (첫 Base 때 만든 파일이 있으면 재사용)
+bash tools/gen_power_base_bridge_config.sh "$OTBR_MLEID" 5684 build/cfg_images "$HOME/otbr-active-dataset.hex"
+
+# 3) 새 Base에 펌웨어와 cfg 기록
+idf.py -C power_base -B ~/esp-builds/pogo_power_base -p "$BASE2_PORT" flash
+python -m esptool --chip esp32h2 -p "$BASE2_PORT" write-flash \
+  0x187000 build/cfg_images/power_base_otbr_bridge_config.bin
+# 이 보드를 전에 STANDALONE으로 쓴 적이 있으면 한 번만:
+python -m esptool --chip esp32h2 -p "$BASE2_PORT" erase-region 0x9000 0x6000
+```
+
+4) 새 Base에 전원을 넣으면 Thread에 가입한 뒤 10초마다 HEARTBEAT를 보낸다. Linux 로그에
+`[power-base] pb=..xxxx first seen (2 Power Base(s) known)`이 찍히고, `/api/v1/snapshot`의
+`power_bases`에 나타난다. PogoHome의 기기 → + → "POGO Power Base 연결" 화면은 화면을 연 뒤
+새로 나타난 Base를 이 데이터로 표시한다.
+
+5) 센서 모듈을 새 Base에 POGO로 연결하면 기존 자동 페어링으로 등록되고 그 Base 아래에 표시된다.
+
 ## 빌드와 플래시
 
 ```bash
