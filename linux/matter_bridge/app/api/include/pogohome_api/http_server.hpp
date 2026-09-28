@@ -1,6 +1,14 @@
-// Read-only PogoHome Local API v1 HTTP server -- GET /api/v1/health,
-// GET /api/v1/snapshot, GET /api/v1/events (Server-Sent Events). See
+// PogoHome Local API v1 HTTP server -- GET /api/v1/health,
+// GET /api/v1/snapshot, GET /api/v1/events (Server-Sent Events), and, when
+// settings sharing is configured (ServerConfig::settings/device_auth/tls),
+// the TLS-only pairing and home-settings routes. See
 // docs/pogohome-api-v1.md for the full contract this implements.
+//
+// Plain HTTP and TLS share the one listening port: each connection's first
+// byte decides (0x16 starts a TLS handshake; HTTP starts with a method
+// letter), so the read-only sensor routes stay exactly as they were for
+// existing clients. Settings, pairing and device routes are refused over
+// plain HTTP (403 tls_required) before any body or header value is used.
 //
 // This is a small, purpose-built HTTP/1.1 subset over plain POSIX sockets
 // (no external HTTP library -- this repo's own follow-up spec: "외부
@@ -29,14 +37,22 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "ingest/registry.hpp"
+#include "pogohome_api/device_auth.hpp"
+#include "pogohome_api/settings_store.hpp"
+#include "pogohome_api/tls_identity.hpp"
 
 namespace pogohome_api {
+
+class Stream;
+struct Request;
 
 struct ServerConfig {
     // A bare numeric literal (IPv4 or IPv6) to bind to -- see
@@ -69,6 +85,21 @@ struct ServerConfig {
     // Served as GET /api/v1/health's `hub_id` (see hub_identity.hpp); empty
     // omits the field.
     std::string hub_id;
+
+    // Home settings sharing (docs/pogohome-api-v1.md "Home settings").
+    // Enabled when all three are set. `settings_requested` with any of them
+    // missing means sharing was wanted but could not start (a damaged TLS
+    // identity, say): the routes answer 503 and health/snapshot report
+    // `settings_state: "unavailable"`, while the sensor routes work as
+    // always. Neither set: the API is exactly the read-only one it was.
+    bool settings_requested = false;
+    std::shared_ptr<SettingsStore> settings;
+    std::shared_ptr<DeviceAuth> device_auth;
+    std::shared_ptr<TlsContext> tls;
+    // Largest accepted request body (PUT /api/v1/settings, pairing).
+    size_t max_request_body_bytes = 256 * 1024;
+    // The wall clock, overridable so tests can expire pairing codes.
+    std::function<int64_t()> now_unix_ms;
 };
 
 class Server {
@@ -119,7 +150,17 @@ private:
     void AcceptLoop();
     void ReapFinishedWorkersLocked();
     void HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> running);
-    void HandleSse(int client_fd);
+    void HandleSse(Stream &stream);
+    // TLS-only routes; `request` has its body read already.
+    void HandlePairingClaim(Stream &stream, const Request &request);
+    void HandleSettings(Stream &stream, const Request &request, const DeviceRecord &device);
+    void HandleRevokeSelf(Stream &stream, const DeviceRecord &device);
+
+    bool SettingsEnabled() const { return config_.settings && config_.device_auth && config_.tls; }
+    // Appends settings_api/settings_state/settings_revision to a health or
+    // snapshot JSON object (nothing unless settings sharing was requested).
+    void AppendSettingsFields(std::string &json) const;
+    int64_t NowUnixMs() const;
 
     ingest::Registry &registry_;
     ServerConfig config_;

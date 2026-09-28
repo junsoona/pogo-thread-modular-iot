@@ -173,6 +173,28 @@ SHT45, BH1750, SGP40, SGP41, PMS5003 데이터를 수신했다. retry 소진이�
 | CHIP 링크 빌드(`pogo_matter_bridge`) | stub 헤더로 문법 확인 | 미확인 | Linux 호스트에서 `tools/build_matter_bridge.sh` 필요 |
 | iPhone·iPad·Mac의 실제 허브 검색 | 앱 단위 테스트(가짜 브라우저) | 미확인 | 로컬 네트워크 권한 포함 |
 
+### 허브 기반 집 설정 공유 (2026-09-28)
+
+집 이름, 방(ID·이름·아이콘·순서), 조각보 센서 모듈의 이름과 방 배치를 허브의
+`<--state-dir>/pogohome/`에 저장하고 페어링한 기기끼리 공유한다. 설정 경로는 API 포트의 TLS에서만
+응답한다. 자세한 규약은 [`pogohome-api-v1.md`](pogohome-api-v1.md) "Home settings".
+
+| 항목 | 코드/host | 실물 | 메모 |
+|---|---|---|---|
+| 서버 revision, 기준 revision 불일치 시 409와 현재 설정 반환 | host 확인 | 미확인 | 첫 업로드는 설정이 없을 때만 |
+| 원자적 저장(tmp+fsync+rename), 저장 실패 시 500·기존 설정 유지 | host 확인(쓰기 실패 주입) | 미확인 | |
+| 손상 파일(잘린 JSON, 스키마, 잘못된 방 참조) → 503, 파일 그대로 | host 확인 | 미확인 | 센서 API·Matter 영향 없음 |
+| 재시작 후 설정·revision·TLS 인증서 유지 | host 확인 | 미확인 | |
+| 입력 검증(중복 이름·ID, 방 참조, 길이, 필드, 64방/256모듈) | host 확인 | 미확인 | 413(256 KiB 초과), 411(chunked), 422 |
+| 같은 포트 평문/TLS 판별, 설정 경로 평문 거부 | host 확인 | 미확인 | 평문 센서 API 출력은 이전과 바이트 단위로 같음(설정 공유 끔) |
+| 페어링 코드(10분, 1회, 5회 실패 폐기), 증명값, 인증서 바인딩 | host 확인 | 미확인 | 앱과 같은 test vector |
+| 토큰 인증, 철회(`pogohome-hubctl revoke`) 즉시 반영, 자기 해제 | host 확인 | 미확인 | devices.json에는 토큰 해시만 |
+| SSE가 설정 revision 변경을 알림 | host 확인 | 미확인 | registry 변경 없이도 1초 이내 |
+| 앱 URLSession ↔ 실제 서버(OpenSSL) 페어링·업로드·충돌·핀 불일치·해제 | Mac loopback 확인 | 미확인 | iOS 시뮬레이터, `HubSettingsLiveNetworkTests` |
+| macOS clang 빌드와 host test | 확인 | - | `-Wall -Wextra -Wshadow -Wconversion -Werror` 문법 검사 포함 |
+| Linux gcc + libssl-dev 빌드, CHIP 링크(`pogo_matter_bridge`, `pogohome-hubctl`) | stub 헤더로 main.cpp 문법 확인 | 미확인 | Linux 호스트에서 `tools/build_matter_bridge.sh` 필요 |
+| 실제 허브의 iPhone·iPad·Mac 두 대 이상 공유 | 앱 단위 테스트(가짜 허브) | 미확인 | |
+
 ## Linux Matter Bridge
 
 Matter SDK는 connectedhomeip v1.6.0.0으로 고정했다. module UUID마다 동적 endpoint 하나를

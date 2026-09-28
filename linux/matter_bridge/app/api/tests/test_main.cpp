@@ -7,6 +7,11 @@ void RunHttpServerTests(int *failures);
 void RunMultiPowerBaseTests(int *failures);
 void RunHubIdentityTests(int *failures);
 void RunMdnsAdvertiserTests(int *failures);
+void RunJsonValueTests(int *failures);
+void RunHomeSettingsTests(int *failures);
+void RunSettingsStoreTests(int *failures);
+void RunDeviceAuthTests(int *failures);
+void RunSettingsApiTests(int *failures);
 
 int main()
 {
@@ -18,6 +23,11 @@ int main()
     RunMultiPowerBaseTests(&failures);
     RunHubIdentityTests(&failures);
     RunMdnsAdvertiserTests(&failures);
+    RunJsonValueTests(&failures);
+    RunHomeSettingsTests(&failures);
+    RunSettingsStoreTests(&failures);
+    RunDeviceAuthTests(&failures);
+    RunSettingsApiTests(&failures);
     std::printf("\n%d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

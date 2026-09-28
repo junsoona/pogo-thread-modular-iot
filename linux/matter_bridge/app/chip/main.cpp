@@ -78,10 +78,14 @@
 #include "ingest/server.hpp"
 #include "matter_bridge/bridge_manager.hpp"
 #include "matter_bridge/endpoint_store.hpp"
+#include "pogohome_api/atomic_file.hpp"
+#include "pogohome_api/device_auth.hpp"
 #include "pogohome_api/http_server.hpp"
 #include "pogohome_api/hub_identity.hpp"
 #include "pogohome_api/interface_address.hpp"
 #include "pogohome_api/mdns_advertiser.hpp"
+#include "pogohome_api/settings_store.hpp"
+#include "pogohome_api/tls_identity.hpp"
 
 using chip::ArgParser::OptionDef;
 using chip::ArgParser::OptionSet;
@@ -103,6 +107,10 @@ struct AppConfig {
     // pogohome_api/mdns_advertiser.hpp) -- on whenever the API is, unless
     // --api-no-advertise.
     bool api_advertise = true;
+    // Home settings sharing over the API's TLS (see
+    // docs/pogohome-api-v1.md "Home settings") -- on whenever the API is,
+    // unless --api-no-settings.
+    bool api_settings = true;
 };
 
 AppConfig gAppConfig;
@@ -113,6 +121,7 @@ constexpr uint16_t kOptionStateDir = 0xFF12;
 constexpr uint16_t kOptionApiInterface = 0xFF13;
 constexpr uint16_t kOptionApiPort = 0xFF14;
 constexpr uint16_t kOptionApiNoAdvertise = 0xFF15;
+constexpr uint16_t kOptionApiNoSettings = 0xFF16;
 
 bool HandlePogoOption(const char *program, OptionSet *, int identifier, const char *name, const char *value)
 {
@@ -147,6 +156,9 @@ bool HandlePogoOption(const char *program, OptionSet *, int identifier, const ch
     case kOptionApiNoAdvertise:
         gAppConfig.api_advertise = false;
         return true;
+    case kOptionApiNoSettings:
+        gAppConfig.api_settings = false;
+        return true;
     default:
         PrintArgError("%s: INTERNAL ERROR: unhandled pogo_matter_bridge option: %s\n", program, name);
         return false;
@@ -160,6 +172,7 @@ OptionDef gPogoOptionDefs[] = {
     {"api-interface", chip::ArgParser::kArgumentRequired, kOptionApiInterface},
     {"api-port", chip::ArgParser::kArgumentRequired, kOptionApiPort},
     {"api-no-advertise", chip::ArgParser::kNoArgument, kOptionApiNoAdvertise},
+    {"api-no-settings", chip::ArgParser::kNoArgument, kOptionApiNoSettings},
     {},
 };
 
@@ -189,7 +202,11 @@ OptionSet gPogoOptions = {
     "  --api-no-advertise\n"
     "       Do not announce the API over Bonjour/mDNS. By default an enabled API is advertised as _jogakbo._tcp\n"
     "       on --api-interface through the host's avahi-daemon while it can take requests (see\n"
-    "       docs/pogohome-api-v1.md). Without avahi the API still runs, unadvertised.\n",
+    "       docs/pogohome-api-v1.md). Without avahi the API still runs, unadvertised.\n"
+    "  --api-no-settings\n"
+    "       Do not offer home settings sharing. By default an enabled API also serves the shared home settings\n"
+    "       (home name, rooms, sensor names and rooms) to devices paired with `pogohome-hubctl pair`, over TLS on\n"
+    "       the same port, with its key, certificate, settings and device list under <--state-dir>/pogohome/.\n",
 };
 
 ingest::Registry gRegistry;
@@ -407,6 +424,50 @@ int main(int argc, char *argv[])
         api_config.address_family = resolved.family;
         api_config.port = gAppConfig.api_port;
         api_config.hub_id = hub_id;
+
+        // Home settings sharing. Anything wrong here (a damaged TLS key or
+        // settings file) turns off only the settings routes -- they answer
+        // 503 and health says `settings_state: "unavailable"` -- while the
+        // sensor API, Bonjour and Matter start as always. Nothing damaged is
+        // ever replaced; see tls_identity.hpp and settings_store.hpp.
+        if (gAppConfig.api_settings) {
+            api_config.settings_requested = true;
+            const std::string settings_dir = gAppConfig.state_dir + "/pogohome";
+            std::string settings_error;
+            if (!pogohome_api::EnsurePrivateDirectory(settings_dir, settings_error)) {
+                fprintf(stderr, "pogohome_api: settings sharing unavailable: %s\n", settings_error.c_str());
+            } else {
+                std::shared_ptr<pogohome_api::TlsContext> tls;
+                pogohome_api::TlsIdentityResult tls_result =
+                    pogohome_api::LoadOrCreateTlsIdentity(settings_dir, "Jogakbo Hub " + hub_id.substr(0, 8), tls,
+                                                          settings_error);
+                if (tls_result == pogohome_api::TlsIdentityResult::Error) {
+                    fprintf(stderr, "pogohome_api: settings sharing unavailable: %s\n", settings_error.c_str());
+                } else {
+                    auto store = std::make_shared<pogohome_api::SettingsStore>(settings_dir);
+                    store->Load();
+                    pogohome_api::SettingsSnapshot settings = store->Get();
+                    if (settings.state == pogohome_api::SettingsState::Unavailable) {
+                        fprintf(stderr,
+                                "pogohome_api: shared settings unavailable (%s) -- settings requests are refused "
+                                "until %s is repaired or moved aside; it is never replaced automatically\n",
+                                settings.unavailable_reason.c_str(), store->path().c_str());
+                    }
+                    api_config.settings = store;
+                    api_config.device_auth = std::make_shared<pogohome_api::DeviceAuth>(settings_dir);
+                    api_config.tls = tls;
+                    // The fingerprint is public (every paired device pins it);
+                    // it is logged so an operator can compare it.
+                    fprintf(stdout, "pogohome_api: settings sharing on, TLS certificate %s (SHA-256 %s), settings %s\n",
+                            tls_result == pogohome_api::TlsIdentityResult::Created ? "created" : "loaded",
+                            tls->certificate_sha256().c_str(),
+                            settings.state == pogohome_api::SettingsState::Ready
+                                ? settings.revision.c_str()
+                                : (settings.state == pogohome_api::SettingsState::Uninitialized ? "not created yet"
+                                                                                                 : "unavailable"));
+                }
+            }
+        }
 
         gApiServer = std::make_unique<pogohome_api::Server>(gRegistry, api_config);
         if (!gApiServer->Start()) {

@@ -1,9 +1,11 @@
-# PogoHome Local API v1 -- the read-only HTTP/SSE server pogo_matter_bridge
-# optionally exposes over --api-interface/--api-port (see
+# PogoHome Local API v1 -- the HTTP/SSE server pogo_matter_bridge
+# optionally exposes over --api-interface/--api-port, plus the TLS-only home
+# settings sharing routes and the pogohome-hubctl operator tool (see
 # linux/matter_bridge/app/chip/main.cpp and docs/pogohome-api-v1.md).
-# Deliberately buildable and testable with nothing beyond a C/C++ compiler +
-# CMake, exactly like linux/matter_bridge/ingest's and app/core's own
-# CMakeLists.txt -- no CHIP_ROOT, no Matter SDK needed here at all.
+# Buildable and testable with a C/C++ compiler, CMake and OpenSSL's
+# development files (libssl-dev) -- no CHIP_ROOT, no Matter SDK needed here
+# at all. OpenSSL is already required by the connectedhomeip Linux build this
+# library ends up in (tools/build_matter_bridge.sh).
 # linux/matter_bridge/app/chip/ is the only part of this application that
 # links against connectedhomeip, and it links this library rather than
 # duplicating any of this logic (see app/BUILD.gn).
@@ -50,6 +52,13 @@ add_library(pogohome_api STATIC
     src/http_server.cpp
     src/hub_identity.cpp
     src/mdns_advertiser.cpp
+    src/json_value.cpp
+    src/crypto_util.cpp
+    src/atomic_file.cpp
+    src/home_settings.cpp
+    src/settings_store.cpp
+    src/device_auth.cpp
+    src/tls_identity.cpp
     ${REPO_ROOT}/linux/matter_bridge/ingest/src/registry.cpp
 )
 target_include_directories(pogohome_api PUBLIC
@@ -63,7 +72,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(pogohome_api PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+find_package(OpenSSL REQUIRED)
+target_link_libraries(pogohome_api PUBLIC Threads::Threads ${CMAKE_DL_LIBS} OpenSSL::SSL OpenSSL::Crypto)
+
+# The operator tool for pairing codes and device access (see
+# tools/pogohome_hubctl.cpp).
+add_executable(pogohome-hubctl tools/pogohome_hubctl.cpp)
+target_link_libraries(pogohome-hubctl PRIVATE pogohome_api)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(pogohome-hubctl PRIVATE -Wall -Wextra)
+endif()
 
 enable_testing()
 
@@ -75,6 +93,11 @@ add_executable(pogohome_api_unit_tests
     tests/test_multi_power_base.cpp
     tests/test_hub_identity.cpp
     tests/test_mdns_advertiser.cpp
+    tests/test_json_value.cpp
+    tests/test_home_settings.cpp
+    tests/test_settings_store.cpp
+    tests/test_device_auth.cpp
+    tests/test_settings_api.cpp
     tests/test_main.cpp
 )
 target_link_libraries(pogohome_api_unit_tests PRIVATE pogohome_api)

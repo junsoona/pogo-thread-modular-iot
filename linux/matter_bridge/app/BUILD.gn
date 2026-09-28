@@ -28,8 +28,29 @@ assert(chip_build_tools)
 _pogo_repo = "//third_party/pogo_repo"
 _ingest_dir = "${_pogo_repo}/linux/matter_bridge/ingest"
 
+# The settings-sharing part of the API (see api/include/pogohome_api/
+# settings_store.hpp, device_auth.hpp, tls_identity.hpp), shared by the
+# bridge and the pogohome-hubctl operator tool.
+_settings_sources = [
+  "api/include/pogohome_api/atomic_file.hpp",
+  "api/include/pogohome_api/crypto_util.hpp",
+  "api/include/pogohome_api/device_auth.hpp",
+  "api/include/pogohome_api/home_settings.hpp",
+  "api/include/pogohome_api/json_value.hpp",
+  "api/include/pogohome_api/settings_store.hpp",
+  "api/include/pogohome_api/tls_identity.hpp",
+  "api/src/atomic_file.cpp",
+  "api/src/crypto_util.cpp",
+  "api/src/device_auth.cpp",
+  "api/src/home_settings.cpp",
+  "api/src/json_value.cpp",
+  "api/src/settings_store.cpp",
+  "api/src/tls_identity.cpp",
+]
+
 executable("pogo_matter_bridge") {
-  sources = [
+  sources = _settings_sources
+  sources += [
     "api/include/pogohome_api/hex.hpp",
     "api/include/pogohome_api/http_server.hpp",
     "api/include/pogohome_api/hub_identity.hpp",
@@ -98,16 +119,42 @@ executable("pogo_matter_bridge") {
 
   # dlopen() of libavahi-client.so.3 for the Bonjour advertisement (see
   # api/include/pogohome_api/mdns_advertiser.hpp) -- no Avahi headers or
-  # link-time dependency.
-  libs = [ "dl" ]
+  # link-time dependency. libssl/libcrypto (OpenSSL) for the settings
+  # API's TLS, pairing proofs and tokens: the same libssl-dev the
+  # connectedhomeip Linux build already requires (tools/build_matter_bridge.sh).
+  libs = [
+    "dl",
+    "ssl",
+    "crypto",
+  ]
 
   output_dir = root_out_dir
 }
 
+# Operator tool: pairing codes and device access (see
+# api/tools/pogohome_hubctl.cpp). No Matter SDK code.
+executable("pogohome-hubctl") {
+  sources = _settings_sources
+  sources += [ "api/tools/pogohome_hubctl.cpp" ]
+  include_dirs = [ "api/include" ]
+  cflags = [ "-Wall" ]
+  libs = [
+    "ssl",
+    "crypto",
+  ]
+  output_dir = root_out_dir
+}
+
 group("linux") {
-  deps = [ ":pogo_matter_bridge" ]
+  deps = [
+    ":pogo_matter_bridge",
+    ":pogohome-hubctl",
+  ]
 }
 
 group("default") {
-  deps = [ ":pogo_matter_bridge" ]
+  deps = [
+    ":pogo_matter_bridge",
+    ":pogohome-hubctl",
+  ]
 }

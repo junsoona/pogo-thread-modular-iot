@@ -1,6 +1,7 @@
 # PogoHome Local API v1
 
-A read-only HTTP/SSE API, served by the existing `pogo_matter_bridge` process
+An HTTP/SSE API (read-only for sensor data; see "Home settings" for the
+TLS-only settings-sharing routes), served by the existing `pogo_matter_bridge` process
 itself (see [`matter-bridge.md`](matter-bridge.md)), that lets a client on the
 same LAN -- the future PogoHome iOS app, `curl`, or anything else -- read the
 same sensor/topology state `pogo_matter_bridge` already bridges onto Matter,
@@ -14,15 +15,19 @@ Implementation: [`linux/matter_bridge/app/api/`](../linux/matter_bridge/app/api/
 
 ## Trust boundary and bind policy
 
-- **Read-only.** Every route is `GET`. There is no way to change Registry
-  state, module/room metadata, or `pogo_matter_bridge`'s own configuration
-  through this API -- `POST`/`PUT`/`PATCH`/`DELETE` are not implemented at
-  all (an unsupported method on a known path is `405`).
-- **No authentication today.** This API trusts whoever can reach it. It must
-  only ever be bound to a trusted private LAN interface -- **never** expose
-  it beyond your home network (no port-forwarding, no public reverse proxy).
-  A future revision may add authentication (see "Future work" below); until
-  then, treat reachability itself as the access control.
+- **Sensor data is read-only.** `/api/v1/health`, `/api/v1/snapshot` and
+  `/api/v1/events` are `GET` only. There is no way to change Registry state or
+  `pogo_matter_bridge`'s own configuration through this API.
+- **Sensor routes need no authentication.** Whoever can reach them can read
+  them, over plain HTTP or TLS. Bind the API to a trusted private LAN
+  interface only -- **never** expose it beyond your home network (no
+  port-forwarding, no public reverse proxy).
+- **Home settings need a paired device and TLS.** The shared home name, rooms
+  and sensor names/rooms (see "Home settings") are only readable and writable
+  over TLS, with a bearer token that a device receives by pairing with a
+  one-time code the operator creates on the hub. Finding the hub over Bonjour
+  grants nothing. Neither codes nor tokens are ever sent over plain HTTP,
+  logged, or put in the Bonjour TXT record.
 - **Bind policy: one explicit interface's own address, never
   `0.0.0.0`/`::`.** The server binds to the *actual LAN address* of the
   interface named by `--api-interface` -- resolved via `getifaddrs()`
@@ -50,6 +55,7 @@ as it always has if `--api-interface` is omitted):
 --api-interface <ifname>   Linux network interface to bind the API server to (e.g. wlp5s0). Disabled if omitted.
 --api-port <port>          TCP port, 1..65535 (default: 8787). Only meaningful with --api-interface.
 --api-no-advertise         Do not announce the API over Bonjour (see "Bonjour" below). Advertised by default.
+--api-no-settings          Do not offer home settings sharing (see "Home settings" below). Offered by default.
 ```
 
 `8787` was chosen because it collides with neither the ingest CoAP port
@@ -426,9 +432,11 @@ never blocks any other client or the registry watcher thread.
 | known path, method other than `GET`            | `405` |
 | unknown path                                  | `404` |
 | oversized request header block (> 8 KiB) or malformed request line | `400`, or the connection is simply closed |
+| settings route over plain HTTP | `403 tls_required` |
 
-This API never reads a request body (none of its routes need one) and never
-adds CORS headers (a native iOS app making a direct request needs none).
+Only `PUT /api/v1/settings` and `POST /api/v1/pairing/claim` read a body
+(`Content-Length` only, at most 256 KiB). The API never adds CORS headers (a
+native iOS app making a direct request needs none).
 
 ## `curl` verification
 
@@ -496,9 +504,169 @@ curl -s http://<LAN-address>:8787/api/v1/health   # hub_id equals the TXT hub_id
 From a Mac on the same network: `dns-sd -B _jogakbo._tcp` and
 `dns-sd -L "<instance name>" _jogakbo._tcp`.
 
+## Home settings (settings-sharing revision)
+
+PogoHome devices (iPhone, iPad, Mac) that follow the same hub can share one
+copy of the **home name, the rooms (id, name, icon, order) and each sensor
+module's custom name and room**. The hub stores it and decides every change;
+there is no CloudKit or Apple Developer Program dependency.
+
+Not shared: sensor readings and online state (the Registry's), simulated
+(mock) data, Apple Home's homes/rooms/accessories, and anything per device
+(language, appearance, selected tab, the Watch's sensor choice, permissions).
+
+Implementation: `app/api/include/pogohome_api/{home_settings,settings_store,
+device_auth,tls_identity}.hpp`; operator tool `app/api/tools/pogohome_hubctl.cpp`.
+
+### Enabling and files
+
+On by default whenever `--api-interface` is given; `--api-no-settings` turns
+it off (the API is then exactly the read-only one, byte for byte). Its state
+lives in `<--state-dir>/pogohome/` (mode 0700, files 0600):
+
+| file | contents |
+|---|---|
+| `tls_key.pem`, `tls_cert.pem` | ECDSA P-256 key and self-signed certificate, created once. Devices pin the certificate's SHA-256 |
+| `settings.json` | the shared settings, revision and a random `settings_id` |
+| `devices.json` | paired devices: id, name, SHA-256 of the token (never the token), paired/last-used time |
+| `pairing.json` | the one waiting pairing code, its expiry and wrong attempts (exists only while a code waits) |
+| `auth.lock` | `flock` shared with `pogohome-hubctl` |
+
+A damaged key/certificate, settings or device file is never replaced or reset:
+the settings routes answer `503` (health says `settings_state: "unavailable"`),
+the reason is logged, and sensors, Bonjour and Matter run as always. Move the
+damaged file aside on purpose to start over (a new TLS identity means every
+device pairs again).
+
+### TLS on the API port
+
+The same port serves plain HTTP and TLS; the server looks at each
+connection's first byte (`0x16` = TLS handshake). TLS 1.2+ with ECDHE-ECDSA
+AES-GCM/ChaCha20 only. There is no CA on a home LAN: a device checks the
+certificate by pairing (below) and then pins its SHA-256 for every request.
+The app never disables certificate checks globally -- only its settings
+requests use the pin, per request.
+
+Over plain HTTP `/api/v1/settings`, `/api/v1/pairing/claim` and
+`/api/v1/devices/self` answer `403 {"error":"tls_required"}` before any
+header value or body is used.
+
+### Pairing
+
+1. The operator runs `pogohome-hubctl --state-dir <dir> pair` on the hub,
+   as the account the bridge runs as (see "Operating" below). It prints a code `XXXX-XXXX-XXXX` (12 Crockford base32 characters,
+   60 bits), valid for 10 minutes by default (`--minutes 1..60`), for one
+   device, destroyed after 5 wrong attempts. A new code replaces a waiting one.
+2. The app connects with TLS, hashes the certificate it received (`C`), and
+   sends `POST /api/v1/pairing/claim`
+   `{"device_name", "client_nonce" (32 hex), "proof"}` where
+   `proof = HMAC-SHA256(code, "pogohome-pair-v1\nclient\n" + hub_id + "\n" + C + "\n" + nonce + "\n" + SHA256hex(device_name))`.
+   **The code itself is never sent.** The hub recomputes the proof with its
+   own certificate hash, so a device talking to an impostor (another
+   certificate) is refused and the impostor learns nothing it can use within
+   the code's lifetime.
+3. The hub answers `{"hub_id", "device_id", "token", "server_proof"}` with
+   `server_proof = HMAC-SHA256(code, "pogohome-pair-v1\nserver\n" + hub_id + "\n" + C + "\n" + nonce + "\n" + device_id + "\n" + SHA256hex(token))`.
+   The app keeps the token (Keychain, this device only) and pins `C` only if
+   that proof checks out.
+
+Errors: `403 {"error":"pairing_rejected","reason":"no_active_code"|"expired"|"bad_proof"}`,
+`409 too_many_devices` (32), `400 invalid_request`, `503 auth_unavailable`.
+
+Test vectors shared by `tests/test_device_auth.cpp` and the app's
+`HubPairingProofTests`: code `7KQM3XWDPA9T`, hub_id
+`3f0c9a4e8b1d4c2a9e7f6b5a4d3c2b1a`, C = SHA-256("test-cert"), nonce
+`000102…0f`, name `Jun의 iPhone` → client proof `096c8f9c…3c99`; device id
+`0123456789abcdef`, token `A`×43 → server proof `4d9e5bc4…94a0`.
+
+### Routes (TLS, `Authorization: Bearer <token>`)
+
+| route | result |
+|---|---|
+| `GET /api/v1/settings` | `{"schema_version":1,"hub_id","initialized","revision","updated_at_unix_ms","settings"}`; before the first upload `initialized:false`, `revision:null`, `settings:null` |
+| `PUT /api/v1/settings` | body `{"base_revision": <revision> or null, "settings": {...}}` |
+| `DELETE /api/v1/devices/self` | removes the calling device |
+
+`settings`:
+
+```json
+{"home_name": "우리 집" | null,
+ "rooms": [{"id": "8A3B1C10-…", "name_kind": "custom", "name": "거실", "symbol": "sofa.fill"},
+           {"id": "…", "name_kind": "suggestion", "suggestion_symbol": "bed.double.fill", "suggestion_ordinal": 1, "symbol": "bed.double.fill"}],
+ "modules": [{"uuid": "744dbdfffe65d357", "name": "공기" | null, "room_id": "…" | null}]}
+```
+
+- Rooms are in display order and keyed by UUID, never by name. A
+  `suggestion` name is the app's own name for an icon, shown in each device's
+  language; a `custom` name is the same everywhere. The app's fixed
+  "unspecified" room (`9C6B8B2E-0000-4000-8000-000000000000`) is never listed;
+  a module in it has `room_id: null`.
+- Modules are keyed by the real module UUID the Registry reports, so a name
+  and room survive detaching, re-docking and moving to another Power Base.
+  Entries stay when a module is absent.
+- Validation (`422 {"error":"invalid_settings","detail": <code>}`): at most
+  64 rooms and 256 modules; names non-empty, no surrounding whitespace or
+  control characters, at most 120 code points; unique room ids; no two custom
+  names equal ignoring ASCII case, no two suggestions with the same icon and
+  number; symbols `[a-z0-9.]{1,64}`; module uuids 16 lowercase hex, unique;
+  `room_id` must name a listed room; unknown fields rejected. Bodies over
+  256 KiB are `413`; chunked bodies `411`; malformed JSON `400`.
+
+Concurrency: the hub owns the revision (`<settings_id>-<n>`, opaque to
+clients). `base_revision: null` is only accepted while there are no settings
+(the first upload); otherwise `base_revision` must equal the current revision.
+Anything else is `409 {"error":"revision_conflict","current": <GET body>}` and
+nothing is written, so an edit based on an older copy never overwrites or
+undoes a newer change or deletion. Device clocks decide nothing. A deleted
+room's modules move to `room_id: null` in the same document, so a deletion,
+a reorder or several placements are always one atomic change.
+
+Saving: temporary file, `fsync`, `rename`, directory `fsync`. A failed save is
+`500 {"error":"settings_save_failed"}` and the previous settings stay in
+memory and on disk -- never reported as saved.
+
+### Health, snapshot and SSE
+
+With settings sharing requested, `/api/v1/health` and every snapshot (GET and
+SSE) end with `"settings_api":1,"settings_state":"ready"|"uninitialized"|"unavailable","settings_revision":<revision or null>`
+(additive, after every earlier field). A saved change makes open SSE streams
+send a new snapshot within one poll interval (1 s) even if the Registry did not
+change, so apps notice another device's change without polling the settings
+route. Without settings sharing none of this appears.
+
+### Operating
+
+Run `pogohome-hubctl` as the account `pogo_matter_bridge` runs as -- not
+blindly with `sudo`. The files it writes under `<--state-dir>/pogohome/`
+(`pairing.json`, `devices.json`, `auth.lock`) are created `0600` by whoever runs
+it, so a copy written by root locks a bridge that runs as a normal user out of
+pairing and settings. That account owns `<--state-dir>/pogohome/` (the bridge
+creates it); before the bridge has ever created it, read the unit's `User=`
+(`systemctl show -p User --value pogo-matter-bridge.service`, empty = root).
+
+```sh
+BRIDGE_USER="$(sudo stat -c %U /var/lib/pogo-matter-bridge/pogohome)"
+hubctl() { sudo -u "$BRIDGE_USER" pogohome-hubctl --state-dir /var/lib/pogo-matter-bridge "$@"; }
+
+hubctl pair                    # new code, 10 min
+hubctl pairing-status
+hubctl cancel-pairing
+hubctl devices                 # id, paired, last used, name
+hubctl revoke <device-id>
+hubctl revoke-all
+hubctl fingerprint             # what devices pin
+hubctl settings                # check + summary
+```
+
+When the bridge runs as your own login account (as in
+[`matter-bridge.md`](matter-bridge.md) "실행"), run `pogohome-hubctl` directly
+without `sudo`.
+
+Revocation applies to the device's next request; no restart. The app's
+Settings shows each device's id ("이 기기 ID") to match `devices`.
+
 ## Future work
 
-- Authentication (this API has none today -- see "Trust boundary" above).
 - Registering a Power Base from a client. The API is read-only. A Base is
   registered by flashing its firmware and `cfg` image (see
   [`power-base.md`](power-base.md) "여러 Power Base 추가").

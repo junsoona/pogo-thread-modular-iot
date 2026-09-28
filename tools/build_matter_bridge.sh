@@ -128,7 +128,8 @@ fi
 (
     cd "$APP_DIR"
     gn gen "$OUT_DIR" --root="$APP_DIR" --args="${GN_ARGS[*]}"
-    ninja -C "$OUT_DIR" pogo_matter_bridge
+    ninja -C "$OUT_DIR" pogo_matter_bridge pogohome-hubctl
 )
 
 echo "==> Built: $OUT_DIR/pogo_matter_bridge"
+echo "==> Built: $OUT_DIR/pogohome-hubctl"
