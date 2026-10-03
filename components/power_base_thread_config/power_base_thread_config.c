@@ -87,8 +87,14 @@ esp_err_t power_base_thread_config_load(power_base_thread_config_t *out)
         ESP_LOGI(TAG, "loaded: mode=STANDALONE");
         return ESP_OK;
     }
+    if (mode_raw == (uint8_t)POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        nvs_close(h);
+        out->mode = POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING;
+        ESP_LOGI(TAG, "loaded: mode=AWAIT_COMMISSIONING (Thread remains disabled)");
+        return ESP_OK;
+    }
     if (mode_raw != (uint8_t)POWER_BASE_THREAD_MODE_EXTERNAL_OTBR) {
-        ESP_LOGE(TAG, "CONFIG_ERROR: unsupported '%s:mode'=%u (expected 0=STANDALONE or 1=EXTERNAL_OTBR)",
+        ESP_LOGE(TAG, "CONFIG_ERROR: unsupported '%s:mode'=%u (expected 0=STANDALONE, 1=EXTERNAL_OTBR, or 2=AWAIT_COMMISSIONING)",
                  POWER_BASE_THREAD_CONFIG_NAMESPACE, (unsigned)mode_raw);
         nvs_close(h);
         memset(out, 0, sizeof(*out));

@@ -54,6 +54,16 @@ static bool port_valid(uart_port_t uart_num)
     return uart_num >= 0 && uart_num < HOST_UART_PORT_COUNT;
 }
 
+/* vTaskDelete() cancels a task wherever it blocks, including inside the
+ * condvar waits below, and a cancelled pthread_cond_(timed)wait() exits
+ * holding the mutex again. Without this cleanup handler every later UART
+ * call in the process would deadlock on s_uart_mutex. */
+static void unlock_uart_mutex(void *arg)
+{
+    (void)arg;
+    pthread_mutex_unlock(&s_uart_mutex);
+}
+
 esp_err_t uart_driver_install(uart_port_t uart_num, int rx_buffer_size, int tx_buffer_size, int queue_size,
                                void *uart_queue, int intr_alloc_flags)
 {
@@ -113,7 +123,9 @@ int uart_write_bytes(uart_port_t uart_num, const void *src, size_t size)
              * until space frees. A host test is expected to drain TX
              * promptly (see host_uart_test_take_tx_byte()), so this ring
              * filling up should not happen in practice. */
+            pthread_cleanup_push(unlock_uart_mutex, NULL);
             pthread_cond_wait(&p->tx_not_full, &s_uart_mutex);
+            pthread_cleanup_pop(0);
         }
         size_t tail = (p->tx_head + p->tx_count) % HOST_UART_RING_CAP;
         p->tx_buf[tail] = bytes[i];
@@ -154,7 +166,11 @@ int uart_read_bytes(uart_port_t uart_num, void *buf, uint32_t length, TickType_t
             host_deadline_from_ticks(&deadline, ticks_to_wait);
             have_deadline = true;
         }
-        if (pthread_cond_timedwait(&p->rx_not_empty, &s_uart_mutex, &deadline) != 0) {
+        int rc;
+        pthread_cleanup_push(unlock_uart_mutex, NULL);
+        rc = pthread_cond_timedwait(&p->rx_not_empty, &s_uart_mutex, &deadline);
+        pthread_cleanup_pop(0);
+        if (rc != 0) {
             break; /* timeout: return whatever was collected so far (possibly 0), matching real uart_read_bytes() */
         }
     }
@@ -260,6 +276,10 @@ void host_uart_test_force_next_read_fail(uart_port_t uart_num)
 void host_uart_test_reset(void)
 {
     pthread_mutex_lock(&s_uart_mutex);
+    /* Tests call this first: without it the condvars stay zeroed, and on
+     * macOS pthread_cond_timedwait() then fails at once (EINVAL), turning
+     * every blocking uart_read_bytes() into a busy loop. */
+    ensure_inited_locked();
     for (int i = 0; i < HOST_UART_PORT_COUNT; i++) {
         s_ports[i].installed = false;
         s_ports[i].force_write_fail = false;

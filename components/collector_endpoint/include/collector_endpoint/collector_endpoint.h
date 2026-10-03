@@ -15,7 +15,7 @@
  * docs/power-base.md, "INTERMEDIATE forwards the ORIGINAL power base
  * endpoint, never its own address"). Consumed by sensor_transport.c and
  * topology_reporter.c (as the destination address for their own CoAP sends)
- * and by parent_service, via module/main/app_main.c's
+ * and by parent_service, via module/main/module_wiring.c's
  * parent_service_context_t.get_collector callback, to hand the SAME endpoint
  * down to whatever docks below this module.
  *

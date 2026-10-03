@@ -52,6 +52,7 @@
  *      -I components/sensor_provider/include -I components/role_manager/include \
  *      -I components/pogo_port/include -I components/pogo_proto/include \
  *      -I components/sensor_root_aggregator/include -I components/coap_response_timing/include \
+ *      -I components/thread_manager/include \
  *      -o /tmp/test_sensor_transport_gate_retry tools/test_sensor_transport_gate_retry.c \
  *      components/sensor_transport/sensor_transport.c \
  *      components/collector_endpoint/collector_endpoint.c \
@@ -74,8 +75,20 @@
 #include "host_ot_coap_sim.h"
 #include "openthread/coap.h"
 #include "openthread/error.h"
+#include "thread_manager/thread_manager.h"
 
 static int g_failures = 0;
+
+/* sensor_transport.c's send_one_attempt() calls this parent-address
+ * diagnostic under the OpenThread lock it already holds for the real send
+ * (see thread_manager.h). It never changes what is sent or retried, and
+ * there is no host OpenThread stack to ask -- a no-op stand-in for the
+ * Thread-radio dependency, same category as host_ot_coap_sim.c. */
+void thread_manager_check_parent_for_sample(otInstance *instance, uint32_t sample_seq)
+{
+    (void)instance;
+    (void)sample_seq;
+}
 
 #define CHECK(cond, msg)                                                                                             \
     do {                                                                                                             \

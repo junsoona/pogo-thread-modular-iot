@@ -47,6 +47,17 @@
  * dataset, a real OpenThread rejection, ...) -- see halt_forever()'s
  * callers below for both the config-load and the Thread-join failure paths.
  *
+ * AWAIT_COMMISSIONING (pb_thread:mode=2, components/power_base_enrollment,
+ * enrollment_runtime.c): steps 1-5 below, then Thread is disabled and step 3
+ * (power rail) is skipped. Thread is enabled only on a Dataset OpenThread
+ * already stored -- never formed -- and only when (a) the enrollment marker
+ * is valid for this EUI-64 and matches that complete Dataset (boot resume),
+ * or (b) a Joiner run succeeded (bench builds: "pb_join" console). In case
+ * (b) the board counts as enrolled only once attached with a complete
+ * Dataset and the marker is committed; on failure it stops Thread and waits
+ * again. Either way on_enrollment_ready() then runs step 3 and step 7 once,
+ * so steps 8-13 (including the exporter and DETECT_OUT) never run before.
+ *
  * Boot sequence:
  *   1. nvs_flash_init()            -- dynamic "nvs" partition (OpenThread's
  *                                      own Active Dataset, see
@@ -200,6 +211,7 @@
 #include "power_base_transport/power_base_transport.h"
 #include "linux_bridge_exporter/linux_bridge_exporter.h"
 #include "thread_manager/thread_manager.h"
+#include "enrollment_runtime.h"
 
 static const char *TAG = "power_base_main";
 
@@ -533,6 +545,30 @@ static void attach_supervisor_task(void *arg)
     }
 }
 
+static void start_attach_supervisor(void)
+{
+    BaseType_t supervisor_ok = xTaskCreate(attach_supervisor_task, "attach_supervisor", 3584, NULL, 4, NULL);
+    if (supervisor_ok != pdPASS) {
+        halt_forever("ATTACH_SUPERVISOR_TASK_FAILED: xTaskCreate failed -- refusing to continue with no way to ever "
+                     "notice this device attaching to Thread");
+    }
+}
+
+/*
+ * AWAIT_COMMISSIONING only: called exactly once by enrollment_runtime.c when
+ * this board is enrolled -- either at boot (valid marker + matching stored
+ * Dataset, Thread just enabled on it) or after a Joiner success, a
+ * CHILD/ROUTER/LEADER attach with a complete Dataset, and a committed marker.
+ * From here on the board behaves like mode 0/1: the supervisor (re)checks the
+ * role and runs start_services_once() exactly once.
+ */
+static void on_enrollment_ready(void)
+{
+    ESP_LOGI(TAG, "AWAIT_COMMISSIONING: enrolled -- enabling the power rail and the normal attach supervisor");
+    apply_power_rail_sequencing();
+    start_attach_supervisor();
+}
+
 void app_main(void)
 {
     /* Minimal, unconditional boot-diagnostic trail -- see module/main/
@@ -580,6 +616,8 @@ void app_main(void)
     if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_EXTERNAL_OTBR) {
         ESP_LOGI(TAG, "Thread dataset mode: EXTERNAL_OTBR (%u bytes; contents hidden)",
                  (unsigned)s_thread_cfg.active_tlvs_len);
+    } else if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        ESP_LOGI(TAG, "Thread dataset mode: AWAIT_COMMISSIONING");
     } else {
         ESP_LOGI(TAG, "Thread dataset mode: STANDALONE");
     }
@@ -601,7 +639,9 @@ void app_main(void)
         s_bridge_cfg.enabled = false; /* fail-safe: never start the exporter on a load error */
     }
 
-    apply_power_rail_sequencing();
+    if (s_thread_cfg.mode != POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        apply_power_rail_sequencing();
+    }
 
     /* Stable identity (section 6): the ESP32-H2's own efuse-provisioned
      * EUI-64 is used directly as this power base's 8-byte UUID -- permanent
@@ -630,6 +670,22 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(thread_manager_init());
+
+    if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        /* Unregistered spare-board state (components/power_base_enrollment).
+         * Thread stays disabled: no Dataset left in dynamic NVS is resumed and
+         * no network is formed unless the enrollment marker says this board
+         * completed a Joiner enrollment AND the stored Dataset matches it.
+         * The power rail, exporter, POGO downstream and DETECT_OUT start only
+         * from on_enrollment_ready(), i.e. once enrolled -- through the same
+         * attach_supervisor_task()/start_services_once() path as modes 0/1. */
+        ESP_ERROR_CHECK(thread_manager_stop());
+        ESP_LOGW(TAG, "AWAIT_COMMISSIONING: Thread and downstream services are disabled until enrolled");
+        if (pb_enrollment_runtime_start(s_own_uuid, on_enrollment_ready) != ESP_OK) {
+            halt_forever("ENROLLMENT_RUNTIME_FAILED: could not create the enrollment runtime");
+        }
+        return;
+    }
 
     /* A failure HERE is a genuine OpenThread API error (bad return from the
      * underlying otThreadSetEnabled/otThreadSetLinkMode/... calls, or
@@ -669,9 +725,5 @@ void app_main(void)
      * comment for the full policy (no fixed timeout, no halt_forever() for
      * "not attached yet", exactly-once service startup).
      */
-    BaseType_t supervisor_ok = xTaskCreate(attach_supervisor_task, "attach_supervisor", 3584, NULL, 4, NULL);
-    if (supervisor_ok != pdPASS) {
-        halt_forever("ATTACH_SUPERVISOR_TASK_FAILED: xTaskCreate failed -- refusing to continue with no way to ever "
-                     "notice this device attaching to Thread");
-    }
+    start_attach_supervisor();
 }

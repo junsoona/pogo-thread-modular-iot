@@ -1,7 +1,7 @@
 /*
  * Host-compiled test for generation-counter invalidation across a role
  * transition -- section 13 of the follow-up spec: "role transition
- * generation 무효화". Mirrors module/main/app_main.c's
+ * generation 무효화". Mirrors module/main/module_wiring.c's
  * s_root_watch_generation / root_ready_watcher_task() pattern: a watcher
  * (or, generically, any long-running async check spawned for one specific
  * role-attempt) only ever acts if the generation it captured at spawn time
@@ -16,7 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* --- model of app_main.c's generation bookkeeping --- */
+/* --- model of module_wiring.c's generation bookkeeping --- */
 static uint32_t g_generation;
 
 static uint32_t start_watcher(void)

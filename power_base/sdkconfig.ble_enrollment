@@ -1,0 +1,46 @@
+#
+# BLE enrollment trial overlay for a SPARE Power Base (pb_thread:mode=2).
+# Never used by a default `idf.py build` and never combined with
+# sdkconfig.bench_joiner. Apply it on top of sdkconfig.defaults with a
+# separate build directory and sdkconfig file, e.g.:
+#
+#   BLE_BUILD="$HOME/esp-builds/pogo_power_base_ble_enrollment"
+#   idf.py -C power_base -B "$BLE_BUILD" -D SDKCONFIG="$BLE_BUILD/sdkconfig" \
+#       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ble_enrollment" build
+#
+# Adds the OpenThread Joiner (and the DTLS/EC-JPAKE it needs), the NimBLE
+# peripheral and the BLE enrollment transport. The "pb_join" console and the
+# OpenThread CLI stay OFF. See docs/power-base.md "BLE 등록 전달 경로".
+#
+CONFIG_OPENTHREAD_JOINER=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+
+#
+# NimBLE, peripheral + GATT server only, one connection. The BLE link itself
+# is not paired or encrypted: the session is protocomm Security 2.
+#
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+#
+# protocomm: Security 2 (SRP-6a + AES-GCM) only. Security 0 (none) and
+# Security 1 are not compiled in, so a client cannot ask for them.
+#
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2=y
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0=n
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=n
+
+#
+# One radio: BLE and IEEE 802.15.4 (Thread) take turns under ESP-IDF's
+# software coexistence while a Joiner runs with the BLE link still up.
+#
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+CONFIG_POWER_BASE_BLE_ENROLLMENT=y

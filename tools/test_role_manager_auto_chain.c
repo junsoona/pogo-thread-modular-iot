@@ -5,11 +5,12 @@
  * "2단 체인: INTERMEDIATE -> LEAF", "3단 체인: INTERMEDIATE ->
  * INTERMEDIATE -> LEAF".
  *
- * role_manager.c cannot be host-compiled directly (role_manager.h pulls in
- * pogo_port.h, which has an ESP-IDF driver/gpio.h + driver/uart.h
- * dependency) -- this mirrors recompute() step for step instead, same
- * approach as every other pogo_port/child_service/parent_service mirror
- * test in this directory. The fix under test: an earlier revision set
+ * This is a MIRROR test: it restates recompute() step for step instead of
+ * linking role_manager.c (written before the host stubs could compile it).
+ * The real file is linked by tools/test_role_manager_downstream_isolation.c,
+ * which is the authority for anything involving a port error -- the mirror
+ * below only keeps the chain-position scenarios. The fix under test: an
+ * earlier revision set
  * MODULE_ROLE_ROOT the moment the UPSTREAM peer was POWER_BASE; role_manager.c
  * (see its own comment on this) now treats POWER_BASE and MODULE upstream
  * peers identically -- LEAF/INTERMEDIATE decided purely by DOWNSTREAM state,
@@ -30,6 +31,7 @@ typedef enum { ROLE_UNASSIGNED = 0, ROLE_ROOT, ROLE_INTERMEDIATE, ROLE_LEAF, ROL
 typedef struct {
     bool attached;
     bool error;
+    bool error_is_transient; /* DOCK_TIMEOUT / LIVENESS_LOST */
     peer_type_t peer_type;
 } port_state_t;
 
@@ -50,7 +52,7 @@ static int g_failures = 0;
  * this function at all). */
 static role_t recompute(port_state_t up, port_state_t down, role_t previous)
 {
-    if (up.error || down.error) {
+    if (up.error || (down.error && !down.error_is_transient)) {
         return ROLE_ERROR;
     }
     if (!up.attached || up.peer_type == PEER_UNKNOWN) {
@@ -60,6 +62,10 @@ static role_t recompute(port_state_t up, port_state_t down, role_t previous)
      * peer is the power base or another module -- see role_manager.c. */
     if (!down.attached) {
         return ROLE_LEAF;
+    }
+    if (down.error) {
+        /* isolated transient DOWNSTREAM fault -- hold the settled role */
+        return (previous == ROLE_LEAF || previous == ROLE_INTERMEDIATE) ? previous : ROLE_LEAF;
     }
     if (down.peer_type == PEER_MODULE) {
         return ROLE_INTERMEDIATE;

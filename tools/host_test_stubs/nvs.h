@@ -71,6 +71,22 @@ static inline esp_err_t nvs_set_u32(nvs_handle_t handle, const char *key, uint32
     return ESP_OK;
 }
 
+/* Added for components/topology_reporter's host test
+ * (tools/test_module_downstream_fault_isolation.c links the REAL
+ * topology_reporter.c, whose load_next_boot_generation() reads its boot
+ * counter back) -- consistent with "discards every value" above: nothing is
+ * ever stored, so a read always reports the key as absent (real ESP-IDF
+ * value of ESP_ERR_NVS_NOT_FOUND). */
+#define ESP_ERR_NVS_NOT_FOUND 0x1102
+
+static inline esp_err_t nvs_get_u32(nvs_handle_t handle, const char *key, uint32_t *out_value)
+{
+    (void)handle;
+    (void)key;
+    (void)out_value;
+    return ESP_ERR_NVS_NOT_FOUND;
+}
+
 static inline esp_err_t nvs_commit(nvs_handle_t handle)
 {
     (void)handle;

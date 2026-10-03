@@ -21,6 +21,13 @@
 extern "C" {
 #endif
 
+/* The real openthread/thread.h pulls otInstance in through
+ * openthread/instance.h; thread_manager.h's
+ * thread_manager_check_parent_for_sample() takes one, so every host build
+ * that includes thread_manager.h needs the opaque type here too (the same
+ * forward declaration openthread/coap.h and esp_openthread.h already repeat). */
+typedef struct otInstance otInstance;
+
 typedef enum {
     OT_DEVICE_ROLE_DISABLED = 0,
     OT_DEVICE_ROLE_DETACHED = 1,

@@ -48,9 +48,21 @@ _settings_sources = [
   "api/src/tls_identity.cpp",
 ]
 
+# Shared by the bridge and the root-run pogohome-otbr-helper (see
+# api/include/pogohome_api/otbr_helper_protocol.hpp): no OpenSSL, no Matter.
+_otbr_helper_core_sources = [
+  "api/include/pogohome_api/otbr_helper_protocol.hpp",
+  "api/include/pogohome_api/subprocess.hpp",
+  "api/src/otbr_helper_protocol.cpp",
+  "api/src/subprocess.cpp",
+]
+
 executable("pogo_matter_bridge") {
   sources = _settings_sources
+  sources += _otbr_helper_core_sources
   sources += [
+    "api/include/pogohome_api/commissioner.hpp",
+    "api/include/pogohome_api/enrollment.hpp",
     "api/include/pogohome_api/hex.hpp",
     "api/include/pogohome_api/http_server.hpp",
     "api/include/pogohome_api/hub_identity.hpp",
@@ -58,6 +70,8 @@ executable("pogo_matter_bridge") {
     "api/include/pogohome_api/json_snapshot.hpp",
     "api/include/pogohome_api/mdns_advertiser.hpp",
     "api/include/pogohome_api/sensor_kind.hpp",
+    "api/src/commissioner.cpp",
+    "api/src/enrollment.cpp",
     "api/src/hex.cpp",
     "api/src/http_server.cpp",
     "api/src/hub_identity.cpp",
@@ -145,10 +159,22 @@ executable("pogohome-hubctl") {
   output_dir = root_out_dir
 }
 
+# Power Base enrollment's root-run OTBR helper (see
+# api/tools/pogohome_otbr_helper.cpp): installed root-owned and allowed to
+# the bridge's account by one exact sudoers rule. No OpenSSL, no Matter SDK.
+executable("pogohome-otbr-helper") {
+  sources = _otbr_helper_core_sources
+  sources += [ "api/tools/pogohome_otbr_helper.cpp" ]
+  include_dirs = [ "api/include" ]
+  cflags = [ "-Wall" ]
+  output_dir = root_out_dir
+}
+
 group("linux") {
   deps = [
     ":pogo_matter_bridge",
     ":pogohome-hubctl",
+    ":pogohome-otbr-helper",
   ]
 }
 
@@ -156,5 +182,6 @@ group("default") {
   deps = [
     ":pogo_matter_bridge",
     ":pogohome-hubctl",
+    ":pogohome-otbr-helper",
   ]
 }

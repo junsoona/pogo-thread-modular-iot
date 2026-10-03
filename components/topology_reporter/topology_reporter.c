@@ -427,7 +427,12 @@ static bool send_detached_report(void)
  */
 static void resync_downstream_connected(bool has_attached)
 {
-    bool ground_truth = pogo_port_is_attached(POGO_PORT_DOWNSTREAM) &&
+    /* "Connected" means the DOWNSTREAM port is PEER_READY with a MODULE right
+     * now. pogo_port_is_attached() alone is not enough: it stays true (and
+     * pogo_port_get_peer_type() keeps the old MODULE) all through a
+     * DOCK_TIMEOUT/LIVENESS_LOST retry cycle, which would re-report a failed
+     * link as connected on the very next tick. */
+    bool ground_truth = pogo_port_is_peer_ready(POGO_PORT_DOWNSTREAM) &&
                          pogo_port_get_peer_type(POGO_PORT_DOWNSTREAM) == POGO_PEER_TYPE_MODULE;
     if (ground_truth == s_downstream_connected) {
         return;

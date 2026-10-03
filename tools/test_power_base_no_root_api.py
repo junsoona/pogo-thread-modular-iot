@@ -125,15 +125,18 @@ def main():
         check(shared_callee is not None and shared_callee.group(1) in root_body,
               "both public functions delegate to the same shared underlying implementation function")
 
-    # module/main/app_main.c must be unaffected: it still uses
+    # The sensor module must be unaffected: it still uses
     # thread_manager_start_as_root() for the DEV_ROOT fixture path (this
     # correction pass explicitly must not change sensor-module DEV_ROOT
-    # behavior/logs).
-    module_app_main = os.path.join(ROOT_DIR, "module", "main", "app_main.c")
-    with open(module_app_main, "r", encoding="utf-8") as f:
-        module_text = f.read()
-    check("thread_manager_start_as_root(" in module_text,
-          "module/main/app_main.c is unaffected -- still calls thread_manager_start_as_root() for its DEV_ROOT fixture")
+    # behavior/logs). The role-change reaction that makes this call lives in
+    # module/main/module_wiring.c (moved out of app_main.c unchanged so host
+    # tests can link it).
+    module_wiring = os.path.join(ROOT_DIR, "module", "main", "module_wiring.c")
+    with open(module_wiring, "r", encoding="utf-8") as f:
+        module_text = strip_c_comments(f.read())
+    check(re.search(r"\bthread_manager_start_as_root\s*\(", module_text) is not None,
+          "module/main/module_wiring.c is unaffected -- still calls thread_manager_start_as_root() for its DEV_ROOT "
+          "fixture")
 
     if failures == 0:
         print("ALL CHECKS PASSED")

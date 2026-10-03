@@ -128,8 +128,9 @@ fi
 (
     cd "$APP_DIR"
     gn gen "$OUT_DIR" --root="$APP_DIR" --args="${GN_ARGS[*]}"
-    ninja -C "$OUT_DIR" pogo_matter_bridge pogohome-hubctl
+    ninja -C "$OUT_DIR" pogo_matter_bridge pogohome-hubctl pogohome-otbr-helper
 )
 
 echo "==> Built: $OUT_DIR/pogo_matter_bridge"
 echo "==> Built: $OUT_DIR/pogohome-hubctl"
+echo "==> Built: $OUT_DIR/pogohome-otbr-helper (installed only by hand; see docs/pogohome-api-v1.md)"

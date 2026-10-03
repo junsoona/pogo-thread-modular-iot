@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.c"
+    SRCS "app_main.c" "module_wiring.c"
     INCLUDE_DIRS "."
     REQUIRES pogo_proto module_config sensor_provider sensor_channel sensor_service pogo_port role_manager
              thread_manager child_service parent_service sensor_transport topology_reporter topology_gate

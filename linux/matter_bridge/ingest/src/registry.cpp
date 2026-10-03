@@ -351,9 +351,37 @@ void Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms
     // Still never touches node state (see this header's own doc comment:
     // never authoritative for modules) -- only the Power Base's own record.
     std::lock_guard<std::mutex> lock(mutex_);
-    if (note_power_base_seen_locked(power_base_uuid, now)) {
+    const bool changed = note_power_base_seen_locked(power_base_uuid, now);
+    for (auto &b : power_bases_) {
+        if (b.power_base_uuid == power_base_uuid) {
+            // Not a visible change by itself (see the doc comment): no
+            // generation() bump for a steady heartbeat.
+            b.last_heartbeat_serial = ++heartbeat_counter_;
+            break;
+        }
+    }
+    if (changed) {
         note_applied_locked();
     }
+}
+
+uint64_t Registry::heartbeat_serial() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return heartbeat_counter_;
+}
+
+bool Registry::get_power_base(const Uuid &power_base_uuid, PowerBaseState &out,
+                              std::chrono::steady_clock::time_point now) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &b : power_bases_) {
+        if (b.power_base_uuid == power_base_uuid) {
+            out = with_staleness_applied(b, now);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Registry::note_power_base_seen_locked(const Uuid &power_base_uuid, std::chrono::steady_clock::time_point now)

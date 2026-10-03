@@ -67,6 +67,7 @@
 #include <vector>
 
 #include <net/if.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <lib/support/CodeUtils.h>
@@ -79,7 +80,9 @@
 #include "matter_bridge/bridge_manager.hpp"
 #include "matter_bridge/endpoint_store.hpp"
 #include "pogohome_api/atomic_file.hpp"
+#include "pogohome_api/commissioner.hpp"
 #include "pogohome_api/device_auth.hpp"
+#include "pogohome_api/enrollment.hpp"
 #include "pogohome_api/http_server.hpp"
 #include "pogohome_api/hub_identity.hpp"
 #include "pogohome_api/interface_address.hpp"
@@ -111,6 +114,11 @@ struct AppConfig {
     // docs/pogohome-api-v1.md "Home settings") -- on whenever the API is,
     // unless --api-no-settings.
     bool api_settings = true;
+    // Power Base enrollment (docs/pogohome-api-v1.md "Power Base
+    // enrollment") -- off unless --api-enroll-helper names the root-run
+    // OTBR helper, which the bridge runs as `sudo -n -- <path>`.
+    std::string api_enroll_helper;
+    int api_enroll_window_s = 120;
 };
 
 AppConfig gAppConfig;
@@ -122,6 +130,8 @@ constexpr uint16_t kOptionApiInterface = 0xFF13;
 constexpr uint16_t kOptionApiPort = 0xFF14;
 constexpr uint16_t kOptionApiNoAdvertise = 0xFF15;
 constexpr uint16_t kOptionApiNoSettings = 0xFF16;
+constexpr uint16_t kOptionApiEnrollHelper = 0xFF17;
+constexpr uint16_t kOptionApiEnrollWindow = 0xFF18;
 
 bool HandlePogoOption(const char *program, OptionSet *, int identifier, const char *name, const char *value)
 {
@@ -159,6 +169,22 @@ bool HandlePogoOption(const char *program, OptionSet *, int identifier, const ch
     case kOptionApiNoSettings:
         gAppConfig.api_settings = false;
         return true;
+    case kOptionApiEnrollHelper:
+        if (value[0] != '/') {
+            PrintArgError("%s: --api-enroll-helper must be an absolute path\n", program);
+            return false;
+        }
+        gAppConfig.api_enroll_helper = value;
+        return true;
+    case kOptionApiEnrollWindow: {
+        int parsed = atoi(value);
+        if (parsed < 30 || parsed > 300) {
+            PrintArgError("%s: --api-enroll-window must be 30..300 seconds\n", program);
+            return false;
+        }
+        gAppConfig.api_enroll_window_s = parsed;
+        return true;
+    }
     default:
         PrintArgError("%s: INTERNAL ERROR: unhandled pogo_matter_bridge option: %s\n", program, name);
         return false;
@@ -173,6 +199,8 @@ OptionDef gPogoOptionDefs[] = {
     {"api-port", chip::ArgParser::kArgumentRequired, kOptionApiPort},
     {"api-no-advertise", chip::ArgParser::kNoArgument, kOptionApiNoAdvertise},
     {"api-no-settings", chip::ArgParser::kNoArgument, kOptionApiNoSettings},
+    {"api-enroll-helper", chip::ArgParser::kArgumentRequired, kOptionApiEnrollHelper},
+    {"api-enroll-window", chip::ArgParser::kArgumentRequired, kOptionApiEnrollWindow},
     {},
 };
 
@@ -206,7 +234,14 @@ OptionSet gPogoOptions = {
     "  --api-no-settings\n"
     "       Do not offer home settings sharing. By default an enabled API also serves the shared home settings\n"
     "       (home name, rooms, sensor names and rooms) to devices paired with `pogohome-hubctl pair`, over TLS on\n"
-    "       the same port, with its key, certificate, settings and device list under <--state-dir>/pogohome/.\n",
+    "       the same port, with its key, certificate, settings and device list under <--state-dir>/pogohome/.\n"
+    "  --api-enroll-helper <absolute-path>\n"
+    "       OPTIONAL. Enables Power Base enrollment for paired devices (TLS, bearer token) and names the\n"
+    "       root-run OTBR helper (pogohome-otbr-helper) this bridge runs as `sudo -n -- <path>`. Needs\n"
+    "       --api-interface and settings sharing, and an operator-installed sudoers rule for exactly that path\n"
+    "       (see docs/pogohome-api-v1.md \"Power Base enrollment\"). Omitted (the default): no enrollment.\n"
+    "  --api-enroll-window <seconds>\n"
+    "       How long one enrollment allows the Power Base's Joiner, 30..300 (default: 120).\n",
 };
 
 ingest::Registry gRegistry;
@@ -227,6 +262,9 @@ std::unique_ptr<pogohome_api::Server> gApiServer;
 // libavahi-client could be loaded. Declared after gApiServer so that, on any
 // exit path, it is destroyed (and withdraws the record) before the server.
 std::unique_ptr<pogohome_api::MdnsAdvertiser> gApiAdvertiser;
+// Null unless --api-enroll-helper was given. Stopped after gApiServer, so
+// its Joiner entry is removed once no request can start another session.
+std::shared_ptr<pogohome_api::EnrollmentManager> gEnrollment;
 
 // Runs on the Matter event-loop thread via
 // chip::DeviceLayer::PlatformMgr().ScheduleWork() -- see this file's own
@@ -372,6 +410,13 @@ void ApplicationShutdown()
 
 int main(int argc, char *argv[])
 {
+    // Under systemd stdout is a pipe, so stdio block-buffers it: the
+    // "pogohome_api: enrollment ..." and "[heartbeat] ..." lines (stdout)
+    // could reach the journal late -- only when something else flushed --
+    // while stderr lines appeared at once. Line buffering writes each line
+    // as it is printed. No line printed to stdout contains a PSKd.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     if (ChipLinuxAppInit(argc, argv, &gPogoOptions) != 0) {
         return -1;
     }
@@ -383,6 +428,21 @@ int main(int argc, char *argv[])
     if (gAppConfig.state_dir.empty()) {
         fprintf(stderr, "%s: --state-dir is required\n", argv[0]);
         return -1;
+    }
+    if (!gAppConfig.api_enroll_helper.empty()) {
+        // Enrollment rides on settings sharing's TLS and paired devices.
+        if (gAppConfig.api_interface.empty() || !gAppConfig.api_settings) {
+            fprintf(stderr, "%s: --api-enroll-helper needs --api-interface and settings sharing (no --api-no-settings)\n",
+                    argv[0]);
+            return -1;
+        }
+        struct stat st{};
+        if (stat(gAppConfig.api_enroll_helper.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+            access(gAppConfig.api_enroll_helper.c_str(), X_OK) != 0) {
+            fprintf(stderr, "%s: --api-enroll-helper %s is not an executable file\n", argv[0],
+                    gAppConfig.api_enroll_helper.c_str());
+            return -1;
+        }
     }
 
     // PogoHome Local API v1 (see docs/pogohome-api-v1.md) -- resolved and
@@ -467,6 +527,23 @@ int main(int argc, char *argv[])
                                                                                                  : "unavailable"));
                 }
             }
+        }
+
+        // Power Base enrollment. Nothing runs as root and nothing touches the
+        // OTBR until a paired device starts a session; the helper is not
+        // probed here.
+        if (!gAppConfig.api_enroll_helper.empty()) {
+            api_config.enrollment_requested = true;
+            pogohome_api::HelperCommissionerConfig helper;
+            helper.command = {"/usr/bin/sudo", "-n", "--", gAppConfig.api_enroll_helper};
+            pogohome_api::EnrollmentConfig enrollment;
+            enrollment.window = std::chrono::seconds(gAppConfig.api_enroll_window_s);
+            gEnrollment = std::make_shared<pogohome_api::EnrollmentManager>(
+                gRegistry, std::make_shared<pogohome_api::HelperCommissioner>(helper), enrollment);
+            api_config.enrollment = gEnrollment;
+            fprintf(stdout, "pogohome_api: Power Base enrollment on (%s via sudo, %d s window)%s\n",
+                    gAppConfig.api_enroll_helper.c_str(), gAppConfig.api_enroll_window_s,
+                    api_config.tls ? "" : " -- but settings sharing is unavailable, so it answers 503");
         }
 
         gApiServer = std::make_unique<pogohome_api::Server>(gRegistry, api_config);
@@ -557,6 +634,12 @@ int main(int argc, char *argv[])
     }
     if (gApiServer) {
         gApiServer->Stop();
+    }
+    // Ends a running enrollment session and removes its Joiner entry
+    // (bounded by the helper's timeouts; the OTBR's own entry timeout closes
+    // it anyway if this process is killed first).
+    if (gEnrollment) {
+        gEnrollment->Stop();
     }
     if (gIngestThread.joinable()) {
         gIngestThread.join();

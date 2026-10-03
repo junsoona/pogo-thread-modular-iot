@@ -19,6 +19,11 @@
 // per connection (`Connection: close`, no keep-alive/pipelining) except
 // GET /api/v1/events, which streams for the connection's whole lifetime.
 //
+// Power Base enrollment (ServerConfig::enrollment_requested/enrollment) adds
+// three more TLS-only, bearer-authenticated routes under
+// /api/v1/power-base-enrollments; without it they answer 404
+// enrollment_disabled and nothing else changes. See enrollment.hpp.
+//
 // Threading model: one acceptor thread (Start()) that poll()s the listening
 // socket on a short bounded timeout (mirrors
 // linux/matter_bridge/ingest/src/server.cpp's own SO_RCVTIMEO-poll pattern)
@@ -46,6 +51,7 @@
 
 #include "ingest/registry.hpp"
 #include "pogohome_api/device_auth.hpp"
+#include "pogohome_api/enrollment.hpp"
 #include "pogohome_api/settings_store.hpp"
 #include "pogohome_api/tls_identity.hpp"
 
@@ -100,6 +106,15 @@ struct ServerConfig {
     size_t max_request_body_bytes = 256 * 1024;
     // The wall clock, overridable so tests can expire pairing codes.
     std::function<int64_t()> now_unix_ms;
+
+    // Power Base enrollment (docs/pogohome-api-v1.md "Power Base
+    // enrollment"). Off unless requested; it needs settings sharing (TLS and
+    // paired devices) as well. Requested but `enrollment` or settings sharing
+    // missing: the routes answer 503 enrollment_unavailable.
+    bool enrollment_requested = false;
+    std::shared_ptr<EnrollmentManager> enrollment;
+    // Largest accepted POST /api/v1/power-base-enrollments body.
+    size_t max_enrollment_body_bytes = 256;
 };
 
 class Server {
@@ -155,11 +170,23 @@ private:
     void HandlePairingClaim(Stream &stream, const Request &request);
     void HandleSettings(Stream &stream, const Request &request, const DeviceRecord &device);
     void HandleRevokeSelf(Stream &stream, const DeviceRecord &device);
+    // Every /api/v1/power-base-enrollments route, from the TLS check on.
+    // `buf` is the raw request read so far (it may hold the start of a body).
+    void HandleEnrollmentRoute(Stream &stream, Request &request, std::string &buf);
+    void HandleEnrollmentStart(Stream &stream, Request &request, const DeviceRecord &device);
+
+    // Shared by the settings and enrollment routes: the bearer token check
+    // (answers 401/503 itself and returns false), and the body read (answers
+    // 411/413/400 itself, or just closes, and returns false).
+    bool AuthenticateDevice(Stream &stream, const Request &request, DeviceRecord &device);
+    bool ReadRequestBody(Stream &stream, Request &request, const std::string &buf, size_t max_bytes);
 
     bool SettingsEnabled() const { return config_.settings && config_.device_auth && config_.tls; }
     // Appends settings_api/settings_state/settings_revision to a health or
     // snapshot JSON object (nothing unless settings sharing was requested).
     void AppendSettingsFields(std::string &json) const;
+    // Appends power_base_enrollment to the health JSON (only when requested).
+    void AppendEnrollmentField(std::string &json) const;
     int64_t NowUnixMs() const;
 
     ingest::Registry &registry_;

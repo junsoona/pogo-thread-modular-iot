@@ -204,14 +204,31 @@ static void scenario_external_max_len_exactly_ok(void)
 
 static void scenario_invalid_mode_value(void)
 {
-    printf("\n-- scenario: unsupported mode value (2) -> fail closed --\n");
+    printf("\n-- scenario: unsupported mode value (3) -> fail closed --\n");
     nvs_sim_reset();
-    nvs_sim_put_u8(PARTITION, NS, "mode", 2);
+    nvs_sim_put_u8(PARTITION, NS, "mode", 3);
 
     power_base_thread_config_t out;
     esp_err_t err = power_base_thread_config_load(&out);
     CHECK(err != ESP_OK, "load FAILS for an unsupported mode value");
     check_zeroed_standalone(&out, "invalid mode value");
+}
+
+static void scenario_await_commissioning(void)
+{
+    printf("\n-- scenario: explicit mode=2 waits without reading a stale dataset --\n");
+    nvs_sim_reset();
+    nvs_sim_put_u8(PARTITION, NS, "mode", (uint8_t)POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING);
+    static const uint8_t stray[] = {0xAA, 0xBB, 0xCC};
+    nvs_sim_put_blob(PARTITION, NS, "active_tlvs", stray, sizeof(stray));
+
+    power_base_thread_config_t out;
+    esp_err_t err = power_base_thread_config_load(&out);
+    CHECK(err == ESP_OK, "load succeeds for explicit commissioning wait mode");
+    CHECK(out.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING, "mode remains AWAIT_COMMISSIONING");
+    CHECK(out.active_tlvs_len == 0, "stale active_tlvs is not surfaced");
+    static const uint8_t zero[POWER_BASE_THREAD_CONFIG_MAX_TLV_LEN] = {0};
+    CHECK(memcmp(out.active_tlvs, zero, sizeof(zero)) == 0, "stale dataset is not copied into RAM");
 }
 
 static void scenario_nvs_read_error(void)
@@ -264,6 +281,7 @@ int main(void)
     scenario_external_empty_blob();
     scenario_external_oversized_blob();
     scenario_external_max_len_exactly_ok();
+    scenario_await_commissioning();
     scenario_invalid_mode_value();
     scenario_out_zeroed_before_anything_else();
 

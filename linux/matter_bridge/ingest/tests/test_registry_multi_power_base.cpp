@@ -214,6 +214,34 @@ int main()
         CHECK(reg.generation() == 2, "steady 10s heartbeats never advance generation() (no SSE churn)");
     }
 
+    printf("\n-- scenario: heartbeat serials say exactly which heartbeats came after a given moment --\n");
+    {
+        Registry reg(milliseconds(120000));
+        CHECK(reg.heartbeat_serial() == 0, "no heartbeat yet: serial 0");
+        PowerBaseState b;
+        CHECK(!reg.get_power_base(pb_a, b, t0), "an unknown Base is not found");
+        reg.apply_topology(pb_a, a_sht, pb_a, true, 1, 2, kSht45Bitmap, true, 7, 1, t0);
+        CHECK(reg.get_power_base(pb_a, b, t0) && b.online && b.last_heartbeat_serial == 0,
+              "a topology report makes the Base known and online but is not a heartbeat");
+        reg.apply_heartbeat(pb_a, 1000, 1, t0);
+        const uint64_t mark = reg.heartbeat_serial();
+        CHECK(mark == 1 && reg.get_power_base(pb_a, b, t0) && b.last_heartbeat_serial == mark,
+              "Base A's heartbeat gets serial 1");
+        reg.apply_heartbeat(pb_b, 1000, 0, t0);
+        CHECK(reg.get_power_base(pb_a, b, t0) && b.last_heartbeat_serial == mark,
+              "another Base's heartbeat does not change Base A's serial");
+        // Same steady_clock instant as the heartbeat before `mark`: only the
+        // serial can tell them apart.
+        reg.apply_heartbeat(pb_a, 1000, 1, t0);
+        CHECK(reg.get_power_base(pb_a, b, t0) && b.last_heartbeat_serial > mark,
+              "a later heartbeat with an identical timestamp still gets a larger serial");
+        const uint64_t generation = reg.generation();
+        reg.apply_heartbeat(pb_a, 2000, 1, t0 + seconds(1));
+        CHECK(reg.generation() == generation, "serials never advance generation() for a steady heartbeat");
+        CHECK(reg.get_power_base(pb_a, b, t0 + seconds(500)) && !b.online,
+              "get_power_base applies the stale timeout like view()");
+    }
+
     printf("\n-- scenario: modules stay separated per Base, even with the same sensor kinds on both --\n");
     {
         Registry reg(milliseconds(120000));

@@ -113,10 +113,20 @@ esp_err_t pogo_port_enable(pogo_port_id_t id, pogo_peer_type_t own_peer_type);
  * in-flight session is invalidated first, same as a physical detach. */
 esp_err_t pogo_port_disable(pogo_port_id_t id);
 
+/* True while DETECT_IN is attached, whatever the handshake's state -- this
+ * includes a port that is mid-handshake, in ERROR, or waiting out its
+ * recovery cooldown. It does NOT mean the link is usable. */
 bool pogo_port_is_attached(pogo_port_id_t id);
 
-/* Only meaningful once POGO_PORT_EVENT_PEER_READY has fired for this port
- * (returns POGO_PEER_TYPE_UNKNOWN otherwise). */
+/* True only while this port is PEER_READY right now, i.e. exactly when
+ * pogo_port_send() would be accepted. False again from the moment a
+ * POGO_PORT_EVENT_ERROR/DETACHED fires until the next PEER_READY. */
+bool pogo_port_is_peer_ready(pogo_port_id_t id);
+
+/* The peer_type the peer last declared in a valid HELLO on this attach
+ * (POGO_PEER_TYPE_UNKNOWN until then). NOT cleared by a transient
+ * ERROR/retry cycle -- combine with pogo_port_is_peer_ready() to ask "is a
+ * peer of this type connected now". */
 pogo_peer_type_t pogo_port_get_peer_type(pogo_port_id_t id);
 
 /*

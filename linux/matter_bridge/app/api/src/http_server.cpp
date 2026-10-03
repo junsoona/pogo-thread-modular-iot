@@ -18,8 +18,10 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include "pogohome_api/crypto_util.hpp"
 #include "pogohome_api/json_snapshot.hpp"
 #include "pogohome_api/json_value.hpp"
+#include "pogohome_api/otbr_helper_protocol.hpp"
 
 namespace pogohome_api {
 
@@ -371,6 +373,62 @@ bool IsTlsOnlyPath(const std::string &path)
     return path == "/api/v1/settings" || path == "/api/v1/pairing/claim" || path == "/api/v1/devices/self";
 }
 
+constexpr char kEnrollmentsPath[] = "/api/v1/power-base-enrollments";
+
+bool IsEnrollmentPath(const std::string &path)
+{
+    const size_t n = sizeof(kEnrollmentsPath) - 1;
+    return path.compare(0, n, kEnrollmentsPath) == 0 && (path.size() == n || path[n] == '/');
+}
+
+// The session id of "/api/v1/power-base-enrollments/<id>", "" for the
+// collection itself.
+std::string EnrollmentIdOf(const std::string &path)
+{
+    const size_t n = sizeof(kEnrollmentsPath) - 1;
+    return path.size() > n ? path.substr(n + 1) : std::string();
+}
+
+std::string EnrollmentSessionJson(const EnrollmentSession &s)
+{
+    std::string out = "{\"session_id\":";
+    AppendJsonStringLiteral(out, s.session_id);
+    out += ",\"eui64\":";
+    AppendJsonStringLiteral(out, s.eui64);
+    out += ",\"state\":";
+    AppendJsonStringLiteral(out, EnrollmentStateName(s.state));
+    out += ",\"finished\":";
+    out += s.finished ? "true" : "false";
+    out += ",\"joiner_entry\":";
+    AppendJsonStringLiteral(out, JoinerEntryName(s.joiner_entry));
+    out += ",\"error\":";
+    if (s.error.empty()) {
+        out += "null";
+    } else {
+        AppendJsonStringLiteral(out, s.error);
+    }
+    out += ",\"window_seconds\":" + std::to_string(s.window_seconds);
+    out += ",\"created_at_unix_ms\":" + std::to_string(s.created_at_unix_ms);
+    out += ",\"expires_at_unix_ms\":" + std::to_string(s.expires_at_unix_ms);
+    out += ",\"expires_in_ms\":" + std::to_string(s.expires_in_ms);
+    out += ",\"heartbeat_received_at_unix_ms\":";
+    out += s.heartbeat_received_at_unix_ms > 0 ? std::to_string(s.heartbeat_received_at_unix_ms) : "null";
+    out += ",\"started_by_device_id\":";
+    AppendJsonStringLiteral(out, s.device_id);
+    out += '}';
+    return out;
+}
+
+std::string ErrorWithSessionJson(const char *error, const EnrollmentSession &s)
+{
+    std::string out = "{\"error\":";
+    AppendJsonStringLiteral(out, error);
+    out += ",\"session\":";
+    out += EnrollmentSessionJson(s);
+    out += '}';
+    return out;
+}
+
 // Closes `fd` and marks the owning Worker slot reapable on destruction --
 // every HandleConnection() exit path (early return included) goes through
 // this, so the socket is never leaked and the worker is never left
@@ -674,6 +732,7 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
         size_t module_count = ResolveModuleOwners(view.nodes).size();
         std::string body = BuildHealthJson(generation, module_count, view.power_bases.size(), config_.hub_id);
         AppendSettingsFields(body);
+        AppendEnrollmentField(body);
         SendJsonResponse(stream, 200, "OK", body);
         return;
     }
@@ -706,6 +765,11 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
         return;
     }
 
+    if (IsEnrollmentPath(path)) {
+        HandleEnrollmentRoute(stream, request, buf);
+        return;
+    }
+
     if (config_.settings_requested && IsTlsOnlyPath(path)) {
         // Nothing from a plain-HTTP request to these routes is ever used.
         if (!stream.is_tls()) {
@@ -730,43 +794,13 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
         }
 
         DeviceRecord device;
-        if (!is_claim) {
-            const std::string *authorization = request.Header("authorization");
-            std::string auth_error;
-            AuthOutcome auth = authorization == nullptr
-                                   ? AuthOutcome::Invalid
-                                   : config_.device_auth->Authenticate(*authorization, NowUnixMs(), device, auth_error);
-            if (auth == AuthOutcome::StorageError) {
-                std::fprintf(stderr, "pogohome_api: device credentials unavailable: %s\n", auth_error.c_str());
-                SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("auth_unavailable"));
-                return;
-            }
-            if (auth != AuthOutcome::Ok) {
-                SendResponse(stream, 401, "Unauthorized", ErrorJson("unauthorized"),
-                             "WWW-Authenticate: Bearer realm=\"pogohome\"\r\n");
-                return;
-            }
+        if (!is_claim && !AuthenticateDevice(stream, request, device)) {
+            return;
         }
 
-        if (method == "PUT" || method == "POST") {
-            size_t header_end = buf.find("\r\n\r\n") + 4;
-            BodyResult body_result = ReadBody(stream, request.headers, buf.substr(header_end),
-                                              config_.max_request_body_bytes, request.body);
-            switch (body_result) {
-            case BodyResult::Ok:
-                break;
-            case BodyResult::TooLarge:
-                SendJsonResponse(stream, 413, "Payload Too Large", ErrorJson("request_too_large"));
-                return;
-            case BodyResult::LengthRequired:
-                SendJsonResponse(stream, 411, "Length Required", ErrorJson("length_required"));
-                return;
-            case BodyResult::BadRequest:
-                SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_content_length"));
-                return;
-            case BodyResult::Incomplete:
-                return;
-            }
+        if ((method == "PUT" || method == "POST") &&
+            !ReadRequestBody(stream, request, buf, config_.max_request_body_bytes)) {
+            return;
         }
 
         if (is_claim) {
@@ -780,6 +814,196 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
     }
 
     SendJsonResponse(stream, 404, "Not Found", "{\"error\":\"not_found\"}");
+}
+
+void Server::AppendEnrollmentField(std::string &json) const
+{
+    if (!config_.enrollment_requested || json.empty() || json.back() != '}') {
+        return;
+    }
+    json.pop_back();
+    json += ",\"power_base_enrollment\":\"";
+    json += SettingsEnabled() && config_.enrollment ? "available" : "unavailable";
+    json += "\"}";
+}
+
+bool Server::AuthenticateDevice(Stream &stream, const Request &request, DeviceRecord &device)
+{
+    const std::string *authorization = request.Header("authorization");
+    std::string auth_error;
+    AuthOutcome auth = authorization == nullptr
+                           ? AuthOutcome::Invalid
+                           : config_.device_auth->Authenticate(*authorization, NowUnixMs(), device, auth_error);
+    if (auth == AuthOutcome::StorageError) {
+        std::fprintf(stderr, "pogohome_api: device credentials unavailable: %s\n", auth_error.c_str());
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("auth_unavailable"));
+        return false;
+    }
+    if (auth != AuthOutcome::Ok) {
+        SendResponse(stream, 401, "Unauthorized", ErrorJson("unauthorized"),
+                     "WWW-Authenticate: Bearer realm=\"pogohome\"\r\n");
+        return false;
+    }
+    return true;
+}
+
+bool Server::ReadRequestBody(Stream &stream, Request &request, const std::string &buf, size_t max_bytes)
+{
+    size_t header_end = buf.find("\r\n\r\n") + 4;
+    BodyResult body_result = ReadBody(stream, request.headers, buf.substr(header_end), max_bytes, request.body);
+    switch (body_result) {
+    case BodyResult::Ok:
+        return true;
+    case BodyResult::TooLarge:
+        SendJsonResponse(stream, 413, "Payload Too Large", ErrorJson("request_too_large"));
+        return false;
+    case BodyResult::LengthRequired:
+        SendJsonResponse(stream, 411, "Length Required", ErrorJson("length_required"));
+        return false;
+    case BodyResult::BadRequest:
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_content_length"));
+        return false;
+    case BodyResult::Incomplete:
+        return false;
+    }
+    return false;
+}
+
+void Server::HandleEnrollmentRoute(Stream &stream, Request &request, std::string &buf)
+{
+    // The same gate order as the settings routes: nothing from a plain-HTTP
+    // request is used, and nothing happens without a paired device's token.
+    if (!config_.enrollment_requested) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("enrollment_disabled"));
+        return;
+    }
+    if (!stream.is_tls()) {
+        SendJsonResponse(stream, 403, "Forbidden", ErrorJson("tls_required"));
+        return;
+    }
+    if (!SettingsEnabled() || !config_.enrollment) {
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("enrollment_unavailable", "reason", "startup"));
+        return;
+    }
+    const std::string session_id = EnrollmentIdOf(request.path);
+    const bool is_collection = request.path == kEnrollmentsPath;
+    const bool method_ok = is_collection ? request.method == "POST"
+                                         : (request.method == "GET" || request.method == "DELETE");
+    if (!method_ok) {
+        SendJsonResponse(stream, 405, "Method Not Allowed", ErrorJson("method_not_allowed"));
+        return;
+    }
+    if (!ParseHeaders(buf, request.headers)) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("malformed_headers"));
+        return;
+    }
+    DeviceRecord device;
+    if (!AuthenticateDevice(stream, request, device)) {
+        return;
+    }
+
+    if (is_collection) {
+        const bool body_ok = ReadRequestBody(stream, request, buf, config_.max_enrollment_body_bytes);
+        SecureWipe(buf); // may hold the start of the body, i.e. the PSKd
+        if (body_ok) {
+            HandleEnrollmentStart(stream, request, device);
+        }
+        SecureWipe(request.body);
+        return;
+    }
+
+    EnrollmentSession session;
+    if (!IsLowerHex(session_id, 32)) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("session_not_found"));
+        return;
+    }
+    if (request.method == "GET") {
+        if (!config_.enrollment->Get(device.id, session_id, session)) {
+            SendJsonResponse(stream, 404, "Not Found", ErrorJson("session_not_found"));
+            return;
+        }
+        SendJsonResponse(stream, 200, "OK", EnrollmentSessionJson(session));
+        return;
+    }
+    switch (config_.enrollment->Cancel(device.id, session_id, session)) {
+    case EnrollmentCancelOutcome::Cancelled:
+        SendJsonResponse(stream, 200, "OK", EnrollmentSessionJson(session));
+        return;
+    case EnrollmentCancelOutcome::AlreadyFinal:
+        SendJsonResponse(stream, 409, "Conflict", ErrorWithSessionJson("session_already_final", session));
+        return;
+    case EnrollmentCancelOutcome::NotFound:
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("session_not_found"));
+        return;
+    }
+}
+
+void Server::HandleEnrollmentStart(Stream &stream, Request &request, const DeviceRecord &device)
+{
+    // {"eui64": "<16 hex>", "pskd": "<6..32 of 0-9 A-Z without I O Q Z>"}.
+    // Error answers never echo either value.
+    JsonValue root;
+    std::string parse_error;
+    JsonParseLimits limits;
+    limits.max_depth = 2;
+    limits.max_string_bytes = 64;
+    limits.max_values = 8;
+    const bool parsed = ParseJson(request.body, root, parse_error, limits);
+    SecureWipe(request.body);
+    auto wipe_json = [&root]() {
+        for (auto &member : root.object_members) {
+            SecureWipe(member.second.string_value);
+        }
+    };
+    const JsonValue *eui = parsed && root.IsObject() ? root.Find("eui64") : nullptr;
+    const JsonValue *pskd_value = parsed && root.IsObject() ? root.Find("pskd") : nullptr;
+    if (eui == nullptr || !eui->IsString() || pskd_value == nullptr || !pskd_value->IsString() ||
+        root.object_members.size() != 2) {
+        wipe_json();
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
+        return;
+    }
+    std::string eui64;
+    if (!NormalizeEui64(eui->string_value, eui64)) {
+        wipe_json();
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_eui64"));
+        return;
+    }
+    if (!IsValidPskd(pskd_value->string_value)) {
+        wipe_json();
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_pskd"));
+        return;
+    }
+    std::string pskd = pskd_value->string_value;
+    wipe_json();
+
+    EnrollmentSession session;
+    EnrollmentStartOutcome outcome = config_.enrollment->Start(device.id, eui64, pskd, session);
+    SecureWipe(pskd);
+    switch (outcome) {
+    case EnrollmentStartOutcome::Started: {
+        std::string location = "Location: ";
+        location += kEnrollmentsPath;
+        location += "/" + session.session_id + "\r\n";
+        SendResponse(stream, 202, "Accepted", EnrollmentSessionJson(session), location.c_str());
+        return;
+    }
+    case EnrollmentStartOutcome::Busy:
+        SendJsonResponse(stream, 409, "Conflict",
+                         session.session_id.empty() ? ErrorJson("enrollment_in_progress")
+                                                    : ErrorWithSessionJson("enrollment_in_progress", session));
+        return;
+    case EnrollmentStartOutcome::AlreadyConnected:
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("power_base_already_connected"));
+        return;
+    case EnrollmentStartOutcome::Stopping:
+        SendJsonResponse(stream, 503, "Service Unavailable",
+                         ErrorJson("enrollment_unavailable", "reason", "stopping"));
+        return;
+    case EnrollmentStartOutcome::InternalError:
+        SendJsonResponse(stream, 500, "Internal Server Error", ErrorJson("internal_error"));
+        return;
+    }
 }
 
 void Server::HandlePairingClaim(Stream &stream, const Request &request)

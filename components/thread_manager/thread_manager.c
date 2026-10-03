@@ -20,7 +20,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "openthread/instance.h" /* otInstanceErasePersistentInfo() */
 #include "openthread/ip6.h"
+#include "openthread/link.h" /* otLinkGetFactoryAssignedIeeeEui64() */
+#include "openthread/netdiag.h" /* otThreadGetVendorName()/Model()/SwVersion() for the Joiner */
 #include "openthread/thread_ftd.h" /* otThreadSetRouterEligible() -- module always builds FTD (see sdkconfig.defaults) */
 
 static const char *TAG = "thread_manager";
@@ -388,6 +391,180 @@ esp_err_t thread_manager_start_as_always_on_ftd_with_dataset(const uint8_t *data
                  (unsigned)dataset_len);
     }
     return result;
+}
+
+/* ---- Power Base enrollment (see thread_manager.h) ---- */
+
+static void wipe_dataset(otOperationalDataset *ds)
+{
+    volatile uint8_t *p = (volatile uint8_t *)ds;
+    for (size_t i = 0; i < sizeof(*ds); i++) {
+        p[i] = 0;
+    }
+}
+
+static bool dataset_is_complete(const otOperationalDataset *ds)
+{
+    const otOperationalDatasetComponents *c = &ds->mComponents;
+    return c->mIsActiveTimestampPresent && c->mIsNetworkKeyPresent && c->mIsNetworkNamePresent &&
+           c->mIsExtendedPanIdPresent && c->mIsMeshLocalPrefixPresent && c->mIsPanIdPresent && c->mIsChannelPresent;
+}
+
+/* Caller holds the OpenThread lock. */
+static void summarize_stored_dataset_locked(otInstance *instance, thread_manager_dataset_summary_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    otOperationalDataset ds;
+    memset(&ds, 0, sizeof(ds));
+    if (otDatasetGetActive(instance, &ds) == OT_ERROR_NONE) {
+        out->has_network_key = ds.mComponents.mIsNetworkKeyPresent;
+        out->complete = dataset_is_complete(&ds);
+        if (out->complete) {
+            memcpy(out->ext_pan_id, ds.mExtendedPanId.m8, sizeof(out->ext_pan_id));
+            memcpy(out->mesh_local_prefix, ds.mMeshLocalPrefix.m8, sizeof(out->mesh_local_prefix));
+        }
+    }
+    wipe_dataset(&ds); /* holds the Network Key */
+}
+
+esp_err_t thread_manager_get_stored_dataset_summary(thread_manager_dataset_summary_t *out)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    summarize_stored_dataset_locked(instance, out);
+    esp_openthread_lock_release();
+    return ESP_OK;
+}
+
+esp_err_t thread_manager_start_as_always_on_ftd_stored(bool require_complete)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_OK;
+    do {
+        thread_manager_dataset_summary_t summary;
+        summarize_stored_dataset_locked(instance, &summary);
+        if (!summary.has_network_key || (require_complete && !summary.complete)) {
+            ESP_LOGE(TAG, "stored-dataset start: no %s Dataset stored -- refusing (never forms a network)",
+                     require_complete ? "complete" : "joined");
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        result = disable_thread_and_apply_always_on_ftd_link_mode(instance, "stored-dataset start");
+        if (result != ESP_OK) {
+            break;
+        }
+        /* Deliberately not esp_openthread_auto_start(NULL): that forms a new
+         * network from Kconfig defaults when nothing is stored. */
+        if (otIp6SetEnabled(instance, true) != OT_ERROR_NONE) {
+            ESP_LOGE(TAG, "stored-dataset start: otIp6SetEnabled(true) failed");
+            result = ESP_FAIL;
+            break;
+        }
+        if (otThreadSetEnabled(instance, true) != OT_ERROR_NONE) {
+            ESP_LOGE(TAG, "stored-dataset start: otThreadSetEnabled(true) failed");
+            (void)otIp6SetEnabled(instance, false);
+            result = ESP_FAIL;
+            break;
+        }
+    } while (0);
+
+    esp_openthread_lock_release();
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "stored-dataset start: Thread enabled on the stored %s Dataset (contents hidden)",
+                 require_complete ? "complete" : "Joiner");
+    }
+    return result;
+}
+
+esp_err_t thread_manager_joiner_start(const char *pskd, otJoinerCallback callback, void *context)
+{
+#if CONFIG_OPENTHREAD_JOINER
+    if (pskd == NULL || callback == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_OK;
+    otError err = OT_ERROR_NONE;
+    do {
+        if (otThreadGetDeviceRole(instance) != OT_DEVICE_ROLE_DISABLED) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (otIp6SetEnabled(instance, true) != OT_ERROR_NONE) {
+            result = ESP_FAIL;
+            break;
+        }
+        /* Same vendor strings `ot joiner start` passes (cli_joiner.cpp). */
+        err = otJoinerStart(instance, pskd, NULL, otThreadGetVendorName(instance), otThreadGetVendorModel(instance),
+                            otThreadGetVendorSwVersion(instance), NULL, callback, context);
+        if (err != OT_ERROR_NONE) {
+            (void)otIp6SetEnabled(instance, false);
+            result = ESP_FAIL;
+        }
+    } while (0);
+    esp_openthread_lock_release();
+
+    if (result != ESP_OK) {
+        /* The OpenThread error only; never the PSKd. */
+        ESP_LOGE(TAG, "Joiner start failed (%s, otError=%d)", esp_err_to_name(result), (int)err);
+    }
+    return result;
+#else
+    (void)pskd;
+    (void)callback;
+    (void)context;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+void thread_manager_joiner_stop(void)
+{
+#if CONFIG_OPENTHREAD_JOINER
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        ESP_LOGE(TAG, "Joiner stop: OpenThread lock timeout");
+        return;
+    }
+    otJoinerStop(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+#endif
+}
+
+esp_err_t thread_manager_get_factory_eui64(uint8_t out_eui64[8])
+{
+    otExtAddress eui;
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otLinkGetFactoryAssignedIeeeEui64(esp_openthread_get_instance(), &eui);
+    esp_openthread_lock_release();
+    memcpy(out_eui64, eui.m8, sizeof(eui.m8));
+    return ESP_OK;
+}
+
+esp_err_t thread_manager_erase_persistent_info(void)
+{
+    if (!esp_openthread_lock_acquire(OT_LOCK_WAIT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otError err = otInstanceErasePersistentInfo(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "otInstanceErasePersistentInfo failed (%d) -- is Thread still enabled?", (int)err);
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGW(TAG, "OpenThread persistent info erased -- restart required");
+    return ESP_OK;
 }
 
 esp_err_t thread_manager_join_with_dataset(thread_manager_role_t role, const uint8_t *dataset_tlvs,

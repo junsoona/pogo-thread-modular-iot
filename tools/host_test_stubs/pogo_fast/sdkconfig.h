@@ -90,3 +90,13 @@
  * the resync/heartbeat timer test.
  */
 #define CONFIG_LINUX_BRIDGE_EXPORTER_SAMPLE_MIN_INTERVAL_MS 1000
+
+/*
+ * Matches the real production Kconfig default (30000ms) exactly --
+ * tools/test_module_downstream_fault_isolation.c links the REAL
+ * components/topology_reporter/topology_reporter.c and finishes well inside
+ * one heartbeat interval, so every "/t" report it observes is an
+ * ATTACHED/UPDATED/DETACHED caused by the scenario itself, never a periodic
+ * heartbeat racing in.
+ */
+#define CONFIG_TOPOLOGY_REPORTER_HEARTBEAT_INTERVAL_MS 30000

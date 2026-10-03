@@ -820,7 +820,14 @@ static void handle_set_dataset(const pogo_frame_t *frame)
         module_role_t role = role_manager_get_role();
         thread_manager_role_t tm_role =
             (role == MODULE_ROLE_INTERMEDIATE) ? THREAD_MANAGER_ROLE_INTERMEDIATE : THREAD_MANAGER_ROLE_LEAF;
-        s_last_joined_role = role;
+        /* Remember the link mode actually applied, not the raw role: this
+         * join can run before role_manager has settled (UPSTREAM resolved
+         * while DOWNSTREAM is still mid-handshake leaves it UNASSIGNED), and
+         * anything other than INTERMEDIATE joins in LEAF link mode. Storing
+         * the raw role made the role later settling to LEAF look like a
+         * change and re-joined Thread right after the first join -- see the
+         * re-apply check in child_service_task(). */
+        s_last_joined_role = (role == MODULE_ROLE_INTERMEDIATE) ? MODULE_ROLE_INTERMEDIATE : MODULE_ROLE_LEAF;
         /* Dataset TLVs are never logged: they contain the Network Key. */
         ESP_LOGI(TAG, "dataset stored (%u bytes) -- starting Thread join as %s", (unsigned)s_dataset_len,
                  role_manager_role_to_str(role));
@@ -891,9 +898,19 @@ static void child_service_task(void *arg)
     (void)arg;
     while (1) {
         if (s_state == CS_STATE_JOINING) {
+            /* Judge this join by OpenThread's live role, not by a queued
+             * role-change event: the queue is only drained here, so it also
+             * holds changes from an earlier membership (an INTERMEDIATE's
+             * ROUTER promotion, thread_manager_stop()'s DISABLED, a LEAF
+             * re-attaching) and drops new ones once full. The join call
+             * itself left Thread DETACHED, so an attached role seen now was
+             * reached by this join. Draining only keeps the queue from
+             * staying full. */
             otDeviceRole role;
-            if (thread_manager_poll_role_change(&role) &&
-                (role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER)) {
+            while (thread_manager_poll_role_change(&role)) {
+            }
+            role = thread_manager_get_role();
+            if (role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER) {
                 ESP_LOGI(TAG, "Thread join succeeded, otDeviceRole=%u(%s)", role, thread_manager_role_to_str(role));
                 begin_join_result_retry(true, role);
                 s_state = CS_STATE_JOINED;
@@ -941,7 +958,7 @@ static void child_service_task(void *arg)
              * Stopping Thread on an UPSTREAM detach is module main's
              * responsibility (role_manager transitions to UNASSIGNED, whose
              * on_role_change handler calls thread_manager_stop(); see
-             * module/main/app_main.c and docs/state-machine.md). */
+             * module/main/module_wiring.c and docs/state-machine.md). */
             reset_session();
             role_manager_set_upstream_ready(false);
             sensor_service_set_thread_joined(false); /* stops sensor_service's wireless hand-off immediately */

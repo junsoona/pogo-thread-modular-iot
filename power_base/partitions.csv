@@ -13,16 +13,21 @@
 # docs/power-base.md section 7 and docs/otbr-rcp.md for the one-time
 # `erase-region 0x9000 0x6000` command used when first converting a board
 # that was previously STANDALONE.
+# In AWAIT_COMMISSIONING mode (pb_thread:mode=2) this partition also holds
+# the 36-byte "pb_enroll" completion marker (components/power_base_enrollment,
+# no secrets); a Dataset stored here is resumed only together with a valid
+# marker for this board's EUI-64 -- see docs/power-base.md.
 nvs,        data, nvs,      0x9000,  0x6000,
 phy_init,   data, phy,      0xf000,  0x1000,
 factory,    app,  factory,  0x10000, 1500K,
 #
-# "cfg" holds the FIXED power-base board configuration -- THREE independent
-# NVS namespaces in the SAME partition/image:
+# "cfg" holds the FIXED power-base board configuration -- independent NVS
+# namespaces in the SAME partition/image (three always, a fourth for BLE
+# enrollment trials):
 #   - "power_base_cfg" (components/power_base_config): POGO GPIOs, timeouts,
 #     ... -- unchanged by this follow-up.
 #   - "pb_thread" (components/power_base_thread_config): mode=STANDALONE(0)/
-#     EXTERNAL_OTBR(1) and, only for EXTERNAL_OTBR, the Linux OTBR's real
+#     EXTERNAL_OTBR(1)/AWAIT_COMMISSIONING(2) and, only for EXTERNAL_OTBR, the Linux OTBR's real
 #     Active Dataset TLVs (a SECRET -- contains the Network Key; the
 #     generated image is written mode 0600 and must never be committed, see
 #     .gitignore). A legacy image with no "pb_thread" namespace at all is
@@ -39,6 +44,10 @@ factory,    app,  factory,  0x10000, 1500K,
 #     as "exporter disabled" -- NOT a boot failure, unlike the two
 #     namespaces above (see components/power_base_bridge_config's own header
 #     comment's "boot policy" section).
+#   - "pb_ble_auth" (components/power_base_ble_auth): one 420-byte "cred"
+#     blob, the protocomm Security 2 salt/verifier for THIS board's BLE
+#     enrollment (tools/gen_power_base_ble_config.py). Only in mode-2 BLE
+#     trial images; absent = no BLE enrollment. Image written mode 0600.
 # Generated offline by tools/pack_power_base_config.py (plain
 # tools/gen_power_base_config.sh for STANDALONE, tools/gen_power_base_otbr_config.sh
 # for EXTERNAL_OTBR, and/or tools/gen_power_base_bridge_config.sh to add the

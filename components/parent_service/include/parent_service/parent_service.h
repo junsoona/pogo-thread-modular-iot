@@ -15,7 +15,7 @@
  * itself; parent_service always assigns depth+1 downstream), "what is my own
  * UUID" (for ASSIGN_PARENT_INFO), and an optional per-call ACK-timeout
  * override (0 = the pogo_proto Kconfig default -- see CONFIG_POGO_ACK_TIMEOUT_MS).
- * A sensor module's app_main.c wires this to role_manager/child_service/
+ * A sensor module's module_wiring.c wires this to role_manager/child_service/
  * sensor_service; power_base/main/app_main.c wires it to its own
  * always-ready-once-Leader / fixed-depth-0 / power_base_config-derived
  * identity instead. Neither side is "pretending" to be the other -- see
@@ -71,7 +71,7 @@ typedef struct {
      * power_base/main/app_main.c's pb_get_collector()); a sensor module
      * forwards the EXACT endpoint it itself received from its own upstream
      * via components/collector_endpoint, unmodified -- see
-     * module/main/app_main.c's module_parent_get_collector() and
+     * module/main/module_wiring.c's module_parent_get_collector() and
      * docs/power-base.md.
      */
     bool (*get_collector)(pogo_collector_endpoint_t *out, void *ctx);

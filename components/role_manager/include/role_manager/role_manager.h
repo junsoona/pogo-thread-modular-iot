@@ -7,7 +7,7 @@
  * it gets redocked in different positions.
  *
  * role_manager does not touch UART, NVS or OpenThread itself -- it is fed
- * port events by module main (see module/main/app_main.c) and in turn only
+ * port events by module main (see module/main/module_wiring.c) and in turn only
  * calls back with role transitions. child_service/parent_service/thread_manager
  * react to those transitions; role_manager never drives them directly.
  */
@@ -36,7 +36,18 @@ typedef enum {
     MODULE_ROLE_ROOT,
     MODULE_ROLE_INTERMEDIATE,   /* UPSTREAM peer is POWER_BASE or MODULE, and a MODULE is also attached DOWNSTREAM */
     MODULE_ROLE_LEAF,           /* UPSTREAM peer is POWER_BASE or MODULE, DOWNSTREAM is empty */
-    MODULE_ROLE_ERROR,          /* contradictory port state (e.g. a PEER_TYPE_CONFLICT on either port) */
+    /*
+     * Any UPSTREAM port error, or a DOWNSTREAM configuration/compatibility
+     * error (PEER_TYPE_CONFLICT, PROTOCOL_VERSION, CAPABILITY_MISMATCH).
+     * A DOWNSTREAM DOCK_TIMEOUT/LIVENESS_LOST is NOT this: it is isolated to
+     * the downstream link and the settled LEAF/INTERMEDIATE role is held
+     * (LEAF if none was settled yet) until that port reaches PEER_READY
+     * again or detaches -- so INTERMEDIATE/LEAF describe this module's own
+     * settled role, not whether DOWNSTREAM is usable right now (ask
+     * pogo_port_is_peer_ready() for that). See recompute() and
+     * docs/state-machine.md.
+     */
+    MODULE_ROLE_ERROR,
 } module_role_t;
 
 typedef void (*role_manager_change_cb_t)(module_role_t new_role, module_role_t old_role, void *ctx);
@@ -54,8 +65,11 @@ esp_err_t role_manager_init(module_dev_mode_t dev_mode, role_manager_change_cb_t
  * Feeds one pogo_port event into the role derivation. Call this for every
  * event on both ports (module main's dispatcher forwards the same event to
  * child_service/parent_service too; role_manager only cares about
- * ATTACHED/DETACHED/PEER_READY/ERROR, not FRAME_RECEIVED). A no-op in
- * forced (non-AUTO) dev-mode.
+ * ATTACHED/DETACHED/PEER_READY/ERROR, not FRAME_RECEIVED). `data` carries
+ * PEER_READY's peer_type and ERROR's error_code (which decides whether a
+ * DOWNSTREAM error is isolated); a NULL `data` is read as "unknown peer" /
+ * "unclassified error", the conservative side of both. A no-op in forced
+ * (non-AUTO) dev-mode.
  */
 void role_manager_on_port_event(pogo_port_id_t port_id, pogo_port_event_t event, const pogo_port_event_data_t *data);
 

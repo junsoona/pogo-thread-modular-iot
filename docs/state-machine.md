@@ -25,18 +25,45 @@ DISABLED
 `DOCK_TIMEOUT`과 `LIVENESS_LOST`는 DETECT_IN이 계속 low면 cooldown 뒤 새 cycle을
 시작한다. version, capability, peer type 충돌은 detach 전까지 유지한다.
 
+재시도 중인 포트는 DETECT_IN이 low이므로 `pogo_port_is_attached()`가 계속 true이고,
+이전 `PEER_READY`에서 기록한 peer type도 남아 있다. 링크를 실제로 쓸 수 있는지는
+`pogo_port_is_peer_ready()`(현재 `PEER_READY`인 동안만 true)로 판단한다.
+
+cooldown 중에도 UART를 읽어 유효한 `PEER_HELLO_REQ`에는 `PEER_HELLO_RESP`로 답하고 곧바로
+자신의 handshake를 시작한다. 양쪽이 같은 주기(handshake 약 1.2초 + cooldown 3초)로 재시도하므로,
+cooldown 동안 듣지 않으면 두 쪽의 재시도 시작이 약 1~3초 어긋났을 때(시차를 두고 체결했거나,
+연결된 상태에서 한 방향만 잠시 끊겨 양쪽의 `LIVENESS_LOST`가 약 1.3초 벌어진 경우) 한쪽의
+handshake 구간이 매번 상대의 cooldown 안에 들어가 배선이 정상이어도 다시 연결되지 않았다.
+
+- 응답만으로는 `PEER_READY`가 되지 않는다. 자신이 보낸 `PEER_HELLO_REQ`에 대한 응답을 받아야
+  `PEER_READY`가 된다.
+- version, peer type, BASE_ID, capability 검사는 handshake와 같다. 검사에 실패하면 같은 영구
+  오류로 바뀌고 detach 전까지 재시도하지 않는다.
+- 다른 frame, CRC·길이가 맞지 않는 frame, 이전 cycle의 `PEER_HELLO_RESP`는 버리고 cooldown을
+  그대로 채운다.
+- 한 번에 최대 20ms만 기다리므로 DETACHED 처리 지연과 재시도 주기는 이전과 같다
+  (`tools/test_pogo_port_cooldown_hello.c`).
+
 DETECT level은 ISR event 외에도 주기적으로 다시 읽어 내부 상태와 맞춘다.
 
 ## role_manager
 
-AUTO 모드의 입력은 두 port의 attach와 peer type이다.
+AUTO 모드의 입력은 두 port의 attach, peer type, 오류 종류다. 위에서부터 먼저 맞는 줄을
+적용한다.
 
 ```text
-UPSTREAM ready + DOWNSTREAM module ready -> INTERMEDIATE
-UPSTREAM ready + DOWNSTREAM not ready    -> LEAF
-UPSTREAM not ready                       -> UNASSIGNED
-conflict                                 -> ROLE_ERROR
+UPSTREAM 오류(종류 무관)                          -> ROLE_ERROR
+DOWNSTREAM 영구 오류                              -> ROLE_ERROR
+UPSTREAM not ready (분리 또는 handshake 미완료)   -> UNASSIGNED
+UPSTREAM ready + DOWNSTREAM 분리                  -> LEAF
+UPSTREAM ready + DOWNSTREAM 일시 오류·재시도 중   -> 직전 LEAF/INTERMEDIATE 유지 (없으면 LEAF)
+UPSTREAM ready + DOWNSTREAM module ready          -> INTERMEDIATE
+UPSTREAM ready + DOWNSTREAM handshake 진행 중     -> 직전 역할 유지
 ```
+
+- 영구 오류: `PEER_TYPE_CONFLICT`, `PROTOCOL_VERSION_ERROR`, `CAPABILITY_MISMATCH`, 그리고
+  분류되지 않은 오류 코드
+- 일시 오류: `DOCK_TIMEOUT`, `LIVENESS_LOST`
 
 역할 변화 callback은 다음 작업을 연결한다.
 
@@ -46,6 +73,46 @@ conflict                                 -> ROLE_ERROR
 - topology report generation 갱신
 
 AUTO 센서 모듈은 ROOT를 선택하지 않는다. DEV_ROOT/DEV_LEAF는 초기 회귀 시험 fixture다.
+
+### DOWNSTREAM 일시 오류 격리
+
+DOWNSTREAM의 `DOCK_TIMEOUT`과 `LIVENESS_LOST`는 하위 링크의 문제이며 자신의 UPSTREAM 관계와
+Thread 가입에는 영향을 주지 않는다. 이 두 오류는 역할을 바꾸지 않으므로 역할 변화
+callback이 호출되지 않는다.
+
+- 자신의 Thread를 중지하지 않고 `upstream_ready`, collector, topology gate를 그대로 둔다.
+  측정과 `/s` 전송이 계속된다.
+- 하위 쪽은 같은 `ERROR` event로 따로 정리한다. parent service는 진행 중인 provisioning
+  session을 취소하고, topology reporter는 `downstream_connected=false`를 보고한다.
+- 하위 module이 물리적으로 붙어 있는 동안에는 빈 포트로 보지 않는다. INTERMEDIATE를 LEAF로
+  내리지 않으므로 SED link mode로 바뀌지 않고, 복구 때 다시 올리는 재적용도 없다.
+- 한 번도 handshake를 마치지 못한 하위 module은 ready module이 아니다. 그 상태에서는 LEAF를
+  유지하고, UPSTREAM이 나중에 ready가 된 경우에도 LEAF로 시작한다.
+- 역할이 INTERMEDIATE로 유지되어도 하위 링크가 연결된 것은 아니다. 하위 연결 여부는 포트가
+  현재 `PEER_READY`인지로 판단한다.
+
+복구 조건은 DOWNSTREAM `PEER_READY`다. pogo_port가 기존 cooldown과 재시도 횟수로 handshake를
+다시 시도하고, 성공하면 다음 순서로 이어진다. 양쪽의 재시도 시점이 어긋난 경우는 pogo_port
+절의 cooldown 설명을 참고한다.
+
+- LEAF였다면 INTERMEDIATE로 바뀌고 같은 Dataset으로 link mode를 한 번 재적용한다.
+- INTERMEDIATE였다면 역할 변화가 없고 자신의 Thread 가입도 그대로다.
+- parent service가 하위 provisioning을 처음부터 다시 시작한다.
+
+DOWNSTREAM `DETACHED`는 실제로 빈 포트이므로 LEAF가 된다.
+
+UPSTREAM 오류는 격리하지 않는다. 하위 오류 중에 UPSTREAM이 `DETACHED` 또는 `ERROR`가 되면
+아래 "UPSTREAM detach"의 정리를 그대로 수행하고, 그 뒤 DOWNSTREAM이 `PEER_READY`로 돌아와도
+자신의 가입과 gate는 열리지 않는다.
+
+role_manager는 격리 로그를 오류 종류가 바뀔 때 한 번만 남긴다. pogo_port의 cycle별 로그
+주기는 그대로다.
+
+역할 판정과 Thread 중지 여부는 `tools/test_role_manager_downstream_isolation.c`가,
+포트·provisioning·gate·전송을 포함한 전체 경로는
+`tools/test_module_downstream_fault_isolation.c`가 실제 소스를 링크해 검사한다.
+일시 오류 격리와 cooldown 중 HELLO 응답은 host 확인만 했고 실물에서는 확인하지 않았다
+([`validation-status.md`](validation-status.md) "POGO 체인 분리·재연결 실물 시험").
 
 ## thread_manager
 
@@ -115,6 +182,18 @@ Dataset보다 먼저 받아야 한다.
 Active Dataset TLV를 검증하고 NVS에 저장한 뒤 역할에 맞는 Thread link mode로 가입한다.
 성공 또는 실패를 `JOIN_RESULT`로 보낸다.
 
+가입 성공은 OpenThread의 현재 role(CHILD/ROUTER/LEADER)로 판정한다. 가입 호출 직후 Thread는
+DETACHED이므로 그 뒤에 보이는 attached role은 이번 가입의 결과다. role 변화 queue는 가입 중에만
+비워지므로 이전 가입 때의 변화(INTERMEDIATE의 ROUTER 승격, Thread 중지의 DISABLED, LEAF의 재연결)가
+남아 있을 수 있고, 가득 차면 새 변화가 버려진다. 그래서 queue의 event만으로는 판정하지 않는다
+(`tools/test_child_service_stale_role_events.c`).
+
+역할이 INTERMEDIATE가 아니면 LEAF link mode로 가입한다. DOWNSTREAM handshake가 끝나기 전에
+`SET_DATASET`이 도착해 역할이 아직 UNASSIGNED인 경우도 여기에 포함된다. 가입 뒤에는 실제로
+적용한 link mode가 바뀔 때(LEAF ↔ INTERMEDIATE)만 같은 Dataset으로 다시 적용한다. 다시
+적용하면 Thread를 껐다 켜므로, 역할이 UNASSIGNED에서 LEAF로 확정되는 것만으로는 다시 적용하지
+않는다(`tools/test_child_service_link_mode_reapply.c`).
+
 ### JOIN_RESULT
 
 parent의 ACK를 받을 때까지 같은 sequence로 제한된 재전송을 한다.
@@ -178,6 +257,10 @@ Thread joined
 
 4.04 또는 4.12 응답은 gate를 닫고 재등록을 요청한다. reporter task의 다음 poll tick에서
 재등록한다. busy loop를 만들지 않는다.
+
+`downstream_connected`는 DOWNSTREAM 포트가 현재 `PEER_READY`이고 peer가 module일 때만
+true다. DETECT_IN이 low이거나 이전 peer type이 module이라는 이유만으로 true가 되지 않는다.
+값이 바뀔 때만 `UPDATED`를 보내므로 하위 재시도가 반복되어도 보고는 한 번이다.
 
 DETACHED, role UNASSIGNED/ROLE_ERROR, 새 provisioning 시작에서도 gate를 닫는다.
 
@@ -264,16 +347,25 @@ depth>1 보고는 parent가 online이고 downstream 연결 상태일 때만 적�
 - 자신의 Thread 가입은 유지
 - INTERMEDIATE에서 LEAF로 바뀌면 같은 Dataset으로 link mode만 재적용
 
+### DOWNSTREAM 일시 오류 (DOCK_TIMEOUT, LIVENESS_LOST)
+
+- 자식 provisioning session 취소, cooldown 뒤 handshake 재시도
+- `downstream_connected=false` 보고, Power Base registry에서 해당 subtree 제거
+- 자신의 Thread 가입, collector, topology gate, 역할은 유지
+- `PEER_READY`로 돌아오면 자식 provisioning 재개
+
 ## 오류와 복구
 
 | 오류 | 처리 |
 |---|---|
 | CONFIG_ERROR | 부팅 중단 |
-| DOCK_TIMEOUT | cooldown 뒤 재시도 |
-| LIVENESS_LOST | cooldown 뒤 재시도 |
-| PEER_TYPE_CONFLICT | detach 전까지 ERROR |
-| PROTOCOL_VERSION_ERROR | detach 전까지 ERROR |
-| CAPABILITY_MISMATCH | detach 전까지 ERROR |
+| DOCK_TIMEOUT (UPSTREAM) | cooldown 뒤 재시도, ROLE_ERROR, Thread 중지 |
+| LIVENESS_LOST (UPSTREAM) | cooldown 뒤 재시도, ROLE_ERROR, Thread 중지 |
+| DOCK_TIMEOUT (DOWNSTREAM) | cooldown 뒤 재시도, 하위 링크만 무효, 자신의 역할과 Thread 유지 |
+| LIVENESS_LOST (DOWNSTREAM) | cooldown 뒤 재시도, 하위 링크만 무효, 자신의 역할과 Thread 유지 |
+| PEER_TYPE_CONFLICT | detach 전까지 ERROR, 어느 포트든 ROLE_ERROR |
+| PROTOCOL_VERSION_ERROR | detach 전까지 ERROR, 어느 포트든 ROLE_ERROR |
+| CAPABILITY_MISMATCH | detach 전까지 ERROR, 어느 포트든 ROLE_ERROR |
 | FRAME_CRC_ERROR | parser 재동기화, request timeout/retry |
 | SENSOR_ERROR | NACK, session 중단 |
 | POLL_CONFIG_ERROR | NACK, session 중단 |

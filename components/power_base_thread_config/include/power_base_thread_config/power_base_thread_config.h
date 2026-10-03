@@ -13,7 +13,8 @@
  * or schema_version at all (see tools/pack_power_base_config.py).
  *
  *   namespace: pb_thread
- *     key "mode"          u8:  0 = STANDALONE, 1 = EXTERNAL_OTBR
+ *     key "mode"          u8:  0 = STANDALONE, 1 = EXTERNAL_OTBR,
+ *                             2 = AWAIT_COMMISSIONING
  *     key "active_tlvs"   blob: OTBR Active Dataset TLVs, ONLY present (and
  *                                only ever read) when mode=EXTERNAL_OTBR
  *
@@ -57,6 +58,9 @@ extern "C" {
 typedef enum {
     POWER_BASE_THREAD_MODE_STANDALONE = 0,
     POWER_BASE_THREAD_MODE_EXTERNAL_OTBR = 1,
+    /* Explicitly prepared for app-based commissioning. Legacy images still
+     * default to STANDALONE; only a new cfg image may enter this safe state. */
+    POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING = 2,
 } power_base_thread_mode_t;
 
 typedef struct {
@@ -80,6 +84,9 @@ typedef struct {
  *   - mode=1 (EXTERNAL_OTBR) with a present, non-empty, <=
  *     POWER_BASE_THREAD_CONFIG_MAX_TLV_LEN "active_tlvs" blob: *out set to
  *     EXTERNAL_OTBR with that blob's exact bytes/length, returns ESP_OK.
+ *   - mode=2 (AWAIT_COMMISSIONING): returns ESP_OK without reading any
+ *     active_tlvs. The caller must not start Thread, the exporter, or the
+ *     downstream POGO port until commissioning completes.
  *   - mode=1 but active_tlvs is missing, 0 bytes, or larger than
  *     POWER_BASE_THREAD_CONFIG_MAX_TLV_LEN: FAILS CLOSED -- logs one clear
  *     "CONFIG_ERROR: ..." line (dataset bytes/length-in-error never

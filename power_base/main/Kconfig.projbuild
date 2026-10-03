@@ -1,0 +1,36 @@
+menu "Power Base"
+
+    config POWER_BASE_BENCH_JOINER_CONSOLE
+        bool "Bench-only: accept a Joiner PSKd on the USB-Serial/JTAG console"
+        depends on OPENTHREAD_JOINER && ESP_CONSOLE_USB_SERIAL_JTAG
+        default n
+        help
+            Development/bench trial path for pb_thread:mode=2 (AWAIT_COMMISSIONING).
+            Adds one console command, "pb_join", that reads a one-time PSKd without
+            echo and runs the OpenThread Joiner. It does not enable the OpenThread
+            CLI. Leave this off in every image flashed to an operating Power Base;
+            it is set only by power_base/sdkconfig.bench_joiner (see
+            docs/power-base.md). The BLE transport is the separate
+            POWER_BASE_BLE_ENROLLMENT option below; the two are never built
+            together.
+
+    config POWER_BASE_BLE_ENROLLMENT
+        bool "BLE enrollment transport for pb_thread:mode=2 (protocomm Security 2)"
+        depends on OPENTHREAD_JOINER && BT_NIMBLE_ENABLED
+        depends on ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2
+        depends on !ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0 && !ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
+        depends on !POWER_BASE_BENCH_JOINER_CONSOLE && !OPENTHREAD_CLI
+        default n
+        help
+            Trial build for a spare Power Base (pb_thread:mode=2): while the board
+            is not enrolled it advertises a BLE service through which a client
+            that knows this board's setup code (protocomm Security 2, SRP-6a +
+            AES-GCM) can hand over a one-time Thread PSKd and start the same
+            Joiner enrollment the bench console starts. Needs a "pb_ble_auth"
+            credential in the cfg partition (tools/gen_power_base_ble_config.py);
+            without a valid one BLE stays off and the board just waits.
+            Set only by power_base/sdkconfig.ble_enrollment, with its own build
+            directory and SDKCONFIG file (see docs/power-base.md). It contains no
+            pb_join console and no OpenThread CLI.
+
+endmenu

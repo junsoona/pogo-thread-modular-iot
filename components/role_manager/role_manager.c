@@ -7,6 +7,7 @@ static const char *TAG = "role_manager";
 typedef struct {
     bool attached;
     bool error;
+    pogo_port_error_t error_code; /* which POGO_PORT_EVENT_ERROR set `error`; only meaningful while it is true */
     pogo_peer_type_t peer_type;
 } port_state_t;
 
@@ -48,13 +49,32 @@ static void set_role(module_role_t new_role)
     }
 }
 
+/*
+ * DOCK_TIMEOUT and LIVENESS_LOST are the two errors pogo_port itself treats
+ * as transient: it keeps DETECT_IN's attach, waits out its cooldown and
+ * starts a fresh handshake cycle on its own (see pogo_port.h). On the
+ * DOWNSTREAM port they say nothing about this module's own UPSTREAM
+ * relationship or Thread membership, so they are isolated to that link
+ * instead of becoming MODULE_ROLE_ERROR -- see recompute(). Every other
+ * error code (PEER_TYPE_CONFLICT, PROTOCOL_VERSION, CAPABILITY_MISMATCH, or
+ * anything unclassified) is NOT isolated, on either port.
+ */
+static bool downstream_fault_is_isolated(void)
+{
+    return s_down.error && (s_down.error_code == POGO_PORT_ERR_DOCK_TIMEOUT ||
+                            s_down.error_code == POGO_PORT_ERR_LIVENESS_LOST);
+}
+
 static void recompute(void)
 {
     if (s_forced) {
         return; /* dev-mode forced role never changes based on port events */
     }
 
-    if (s_up.error || s_down.error) {
+    /* Any UPSTREAM error, and any DOWNSTREAM error that is not an isolated
+     * transient fault, is ROLE_ERROR. UPSTREAM is checked first and wins
+     * when both ports are in error. */
+    if (s_up.error || (s_down.error && !downstream_fault_is_isolated())) {
         set_role(MODULE_ROLE_ERROR);
         return;
     }
@@ -77,6 +97,27 @@ static void recompute(void)
      */
     if (!s_down.attached) {
         set_role(MODULE_ROLE_LEAF);
+        return;
+    }
+    if (s_down.error) {
+        /*
+         * Isolated DOWNSTREAM fault: something is still physically docked
+         * below (DETECT_IN attached) but its link is failed/retrying. That
+         * is neither an empty port nor a ready MODULE, so the role this
+         * module already settled into is held -- no ROLE_ERROR (which would
+         * stop this module's own Thread membership), and no demotion of an
+         * INTERMEDIATE to LEAF either (a sleepy-end-device link-mode
+         * re-apply while a module is still docked, undone again on
+         * recovery). parent_service and topology_reporter get the same
+         * ERROR event and drop the DOWNSTREAM session / connected state
+         * themselves; a later PEER_READY clears `error` and resumes the
+         * normal derivation below. With no settled role to hold (UPSTREAM
+         * resolved while DOWNSTREAM was already faulted), the unresolved
+         * peer is not a ready MODULE: LEAF.
+         */
+        if (s_role != MODULE_ROLE_LEAF && s_role != MODULE_ROLE_INTERMEDIATE) {
+            set_role(MODULE_ROLE_LEAF);
+        }
         return;
     }
     if (s_down.peer_type == POGO_PEER_TYPE_MODULE) {
@@ -113,11 +154,13 @@ void role_manager_on_port_event(pogo_port_id_t port_id, pogo_port_event_t event,
         return;
     }
     port_state_t *st = (port_id == POGO_PORT_UPSTREAM) ? &s_up : &s_down;
+    bool new_downstream_fault = false;
 
     switch (event) {
     case POGO_PORT_EVENT_ATTACHED:
         st->attached = true;
         st->error = false;
+        st->error_code = POGO_PORT_ERR_NONE;
         st->peer_type = POGO_PEER_TYPE_UNKNOWN;
         break;
     case POGO_PORT_EVENT_DETACHED:
@@ -129,17 +172,35 @@ void role_manager_on_port_event(pogo_port_id_t port_id, pogo_port_event_t event,
     case POGO_PORT_EVENT_PEER_READY:
         st->attached = true;
         st->error = false;
-        st->peer_type = data->peer_type;
+        st->error_code = POGO_PORT_ERR_NONE;
+        st->peer_type = (data != NULL) ? data->peer_type : POGO_PEER_TYPE_UNKNOWN;
         break;
-    case POGO_PORT_EVENT_ERROR:
+    case POGO_PORT_EVENT_ERROR: {
+        /* pogo_port always passes the code; without one the error is
+         * unclassified and therefore never isolated (see recompute()). */
+        pogo_port_error_t code = (data != NULL) ? data->error_code : POGO_PORT_ERR_NONE;
+        /* Once per fault kind, not once per retry cycle -- pogo_port already
+         * logs every cycle's own DOCK_TIMEOUT. */
+        new_downstream_fault = (port_id == POGO_PORT_DOWNSTREAM && code != s_down.error_code);
         st->error = true;
+        st->error_code = code;
+        /* The peer_type learned from an earlier PEER_READY describes a link
+         * that no longer exists; only a fresh PEER_READY sets it again. */
+        st->peer_type = POGO_PEER_TYPE_UNKNOWN;
         break;
+    }
     case POGO_PORT_EVENT_FRAME_RECEIVED:
     default:
         return; /* not a topology-relevant event */
     }
 
     recompute();
+
+    if (new_downstream_fault && downstream_fault_is_isolated() &&
+        (s_role == MODULE_ROLE_LEAF || s_role == MODULE_ROLE_INTERMEDIATE)) {
+        ESP_LOGW(TAG, "DOWNSTREAM transient error=%d isolated to the downstream link -- keeping role %s",
+                 (int)s_down.error_code, role_manager_role_to_str(s_role));
+    }
 }
 
 module_role_t role_manager_get_role(void)

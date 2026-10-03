@@ -32,6 +32,15 @@ written as STANDALONE(0) and no "active_tlvs" key is written at all -- this
 is the pre-existing, secret-free default and is what a plain
 `tools/gen_power_base_config.sh` invocation still produces.
 
+For a spare board that must wait safely for app-based registration, pass
+--await-commissioning instead. This writes mode=2 with NO Dataset (so it is
+never combined with --external-dataset-file). It may be combined with
+--bridge-host/--bridge-port: the address is stored in "pb_bridge" as usual,
+but the firmware starts the exporter only after the board has enrolled
+(Joiner success, Thread attach, completion marker -- see docs/power-base.md).
+The Linux host's Mesh-Local address is always passed explicitly by the
+operator; nothing here defaults to a particular installation's address.
+
 Optionally ALSO writes the "pb_bridge" namespace (components/
 power_base_bridge_config -- this follow-up: Power Base -> Linux OTBR
 northbound bridge transport, see docs/power-base.md) into the SAME
@@ -51,6 +60,21 @@ the operator. Omitting both flags (the default) writes "pb_bridge:enabled=0"
 -- the bridge exporter stays disabled, same as a legacy image with no
 "pb_bridge" namespace at all (see that component's own compatibility
 policy).
+
+Optionally ALSO writes the "pb_ble_auth" namespace (components/
+power_base_ble_auth -- the per-board protocomm Security 2 salt/verifier
+record for BLE enrollment, see docs/power-base.md "BLE 등록 전달 경로"):
+
+    python3 tools/pack_power_base_config.py configs/power_base.json out.bin \
+        --await-commissioning --bridge-host fd11:22::1 --bridge-port 5684 \
+        --ble-auth-record-file /absolute/path/to/record.bin
+
+Only together with --await-commissioning (BLE enrollment exists for mode 2
+only). The record is a 420-byte file that tools/gen_power_base_ble_config.py
+builds and passes here; it is never a command-line value, must not be
+group/world-accessible, and its bytes are never printed. Use that tool
+instead of calling this flag by hand: it also draws the board's setup code
+and checks the result. The image is then written mode 0600.
 
 Requires the ESP-IDF python environment (for nvs_partition_gen.py) --
 source $IDF_PATH/export.sh first, same as for idf.py.
@@ -79,6 +103,7 @@ OT_OPERATIONAL_DATASET_MAX_LENGTH = 254
 PB_THREAD_NAMESPACE = "pb_thread"
 PB_THREAD_MODE_STANDALONE = 0
 PB_THREAD_MODE_EXTERNAL_OTBR = 1
+PB_THREAD_MODE_AWAIT_COMMISSIONING = 2
 
 # Must match components/power_base_bridge_config/include/power_base_bridge_config/
 # power_base_bridge_config.h's own constants and wire layout.
@@ -86,7 +111,33 @@ PB_BRIDGE_NAMESPACE = "pb_bridge"
 PB_BRIDGE_SCHEMA_VERSION = 1
 PB_BRIDGE_BLOB_LEN = 24
 
+# Must match components/power_base_ble_auth/include/power_base_ble_auth/
+# power_base_ble_auth.h.
+PB_BLE_AUTH_NAMESPACE = "pb_ble_auth"
+PB_BLE_AUTH_KEY = "cred"
+PB_BLE_AUTH_RECORD_LEN = 420
+
 _HEX_ONLY_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def read_ble_auth_record_file(path: str) -> bytes:
+    """
+    Reads the pb_ble_auth record (salt + verifier for one board) that
+    tools/gen_power_base_ble_config.py prepared. Only its length is ever
+    mentioned in a message. Refuses a missing file, a file that group or
+    others can access, and any size other than PB_BLE_AUTH_RECORD_LEN --
+    the record's own magic/CRC/EUI-64 are checked by the generator that made
+    it and again by the firmware.
+    """
+    if not os.path.isfile(path):
+        sys.exit(f"refusing to pack: BLE auth record file not found: {path}")
+    if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+        sys.exit("refusing to pack: BLE auth record file is accessible to group/others (expected mode 0600)")
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) != PB_BLE_AUTH_RECORD_LEN:
+        sys.exit(f"refusing to pack: BLE auth record is {len(data)} bytes, expected {PB_BLE_AUTH_RECORD_LEN}")
+    return data
 
 
 def validate_bridge_host(addr_str: str) -> bytes:
@@ -252,12 +303,12 @@ def verify_power_base_cfg_blob_len(image_path: str, expected_len: int) -> None:
         )
 
 
-def verify_pb_thread_config(image_path: str, expect_external: bool, expected_tlvs_len: int,
+def verify_pb_thread_config(image_path: str, expected_mode: int, expected_tlvs_len: int,
                              expected_tlvs: bytes = None) -> None:
     """
     Re-parses the just-generated image and asserts the 'pb_thread' namespace
-    matches what this run requested: mode (STANDALONE/EXTERNAL_OTBR) always,
-    and -- only when expect_external -- that 'active_tlvs' is present and its
+    matches what this run requested: mode always, and -- only when mode is
+    EXTERNAL_OTBR -- that 'active_tlvs' is present and its
     on-the-wire byte content is EXACTLY expected_tlvs (length AND bytes).
 
     NEVER logs/prints expected_tlvs or the re-parsed active_tlvs bytes
@@ -294,12 +345,11 @@ def verify_pb_thread_config(image_path: str, expect_external: bool, expected_tlv
     if mode_val is None:
         sys.exit(f"verify_pb_thread_config: '{PB_THREAD_NAMESPACE}:mode' not found in {image_path}")
 
-    expected_mode = PB_THREAD_MODE_EXTERNAL_OTBR if expect_external else PB_THREAD_MODE_STANDALONE
     if mode_val != expected_mode:
         sys.exit(f"verify_pb_thread_config: {PB_THREAD_NAMESPACE}:mode={mode_val} in {image_path}, "
                  f"expected {expected_mode}")
 
-    if not expect_external:
+    if expected_mode != PB_THREAD_MODE_EXTERNAL_OTBR:
         if tlv_entry is not None:
             sys.exit(f"verify_pb_thread_config: a non-external image unexpectedly contains an "
                      f"'active_tlvs' blob in {image_path}")
@@ -387,6 +437,52 @@ def verify_pb_bridge_config(image_path: str, expect_enabled: bool, expected_host
                      f"expected {expected_port}")
 
 
+def verify_pb_ble_auth(image_path: str, expected_record: bytes = None) -> None:
+    """
+    Re-parses the image and asserts the 'pb_ble_auth' namespace matches this
+    run: absent when expected_record is None, otherwise 'cred' present with
+    exactly those bytes. Never prints record bytes.
+    """
+    idf_path = os.environ.get("IDF_PATH", "")
+    tool_dir = os.path.join(idf_path, "components", "nvs_flash", "nvs_partition_tool")
+    if not os.path.isdir(tool_dir):
+        sys.exit(f"cannot verify the generated image: nvs_partition_tool not found at {tool_dir}")
+    if tool_dir not in sys.path:
+        sys.path.insert(0, tool_dir)
+    import nvs_parser  # noqa: E402 -- IDF_PATH-dependent, must be imported at runtime
+
+    with open(image_path, "rb") as f:
+        raw = bytearray(f.read())
+    partition = nvs_parser.NVS_Partition(os.path.basename(image_path), raw)
+
+    namespace_id = None
+    cred_entry = None
+    for page in partition.pages:
+        for entry in page.entries:
+            if entry.key == PB_BLE_AUTH_NAMESPACE and entry.metadata["namespace"] == 0 and entry.data:
+                namespace_id = entry.data.get("value")
+            elif (namespace_id is not None and entry.metadata["namespace"] == namespace_id and entry.data
+                  and entry.key == PB_BLE_AUTH_KEY and entry.metadata["type"] == "blob_data"):
+                cred_entry = entry
+
+    if expected_record is None:
+        if namespace_id is not None:
+            sys.exit(f"verify_pb_ble_auth: unexpected '{PB_BLE_AUTH_NAMESPACE}' namespace in {image_path}")
+        return
+    if namespace_id is None or cred_entry is None:
+        sys.exit(f"verify_pb_ble_auth: '{PB_BLE_AUTH_NAMESPACE}:{PB_BLE_AUTH_KEY}' not found in {image_path}")
+    actual_len = cred_entry.data.get("size")
+    if actual_len != len(expected_record):
+        sys.exit(f"verify_pb_ble_auth: {PB_BLE_AUTH_NAMESPACE}:{PB_BLE_AUTH_KEY} is {actual_len} bytes in "
+                 f"{image_path}, expected {len(expected_record)} (content itself never printed)")
+    raw_bytes = bytearray()
+    for child in cred_entry.children:
+        raw_bytes += child.raw
+    if bytes(raw_bytes[:actual_len]) != expected_record:
+        sys.exit(f"verify_pb_ble_auth: {PB_BLE_AUTH_NAMESPACE}:{PB_BLE_AUTH_KEY} content mismatch in {image_path} "
+                 f"(content itself never printed)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config_json", help="e.g. configs/power_base.json")
@@ -399,6 +495,11 @@ def main():
                           "hex text -- see this script's own module docstring. When given, writes "
                           "pb_thread:mode=EXTERNAL_OTBR(1) and pb_thread:active_tlvs=<these exact bytes>; when "
                           "omitted (default), writes pb_thread:mode=STANDALONE(0) and no active_tlvs key at all.")
+    ap.add_argument("--await-commissioning", action="store_true",
+                    help="Prepare a spare Power Base without Thread credentials. Writes pb_thread:mode=2 and "
+                         "no Dataset; Thread, the exporter and downstream services stay disabled until the board "
+                         "enrolls. Mutually exclusive with --external-dataset-file; may be combined with "
+                         "--bridge-host/--bridge-port.")
     ap.add_argument("--bridge-host", default=None, metavar="IPV6_ADDR",
                      help="The Linux OTBR host's real IPv6 address (e.g. from `sudo ot-ctl ipaddr mleid` on that "
                           "host) -- writes pb_bridge:enabled=1 with this address. Must be given together with "
@@ -406,9 +507,20 @@ def main():
     ap.add_argument("--bridge-port", type=int, default=None, metavar="PORT",
                      help="The Linux OTBR host's CoAP ingest port (see linux/matter_bridge/ingest, default 5684 "
                           "in that program). Must be given together with --bridge-host.")
+    ap.add_argument("--ble-auth-record-file", default=None, metavar="PATH",
+                    help="Path to a file (NEVER a literal value) holding the 420-byte pb_ble_auth record for ONE "
+                         "board, as prepared by tools/gen_power_base_ble_config.py. Only with "
+                         "--await-commissioning. Its bytes are never printed.")
     args = ap.parse_args()
 
     external_tlvs = None
+    if args.await_commissioning and args.external_dataset_file:
+        sys.exit("refusing to pack: --await-commissioning and --external-dataset-file are mutually exclusive")
+    ble_auth_record = None
+    if args.ble_auth_record_file:
+        if not args.await_commissioning:
+            sys.exit("refusing to pack: --ble-auth-record-file is only for --await-commissioning images")
+        ble_auth_record = read_ble_auth_record_file(args.ble_auth_record_file)
     if args.external_dataset_file:
         external_tlvs = read_external_dataset_hex_file(args.external_dataset_file)
 
@@ -483,6 +595,8 @@ def main():
                 with os.fdopen(fd, "wb") as tf:
                     tf.write(external_tlvs)
                 f.write(f"active_tlvs,file,binary,{tlv_path}\n")
+            elif args.await_commissioning:
+                f.write(f"mode,data,u8,{PB_THREAD_MODE_AWAIT_COMMISSIONING}\n")
             else:
                 f.write(f"mode,data,u8,{PB_THREAD_MODE_STANDALONE}\n")
 
@@ -496,6 +610,15 @@ def main():
             f.write(f"blob,file,binary,{pb_bridge_blob_path}\n")
             f.write(f"crc,data,u16,{pb_bridge_crc}\n")
 
+            if ble_auth_record is not None:
+                # A private copy inside the 0700 temp directory; never logged.
+                ble_auth_path = os.path.join(tmp, "pb_ble_auth_cred.bin")
+                fd = os.open(ble_auth_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as af:
+                    af.write(ble_auth_record)
+                f.write(f"{PB_BLE_AUTH_NAMESPACE},namespace,,\n")
+                f.write(f"{PB_BLE_AUTH_KEY},file,binary,{ble_auth_path}\n")
+
         tool = find_nvs_partition_gen()
         out_path = os.path.abspath(args.output_bin)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -505,11 +628,18 @@ def main():
         )
 
     verify_power_base_cfg_blob_len(out_path, len(blob))
-    verify_pb_thread_config(out_path, expect_external=(external_tlvs is not None),
+    expected_mode = (PB_THREAD_MODE_EXTERNAL_OTBR if external_tlvs is not None else
+                     PB_THREAD_MODE_AWAIT_COMMISSIONING if args.await_commissioning else
+                     PB_THREAD_MODE_STANDALONE)
+    verify_pb_thread_config(out_path, expected_mode=expected_mode,
                              expected_tlvs_len=(len(external_tlvs) if external_tlvs is not None else 0),
                              expected_tlvs=external_tlvs)
     verify_pb_bridge_config(out_path, expect_enabled=(bridge_host_bytes is not None),
                              expected_host_addr=bridge_host_bytes, expected_port=args.bridge_port)
+    verify_pb_ble_auth(out_path, expected_record=ble_auth_record)
+    if os.path.getsize(out_path) != args.size:
+        sys.exit(f"generated image is {os.path.getsize(out_path)} bytes, expected the cfg partition size "
+                 f"0x{args.size:x}")
 
     bridge_note = (f"pb_bridge:enabled=1 port={args.bridge_port}" if bridge_host_bytes is not None
                    else "pb_bridge:enabled=0")
@@ -520,6 +650,16 @@ def main():
         print(f"wrote {args.output_bin} (blob_crc=0x{crc:04x}, verified power_base_cfg:blob={len(blob)} bytes, "
               f"pb_thread:mode=EXTERNAL_OTBR, pb_thread:active_tlvs={len(external_tlvs)} bytes [content never "
               f"printed], {bridge_note}, file mode=0600)")
+    elif args.await_commissioning:
+        ble_note = ""
+        if ble_auth_record is not None:
+            # The verifier lets someone test setup-code guesses offline.
+            os.chmod(out_path, stat.S_IRUSR | stat.S_IWUSR)
+            ble_note = (f", pb_ble_auth:cred={len(ble_auth_record)} bytes [content never printed], "
+                        f"file mode=0600")
+        print(f"wrote {args.output_bin} (blob_crc=0x{crc:04x}, verified power_base_cfg:blob={len(blob)} bytes, "
+              f"pb_thread:mode=AWAIT_COMMISSIONING, no Dataset, {bridge_note}"
+              f"{' [exporter starts only after enrollment]' if bridge_host_bytes is not None else ''}{ble_note})")
     else:
         print(f"wrote {args.output_bin} (blob_crc=0x{crc:04x}, verified power_base_cfg:blob={len(blob)} bytes, "
               f"pb_thread:mode=STANDALONE, {bridge_note})")

@@ -145,6 +145,14 @@ struct PowerBaseState {
     bool online = false;
     std::chrono::steady_clock::time_point first_seen_at{};
     std::chrono::steady_clock::time_point last_seen_at{};
+    // Power Base enrollment milestone. The Registry-wide heartbeat_serial()
+    // value this Base's most recent heartbeat got, 0 before its first one.
+    // Only apply_heartbeat() sets it (never a topology/sample/removal), and
+    // every heartbeat gets a strictly larger value than any earlier one, so
+    // "a heartbeat from this Base arrived after I read heartbeat_serial()"
+    // is `last_heartbeat_serial > that value` -- exact, unlike comparing
+    // timestamps, and never satisfied by state cached before that read.
+    uint64_t last_heartbeat_serial = 0;
 };
 
 // One consistent copy of nodes and Power Bases taken under a single lock.
@@ -300,6 +308,16 @@ public:
     void apply_heartbeat(const Uuid &power_base_uuid, uint32_t uptime_ms, uint16_t node_count,
                          std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
+    // Power Base enrollment milestone (see PowerBaseState::
+    // last_heartbeat_serial): the serial the most recent heartbeat got, 0
+    // before any. A later heartbeat from any Base gets a larger one.
+    uint64_t heartbeat_serial() const;
+
+    // A copy of one tracked Power Base (staleness applied, like view()).
+    // False when that Base is not tracked.
+    bool get_power_base(const Uuid &power_base_uuid, PowerBaseState &out,
+                        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
     size_t node_count() const;
     // `now` lets a caller (or a test) evaluate staleness at a specific
     // instant; defaults to the real clock for every production call site.
@@ -365,6 +383,7 @@ private:
     std::vector<std::pair<Uuid, Uuid>> removed_; // (power_base_uuid, module_uuid)
     std::vector<PowerBaseState> power_bases_;
     uint64_t attach_counter_ = 0;
+    uint64_t heartbeat_counter_ = 0;
     uint64_t generation_ = 0;
     std::chrono::milliseconds stale_timeout_;
     std::chrono::milliseconds sweep_interval_;

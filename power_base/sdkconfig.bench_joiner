@@ -1,0 +1,17 @@
+#
+# Bench-only overlay for a SPARE Power Base enrollment trial (pb_thread:mode=2).
+# Never used by a default `idf.py build`. Apply it on top of sdkconfig.defaults
+# with a separate build directory and sdkconfig file, e.g.:
+#
+#   idf.py -C power_base -B build/power_base_bench_joiner \
+#       -D SDKCONFIG=build/power_base_bench_joiner/sdkconfig \
+#       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bench_joiner" build
+#
+# Adds the OpenThread Joiner (and the DTLS/EC-JPAKE it needs) plus the
+# "pb_join" console command. The OpenThread CLI stays OFF (sdkconfig.defaults).
+#
+CONFIG_OPENTHREAD_JOINER=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+CONFIG_POWER_BASE_BENCH_JOINER_CONSOLE=y

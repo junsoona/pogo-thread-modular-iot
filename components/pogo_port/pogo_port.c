@@ -326,6 +326,7 @@ static void enter_recover_cooldown(pogo_port_ctx_t *p)
     p->state = PORT_STATE_RECOVER_COOLDOWN;
     p->state_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_POGO_HOTSWAP_COOLDOWN_MS);
     p->last_status_log = xTaskGetTickCount();
+    pogo_frame_parser_init(&p->parser); /* process_recover_cooldown() listens for the peer's HELLO_REQ */
     ESP_LOGI(TAG, "port %d: transient error, DETECT_IN still attached -- cooldown %dms before retrying handshake",
              p->id, CONFIG_POGO_HOTSWAP_COOLDOWN_MS);
 }
@@ -462,13 +463,15 @@ static bool validate_incoming_hello(pogo_port_ctx_t *p, const pogo_frame_t *fram
 }
 
 /* Answers a HELLO_REQ with HELLO_RESP (same seq). Called regardless of this
- * port's own state -- HANDSHAKE (simultaneous/staggered boot) or already
- * PEER_READY (the peer rebooted while still docked, section 1 items 4-5). */
-static void handle_incoming_hello_req(pogo_port_ctx_t *p, const pogo_frame_t *frame)
+ * port's own state -- HANDSHAKE (simultaneous/staggered boot), already
+ * PEER_READY (the peer rebooted while still docked, section 1 items 4-5), or
+ * RECOVER_COOLDOWN (see process_recover_cooldown()). Returns true if the
+ * HELLO was valid and answered. */
+static bool handle_incoming_hello_req(pogo_port_ctx_t *p, const pogo_frame_t *frame)
 {
     pogo_peer_type_t peer_type;
     if (!validate_incoming_hello(p, frame, &peer_type)) {
-        return; /* malformed: ignored; invalid/conflicting: already moved to ERROR */
+        return false; /* malformed: ignored; invalid/conflicting: already moved to ERROR */
     }
     p->peer_type = peer_type; /* opportunistic refresh; does not by itself change PORT_STATE_PEER_READY */
 
@@ -478,6 +481,7 @@ static void handle_incoming_hello_req(pogo_port_ctx_t *p, const pogo_frame_t *fr
     uint8_t payload[3];
     size_t len = pogo_pack_peer_hello(&resp, payload, sizeof(payload));
     pogo_transport_send_on(p, POGO_MSG_PEER_HELLO_RESP, frame->seq, payload, len);
+    return true;
 }
 
 /* Completes THIS port's own initiator role once a HELLO_RESP matching our
@@ -585,20 +589,50 @@ static void process_attach_settle(pogo_port_ctx_t *p)
     begin_handshake(p);
 }
 
-/* PORT_STATE_RECOVER_COOLDOWN: same bounded-poll shape as
- * process_attach_settle() above, and the same detach-cancels-it guarantee
- * (process_debounce() pre-empts p->state before this ever runs). Once
- * state_deadline elapses, begin_handshake() starts a fresh cycle -- still
- * capped at CONFIG_POGO_MAX_RETRY retries internally, exactly like the very
- * first handshake after ATTACHED. */
+/* PORT_STATE_RECOVER_COOLDOWN: same detach-cancels-it guarantee as
+ * process_attach_settle() above (process_debounce() pre-empts p->state
+ * before this ever runs). Once state_deadline elapses, begin_handshake()
+ * starts a fresh cycle -- still capped at CONFIG_POGO_MAX_RETRY retries
+ * internally, exactly like the very first handshake after ATTACHED.
+ *
+ * Until then the UART is still read, for one thing only: a valid HELLO_REQ.
+ * The peer retries on the same handshake+cooldown period as this port, so
+ * once each side's handshake window falls inside the other's cooldown, two
+ * deaf cooldowns would never overlap a window again on a perfectly good
+ * wire (a 1-3s offset is enough). A HELLO_REQ heard here means the peer is
+ * in its window right now: answer it and start this port's own handshake at
+ * once, which brings the two loops back in step. This port still becomes
+ * PEER_READY only on a HELLO_RESP to its own HELLO_REQ. Every other frame
+ * and every malformed HELLO is dropped; a HELLO failing the version/peer
+ * type/capability checks moves the port to ERROR exactly as it would during
+ * a handshake. Each pass blocks at most 20ms, the same poll period as
+ * before. */
 static void process_recover_cooldown(pogo_port_ctx_t *p)
 {
-    if ((int32_t)(xTaskGetTickCount() - p->state_deadline) < 0) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(now - p->state_deadline) >= 0) {
+        ESP_LOGI(TAG, "port %d: cooldown elapsed -- starting a fresh handshake cycle", p->id);
+        begin_handshake(p);
         return;
     }
-    ESP_LOGI(TAG, "port %d: cooldown elapsed -- starting a fresh handshake cycle", p->id);
-    begin_handshake(p);
+    TickType_t remaining = p->state_deadline - now;
+    TickType_t wait = remaining < pdMS_TO_TICKS(20) ? remaining : pdMS_TO_TICKS(20);
+
+    uint8_t byte;
+    int n = uart_read_bytes((uart_port_t)p->cfg.uart_num, &byte, 1, wait);
+    if (n < 0) {
+        vTaskDelay(pdMS_TO_TICKS(20)); /* driver error: keep the old poll period rather than spin */
+        return;
+    }
+    pogo_frame_t frame;
+    if (n != 1 || !pogo_frame_parser_feed(&p->parser, byte, &frame) || frame.type != POGO_MSG_PEER_HELLO_REQ) {
+        return;
+    }
+    if (handle_incoming_hello_req(p, &frame)) {
+        ESP_LOGI(TAG, "port %d: peer HELLO_REQ during cooldown -- answered, starting a fresh handshake cycle now",
+                 p->id);
+        begin_handshake(p);
+    }
 }
 
 static void process_handshake(pogo_port_ctx_t *p)
@@ -1028,6 +1062,14 @@ bool pogo_port_is_attached(pogo_port_id_t id)
     port_internal_state_t st = s_ports[id].state;
     return st == PORT_STATE_ATTACH_SETTLE || st == PORT_STATE_HANDSHAKE || st == PORT_STATE_PEER_READY ||
            st == PORT_STATE_RECOVER_COOLDOWN || st == PORT_STATE_ERROR;
+}
+
+bool pogo_port_is_peer_ready(pogo_port_id_t id)
+{
+    if (id >= POGO_PORT_ID_COUNT) {
+        return false;
+    }
+    return s_ports[id].state == PORT_STATE_PEER_READY;
 }
 
 pogo_peer_type_t pogo_port_get_peer_type(pogo_port_id_t id)

@@ -28,6 +28,10 @@ Implementation: [`linux/matter_bridge/app/api/`](../linux/matter_bridge/app/api/
   one-time code the operator creates on the hub. Finding the hub over Bonjour
   grants nothing. Neither codes nor tokens are ever sent over plain HTTP,
   logged, or put in the Bonjour TXT record.
+- **Power Base enrollment is off unless configured** (`--api-enroll-helper`)
+  and then has exactly the settings routes' boundary: TLS only, a paired
+  device's bearer token, and each session visible only to the device that
+  started it. See "Power Base enrollment".
 - **Bind policy: one explicit interface's own address, never
   `0.0.0.0`/`::`.** The server binds to the *actual LAN address* of the
   interface named by `--api-interface` -- resolved via `getifaddrs()`
@@ -56,6 +60,8 @@ as it always has if `--api-interface` is omitted):
 --api-port <port>          TCP port, 1..65535 (default: 8787). Only meaningful with --api-interface.
 --api-no-advertise         Do not announce the API over Bonjour (see "Bonjour" below). Advertised by default.
 --api-no-settings          Do not offer home settings sharing (see "Home settings" below). Offered by default.
+--api-enroll-helper <path> Enable Power Base enrollment through this root-run OTBR helper (see "Power Base enrollment"). Off by default.
+--api-enroll-window <s>    Joiner window per enrollment, 30..300 seconds (default: 120).
 ```
 
 `8787` was chosen because it collides with neither the ingest CoAP port
@@ -433,9 +439,12 @@ never blocks any other client or the registry watcher thread.
 | unknown path                                  | `404` |
 | oversized request header block (> 8 KiB) or malformed request line | `400`, or the connection is simply closed |
 | settings route over plain HTTP | `403 tls_required` |
+| enrollment route, enrollment not configured | `404 enrollment_disabled` |
+| enrollment route over plain HTTP (configured) | `403 tls_required` |
 
-Only `PUT /api/v1/settings` and `POST /api/v1/pairing/claim` read a body
-(`Content-Length` only, at most 256 KiB). The API never adds CORS headers (a
+Only `PUT /api/v1/settings`, `POST /api/v1/pairing/claim` and
+`POST /api/v1/power-base-enrollments` read a body (`Content-Length` only, at
+most 256 KiB; 256 bytes for the enrollment body). The API never adds CORS headers (a
 native iOS app making a direct request needs none).
 
 ## `curl` verification
@@ -665,11 +674,305 @@ without `sudo`.
 Revocation applies to the device's next request; no restart. The app's
 Settings shows each device's id ("이 기기 ID") to match `devices`.
 
+## Power Base enrollment (enrollment revision)
+
+A paired device can ask the hub to let **one** new Power Base, named by its
+exact EUI-64, join the Thread network with a PSKd (Joiner passphrase) the
+device chose for that board, for a short time. The hub reports success only
+once **this Linux bridge has received a heartbeat from that Power Base**.
+
+What exists: the hub side -- the routes below, the session logic
+(`app/api/include/pogohome_api/enrollment.hpp`) and a small root-run helper
+that is the bridge's only way to the OTBR Commissioner
+(`app/api/tools/pogohome_otbr_helper.cpp`); the PogoHome app's DEBUG-only
+"Power Base 등록 시험"; and, for a development/bench trial only, Power Base
+firmware in `pb_thread:mode=2` that takes the PSKd on the spare board's
+USB-Serial/JTAG console (`pb_join start`, bench build with
+`power_base/sdkconfig.bench_joiner`), runs the Joiner, attaches, records its
+enrollment and then starts the normal exporter, whose heartbeat is what ends
+a session as `heartbeat_received` (see [`power-base.md`](power-base.md) "앱
+등록 대기 상태와 Joiner 가입"). The Linux bridge address comes from the
+board's prepared `pb_bridge` image, not from this API. What does not exist:
+a product transport for the PSKd (BLE/QR) and a release app UI. Host tests
+use a fake Commissioner and a fake `ot-ctl`; nothing here has enrolled a real
+board yet.
+
+### Enabling
+
+`--api-enroll-helper <absolute path>` turns it on; it needs `--api-interface`
+and settings sharing (no `--api-no-settings`), otherwise the bridge refuses
+to start. `--api-enroll-window <seconds>` (30..300, default 120) sets the
+Joiner window. The helper is not run at startup; nothing runs as root and
+nothing touches the OTBR until a paired device starts a session. The bridge
+runs the helper as `/usr/bin/sudo -n -- <path>`; the operator allows that one
+command (see "Installing the OTBR helper" below).
+
+Without `--api-enroll-helper` the routes answer `404 enrollment_disabled` and
+nothing else changes: health, snapshot, SSE, settings, Bonjour, Matter and
+sensor ingest behave exactly as before. With it, `GET /api/v1/health` adds
+`"power_base_enrollment":"available"` (or `"unavailable"` when settings
+sharing could not start) after every earlier field; snapshots and SSE are
+unchanged. The Registry now numbers each Power Base heartbeat (an internal
+counter; no wire, JSON or `generation()` change).
+
+### Routes (TLS, `Authorization: Bearer <token>`)
+
+Checked in this order, like the settings routes: not configured → `404
+enrollment_disabled`; plain HTTP → `403 tls_required` (no header or body is
+used); settings sharing unavailable → `503 enrollment_unavailable`; wrong
+method → `405`; no/unknown token → `401` (`WWW-Authenticate: Bearer`);
+credentials unreadable → `503 auth_unavailable`. Every answer has
+`Cache-Control: no-store`.
+
+| route | result |
+|---|---|
+| `POST /api/v1/power-base-enrollments` | starts a session: `202` + session, `Location: /api/v1/power-base-enrollments/<session_id>` |
+| `GET /api/v1/power-base-enrollments/<session_id>` | `200` + session |
+| `DELETE /api/v1/power-base-enrollments/<session_id>` | cancels: `200` + session (`state: "cancelled"`) |
+
+Request (`Content-Length` only, at most 256 bytes, exactly these two fields):
+
+```json
+{"eui64": "744dbdfffe65d357", "pskd": "J01NME7K2"}
+```
+
+- `eui64`: exactly 16 hex digits (either case; answered lowercase), not all
+  zero. No `*` (wildcard Joiner), no separators, no discerner. It must be the
+  EUI-64 the board's Joiner uses (`pb_join status` on the mode-2 bench
+  firmware, `ot eui64` on an OpenThread CLI image), which is also the Power
+  Base's `uuid` in snapshots and heartbeats.
+- `pskd`: 6..32 characters of `0-9 A-Z` without `I O Q Z` (the Thread PSKd
+  alphabet, uppercase only). Use a new random value per board and session.
+
+Session:
+
+```json
+{"session_id": "5f0c…(32 hex)", "eui64": "744dbdfffe65d357",
+ "state": "waiting_for_heartbeat", "finished": false, "joiner_entry": "allowed",
+ "error": null, "window_seconds": 120,
+ "created_at_unix_ms": 1790000000000, "expires_at_unix_ms": 1790000120000,
+ "expires_in_ms": 118250, "heartbeat_received_at_unix_ms": null,
+ "started_by_device_id": "0123456789abcdef"}
+```
+
+`state`:
+
+| state | meaning |
+|---|---|
+| `preparing` | making sure the Commissioner is active, then adding the Joiner entry |
+| `waiting_for_heartbeat` | the OTBR allows this EUI-64 as a Joiner; the bridge has not yet received a new heartbeat from it |
+| `heartbeat_received` | final. The bridge's Registry received a heartbeat from a Power Base with this EUI-64 **after** the session started. It means this Linux bridge heard the Base over Thread; it does **not** mean its modules or sensors work -- watch the snapshot for that |
+| `cancelled` | final. The starting device cancelled it |
+| `expired` | final. The window ended without a new heartbeat. The board may still have joined Thread (e.g. firmware that joins but does not report); the hub cannot tell |
+| `failed` | final. `error` says why: `otbr_unavailable` (helper, sudo or OTBR not reachable), `otbr_timeout`, `commissioner_rejected` (e.g. another Commissioner holds the role), `joiner_rejected`, `helper_failed`, `window_too_short`, `bridge_stopping` |
+
+Joiner success, a Commissioner command succeeding or the board reaching
+Thread `child`/`router` are never reported as success by themselves.
+A Base that was already known before the start does not count either: a
+cached online state or an old heartbeat -- even one with the same timestamp --
+never ends a session; only a heartbeat applied after the start does (see
+`Registry::heartbeat_serial()`).
+
+`joiner_entry`: `none` (never added), `adding`, `allowed`, `removing`,
+`removed` (removed, or already gone -- OpenThread removes an entry itself
+after a successful join or at its timeout, and that `NotFound` counts as
+removed), `remove_failed` (the OTBR still closes it at its own timeout, at
+the latest `expires_at_unix_ms`). `finished` is `true` once the state is
+final and the cleanup is done.
+
+Errors (never echoing the EUI-64 or PSKd sent):
+
+| status | `error` | when |
+|---|---|---|
+| `400` | `invalid_request` | not JSON, missing/extra/non-string fields |
+| `400` | `malformed_headers`, `invalid_content_length` | |
+| `411` | `length_required` | chunked or no `Content-Length` |
+| `413` | `request_too_large` | body over 256 bytes |
+| `422` | `invalid_eui64` | including `*` |
+| `422` | `invalid_pskd` | |
+| `409` | `enrollment_in_progress` | a session is running or still cleaning up. To the device that started it, the answer also has `"session": {…}` (so a repeated POST finds its session); others get only the error |
+| `409` | `power_base_already_connected` | a Base with this EUI-64 is online in the Registry right now |
+| `409` | `session_already_final` + `"session"` | DELETE after the session ended |
+| `404` | `session_not_found` | unknown or malformed id, forgotten, or **another device's** session (indistinguishable on purpose) |
+| `503` | `enrollment_unavailable` (`reason`: `startup`/`stopping`) | |
+| `500` | `internal_error` | no randomness for a session id |
+
+### Session lifetime
+
+1. `POST` checks the request, refuses if a session is running or the Base is
+   online, records the Registry's heartbeat counter, and answers `202`
+   (`preparing`) at once. Everything slow happens on the session's own thread.
+2. The helper makes sure the Commissioner is active. If it already was (for
+   anything else), it is left as it is; the bridge **never stops** the
+   Commissioner, also not one it started (stopping is not among the
+   helper's operations; an operator can run `sudo ot-ctl commissioner stop`).
+3. The helper runs `commissioner joiner add <eui64> <pskd> <timeout>` with
+   `timeout` = the rest of the window, so the OTBR closes the entry by itself
+   at `expires_at_unix_ms` even if the bridge crashes or is killed.
+4. The session thread checks the Registry every 250 ms for a new heartbeat
+   from that EUI-64, and ends at `heartbeat_received`, a `DELETE`, the
+   deadline (monotonic clock; `expires_at_unix_ms` is informational), or the
+   bridge stopping.
+5. For every ending, if an add was attempted (even one that failed or timed
+   out -- the entry may exist), the helper runs `commissioner joiner remove
+   <eui64>` for that EUI-64 only.
+
+Races: the first final state wins and is never changed. A heartbeat that has
+reached the Registry before a `DELETE` or the deadline is evaluated wins
+(`DELETE` then answers `409 session_already_final` with `heartbeat_received`);
+a heartbeat after the session is final changes nothing. A `DELETE` while the
+add is still running is accepted at once; the entry is removed right after
+the add returns. On shutdown (`SIGTERM`) a running session becomes `failed`
+/ `bridge_stopping` and its entry is removed before the process exits
+(bounded by the helper timeouts below).
+
+One session at a time, bridge-wide. A finished session stays readable by its
+device for 10 minutes or until the next `POST` replaces it. Sessions are in
+memory only; after a restart they are gone (and the OTBR entry has its own
+timeout).
+
+No lock of the API server or the Registry is held while the helper runs:
+health, snapshot, SSE, settings and ingest keep working during an enrollment.
+Helper time limits: 20 s for the Commissioner start (it waits up to 10 s for
+the Leader to accept the petition), 8 s for each other call; inside the
+helper, 5 s per `ot-ctl` command and a 30 s hard limit for the whole run.
+
+### How the PSKd is handled
+
+It travels app → hub only inside TLS, is checked and kept in memory for the
+one Joiner add, and goes bridge → helper → `ot-ctl` only through **stdin**
+pipes: never in a command line (`ps`, `/proc/<pid>/cmdline`), an environment
+variable, a log line, a response, an error message or a file. The helper
+runs `ot-ctl` with no command arguments and closes its stdin only after
+`ot-ctl` printed `Done`/`Error`; it never prints `ot-ctl`'s output (which may
+echo the command). Memory copies are overwritten after use as far as C++
+strings allow (best effort). The OTBR itself keeps the PSKd only in its
+Joiner table until the entry is removed or expires.
+
+### Installing the OTBR helper (operator procedure -- review before applying)
+
+The bridge runs as a normal user (`User=junsoo-na`), and the OTBR's control
+socket `/run/openthread-wpan0.sock` is `root:root 0755`, so `ot-ctl` fails for
+that user (`connect session failed: Permission denied`). Opening the socket
+(chmod 777), running the bridge as root or allowing `sudo ot-ctl *` would each
+give the bridge -- and anything that compromises it -- the whole OTBR CLI,
+including the Network Key and Dataset. Instead the bridge may run exactly one
+root-owned program with no arguments, which can only do the four operations
+above. Nothing in this repository applies any of this; the running service is
+not changed until an operator does so.
+
+1. **Check the OTBR on the host** (as an admin):
+
+   ```sh
+   command -v ot-ctl; ls -l "$(command -v ot-ctl)"     # expect a root-owned file, e.g. /usr/sbin/ot-ctl
+   sudo ot-ctl commissioner state                        # disabled | active ...  Done
+   printf 'commissioner state\n' | sudo ot-ctl           # the SAME answer through stdin, then ot-ctl exits
+   ```
+
+   The third line is the helper's whole transport. If it prints nothing,
+   hangs, or needs a command-line argument to work, stop here: this
+   `ot-ctl` build does not take commands on stdin, and the helper must not be
+   used with it (passing the PSKd as an argument would expose it). Also check
+   that `commissioner` exists (`sudo ot-ctl help | grep commissioner`).
+
+2. **Build** the helper on the host (CMake, no Matter SDK needed; or take it
+   from `tools/build_matter_bridge.sh`'s output, which assumes
+   `/usr/sbin/ot-ctl`):
+
+   ```sh
+   cd linux/matter_bridge/app/api
+   cmake -S . -B build -DPOGOHOME_OT_CTL_PATH="$(command -v ot-ctl)"
+   cmake --build build --target pogohome-otbr-helper pogohome_api_unit_tests
+   ctest --test-dir build --output-on-failure
+   ```
+
+3. **Install** it root-owned in a root-owned directory (nothing on the path
+   may be writable by the bridge's user):
+
+   ```sh
+   sudo install -d -o root -g root -m 0755 /usr/local/libexec/pogohome
+   sudo install -o root -g root -m 0755 build/pogohome-otbr-helper /usr/local/libexec/pogohome/pogohome-otbr-helper
+   ```
+
+4. **Allow exactly that command** to the bridge's account. `""` means "no
+   arguments allowed"; `!log_input`/`!log_output` keep sudo's I/O logging (if
+   enabled on this host) from recording stdin, where the PSKd travels:
+
+   ```sh
+   sudo tee /etc/sudoers.d/pogohome-otbr-helper >/dev/null <<'SUDOERS'
+   Defaults!/usr/local/libexec/pogohome/pogohome-otbr-helper !log_input, !log_output
+   junsoo-na ALL=(root) NOPASSWD: /usr/local/libexec/pogohome/pogohome-otbr-helper ""
+   SUDOERS
+   sudo chmod 0440 /etc/sudoers.d/pogohome-otbr-helper
+   sudo visudo -cf /etc/sudoers.d/pogohome-otbr-helper
+   ```
+
+   The unit must allow `sudo` to raise privileges:
+   `systemctl show -p NoNewPrivileges -p RestrictSUIDSGID pogo-matter-bridge.service`
+   must print `no` for both (they are off unless the unit sets them). If the
+   unit needs them on, use a root-run socket-activated service for the helper
+   instead of sudo (not implemented here).
+
+5. **Try it as the bridge's user** (nothing changes on the OTBR):
+
+   ```sh
+   sudo -u junsoo-na sh -c "printf 'pogohome-otbr/1 commissioner-state\n' | sudo -n -- /usr/local/libexec/pogohome/pogohome-otbr-helper"
+   # ok disabled | ok petitioning | ok active
+   sudo -u junsoo-na sudo -n -- /usr/local/libexec/pogohome/pogohome-otbr-helper extra-arg   # must be refused by sudo
+   sudo -u junsoo-na sudo -n /usr/sbin/ot-ctl state                                          # must be refused by sudo
+   journalctl -t pogohome-otbr-helper -n 5                                                  # audit lines, no PSKd
+   ```
+
+6. **Enable it in the bridge** by adding
+   `--api-enroll-helper /usr/local/libexec/pogohome/pogohome-otbr-helper` to
+   the unit's `ExecStart=`, then `systemctl daemon-reload && systemctl restart
+   pogo-matter-bridge` when ready.
+
+To undo: remove the flag and restart the bridge, then
+`sudo rm /etc/sudoers.d/pogohome-otbr-helper /usr/local/libexec/pogohome/pogohome-otbr-helper`.
+
+Notes: the OTBR daemon serves one CLI session at a time, so each helper call
+briefly replaces an interactive `ot-ctl` someone has open. The helper logs
+each operation and EUI-64 (never the PSKd) to syslog as
+`pogohome-otbr-helper`. `sudo` logs each run without arguments.
+
+### Still to verify on the operating host and a spare board
+
+Host tests prove the logic against fakes only. Before relying on it:
+
+- On the Linux host: the full CMake test suite and the GN/Matter build
+  (`tools/build_matter_bridge.sh`) with the host's GCC; the steps in
+  "Installing the OTBR helper" (especially stdin mode of this `ot-ctl`).
+- With the helper installed and the spare board running the Joiner probe:
+  a session through the API reaches `waiting_for_heartbeat`;
+  `sudo ot-ctl commissioner joiner table` shows exactly that EUI-64; after
+  cancel or expiry the entry is gone; `journalctl -u otbr-agent` and the
+  bridge's journal contain no PSKd. The probe never sends heartbeats, so such
+  a session must end `expired`, never `heartbeat_received`.
+- That the board's Joiner EUI-64 equals the `uuid` its Power Base firmware
+  reports. Both come from the ESP32-H2 eFuse (ESP-IDF v6.1 builds them the
+  same way); the mode-2 firmware compares them at boot and refuses the Joiner
+  if they differ (`pb_join status` shows a warning), but this has not been
+  observed on hardware yet.
+- A real `heartbeat_received` with the mode-2 bench firmware on a spare board
+  (procedure: [`validation-status.md`](validation-status.md) "Power Base 앱
+  등록(mode 2)"), and that a wrong PSKd, a closed window or a missing OTBR
+  ends the session `expired`.
+- Journal output: `pogohome_api: enrollment ...` and `[heartbeat] ...` go to
+  stdout, which stdio block-buffers under systemd, so they could appear late
+  or not at all in `journalctl` while stderr lines appeared at once. The
+  source now makes stdout line-buffered (`app/chip/main.cpp`); a bridge built
+  before that change still shows the old behavior until it is rebuilt and
+  redeployed.
+
 ## Future work
 
-- Registering a Power Base from a client. The API is read-only. A Base is
-  registered by flashing its firmware and `cfg` image (see
-  [`power-base.md`](power-base.md) "여러 Power Base 추가").
+- Registering a Power Base end to end as a product. The hub side, the app's
+  DEBUG test and a bench-only firmware path (PSKd typed on the spare board's
+  USB console, bridge address pre-set in its `cfg` image) exist; delivering
+  the PSKd over BLE/QR and a release app flow do not. Operating Bases are
+  still added by flashing firmware and `cfg` (see [`power-base.md`](power-base.md)
+  "여러 Power Base 추가").
 - The PogoHome iOS app (`pogo-sensor-ios`, a separate repository) connecting
   to this API is its own, later milestone -- this follow-up only implements
   and documents the server side.

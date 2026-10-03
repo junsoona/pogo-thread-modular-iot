@@ -113,6 +113,10 @@ AUTO 모드에서 DETECT_IN이 계속 연결 상태라면 cooldown 뒤 새 DETEC
 다시 시작한다. 한 cycle 안에서는 `CONFIG_POGO_MAX_RETRY`만큼 재시도하고, cycle이
 끝나면 cooldown을 둔다. busy loop를 만들지 않는다.
 
+cooldown 중에도 상대의 유효한 `PEER_HELLO_REQ`에는 응답하고 바로 새 handshake를 시작한다.
+이렇게 하지 않으면 양쪽 재시도 주기가 같아 어긋난 채로 계속 엇갈린다. 응답만으로
+`PEER_READY`가 되지는 않으며, HELLO 검사와 영구 오류 처리는 handshake 중과 같다.
+
 ### 영구 오류
 
 - `PEER_TYPE_CONFLICT`
@@ -146,8 +150,13 @@ AUTO 센서 모듈은 다음 규칙을 사용한다.
 |---|---|---|
 | Power Base 또는 Module에 연결 | Module 연결 | INTERMEDIATE |
 | Power Base 또는 Module에 연결 | 분리 | LEAF |
+| Power Base 또는 Module에 연결 | 연결됐지만 `DOCK_TIMEOUT`/`LIVENESS_LOST` 재시도 중 | 직전 LEAF/INTERMEDIATE 유지 (없으면 LEAF) |
 | 분리 | 임의 | UNASSIGNED |
-| peer type/BASE_ID 충돌 | 임의 | ROLE_ERROR |
+| 오류(종류 무관) | 임의 | ROLE_ERROR |
+| 임의 | peer type/version/capability 충돌 | ROLE_ERROR |
+
+우선순위와 DOWNSTREAM 일시 오류 격리 규칙은 [`state-machine.md`](state-machine.md)의
+role_manager 절을 따른다.
 
 센서 모듈 AUTO 경로에서 ROOT를 만들지 않는다. Power Base가 POGO 체인의 고정 루트다.
 INTERMEDIATE와 LEAF는 Thread의 ROUTER/CHILD 이름과 별개다.

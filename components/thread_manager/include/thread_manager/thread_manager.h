@@ -18,6 +18,7 @@
 #include "esp_err.h"
 #include "openthread/thread.h"
 #include "openthread/dataset.h"
+#include "openthread/joiner.h" /* otJoinerCallback (type only; see thread_manager_joiner_start()) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -90,6 +91,64 @@ esp_err_t thread_manager_start_as_always_on_ftd(void);
  * logged, same policy as thread_manager_join_with_dataset() below.
  */
 esp_err_t thread_manager_start_as_always_on_ftd_with_dataset(const uint8_t *dataset_tlvs, uint16_t dataset_len);
+
+/*
+ * Power Base enrollment (pb_thread:mode=2, components/power_base_enrollment).
+ *
+ * Non-secret summary of the Active Dataset OpenThread has stored. The
+ * Network Key itself never leaves this component: the copy read to build
+ * the summary is wiped before returning.
+ *   has_network_key -- at least the Joiner's partial save (Network Key,
+ *                      Channel, PAN ID) exists.
+ *   complete        -- Active Timestamp, Network Key, Network Name,
+ *                      Extended PAN ID, Mesh-Local Prefix, PAN ID and
+ *                      Channel are all present (received from a network).
+ * Returns ESP_OK with both false when nothing is stored.
+ */
+typedef struct {
+    bool has_network_key;
+    bool complete;
+    uint8_t ext_pan_id[8];        /* valid when complete */
+    uint8_t mesh_local_prefix[8]; /* valid when complete */
+} thread_manager_dataset_summary_t;
+
+esp_err_t thread_manager_get_stored_dataset_summary(thread_manager_dataset_summary_t *out);
+
+/*
+ * Enables Thread on the Dataset already stored in OpenThread, with the same
+ * always-on FTD link mode as thread_manager_start_as_always_on_ftd(). Unlike
+ * that function it NEVER calls esp_openthread_auto_start() and never forms
+ * a network: with no stored Network Key (or, when `require_complete`, no
+ * complete Dataset) it returns ESP_ERR_INVALID_STATE and leaves Thread
+ * disabled. After a Joiner success only a partial Dataset exists; OpenThread
+ * then refuses to become Leader of its own partition
+ * (Mle::BecomeLeader() requires !IsPartiallyComplete()), so the device can
+ * only attach to the network that commissioned it.
+ */
+esp_err_t thread_manager_start_as_always_on_ftd_stored(bool require_complete);
+
+/*
+ * Starts the OpenThread Joiner with `pskd` (IPv6 enabled, Thread must be
+ * disabled). `callback` runs later in the OpenThread task with the API lock
+ * held -- it must not take that lock or block. OpenThread copies the PSKd;
+ * the caller wipes its own buffer after this returns. On failure IPv6 is
+ * disabled again. ESP_ERR_NOT_SUPPORTED when built without
+ * CONFIG_OPENTHREAD_JOINER.
+ */
+esp_err_t thread_manager_joiner_start(const char *pskd, otJoinerCallback callback, void *context);
+/* Aborts a running Joiner; its callback is then never invoked. */
+void thread_manager_joiner_stop(void);
+
+/* The factory EUI-64 the Joiner identifies itself with
+ * (otLinkGetFactoryAssignedIeeeEui64). */
+esp_err_t thread_manager_get_factory_eui64(uint8_t out_eui64[8]);
+
+/*
+ * otInstanceErasePersistentInfo(): wipes OpenThread's own settings (Dataset,
+ * network info) in the dynamic NVS. Thread must be disabled. The caller
+ * restarts the chip afterwards. Only for an explicit operator command.
+ */
+esp_err_t thread_manager_erase_persistent_info(void);
 
 /*
  * ROOT: identical underlying behavior to thread_manager_start_as_always_on_ftd()
