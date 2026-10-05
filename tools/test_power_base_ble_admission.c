@@ -8,6 +8,11 @@
  * linked against the functional NVS simulator and the same kind of fake
  * OpenThread operations tools/test_power_base_enrollment.c uses.
  *
+ * Also here: the second start message, PB_BLE_MSG_START_EP_REQ, which carries
+ * the Linux bridge endpoint -- its golden vector (shared with the app's Swift
+ * codec), every length, the address and port rules, the request digest, and
+ * what becomes of the endpoint on cancel, failure and enrollment.
+ *
  * What is NOT here: the Security 2 handshake and protocomm (run for real, on
  * the host, by tools/host_ble_sec2 + tools/test_power_base_ble_sec2_interop.py)
  * and anything over a real BLE link. In this file a "session" is what the
@@ -135,12 +140,20 @@ static bool test_sha256(const uint8_t *data, size_t len, uint8_t out[32], void *
 
 static uint32_t g_rand_state = 0x1234abcdu;
 static bool g_rand_fails;
+/* When set: the next random bytes are exactly these (a golden vector's
+ * challenge), once. */
+static const uint8_t *g_rand_fixed;
 
 static bool test_random(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
     if (g_rand_fails) {
         return false;
+    }
+    if (g_rand_fixed != NULL) {
+        memcpy(buf, g_rand_fixed, len);
+        g_rand_fixed = NULL;
+        return true;
     }
     for (size_t i = 0; i < len; i++) {
         g_rand_state ^= g_rand_state << 13;
@@ -235,11 +248,24 @@ static uint32_t g_now;
 static int g_lock_depth;
 static int g_ctl_calls_under_lock;
 
-static esp_err_t w_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], void *ctx)
+/* What the worker handed to the controller with the last start. */
+static int g_join_calls;
+static bool g_join_had_endpoint;
+static pb_enroll_bridge_endpoint_t g_join_endpoint;
+
+static esp_err_t w_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                                void *ctx)
 {
     (void)ctx;
     if (g_lock_depth != 0) {
         g_ctl_calls_under_lock++;
+    }
+    g_join_calls++;
+    g_join_had_endpoint = endpoint != NULL;
+    memset(&g_join_endpoint, 0, sizeof(g_join_endpoint));
+    if (endpoint != NULL) {
+        g_join_endpoint = *endpoint;
+        return pb_enroll_ctl_request_join_with_endpoint(&g_ctl, pskd, endpoint, g_now);
     }
     return pb_enroll_ctl_request_join(&g_ctl, pskd, g_now);
 }
@@ -294,8 +320,12 @@ static void fresh(void)
     memset(&g_ot, 0, sizeof(g_ot));
     g_now = 1000;
     g_rand_fails = false;
+    g_rand_fixed = NULL;
     g_lock_depth = 0;
     g_ctl_calls_under_lock = 0;
+    g_join_calls = 0;
+    g_join_had_endpoint = false;
+    memset(&g_join_endpoint, 0, sizeof(g_join_endpoint));
     pb_enroll_ctl_init(&g_ctl, &k_ot_ops, EUI_A);
     pb_enroll_ctl_boot(&g_ctl);
     pb_ble_adm_init(&g_adm, &k_adm_ops, EUI_A, true, g_now);
@@ -1200,6 +1230,869 @@ static void scenario_no_secret_in_logs(void)
     CHECK(strstr(log, hex) == NULL && strstr(log, idhex) == NULL, "no challenge or request id bytes in the log");
 }
 
+
+/* ==== pb-start with the bridge endpoint (PB_BLE_MSG_START_EP_REQ) ==== */
+
+/* A Mesh-Local EID inside NET_OTBR's prefix, and the ingest port. Made up. */
+static const pb_enroll_bridge_endpoint_t EP_OTBR = {
+    .addr = {0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79},
+    .port = 5684,
+};
+
+static bool ep_equal(const pb_enroll_bridge_endpoint_t *x, const pb_enroll_bridge_endpoint_t *y)
+{
+    return memcmp(x->addr, y->addr, sizeof(x->addr)) == 0 && x->port == y->port;
+}
+
+static size_t build_start_ep(uint8_t out[PB_BLE_START_EP_REQ_MAX_LEN + 8], const uint8_t target[8],
+                             const uint8_t request_id[16], const uint8_t challenge[16],
+                             const pb_enroll_bridge_endpoint_t *ep, const char *pskd)
+{
+    size_t n = strlen(pskd);
+    memset(out, 0, PB_BLE_START_EP_REQ_MAX_LEN + 8);
+    out[0] = PB_BLE_PROTO_VERSION;
+    out[1] = PB_BLE_MSG_START_EP_REQ;
+    out[2] = (uint8_t)n;
+    memcpy(&out[4], target, 8);
+    memcpy(&out[12], request_id, 16);
+    memcpy(&out[28], challenge, 16);
+    out[44] = PB_BLE_BRIDGE_ENDPOINT_VERSION;
+    out[46] = (uint8_t)(ep->port >> 8);
+    out[47] = (uint8_t)ep->port;
+    memcpy(&out[48], ep->addr, 16);
+    memcpy(&out[64], pskd, n);
+    return 64 + n;
+}
+
+/* Sends the bytes as they are; resp gets the whole 4-byte answer. */
+static uint8_t send_raw_start(const uint8_t *msg, size_t len, uint8_t resp[PB_BLE_SHORT_RESP_LEN])
+{
+    uint8_t copy[PB_BLE_START_EP_REQ_MAX_LEN + 16];
+    memcpy(copy, msg, len);
+    pb_ble_adm_handle_start(&g_adm, copy, len, resp, g_now);
+    return resp[2];
+}
+
+static uint8_t send_start_ep(const uint8_t request_id[16], const uint8_t challenge[16],
+                             const pb_enroll_bridge_endpoint_t *ep, const char *pskd)
+{
+    uint8_t req[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+    size_t n = build_start_ep(req, EUI_A, request_id, challenge, ep, pskd);
+    pb_ble_adm_handle_start(&g_adm, req, n, resp, g_now);
+    return resp[2];
+}
+
+/* Fresh challenge + start with an endpoint. */
+static uint8_t start_ep_new(const uint8_t request_id[16], const pb_enroll_bridge_endpoint_t *ep, const char *pskd)
+{
+    uint8_t ch[16];
+    get_challenge(ch);
+    return send_start_ep(request_id, ch, ep, pskd);
+}
+
+static bool endpoint_slot_empty(void)
+{
+    return !g_adm.endpoint_pending && all_zero(&g_adm.endpoint, sizeof(g_adm.endpoint));
+}
+
+static bool no_record(void)
+{
+    pb_enroll_record_t rec;
+    return pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_ABSENT;
+}
+
+static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t cap)
+{
+    size_t n = strlen(hex) / 2;
+    if (n > cap) {
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned v = 0;
+        sscanf(&hex[2 * i], "%2x", &v);
+        out[i] = (uint8_t)v;
+    }
+    return n;
+}
+
+/*
+ * The same bytes are in the app repository's
+ * PowerBaseBLEKit/Tests/PowerBaseBLEKitTests/CodecTests.swift
+ * (BridgeEndpointGolden). Both sides must produce and accept exactly these.
+ *   target 6055f9fffe001234, request id a0..af, challenge c0..cf,
+ *   endpoint v1, port 5684 (0x1634), address fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79,
+ *   PSKd "J01NME7K"
+ */
+#define GOLDEN_START_EP_HEX                                                                                          \
+    "01040800" "6055f9fffe001234" "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"               \
+    "0100" "1634" "fd112233445500008c1f2e3d4c5b6a79" "4a30314e4d45374b"
+#define GOLDEN_START_EP_RESP_ACCEPTED_HEX "01840100"
+#define GOLDEN_START_EP_RESP_INVALID_ENDPOINT_HEX "01841d00"
+
+static void scenario_endpoint_golden_vector(void)
+{
+    printf("\n-- pb-start with the bridge endpoint: golden vector shared with the Swift codec --\n");
+    uint8_t golden[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    size_t golden_len = hex_to_bytes(GOLDEN_START_EP_HEX, golden, sizeof(golden));
+    CHECK(golden_len == 72 && golden_len == PB_BLE_START_EP_REQ_FIXED_LEN + 8, "the vector is 64 + 8 bytes");
+
+    uint8_t id[16], ch[16];
+    for (int i = 0; i < 16; i++) {
+        id[i] = (uint8_t)(0xa0 + i);
+        ch[i] = (uint8_t)(0xc0 + i);
+    }
+    uint8_t built[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    size_t n = build_start_ep(built, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(n == golden_len && memcmp(built, golden, golden_len) == 0,
+          "the layout in pb_ble_proto.h produces exactly the vector's bytes");
+    CHECK(golden[46] == 0x16 && golden[47] == 0x34, "the port is big-endian at [46..47]");
+
+    /* The real admission code takes those bytes. */
+    fresh();
+    g_rand_fixed = ch;
+    uint8_t issued[16];
+    CHECK(get_challenge(issued) == PB_BLE_CODE_OK && memcmp(issued, ch, 16) == 0, "(setup) the vector's challenge");
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+    uint8_t expect[PB_BLE_SHORT_RESP_LEN];
+    hex_to_bytes(GOLDEN_START_EP_RESP_ACCEPTED_HEX, expect, sizeof(expect));
+    send_raw_start(golden, golden_len, resp);
+    CHECK(memcmp(resp, expect, sizeof(expect)) == 0, "answer is 01 84 01 00: its own response type, ACCEPTED");
+    CHECK(g_adm.endpoint_pending && ep_equal(&g_adm.endpoint, &EP_OTBR) && g_adm.pskd_pending &&
+              strcmp(g_adm.pskd, PSKD) == 0,
+          "the address, the port and the PSKd were read from the vector's offsets");
+    CHECK(g_ot.joiner_start_calls == 0 && no_record(), "accepted: nothing started and nothing stored in the BLE callback");
+
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && g_join_had_endpoint && ep_equal(&g_join_endpoint, &EP_OTBR),
+          "the worker hands exactly that endpoint to the controller");
+    CHECK(g_ctl_calls_under_lock == 0, "with the leaf lock released");
+    CHECK(g_ctl.state == PB_ENROLL_STATE_JOINING && g_ctl.pending_endpoint && ep_equal(&g_ctl.pending_ep, &EP_OTBR),
+          "the controller holds it in RAM while joining");
+    CHECK(endpoint_slot_empty() && all_zero(g_adm.pskd, sizeof(g_adm.pskd)), "the admission slot is wiped once taken");
+    CHECK(no_record(), "still nothing in NVS");
+
+    /* An invalid endpoint's answer, as bytes. */
+    fresh();
+    pb_enroll_bridge_endpoint_t bad = EP_OTBR;
+    bad.port = 0;
+    get_challenge(ch);
+    n = build_start_ep(built, EUI_A, id, ch, &bad, PSKD);
+    hex_to_bytes(GOLDEN_START_EP_RESP_INVALID_ENDPOINT_HEX, expect, sizeof(expect));
+    send_raw_start(built, n, resp);
+    CHECK(memcmp(resp, expect, sizeof(expect)) == 0, "port 0 is answered 01 84 1d 00 (INVALID_ENDPOINT)");
+}
+
+static void scenario_endpoint_lengths_and_format(void)
+{
+    printf("\n-- pb-start with the bridge endpoint: every length, reserved bytes, message types --\n");
+    uint8_t id[16], ch[16];
+    make_id(id, 0x40);
+    uint8_t msg[PB_BLE_START_EP_REQ_MAX_LEN + 16];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+
+    /* A valid 72-byte request cut or padded to every length 0..104: only
+     * its own length is taken. */
+    int accepted = 0, malformed = 0, other = 0;
+    for (size_t len = 0; len <= PB_BLE_START_EP_REQ_MAX_LEN + 8; len++) {
+        fresh();
+        get_challenge(ch);
+        memset(msg, 0, sizeof(msg));
+        build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+        uint8_t code = send_raw_start(msg, len, resp);
+        if (code == PB_BLE_CODE_ACCEPTED && len == 72) {
+            accepted++;
+        } else if (code == PB_BLE_CODE_MALFORMED && len != 72 && nothing_started() && endpoint_slot_empty()) {
+            malformed++;
+        } else {
+            other++;
+        }
+        /* A malformed request does not use up the challenge. */
+        if (len != 72 && len >= 2) {
+            build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+            if (send_raw_start(msg, 72, resp) != PB_BLE_CODE_ACCEPTED) {
+                other++;
+            }
+        }
+    }
+    CHECK(accepted == 1 && malformed == (int)(PB_BLE_START_EP_REQ_MAX_LEN + 8) && other == 0,
+          "lengths 0..104 of one request: only 72 is accepted, all others MALFORMED with the challenge kept");
+
+    /* pskd_len decides the length: 6..32 are the valid sizes. */
+    static const char *PSKD6 = "J01NME";
+    static const char *PSKD32 = "ABCDEFGHJKLMNPRSTUVWXY0123456789";
+    fresh();
+    CHECK(start_ep_new(id, &EP_OTBR, PSKD6) == PB_BLE_CODE_ACCEPTED, "70 bytes (6-character PSKd): accepted");
+    fresh();
+    CHECK(start_ep_new(id, &EP_OTBR, PSKD32) == PB_BLE_CODE_ACCEPTED, "96 bytes (32-character PSKd): accepted");
+    fresh();
+    CHECK(start_ep_new(id, &EP_OTBR, "J01NM") == PB_BLE_CODE_INVALID_PSKD && nothing_started(),
+          "69 bytes with pskd_len 5: INVALID_PSKD");
+    fresh();
+    get_challenge(ch);
+    size_t n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD32);
+    msg[2] = 33;
+    msg[n] = 'A';
+    CHECK(send_raw_start(msg, n + 1, resp) == PB_BLE_CODE_MALFORMED && nothing_started(),
+          "97 bytes with pskd_len 33: MALFORMED");
+    fresh();
+    get_challenge(ch);
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[2] = 9; /* says 9, carries 8 */
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && nothing_started(),
+          "pskd_len that disagrees with the length: MALFORMED");
+
+    /* Reserved bytes. */
+    fresh();
+    get_challenge(ch);
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[3] = 1;
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && resp[1] == PB_BLE_MSG_START_EP_RESP &&
+              nothing_started(),
+          "reserved byte [3] set: MALFORMED");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[45] = 0x80;
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && nothing_started() && endpoint_slot_empty(),
+          "reserved byte [45] set: MALFORMED");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_ACCEPTED, "neither used up the challenge");
+
+    /* All-zero request id. */
+    fresh();
+    get_challenge(ch);
+    uint8_t zero_id[16] = {0};
+    n = build_start_ep(msg, EUI_A, zero_id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && nothing_started(), "all-zero request id: MALFORMED");
+
+    /* The two layouts are not interchangeable. */
+    fresh();
+    get_challenge(ch);
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[1] = PB_BLE_MSG_START_REQ; /* 72 bytes announced as the version 1 start: 44 + 8 != 72 */
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && resp[1] == PB_BLE_MSG_START_RESP &&
+              nothing_started(),
+          "the endpoint layout under the version 1 type: MALFORMED, answered as pb-start");
+    uint8_t legacy[PB_BLE_START_REQ_MAX_LEN + 8];
+    n = build_start(legacy, EUI_A, id, ch, PSKD);
+    legacy[1] = PB_BLE_MSG_START_EP_REQ; /* 52 bytes announced as the endpoint start: shorter than 64 */
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_MALFORMED && resp[1] == PB_BLE_MSG_START_EP_RESP &&
+              nothing_started(),
+          "the version 1 layout under the endpoint type: MALFORMED");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[1] = 0x05;
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_MALFORMED && resp[1] == PB_BLE_MSG_START_RESP &&
+              nothing_started(),
+          "an unknown message type: MALFORMED");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    msg[0] = 2;
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_UNSUPPORTED_VERSION && resp[0] == PB_BLE_PROTO_VERSION &&
+              nothing_started(),
+          "another protocol version: UNSUPPORTED_VERSION, nothing read");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    uint8_t before[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    memcpy(before, msg, n);
+    pb_ble_adm_handle_start(&g_adm, msg, n, resp, g_now);
+    CHECK(resp[2] == PB_BLE_CODE_ACCEPTED && all_zero(msg, n), "the decrypted request buffer (PSKd, address) is wiped");
+}
+
+static void scenario_endpoint_rejections(void)
+{
+    printf("\n-- pb-start with the bridge endpoint: addresses, port, challenge, target --\n");
+    uint8_t id[16], ch[16];
+    make_id(id, 0x50);
+    static const struct {
+        uint8_t addr[16];
+        const char *what;
+    } bad_addr[] = {
+        {{0}, "unspecified (::)"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "loopback (::1)"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 10}, "IPv4-mapped (::ffff:192.168.1.10)"},
+        {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 10}, "IPv4-compatible (::192.168.1.10)"},
+        {{0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, "multicast (ff03::1)"},
+        {{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79}, "link-local (fe80::/10)"},
+        {{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79}, "global (2001:db8::/32)"},
+        {{0xfc, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79}, "fc00::/8, not fd00::/8"},
+        {{0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0x4c, 0x00}, "an RLOC (…:0:ff:fe00:4c00)"},
+        {{0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0xfc, 0x00}, "an ALOC (…:0:ff:fe00:fc00)"},
+    };
+    for (size_t i = 0; i < sizeof(bad_addr) / sizeof(bad_addr[0]); i++) {
+        fresh();
+        pb_enroll_bridge_endpoint_t ep = {.port = 5684};
+        memcpy(ep.addr, bad_addr[i].addr, 16);
+        uint8_t code = start_ep_new(id, &ep, PSKD);
+        printf("      (%s)\n", bad_addr[i].what);
+        CHECK(code == PB_BLE_CODE_INVALID_ENDPOINT && nothing_started() && endpoint_slot_empty() && no_record() &&
+                  g_adm.rec_phase == PB_BLE_REC_NONE,
+              "INVALID_ENDPOINT: no attempt, no Joiner, nothing kept, nothing stored");
+        CHECK(poll() == PB_BLE_OPEN && g_join_calls == 0, "and the worker has nothing to run");
+    }
+
+    fresh();
+    pb_enroll_bridge_endpoint_t ep = EP_OTBR;
+    ep.port = 0;
+    CHECK(start_ep_new(id, &ep, PSKD) == PB_BLE_CODE_INVALID_ENDPOINT && nothing_started() && endpoint_slot_empty(),
+          "port 0: INVALID_ENDPOINT");
+    fresh();
+    ep.port = 1;
+    CHECK(start_ep_new(id, &ep, PSKD) == PB_BLE_CODE_ACCEPTED && g_adm.endpoint.port == 1, "port 1: accepted");
+    fresh();
+    ep.port = 65535;
+    CHECK(start_ep_new(id, &ep, PSKD) == PB_BLE_CODE_ACCEPTED && g_adm.endpoint.port == 65535, "port 65535: accepted");
+
+    /* Endpoint format versions other than 1. */
+    uint8_t msg[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+    for (int v = 0; v <= 2; v += 2) {
+        fresh();
+        get_challenge(ch);
+        size_t n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+        msg[44] = (uint8_t)v;
+        CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_INVALID_ENDPOINT && nothing_started() &&
+                  endpoint_slot_empty(),
+              "endpoint format version 0 / 2: INVALID_ENDPOINT");
+    }
+
+    /* The same checks as the version 1 start, with an endpoint on board. */
+    fresh();
+    uint8_t wrong[16] = {0};
+    get_challenge(ch);
+    memcpy(wrong, ch, 16);
+    wrong[5] ^= 1;
+    CHECK(send_start_ep(id, wrong, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_INVALID && nothing_started() &&
+              endpoint_slot_empty() && no_record(),
+          "wrong challenge: CHALLENGE_INVALID, the endpoint is not kept");
+    CHECK(send_start_ep(id, ch, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_INVALID && nothing_started(),
+          "and the right challenge is used up by that attempt");
+
+    fresh();
+    CHECK(send_start_ep(id, wrong, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_INVALID && nothing_started(),
+          "no challenge issued in this session: CHALLENGE_INVALID");
+
+    fresh();
+    get_challenge(ch);
+    g_now += PB_BLE_CHALLENGE_TTL_MS;
+    CHECK(send_start_ep(id, ch, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_EXPIRED && nothing_started() &&
+              endpoint_slot_empty(),
+          "expired challenge: CHALLENGE_EXPIRED");
+
+    fresh();
+    get_challenge(ch);
+    pb_ble_adm_session_changed(&g_adm); /* another session: a new handshake would be needed */
+    CHECK(send_start_ep(id, ch, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_INVALID && nothing_started(),
+          "a challenge from an earlier session (no authentication for this one): refused");
+
+    fresh();
+    get_challenge(ch);
+    size_t n = build_start_ep(msg, EUI_B, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_WRONG_TARGET && nothing_started() && endpoint_slot_empty(),
+          "another board's EUI-64: WRONG_TARGET");
+
+    fresh();
+    pb_ble_adm_init(&g_adm, &k_adm_ops, EUI_A, false, g_now);
+    pb_ble_adm_session_changed(&g_adm);
+    CHECK(start_ep_new(id, &EP_OTBR, PSKD) == PB_BLE_CODE_UNAVAILABLE && nothing_started() && endpoint_slot_empty(),
+          "a board that cannot run a Joiner: UNAVAILABLE");
+
+    /* Auth lock / closed: nothing is taken any more. */
+    fresh();
+    for (unsigned i = 0; i < PB_BLE_MAX_AUTH_FAILURES; i++) {
+        pb_ble_adm_sec_request_begin(&g_adm);
+        pb_ble_adm_sec_request_end(&g_adm, false);
+    }
+    CHECK(poll() == PB_BLE_CLOSE_AUTH_LOCKED, "(setup) five failed handshakes close BLE enrollment");
+    uint8_t any[16] = {1};
+    CHECK(send_start_ep(id, any, &EP_OTBR, PSKD) == PB_BLE_CODE_CLOSED && nothing_started() && endpoint_slot_empty() &&
+              no_record(),
+          "after failed authentication: CLOSED, no Joiner, nothing stored");
+}
+
+static void scenario_endpoint_duplicates(void)
+{
+    printf("\n-- same request id: the same endpoint is a duplicate, another one is a conflict --\n");
+    uint8_t id[16], ch[16];
+    make_id(id, 0x60);
+    uint8_t msg[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+
+    fresh();
+    get_challenge(ch);
+    size_t n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_ACCEPTED, "(setup) accepted");
+    uint32_t gen = g_adm.rec_gen;
+
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_DUPLICATE && resp[1] == PB_BLE_MSG_START_EP_RESP,
+          "the very same request again: DUPLICATE");
+
+    pb_enroll_bridge_endpoint_t other = EP_OTBR;
+    other.addr[15] ^= 0x01;
+    n = build_start_ep(msg, EUI_A, id, ch, &other, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_REQUEST_CONFLICT,
+          "same request id, another address: REQUEST_CONFLICT, not DUPLICATE");
+    other = EP_OTBR;
+    other.port = 5685;
+    n = build_start_ep(msg, EUI_A, id, ch, &other, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_REQUEST_CONFLICT,
+          "same request id, another port: REQUEST_CONFLICT, not DUPLICATE");
+    uint8_t legacy[PB_BLE_START_REQ_MAX_LEN + 8];
+    n = build_start(legacy, EUI_A, id, ch, PSKD);
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_REQUEST_CONFLICT && resp[1] == PB_BLE_MSG_START_RESP,
+          "same request id, challenge and PSKd as the version 1 message: REQUEST_CONFLICT (the type is part of it)");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD2);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_REQUEST_CONFLICT, "same request id, another PSKd: REQUEST_CONFLICT");
+
+    CHECK(g_adm.rec_gen == gen && g_adm.rec_phase == PB_BLE_REC_QUEUED && g_adm.endpoint_pending &&
+              ep_equal(&g_adm.endpoint, &EP_OTBR) && strcmp(g_adm.pskd, PSKD) == 0 && g_adm.q_count == 1,
+          "none of them touched the accepted attempt, its endpoint or its PSKd");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && g_ot.joiner_start_calls == 1 && g_join_had_endpoint &&
+              ep_equal(&g_join_endpoint, &EP_OTBR) && strcmp(g_ot.last_pskd, PSKD) == 0,
+          "one Joiner, with the first request's endpoint and PSKd");
+
+    /* The reverse: an accepted version 1 start, then the endpoint message
+     * under the same id. */
+    fresh();
+    get_challenge(ch);
+    CHECK(send_start(EUI_A, id, ch, PSKD) == PB_BLE_CODE_ACCEPTED, "(setup) a version 1 start accepted");
+    n = build_start_ep(msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(msg, n, resp) == PB_BLE_CODE_REQUEST_CONFLICT && endpoint_slot_empty(),
+          "the endpoint message reusing a version 1 request id: REQUEST_CONFLICT, no endpoint taken");
+    CHECK(send_start(EUI_A, id, ch, PSKD) == PB_BLE_CODE_DUPLICATE, "the version 1 start again: still DUPLICATE");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && !g_join_had_endpoint && !g_ctl.pending_endpoint,
+          "the version 1 attempt runs without any endpoint");
+
+    /* Another request id while one is in progress. */
+    uint8_t id2[16];
+    make_id(id2, 0x61);
+    CHECK(start_ep_new(id2, &EP_OTBR, PSKD2) == PB_BLE_CODE_BUSY && endpoint_slot_empty() && g_join_calls == 1,
+          "a second request (other id) while one runs: BUSY, its endpoint is not kept");
+}
+
+static void scenario_endpoint_pending_is_dropped(void)
+{
+    printf("\n-- the delivered endpoint never outlives an attempt that did not enroll --\n");
+    uint8_t id[16];
+    uint8_t st[PB_BLE_STATUS_RESP_LEN];
+
+    /* Cancelled while still queued. */
+    make_id(id, 0x70);
+    fresh();
+    CHECK(start_ep_new(id, &EP_OTBR, PSKD) == PB_BLE_CODE_ACCEPTED && g_adm.endpoint_pending, "(setup) queued");
+    CHECK(send_cancel(EUI_A, id) == PB_BLE_CODE_OK && endpoint_slot_empty() && all_zero(g_adm.pskd, sizeof(g_adm.pskd)),
+          "cancel while queued: the endpoint and the PSKd are dropped at once");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 0 && g_ot.joiner_start_calls == 0 && !g_ctl.pending_endpoint &&
+              no_record(),
+          "the worker never starts it; the controller never saw the endpoint");
+
+    /* The Joiner fails. */
+    make_id(id, 0x71);
+    fresh();
+    start_ep_new(id, &EP_OTBR, PSKD);
+    poll();
+    CHECK(g_ctl.state == PB_ENROLL_STATE_JOINING && g_ctl.pending_endpoint, "(setup) joining with a pending endpoint");
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_ERR_SECURITY, g_now);
+    poll();
+    query(id, st);
+    CHECK(st[15] == PB_BLE_PHASE_FAILED && st[16] == PB_ENROLL_RESULT_JOINER_SECURITY, "the request is reported failed");
+    CHECK(!g_ctl.pending_endpoint && all_zero(&g_ctl.pending_ep, sizeof(g_ctl.pending_ep)) && no_record() &&
+              !pb_enroll_ctl_services_allowed(&g_ctl),
+          "Joiner failure: pending endpoint gone, nothing stored, no services");
+
+    /* Cancelled while attaching. */
+    make_id(id, 0x72);
+    fresh();
+    start_ep_new(id, &EP_OTBR, PSKD);
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    poll();
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ATTACHING && g_ctl.pending_endpoint && no_record(),
+          "(setup) attaching: the endpoint is still RAM only");
+    CHECK(send_cancel(EUI_A, id) == PB_BLE_CODE_OK, "cancel while attaching is taken");
+    poll();
+    query(id, st);
+    CHECK(st[15] == PB_BLE_PHASE_CANCELLED && g_ctl.state == PB_ENROLL_STATE_WAITING && !g_ot.thread_enabled,
+          "the attempt is cancelled and Thread is off");
+    CHECK(!g_ctl.pending_endpoint && all_zero(&g_ctl.pending_ep, sizeof(g_ctl.pending_ep)) && no_record(),
+          "cancel while attaching: pending endpoint gone, nothing stored");
+
+    /* A later version 1 attempt on the same boot does not inherit it. */
+    uint8_t id2[16];
+    make_id(id2, 0x73);
+    CHECK(start_new(id2, PSKD2) == PB_BLE_CODE_ACCEPTED, "(setup) a version 1 start afterwards");
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    pb_enroll_record_t rec;
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ENROLLED && !g_ctl.has_bridge_endpoint &&
+              pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_VALID && !rec.has_bridge_endpoint,
+          "it enrolls with a version 1 record: the cancelled attempt's endpoint is nowhere");
+}
+
+static void scenario_endpoint_enrollment(void)
+{
+    printf("\n-- enrolled: the endpoint is stored with the marker, only for the joined network --\n");
+    uint8_t id[16];
+    uint8_t st[PB_BLE_STATUS_RESP_LEN];
+    pb_enroll_record_t rec;
+
+    make_id(id, 0x80);
+    fresh();
+    start_ep_new(id, &EP_OTBR, PSKD);
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ATTACHING && no_record(), "attached with a partial Dataset: nothing stored yet");
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ENROLLED && g_ctl.has_bridge_endpoint &&
+              ep_equal(&g_ctl.bridge_endpoint, &EP_OTBR) && !g_ctl.pending_endpoint,
+          "enrolled with the delivered endpoint");
+    CHECK(pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_VALID && rec.has_bridge_endpoint &&
+              ep_equal(&rec.bridge_endpoint, &EP_OTBR) && memcmp(&rec.id, &NET_OTBR, sizeof(rec.id)) == 0,
+          "one record holds the marker and the endpoint");
+    CHECK(poll() == PB_BLE_CLOSE_ENROLLED, "BLE enrollment closes");
+    query(id, st);
+    CHECK(st[15] == PB_BLE_PHASE_ENROLLED && st[16] == PB_ENROLL_RESULT_ENROLLED && st[13] <= 18,
+          "the request is reported enrolled with a version 1 result value");
+
+    /* The network the board joined is not the endpoint's. */
+    make_id(id, 0x81);
+    fresh();
+    pb_enroll_bridge_endpoint_t elsewhere = EP_OTBR;
+    elsewhere.addr[1] ^= 0xff; /* another fd00::/8 prefix: passes the format check */
+    CHECK(start_ep_new(id, &elsewhere, PSKD) == PB_BLE_CODE_ACCEPTED, "(setup) an endpoint in another Mesh-Local Prefix");
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_WAITING && g_ctl.last == PB_ENROLL_RESULT_DATASET_MISMATCH &&
+              !g_ot.thread_enabled && !pb_enroll_ctl_services_allowed(&g_ctl),
+          "attached to a network the endpoint is not in: not enrolled, Thread stopped");
+    CHECK(no_record() && !g_ctl.pending_endpoint && !g_ctl.has_bridge_endpoint, "nothing stored, nothing kept");
+    poll();
+    query(id, st);
+    CHECK(st[15] == PB_BLE_PHASE_FAILED && st[16] == PB_ENROLL_RESULT_DATASET_MISMATCH,
+          "the request is reported failed (dataset_mismatch)");
+
+    /* The record cannot be written. */
+    make_id(id, 0x82);
+    fresh();
+    start_ep_new(id, &EP_OTBR, PSKD);
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    nvs_sim_force_next_commit_error(ESP_FAIL);
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_WAITING && g_ctl.last == PB_ENROLL_RESULT_MARKER_WRITE_FAILED &&
+              !pb_enroll_ctl_services_allowed(&g_ctl) && !g_ctl.has_bridge_endpoint && no_record(),
+          "storing the record failed: not enrolled, no services, no half-written record");
+    CHECK(poll() == PB_BLE_OPEN, "BLE enrollment stays open for another attempt");
+}
+
+static void scenario_endpoint_never_logged(void)
+{
+    printf("\n-- neither the bridge address nor the PSKd reaches the log --\n");
+    char path[] = "/tmp/pb_ble_ep_logXXXXXX";
+    int fd = mkstemp(path);
+    fflush(stderr);
+    int saved = dup(STDERR_FILENO);
+    dup2(fd, STDERR_FILENO);
+
+    uint8_t id[16];
+    make_id(id, 0x90);
+    fresh();
+    pb_enroll_bridge_endpoint_t bad = EP_OTBR;
+    bad.addr[0] = 0xfe;
+    bad.addr[1] = 0x80;
+    start_ep_new(id, &bad, PSKD);
+    start_ep_new(id, &EP_OTBR, PSKD);
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    poll();
+
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    char log[16384] = {0};
+    lseek(fd, 0, SEEK_SET);
+    ssize_t n = read(fd, log, sizeof(log) - 1);
+    close(fd);
+    unlink(path);
+    CHECK(n > 0 && g_ctl.state == PB_ENROLL_STATE_ENROLLED, "the scenario enrolled and produced log output");
+    CHECK(strstr(log, PSKD) == NULL, "no PSKd in the log");
+    CHECK(strstr(log, "8c1f") == NULL && strstr(log, "8c:1f") == NULL && strstr(log, "fd11") == NULL &&
+              strstr(log, "2e3d") == NULL && strstr(log, "6a79") == NULL,
+          "no part of the bridge address in the log");
+}
+
+
+/* ==== endpoint policy: the prepared image requires a delivered endpoint ==== */
+
+static uint32_t test_crc32(const uint8_t *data, size_t len)
+{
+    return crc32_ieee(data, len);
+}
+
+/* A version 1 enrollment record for EUI_A / NET_OTBR, written by hand. */
+static void make_v1_record(uint8_t raw[PB_ENROLL_MARKER_LEN])
+{
+    memset(raw, 0, PB_ENROLL_MARKER_LEN);
+    memcpy(raw, "PBE1", 4);
+    raw[4] = 1;
+    memcpy(&raw[8], EUI_A, 8);
+    memcpy(&raw[16], NET_OTBR.ext_pan_id, 8);
+    memcpy(&raw[24], NET_OTBR.mesh_local_prefix, 8);
+    uint32_t crc = test_crc32(raw, 32);
+    raw[32] = (uint8_t)crc;
+    raw[33] = (uint8_t)(crc >> 8);
+    raw[34] = (uint8_t)(crc >> 16);
+    raw[35] = (uint8_t)(crc >> 24);
+}
+
+static size_t stored_record(uint8_t *out, size_t cap)
+{
+    nvs_handle_t h;
+    size_t len = cap;
+    if (nvs_open(PB_ENROLL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 0;
+    }
+    esp_err_t err = nvs_get_blob(h, PB_ENROLL_NVS_KEY, out, &len);
+    nvs_close(h);
+    return err == ESP_OK ? len : 0;
+}
+
+/* Like fresh(), with the image's endpoint policy given to the admission
+ * rules (`adm_policy`) and to the controller (`ctl_policy`) -- on the board
+ * both get the same value; the tests also set them apart to check each layer
+ * on its own. `with_old_record`: the board still holds a version 1 record
+ * and that network's complete Dataset from an earlier enrollment. */
+static void fresh_with_policy(pb_enroll_endpoint_policy_t adm_policy, pb_enroll_endpoint_policy_t ctl_policy,
+                              bool with_old_record)
+{
+    nvs_sim_reset();
+    memset(&g_ot, 0, sizeof(g_ot));
+    g_now = 1000;
+    g_rand_fails = false;
+    g_rand_fixed = NULL;
+    g_lock_depth = 0;
+    g_ctl_calls_under_lock = 0;
+    g_join_calls = 0;
+    g_join_had_endpoint = false;
+    memset(&g_join_endpoint, 0, sizeof(g_join_endpoint));
+    if (with_old_record) {
+        uint8_t v1[PB_ENROLL_MARKER_LEN];
+        make_v1_record(v1);
+        nvs_sim_put_blob("nvs", PB_ENROLL_NVS_NAMESPACE, PB_ENROLL_NVS_KEY, v1, sizeof(v1));
+        g_ot.has_key = true;
+        g_ot.complete = true;
+        g_ot.id = NET_OTBR;
+    }
+    pb_enroll_ctl_init(&g_ctl, &k_ot_ops, EUI_A);
+    pb_enroll_ctl_set_endpoint_policy(&g_ctl, ctl_policy);
+    pb_enroll_ctl_boot(&g_ctl);
+    pb_ble_adm_init(&g_adm, &k_adm_ops, EUI_A, true, g_now);
+    pb_ble_adm_set_endpoint_policy(&g_adm, adm_policy);
+    pb_ble_ctl_status_t st = {.state = g_ctl.state, .last = g_ctl.last, .attempt = g_ctl.attempt};
+    g_adm.ctl = st; /* what pb_ble_service_start() does */
+    pb_ble_adm_session_changed(&g_adm);
+}
+
+/* The record in flash is exactly the hand-written version 1 record and the
+ * fake OpenThread still holds that Dataset. */
+static bool old_record_and_dataset_untouched(void)
+{
+    uint8_t v1[PB_ENROLL_MARKER_LEN];
+    uint8_t now[80];
+    make_v1_record(v1);
+    return stored_record(now, sizeof(now)) == sizeof(v1) && memcmp(now, v1, sizeof(v1)) == 0 && g_ot.has_key &&
+           g_ot.complete && memcmp(&g_ot.id, &NET_OTBR, sizeof(g_ot.id)) == 0;
+}
+
+static void scenario_endpoint_policy_required(void)
+{
+    printf("\n-- endpoint policy REQUIRED: the start without an endpoint (0x02) is refused before anything happens --\n");
+    uint8_t id[16], ch[16];
+    uint8_t st[PB_BLE_STATUS_RESP_LEN];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+    uint8_t legacy[PB_BLE_START_REQ_MAX_LEN + 8];
+    make_id(id, 0xa0);
+
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_REQUIRED, PB_ENROLL_ENDPOINT_POLICY_REQUIRED, true);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_WAITING && g_ot.joiner_start_calls == 0 && !g_ot.thread_enabled,
+          "(setup) the board waits: its old version 1 record is not resumed under this policy");
+    query(NULL, st);
+    CHECK(st[2] == PB_BLE_CODE_OK && st[12] == PB_ENROLL_STATE_WAITING && (st[14] & PB_BLE_STATUS_F_JOINER_UNAVAILABLE) == 0 &&
+              st[13] <= 18,
+          "pb-status: waiting, and NOT 'Joiner unavailable' -- the endpoint start works on this board");
+
+    CHECK(get_challenge(ch) == PB_BLE_CODE_OK, "(setup) a challenge is issued");
+    size_t n = build_start(legacy, EUI_A, id, ch, PSKD);
+    uint8_t copy[PB_BLE_START_REQ_MAX_LEN + 8];
+    memcpy(copy, legacy, n);
+    pb_ble_adm_handle_start(&g_adm, copy, n, resp, g_now);
+    static const uint8_t expect[4] = {0x01, 0x82, 0x1b, 0x00};
+    CHECK(memcmp(resp, expect, 4) == 0, "0x02 start: answered 01 82 1b 00 -- UNAVAILABLE, a code every version 1 client knows");
+    CHECK(all_zero(copy, n), "the decrypted request (with its PSKd) is wiped");
+    CHECK(g_adm.q_count == 0 && g_adm.rec_phase == PB_BLE_REC_NONE && g_adm.rec_gen == 0 && !g_adm.pskd_pending &&
+              all_zero(g_adm.pskd, sizeof(g_adm.pskd)) && all_zero(g_adm.rec_request_id, 16) && endpoint_slot_empty(),
+          "nothing queued, no attempt record, no PSKd kept");
+    CHECK(g_adm.ch_valid, "the session's challenge was NOT used up by the refused message");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 0 && g_ot.joiner_start_calls == 0 && g_ot.thread_stop_calls == 0 &&
+              g_ctl.state == PB_ENROLL_STATE_WAITING && g_ctl.attempt == 0,
+          "the worker has nothing to run: no Joiner, the controller was never asked");
+    CHECK(old_record_and_dataset_untouched(), "the stored record and Dataset are byte for byte what they were");
+    query(id, st);
+    CHECK((st[14] & (PB_BLE_STATUS_F_REQUEST_MATCH | PB_BLE_STATUS_F_ATTEMPT_ACTIVE)) == 0 && st[15] == PB_BLE_PHASE_NONE,
+          "pb-status knows nothing under that request id, and no attempt is active");
+
+    /* Sending it again changes nothing. */
+    for (int i = 0; i < 3; i++) {
+        send_raw_start(legacy, n, resp);
+    }
+    CHECK(resp[2] == PB_BLE_CODE_UNAVAILABLE && g_adm.q_count == 0 && g_adm.rec_phase == PB_BLE_REC_NONE && g_adm.ch_valid &&
+              g_ot.joiner_start_calls == 0,
+          "retransmissions get the same answer (never DUPLICATE or CONFLICT) and still leave no trace");
+    CHECK(send_cancel(EUI_A, id) == PB_BLE_CODE_NO_SUCH_ATTEMPT, "there is nothing to cancel under that request id");
+
+    /* The right message afterwards: same session, same challenge, even the same request id. */
+    uint8_t ep_msg[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    size_t m = build_start_ep(ep_msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(ep_msg, m, resp) == PB_BLE_CODE_ACCEPTED && resp[1] == PB_BLE_MSG_START_EP_RESP,
+          "the endpoint start (0x04) with that same challenge and request id: ACCEPTED, as if the 0x02 had never come");
+    CHECK(send_raw_start(ep_msg, m, resp) == PB_BLE_CODE_DUPLICATE, "and its own retransmission is a DUPLICATE as usual");
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_UNAVAILABLE && g_adm.rec_phase == PB_BLE_REC_QUEUED,
+          "a 0x02 under the now active request id is still UNAVAILABLE and does not disturb the attempt");
+    CHECK(old_record_and_dataset_untouched(), "accepted is not started: the old record is still there");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && g_join_had_endpoint && g_ot.joiner_start_calls == 1 &&
+              strcmp(g_ot.last_pskd, PSKD) == 0 && g_ctl.pending_endpoint,
+          "the worker starts ONE Joiner, with the endpoint");
+    CHECK(no_record(), "the old record was cleared by that accepted request, as for any new attempt");
+    g_ot.has_key = true;
+    g_ot.complete = false;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    CHECK(no_record(), "Joiner success: still nothing stored");
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    pb_enroll_record_t rec;
+    uint8_t raw[80];
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ENROLLED && pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_VALID &&
+              rec.has_bridge_endpoint && ep_equal(&rec.bridge_endpoint, &EP_OTBR) &&
+              stored_record(raw, sizeof(raw)) == PB_ENROLL_MARKER_V2_LEN,
+          "enrolled: marker and endpoint in ONE 56-byte record");
+    CHECK(poll() == PB_BLE_CLOSE_ENROLLED, "BLE enrollment closes only now");
+
+    /* A fresh board, a new session: the refusal needs no challenge at all. */
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_REQUIRED, PB_ENROLL_ENDPOINT_POLICY_REQUIRED, false);
+    uint8_t none[16] = {7};
+    n = build_start(legacy, EUI_A, id, none, PSKD);
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_UNAVAILABLE && nothing_started() && no_record(),
+          "0x02 without any challenge issued: UNAVAILABLE (the policy answers before the challenge is looked at)");
+    n = build_start(legacy, EUI_B, id, none, PSKD);
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_UNAVAILABLE && nothing_started(),
+          "0x02 for another board's EUI-64: UNAVAILABLE too -- its content is not examined");
+
+    /* The checks that come before the policy keep their own answers. */
+    n = build_start(legacy, EUI_A, id, none, PSKD);
+    legacy[3] = 1;
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_MALFORMED, "a malformed 0x02 is still MALFORMED");
+    n = build_start(legacy, EUI_A, id, none, PSKD);
+    legacy[0] = 2;
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_UNSUPPORTED_VERSION, "another protocol version is still UNSUPPORTED_VERSION");
+    for (unsigned i = 0; i < PB_BLE_MAX_AUTH_FAILURES; i++) {
+        pb_ble_adm_sec_request_begin(&g_adm);
+        pb_ble_adm_sec_request_end(&g_adm, false);
+    }
+    poll();
+    n = build_start(legacy, EUI_A, id, none, PSKD);
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_CLOSED, "a closed board still answers CLOSED");
+
+    /* The endpoint start is judged exactly as on any board. */
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_REQUIRED, PB_ENROLL_ENDPOINT_POLICY_REQUIRED, false);
+    pb_enroll_bridge_endpoint_t bad = EP_OTBR;
+    bad.port = 0;
+    CHECK(start_ep_new(id, &bad, PSKD) == PB_BLE_CODE_INVALID_ENDPOINT && nothing_started(),
+          "an endpoint start with port 0: INVALID_ENDPOINT, as without the policy");
+    get_challenge(ch);
+    uint8_t wrong[16];
+    memcpy(wrong, ch, 16);
+    wrong[0] ^= 1;
+    CHECK(send_start_ep(id, wrong, &EP_OTBR, PSKD) == PB_BLE_CODE_CHALLENGE_INVALID && nothing_started(),
+          "an endpoint start with a wrong challenge: CHALLENGE_INVALID");
+}
+
+static void scenario_endpoint_policy_other(void)
+{
+    uint8_t id[16], ch[16];
+    uint8_t st[PB_BLE_STATUS_RESP_LEN];
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN];
+    uint8_t legacy[PB_BLE_START_REQ_MAX_LEN + 8];
+    uint8_t ep_msg[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    make_id(id, 0xb0);
+
+    printf("\n-- no policy in the image (OPTIONAL): the 0x02 start enrolls exactly as before --\n");
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_OPTIONAL, PB_ENROLL_ENDPOINT_POLICY_OPTIONAL, false);
+    CHECK(start_new(id, PSKD) == PB_BLE_CODE_ACCEPTED, "0x02 start: ACCEPTED");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && !g_join_had_endpoint && g_ot.joiner_start_calls == 1,
+          "the worker starts the Joiner without an endpoint");
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    uint8_t raw[80];
+    uint8_t v1[PB_ENROLL_MARKER_LEN];
+    make_v1_record(v1);
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ENROLLED && stored_record(raw, sizeof(raw)) == 36 && memcmp(raw, v1, 36) == 0 &&
+              !g_ctl.has_bridge_endpoint,
+          "and the board enrolls with the same version 1 record as before");
+    CHECK(poll() == PB_BLE_CLOSE_ENROLLED, "BLE enrollment closes");
+
+    printf("\n-- unusable policy (INVALID): no start of either kind is taken --\n");
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_INVALID, PB_ENROLL_ENDPOINT_POLICY_INVALID, false);
+    get_challenge(ch);
+    size_t n = build_start(legacy, EUI_A, id, ch, PSKD);
+    CHECK(send_raw_start(legacy, n, resp) == PB_BLE_CODE_UNAVAILABLE && resp[1] == PB_BLE_MSG_START_RESP && nothing_started(),
+          "0x02: UNAVAILABLE");
+    size_t m = build_start_ep(ep_msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    CHECK(send_raw_start(ep_msg, m, resp) == PB_BLE_CODE_UNAVAILABLE && resp[1] == PB_BLE_MSG_START_EP_RESP &&
+              nothing_started() && endpoint_slot_empty(),
+          "0x04: UNAVAILABLE too, the endpoint is not kept");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 0 && no_record(), "nothing reaches the worker or the flash");
+
+    printf("\n-- (defence in depth) the controller refuses on its own if the admission layer did not --\n");
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_OPTIONAL, PB_ENROLL_ENDPOINT_POLICY_REQUIRED, true);
+    CHECK(start_new(id, PSKD) == PB_BLE_CODE_ACCEPTED, "(setup) admission without the policy lets a 0x02 start through");
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && !g_join_had_endpoint, "the worker hands it to the controller");
+    CHECK(g_ot.joiner_start_calls == 0 && g_ctl.state == PB_ENROLL_STATE_WAITING && g_ctl.attempt == 0 &&
+              g_ot.thread_stop_calls == 0,
+          "the controller refuses it: no Joiner, still waiting");
+    CHECK(old_record_and_dataset_untouched(), "and it erased neither the record nor the Dataset");
+    query(id, st);
+    CHECK((st[14] & PB_BLE_STATUS_F_REQUEST_MATCH) && st[15] == PB_BLE_PHASE_FAILED && st[16] == PB_BLE_REQ_RESULT_START_REFUSED &&
+              (st[14] & PB_BLE_STATUS_F_ATTEMPT_ACTIVE) == 0,
+          "the request is reported failed / start refused (0x80), a value version 1 clients know");
+    CHECK(all_zero(g_adm.pskd, sizeof(g_adm.pskd)) && all_zero(g_adm.rec_tag, sizeof(g_adm.rec_tag)),
+          "its PSKd and digest are gone");
+    uint8_t id2[16];
+    make_id(id2, 0xb1);
+    CHECK(start_ep_new(id2, &EP_OTBR, PSKD) == PB_BLE_CODE_ACCEPTED && poll() == PB_BLE_OPEN && g_ot.joiner_start_calls == 1 &&
+              g_ctl.pending_endpoint,
+          "an endpoint start afterwards is accepted and started");
+}
+
 int main(void)
 {
     uint8_t d[32];
@@ -1222,6 +2115,15 @@ int main(void)
     scenario_auth_limits();
     scenario_window();
     scenario_no_secret_in_logs();
+    scenario_endpoint_golden_vector();
+    scenario_endpoint_lengths_and_format();
+    scenario_endpoint_rejections();
+    scenario_endpoint_duplicates();
+    scenario_endpoint_pending_is_dropped();
+    scenario_endpoint_enrollment();
+    scenario_endpoint_never_logged();
+    scenario_endpoint_policy_required();
+    scenario_endpoint_policy_other();
 
     printf("\n%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

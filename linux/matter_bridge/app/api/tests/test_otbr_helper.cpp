@@ -44,6 +44,7 @@ void ResetFake(const std::string &state, const std::string &mode = "")
     WriteFake("state", state);
     WriteFake("mode", mode);
     WriteFake("joiners", "");
+    WriteFake("mleid", "");
     WriteFake("argv.log", "");
     WriteFake("stdin.log", "");
 }
@@ -283,6 +284,238 @@ void RunOtbrHelperTests(int *failures)
         garbage.command = {"/bin/echo", "ok", "J01NME"};
         HelperCommissioner odd(garbage);
         API_CHECK(odd.QueryState(state) == CommissionerStatus::Failed, "an unexpected answer is Failed");
+        ResetFake("disabled");
+    }
+    // A made-up Mesh-Local EID in a made-up prefix; no real network's.
+    const std::string kMleid = "fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79";
+
+    printf("\n-- scenario: what counts as a Mesh-Local EID --\n");
+    {
+        unsigned char bytes[16] = {0};
+        std::string canonical;
+        API_CHECK(ParseMeshLocalEid(kMleid, &bytes, &canonical) && canonical == kMleid && bytes[0] == 0xfd &&
+                      bytes[1] == 0x11 && bytes[8] == 0x8c && bytes[15] == 0x79,
+                  "an fd00::/8 address with an ordinary interface id is one, bytes in network order");
+        API_CHECK(ParseMeshLocalEid("fd11:2233:4455:0000:8c1f:2e3d:4c5b:6a79", nullptr, &canonical) && canonical == kMleid,
+                  "leading zeros are accepted and the canonical text has none");
+        API_CHECK(ParseMeshLocalEid("fdde:ad00:beef::1", nullptr, &canonical) && canonical == "fdde:ad00:beef::1",
+                  "a compressed literal is accepted");
+
+        API_CHECK(!ParseMeshLocalEid("::"), "the unspecified address is refused");
+        API_CHECK(!ParseMeshLocalEid("::1"), "loopback is refused");
+        API_CHECK(!ParseMeshLocalEid("::ffff:c0a8:10a") && !ParseMeshLocalEid("::ffff:192.168.1.10"),
+                  "an IPv4-mapped address is refused in either spelling");
+        API_CHECK(!ParseMeshLocalEid("::c0a8:10a") && !ParseMeshLocalEid("::192.168.1.10"),
+                  "an IPv4-compatible address is refused in either spelling");
+        API_CHECK(!ParseMeshLocalEid("192.168.1.10") && !ParseMeshLocalEid("fd11:2233:4455::192.168.1.10"),
+                  "IPv4 and a dotted tail are refused");
+        API_CHECK(!ParseMeshLocalEid("ff03::1") && !ParseMeshLocalEid("ff02::1"), "multicast is refused");
+        API_CHECK(!ParseMeshLocalEid("fe80::8c1f:2e3d:4c5b:6a79") && !ParseMeshLocalEid("febf::1"),
+                  "link-local is refused");
+        API_CHECK(!ParseMeshLocalEid("fe80::8c1f:2e3d:4c5b:6a79%wpan0") && !ParseMeshLocalEid(kMleid + "%wpan0") &&
+                      !ParseMeshLocalEid(kMleid + "%25"),
+                  "a zone id is refused");
+        API_CHECK(!ParseMeshLocalEid("2001:db8::1") && !ParseMeshLocalEid("fc11:2233:4455:0:8c1f:2e3d:4c5b:6a79"),
+                  "a global address and fc00::/8 are refused: a Mesh-Local Prefix is in fd00::/8");
+        API_CHECK(!ParseMeshLocalEid("fd11:2233:4455:0:0:ff:fe00:4c00"), "an RLOC is refused");
+        API_CHECK(!ParseMeshLocalEid("fd11:2233:4455:0:0:ff:fe00:fc00") &&
+                      !ParseMeshLocalEid("fd11:2233:4455::ff:fe00:fc38"),
+                  "an ALOC is refused");
+        API_CHECK(ParseMeshLocalEid("fd11:2233:4455:0:0:ff:fe01:4c00") && ParseMeshLocalEid("fd11:2233:4455:0:1:ff:fe00:4c00"),
+                  "interface ids that only resemble the locator form are still EIDs");
+        API_CHECK(!ParseMeshLocalEid("FD11:2233:4455:0:8C1F:2E3D:4C5B:6A79"), "upper case is refused (ot-ctl prints lower case)");
+        API_CHECK(!ParseMeshLocalEid("[" + kMleid + "]") && !ParseMeshLocalEid("[" + kMleid + "]:5684") &&
+                      !ParseMeshLocalEid("coap://[" + kMleid + "]:5684/"),
+                  "brackets, a port and a URL are refused");
+        API_CHECK(!ParseMeshLocalEid("hub.local") && !ParseMeshLocalEid("jogakbo-hub") && !ParseMeshLocalEid(""),
+                  "a hostname and an empty string are refused");
+        API_CHECK(!ParseMeshLocalEid(" " + kMleid) && !ParseMeshLocalEid(kMleid + " ") && !ParseMeshLocalEid(kMleid + "\n") &&
+                      !ParseMeshLocalEid(kMleid + " " + kMleid),
+                  "surrounding whitespace, a newline and a second address are refused");
+        API_CHECK(!ParseMeshLocalEid("fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79:1") && !ParseMeshLocalEid("fd11::8c1f::1") &&
+                      !ParseMeshLocalEid("fd11:2233:4455:0:8c1f:2e3d:4c5b") && !ParseMeshLocalEid("fd11:22333::1"),
+                  "nine groups, two '::', seven groups and a five-digit group are refused");
+    }
+
+    printf("\n-- scenario: the mesh-local-eid request and its one-value answer --\n");
+    {
+        HelperRequest eid;
+        eid.op = HelperOp::MeshLocalEid;
+        const std::string line = BuildHelperRequest(eid);
+        API_CHECK(line == "pogohome-otbr/1 mesh-local-eid\n", "the request is one fixed line without arguments");
+        HelperRequest parsed;
+        API_CHECK(ParseHelperRequest(line, parsed) && parsed.op == HelperOp::MeshLocalEid && parsed.eui64.empty() &&
+                      parsed.pskd.empty(),
+                  "it parses back");
+        API_CHECK(!ParseHelperRequest("pogohome-otbr/1 mesh-local-eid x\n", parsed) &&
+                      !ParseHelperRequest("pogohome-otbr/1 mesh-local-eid " + kMleid + "\n", parsed),
+                  "it takes no argument -- an address can never be sent TO the helper");
+        eid.eui64 = kEui;
+        API_CHECK(BuildHelperRequest(eid).empty(), "no request can be built with an argument either");
+        API_CHECK(!ParseHelperRequest("pogohome-otbr/1 ipaddr\n", parsed) &&
+                      !ParseHelperRequest("pogohome-otbr/1 ipaddr mleid\n", parsed) &&
+                      !ParseHelperRequest("pogohome-otbr/1 ipaddr rloc\n", parsed) &&
+                      !ParseHelperRequest("pogohome-otbr/1 dataset active -x\n", parsed),
+                  "no raw CLI word, address list or Dataset read became possible");
+
+        std::string address;
+        API_CHECK(ParseHelperMleidResponse("ok mleid " + kMleid + "\n", address) && address == kMleid,
+                  "\"ok mleid <address>\" parses to the address");
+        API_CHECK(!ParseHelperMleidResponse("ok mleid " + kMleid + " " + kMleid + "\n", address) && address.empty(),
+                  "two addresses are refused");
+        API_CHECK(!ParseHelperMleidResponse("ok mleid  " + kMleid + "\n", address) &&
+                      !ParseHelperMleidResponse("ok  mleid " + kMleid + "\n", address) &&
+                      !ParseHelperMleidResponse(" ok mleid " + kMleid + "\n", address),
+                  "extra spaces are refused");
+        API_CHECK(!ParseHelperMleidResponse("ok mleid " + kMleid + "\n\n", address) &&
+                      !ParseHelperMleidResponse("ok mleid " + kMleid + "\nok mleid " + kMleid + "\n", address),
+                  "a second line is refused");
+        API_CHECK(!ParseHelperMleidResponse("ok address " + kMleid + "\n", address) &&
+                      !ParseHelperMleidResponse("ok " + kMleid + "\n", address) &&
+                      !ParseHelperMleidResponse("mleid " + kMleid + "\n", address),
+                  "any other wording is refused");
+        API_CHECK(!ParseHelperMleidResponse("ok mleid fe80::1\n", address) &&
+                      !ParseHelperMleidResponse("ok mleid fd11:2233:4455:0:0:ff:fe00:4c00\n", address) &&
+                      !ParseHelperMleidResponse("ok mleid ::ffff:192.168.1.10\n", address) &&
+                      !ParseHelperMleidResponse("ok mleid\n", address) && !ParseHelperMleidResponse("ok mleid \n", address),
+                  "an address that is not a Mesh-Local EID, or none, is refused");
+
+        // The general parser did not get looser for it.
+        bool ok = false;
+        std::vector<std::string> words;
+        API_CHECK(!ParseHelperResponse("ok mleid " + kMleid + "\n", ok, words),
+                  "the general answer parser still refuses anything but [a-z_] words -- also this answer");
+        API_CHECK(!ParseHelperResponse("ok active 1\n", ok, words) && !ParseHelperResponse("ok a:b\n", ok, words) &&
+                      !ParseHelperResponse("err fd11::1\n", ok, words),
+                  "digits and colons are still refused in every other answer");
+        API_CHECK(ParseHelperResponse("err invalid_address\n", ok, words) && !ok && words[0] == "invalid_address",
+                  "the new error code is an ordinary [a-z_] word");
+    }
+
+    printf("\n-- scenario: HelperCommissioner reads the OTBR's Mesh-Local EID through the helper --\n");
+    {
+        ResetFake("disabled");
+        WriteFake("mleid", kMleid);
+        HelperCommissioner commissioner = MakeCommissioner();
+        std::string address;
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::Ok && address == kMleid,
+                  "the address ot-ctl printed for \"ipaddr mleid\" comes back");
+        API_CHECK(ReadFake("stdin.log") == "ipaddr mleid\n", "the helper ran exactly the fixed command \"ipaddr mleid\"");
+        API_CHECK(ReadFake("argv.log").find("args=\n") != std::string::npos, "ot-ctl got no command arguments");
+        API_CHECK(ReadFake("state") == "disabled" && ReadFake("joiners").empty(),
+                  "nothing on the OTBR changed: the Commissioner was not started and no Joiner was added");
+
+        SubprocessResult r = RunHelper("pogohome-otbr/1 mesh-local-eid\n");
+        API_CHECK(r.exited && r.exit_code == 0 && r.out == "ok mleid " + kMleid + "\n", "the helper's own answer line");
+        r = RunHelper("pogohome-otbr/1 mesh-local-eid\n", {"mleid"});
+        API_CHECK(r.exit_code == 2 && r.out == "err invalid_request\n", "it still takes no command-line argument");
+
+        WriteFake("mleid", "fd11:2233:4455:0000:8c1f:2e3d:4c5b:6a79");
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::Ok && address == kMleid,
+                  "an uncompressed spelling comes back canonical");
+
+        ResetFake("active", "echo");
+        WriteFake("mleid", kMleid);
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::Ok && address == kMleid,
+                  "an ot-ctl that echoes the command first changes nothing");
+    }
+
+    printf("\n-- scenario: anything but that one address is refused, never guessed --\n");
+    {
+        HelperCommissioner commissioner = MakeCommissioner();
+        std::string address = "stale";
+        const struct {
+            const char *printed;
+            const char *what;
+        } cases[] = {
+            {"", "ot-ctl printed no address"},
+            {"fd11:2233:4455:0:0:ff:fe00:4c00", "ot-ctl printed an RLOC"},
+            {"fd11:2233:4455:0:0:ff:fe00:fc00", "ot-ctl printed an ALOC"},
+            {"fe80::8c1f:2e3d:4c5b:6a79", "ot-ctl printed a link-local address"},
+            {"fd11:2233:4455:0:0:ff:fe00:4c00\nfd11:2233:4455:0:8c1f:2e3d:4c5b:6a79\nfe80::8c1f:2e3d:4c5b:6a79",
+             "ot-ctl printed a list of addresses (as \"ipaddr\" would): the EID in it is not picked out"},
+            {"fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79\nfd11:2233:4455:0:8c1f:2e3d:4c5b:6a79", "the same address twice"},
+            {"fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79 extra", "the address followed by another word"},
+            {"192.168.1.10", "an IPv4 address"},
+            {"::ffff:192.168.1.10", "an IPv4-mapped address"},
+            {"not an address", "text"},
+        };
+        for (const auto &c : cases) {
+            ResetFake("active");
+            WriteFake("mleid", c.printed);
+            address = "stale";
+            const CommissionerStatus status = commissioner.QueryMeshLocalEid(address);
+            printf("      (%s)\n", c.what);
+            API_CHECK(status == CommissionerStatus::Failed && address.empty(), "Failed, and no address is handed back");
+            SubprocessResult r = RunHelper("pogohome-otbr/1 mesh-local-eid\n");
+            API_CHECK(r.exit_code == 1 && r.out == "err invalid_address\n",
+                      "the helper answers err invalid_address and passes nothing of ot-ctl's output on");
+        }
+
+        ResetFake("active");
+        WriteFake("mleid", "ERROR");
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::InvalidState && address.empty(),
+                  "an OTBR error for the command is reported as such");
+
+        ResetFake("active", "unavailable");
+        WriteFake("mleid", kMleid);
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::Unavailable && address.empty(),
+                  "no OTBR to talk to: Unavailable");
+
+        ResetFake("active", "hang");
+        WriteFake("mleid", kMleid);
+        auto t0 = std::chrono::steady_clock::now();
+        API_CHECK(commissioner.QueryMeshLocalEid(address) == CommissionerStatus::Timeout && address.empty(),
+                  "an ot-ctl that never answers: Timeout");
+        API_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4), "within the helper's own ot-ctl timeout");
+        HelperCommissioner impatient = MakeCommissioner(std::chrono::milliseconds(500));
+        t0 = std::chrono::steady_clock::now();
+        API_CHECK(impatient.QueryMeshLocalEid(address) == CommissionerStatus::Timeout &&
+                      std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2),
+                  "a helper that does not answer in time: Timeout for the bridge, which does not wait longer");
+
+        // Helpers that are not this helper.
+        HelperCommissionerConfig old_helper;
+        old_helper.command = {"/bin/sh", "-c", "cat >/dev/null; echo 'err invalid_request'; exit 2"};
+        HelperCommissioner predates(old_helper);
+        API_CHECK(predates.QueryMeshLocalEid(address) == CommissionerStatus::Unsupported && address.empty(),
+                  "a helper installed before this operation existed (err invalid_request): Unsupported");
+        HelperCommissionerConfig liar;
+        liar.command = {"/bin/sh", "-c", "cat >/dev/null; echo 'ok mleid fe80::1'"};
+        HelperCommissioner lying(liar);
+        API_CHECK(lying.QueryMeshLocalEid(address) == CommissionerStatus::Failed && address.empty(),
+                  "a helper answer with an address that is not a Mesh-Local EID: Failed (the bridge checks again)");
+        liar.command = {"/bin/sh", "-c", "cat >/dev/null; echo 'ok mleid fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79 fd11::1'"};
+        HelperCommissioner two(liar);
+        API_CHECK(two.QueryMeshLocalEid(address) == CommissionerStatus::Failed && address.empty(),
+                  "a helper answer with two addresses: Failed");
+        liar.command = {"/bin/sh", "-c", "cat >/dev/null; echo 'ok added'"};
+        HelperCommissioner wrong_word(liar);
+        API_CHECK(wrong_word.QueryMeshLocalEid(address) == CommissionerStatus::Failed && address.empty(),
+                  "an ok answer that is not an address: Failed");
+        HelperCommissionerConfig missing;
+        missing.command = {"/nonexistent/pogohome-otbr-helper"};
+        HelperCommissioner absent(missing);
+        API_CHECK(absent.QueryMeshLocalEid(address) != CommissionerStatus::Ok && address.empty(),
+                  "a missing helper is never Ok");
+        ResetFake("disabled");
+    }
+
+    printf("\n-- scenario: the four earlier operations are unchanged by the new one --\n");
+    {
+        ResetFake("active");
+        WriteFake("mleid", kMleid);
+        HelperCommissioner commissioner = MakeCommissioner();
+        std::string pskd = kPskd;
+        std::string state;
+        bool started = true;
+        API_CHECK(commissioner.QueryState(state) == CommissionerStatus::Ok && state == "active" &&
+                      commissioner.EnsureActive(started) == CommissionerStatus::Ok && !started &&
+                      commissioner.AddJoiner(kEui, pskd, 120) == CommissionerStatus::Ok &&
+                      commissioner.RemoveJoiner(kEui) == CommissionerStatus::Ok,
+                  "state, start, joiner add and joiner remove answer as before");
+        API_CHECK(ReadFake("stdin.log").find("ipaddr") == std::string::npos,
+                  "none of them reads an address");
         ResetFake("disabled");
     }
 }

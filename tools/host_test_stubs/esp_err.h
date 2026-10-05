@@ -28,3 +28,6 @@ typedef int esp_err_t;
  * of these same two symbols. */
 #define ESP_ERR_INVALID_CRC     0x109
 #define ESP_ERR_INVALID_VERSION 0x10A
+/* Added for components/power_base_enrollment's "bridge endpoint required at
+ * enrollment" refusal -- the real ESP-IDF value. */
+#define ESP_ERR_NOT_ALLOWED     0x10D

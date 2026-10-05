@@ -472,4 +472,268 @@ void RunEnrollmentTests(int *failures)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         API_CHECK(!m.Get(kDeviceA, s.session_id, c), "a finished session is forgotten after retain_finished");
     }
+
+    // ---- bridge endpoint delivery ----
+    const std::string kMleid = "fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79"; // the fake Commissioner's made-up EID
+    const uint16_t kIngestPort = 5701;                                  // deliberately not the default 5684
+    auto EndpointConfig = [&](std::chrono::milliseconds window = std::chrono::milliseconds(120000)) {
+        EnrollmentConfig c = FastConfig(window);
+        c.bridge_port = kIngestPort;
+        return c;
+    };
+    auto StartWithEndpoint = [&](EnrollmentManager &m, EnrollmentSession &s, const char *device = kDeviceA) {
+        std::string pskd = kPskd;
+        EnrollmentStartOptions options;
+        options.bridge_endpoint_version = kBridgeEndpointVersion;
+        return m.Start(device, kEui, pskd, s, options);
+    };
+    auto Order = [](FakeCommissioner &fake) {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        std::string joined;
+        for (const auto &step : fake.order) {
+            joined += (joined.empty() ? "" : ",") + step;
+        }
+        return joined;
+    };
+
+    printf("\n-- scenario: a session that asks gets this hub's bridge endpoint, fixed once --\n");
+    {
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        API_CHECK(StartWithEndpoint(m, s) == EnrollmentStartOutcome::Started && s.bridge_endpoint_requested &&
+                      !s.has_bridge_endpoint && s.state == EnrollmentState::Preparing,
+                  "it starts out preparing, with the endpoint not established yet");
+        API_CHECK(WaitFor([&] { return GetOrEmpty(m, kDeviceA, s.session_id).state == EnrollmentState::WaitingForHeartbeat; }),
+                  "it reaches waiting_for_heartbeat");
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.has_bridge_endpoint && now.bridge_endpoint.version == 1 && now.bridge_endpoint.address == kMleid,
+                  "with the OTBR's Mesh-Local EID as its bridge endpoint (format version 1)");
+        API_CHECK(now.bridge_endpoint.port == kIngestPort, "and the ingest listener's configured port, not a built-in number");
+        API_CHECK(Order(*fake) == "mleid,ensure,add", "the address was read BEFORE the Commissioner start and the Joiner add");
+        API_CHECK(fake->mleid_calls.load() == 1, "it was read once");
+
+        // The same value for every later read, and for a repeated start.
+        fake->mleid_address = "fd99:1:2:3:4:5:6:7"; // the OTBR's address "changes" mid-session
+        EnrollmentSession again = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(again.has_bridge_endpoint && again.bridge_endpoint.address == kMleid && again.bridge_endpoint.port == kIngestPort,
+                  "a later read reports the same endpoint");
+        EnrollmentSession retry;
+        API_CHECK(StartWithEndpoint(m, retry) == EnrollmentStartOutcome::Busy && retry.session_id == s.session_id &&
+                      retry.has_bridge_endpoint && retry.bridge_endpoint.address == kMleid &&
+                      retry.bridge_endpoint.port == kIngestPort,
+                  "a repeated start by the same device finds the same session with the same endpoint");
+        API_CHECK(fake->mleid_calls.load() == 1 && fake->add_calls.load() == 1, "neither read the address nor added a Joiner again");
+
+        EnrollmentSession other;
+        API_CHECK(!m.Get(kDeviceB, s.session_id, other) && !other.has_bridge_endpoint && other.bridge_endpoint.address.empty(),
+                  "another device cannot read the session, so not its endpoint either");
+        EnrollmentSession other_start;
+        std::string pskd = kPskd;
+        EnrollmentStartOptions options;
+        options.bridge_endpoint_version = kBridgeEndpointVersion;
+        API_CHECK(m.Start(kDeviceB, kEui, pskd, other_start, options) == EnrollmentStartOutcome::Busy &&
+                      other_start.session_id.empty() && !other_start.has_bridge_endpoint &&
+                      other_start.bridge_endpoint.address.empty(),
+                  "another device's start is Busy and learns nothing: no session, no endpoint");
+
+        registry.apply_heartbeat(UuidOf(kEui), 1000, 0);
+        API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }), "the heartbeat ends it");
+        now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.state == EnrollmentState::HeartbeatReceived && now.has_bridge_endpoint &&
+                      now.bridge_endpoint.address == kMleid,
+                  "success is still only heartbeat_received; the finished session keeps its endpoint");
+    }
+
+    printf("\n-- scenario: a session that does not ask is exactly the old session --\n");
+    {
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        API_CHECK(StartA(m, s) == EnrollmentStartOutcome::Started && !s.bridge_endpoint_requested, "started without the option");
+        API_CHECK(WaitFor([&] { return GetOrEmpty(m, kDeviceA, s.session_id).state == EnrollmentState::WaitingForHeartbeat; }),
+                  "it waits for the heartbeat as before");
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(!now.has_bridge_endpoint && now.bridge_endpoint.address.empty() && fake->mleid_calls.load() == 0 &&
+                      Order(*fake) == "ensure,add",
+                  "no endpoint and no address read: the same two OTBR calls as before");
+        m.Stop();
+    }
+
+    printf("\n-- scenario: no endpoint means no Joiner -- failure, timeout and bad answers --\n");
+    {
+        const struct {
+            CommissionerStatus status;
+            const char *address;
+            const char *error;
+            const char *what;
+        } cases[] = {
+            {CommissionerStatus::Unavailable, "", "bridge_endpoint_unavailable", "helper/OTBR not reachable"},
+            {CommissionerStatus::InvalidState, "", "bridge_endpoint_unavailable", "the OTBR refused the command"},
+            {CommissionerStatus::Timeout, "", "bridge_endpoint_timeout", "the helper timed out"},
+            {CommissionerStatus::Failed, "", "bridge_endpoint_invalid", "the helper's answer was not one usable address"},
+            {CommissionerStatus::Unsupported, "", "bridge_endpoint_unsupported", "an older helper without the operation"},
+            {CommissionerStatus::Ok, "fe80::1", "bridge_endpoint_invalid", "Ok but a link-local address"},
+            {CommissionerStatus::Ok, "fd11:2233:4455:0:0:ff:fe00:4c00", "bridge_endpoint_invalid", "Ok but an RLOC"},
+            {CommissionerStatus::Ok, "::ffff:192.168.1.10", "bridge_endpoint_invalid", "Ok but an IPv4-mapped address"},
+            {CommissionerStatus::Ok, "192.168.1.10", "bridge_endpoint_invalid", "Ok but an IPv4 address"},
+            {CommissionerStatus::Ok, "hub.local", "bridge_endpoint_invalid", "Ok but a hostname"},
+            {CommissionerStatus::Ok, "", "bridge_endpoint_invalid", "Ok but no address"},
+            {CommissionerStatus::Ok, "fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79%wpan0", "bridge_endpoint_invalid",
+             "Ok but with a zone id"},
+        };
+        for (const auto &c : cases) {
+            ingest::Registry registry;
+            auto fake = std::make_shared<FakeCommissioner>();
+            fake->mleid_result = c.status;
+            fake->mleid_address = c.address;
+            EnrollmentManager m(registry, fake, EndpointConfig());
+            EnrollmentSession s;
+            StartWithEndpoint(m, s);
+            printf("      (%s)\n", c.what);
+            API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }), "the session ends");
+            EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+            API_CHECK(now.state == EnrollmentState::Failed && now.error == c.error && !now.has_bridge_endpoint &&
+                          now.bridge_endpoint.address.empty(),
+                      "as failed with its fixed error code, without an endpoint");
+            API_CHECK(now.joiner_entry == JoinerEntry::None && fake->add_calls.load() == 0 && fake->ensure_calls.load() == 0 &&
+                          fake->remove_calls.load() == 0 && Order(*fake) == "mleid",
+                      "nothing was added to the OTBR: no Commissioner start, no Joiner add, so nothing to remove");
+            // The failure is final: a heartbeat afterwards changes nothing.
+            registry.apply_heartbeat(UuidOf(kEui), 1000, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            API_CHECK(GetOrEmpty(m, kDeviceA, s.session_id).state == EnrollmentState::Failed, "and it stays failed");
+        }
+
+        // No ingest port known to the manager: refused before anything exists.
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        EnrollmentManager m(registry, fake, FastConfig());
+        EnrollmentSession s;
+        API_CHECK(StartWithEndpoint(m, s) == EnrollmentStartOutcome::BridgeEndpointUnavailable && s.session_id.empty() &&
+                      fake->mleid_calls.load() == 0 && fake->add_calls.load() == 0,
+                  "without a configured ingest port the start is refused: no session, no OTBR call");
+        API_CHECK(StartA(m, s) == EnrollmentStartOutcome::Started, "a start without the option still works there");
+        m.Stop();
+
+        // A version this hub does not make.
+        std::string pskd = kPskd;
+        EnrollmentStartOptions bad;
+        bad.bridge_endpoint_version = 2;
+        ingest::Registry registry2;
+        auto fake2 = std::make_shared<FakeCommissioner>();
+        EnrollmentManager m2(registry2, fake2, EndpointConfig());
+        API_CHECK(m2.Start(kDeviceA, kEui, pskd, s, bad) == EnrollmentStartOutcome::InternalError && pskd.empty() &&
+                      fake2->mleid_calls.load() == 0,
+                  "an endpoint format version the hub does not make starts nothing (the HTTP layer refuses it first)");
+    }
+
+    printf("\n-- scenario: the address read holds no lock --\n");
+    {
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->mleid_delay = std::chrono::milliseconds(600);
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        API_CHECK(WaitFor([&] { return fake->mleid_in_progress.load(); }), "the helper call is under way");
+        auto t0 = std::chrono::steady_clock::now();
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        registry.apply_heartbeat(UuidOf(kOtherEui), 1000, 0);
+        EnrollmentSession busy;
+        const auto second = StartWithEndpoint(m, busy, kDeviceB);
+        auto took = std::chrono::steady_clock::now() - t0;
+        API_CHECK(fake->mleid_in_progress.load() && took < std::chrono::milliseconds(200),
+                  "Get, another Start and a Registry heartbeat all return while it still runs");
+        API_CHECK(now.state == EnrollmentState::Preparing && !now.has_bridge_endpoint && now.joiner_entry == JoinerEntry::None,
+                  "the session is preparing, without an endpoint and without a Joiner entry");
+        API_CHECK(second == EnrollmentStartOutcome::Busy && fake->add_calls.load() == 0, "the other start is Busy; no Joiner yet");
+        API_CHECK(WaitFor([&] { return GetOrEmpty(m, kDeviceA, s.session_id).state == EnrollmentState::WaitingForHeartbeat; }),
+                  "afterwards the session goes on");
+        m.Stop();
+    }
+
+    printf("\n-- scenario: a session that ends while the address is read goes no further --\n");
+    {
+        // Cancelled.
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->mleid_delay = std::chrono::milliseconds(300);
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        WaitFor([&] { return fake->mleid_in_progress.load(); });
+        EnrollmentSession c;
+        API_CHECK(m.Cancel(kDeviceA, s.session_id, c) == EnrollmentCancelOutcome::Cancelled, "cancel during the address read is taken");
+        API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }), "the session finishes");
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.state == EnrollmentState::Cancelled && !now.has_bridge_endpoint && now.joiner_entry == JoinerEntry::None,
+                  "it stays cancelled: the address that arrived afterwards is not attached and the state not revived");
+        API_CHECK(fake->ensure_calls.load() == 0 && fake->add_calls.load() == 0 && fake->remove_calls.load() == 0 &&
+                      Order(*fake) == "mleid",
+                  "no Commissioner start and no Joiner add followed");
+    }
+    {
+        // Cancelled, and the read then fails: still cancelled, not "failed".
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->mleid_delay = std::chrono::milliseconds(300);
+        fake->mleid_result = CommissionerStatus::Timeout;
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        WaitFor([&] { return fake->mleid_in_progress.load(); });
+        EnrollmentSession c;
+        m.Cancel(kDeviceA, s.session_id, c);
+        API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }) &&
+                      GetOrEmpty(m, kDeviceA, s.session_id).state == EnrollmentState::Cancelled &&
+                      GetOrEmpty(m, kDeviceA, s.session_id).error.empty() && fake->add_calls.load() == 0,
+                  "a cancel followed by a failed read stays cancelled (the first final state wins), no Joiner");
+    }
+    {
+        // Expired.
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->mleid_delay = std::chrono::milliseconds(1300);
+        EnrollmentManager m(registry, fake, EndpointConfig(std::chrono::milliseconds(1000)));
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }), "a window that ends during the address read");
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.state == EnrollmentState::Expired && !now.has_bridge_endpoint && fake->add_calls.load() == 0 &&
+                      fake->ensure_calls.load() == 0,
+                  "expires: no endpoint, no Commissioner start, no Joiner add");
+    }
+    {
+        // Shutdown.
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->mleid_delay = std::chrono::milliseconds(300);
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        WaitFor([&] { return fake->mleid_in_progress.load(); });
+        m.Stop();
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.state == EnrollmentState::Failed && now.error == "bridge_stopping" && !now.has_bridge_endpoint,
+                  "shutdown during the address read: failed / bridge_stopping, no endpoint");
+        API_CHECK(fake->ensure_calls.load() == 0 && fake->add_calls.load() == 0, "and nothing was added to the OTBR");
+    }
+
+    printf("\n-- scenario: later failures still happen after the endpoint, and clean up as before --\n");
+    {
+        ingest::Registry registry;
+        auto fake = std::make_shared<FakeCommissioner>();
+        fake->add_result = CommissionerStatus::Rejected;
+        EnrollmentManager m(registry, fake, EndpointConfig());
+        EnrollmentSession s;
+        StartWithEndpoint(m, s);
+        API_CHECK(WaitFor([&] { return Finished(m, s.session_id); }), "a rejected Joiner add ends the session");
+        EnrollmentSession now = GetOrEmpty(m, kDeviceA, s.session_id);
+        API_CHECK(now.state == EnrollmentState::Failed && now.error == "joiner_rejected" && now.has_bridge_endpoint,
+                  "as joiner_rejected; the endpoint that had been fixed is still reported");
+        API_CHECK(Order(*fake) == "mleid,ensure,add,remove", "the possible entry is removed, as for any attempted add");
+    }
 }

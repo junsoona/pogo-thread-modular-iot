@@ -35,9 +35,32 @@ const char *CommissionerError(CommissionerStatus status, bool adding_joiner)
         return adding_joiner ? "joiner_rejected" : "commissioner_rejected";
     case CommissionerStatus::Ok:
     case CommissionerStatus::Failed:
+    case CommissionerStatus::Unsupported:
         break;
     }
     return "helper_failed";
+}
+
+// Why a session that asked for a bridge endpoint did not get one.
+const char *BridgeEndpointError(CommissionerStatus status)
+{
+    switch (status) {
+    case CommissionerStatus::Timeout:
+        return "bridge_endpoint_timeout";
+    case CommissionerStatus::Unsupported:
+        // The installed root helper predates the mesh-local-eid operation.
+        return "bridge_endpoint_unsupported";
+    case CommissionerStatus::Unavailable:
+    case CommissionerStatus::Rejected:
+    case CommissionerStatus::InvalidState:
+    case CommissionerStatus::NotFound:
+        return "bridge_endpoint_unavailable";
+    case CommissionerStatus::Ok:
+    case CommissionerStatus::Failed:
+        break;
+    }
+    // The helper answered, but not with one usable Mesh-Local EID.
+    return "bridge_endpoint_invalid";
 }
 
 std::string ShortId(const std::string &session_id)
@@ -141,7 +164,8 @@ int64_t EnrollmentManager::NowUnixMs() const
 }
 
 EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, const std::string &eui64,
-                                                std::string &pskd, EnrollmentSession &out)
+                                                std::string &pskd, EnrollmentSession &out,
+                                                const EnrollmentStartOptions &options)
 {
     // The PSKd lives on the heap in one place until the worker has used it.
     auto secret = std::make_unique<std::string>(pskd);
@@ -150,10 +174,12 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
 
     ingest::Uuid uuid{};
     std::string normalized;
-    if (!NormalizeEui64(eui64, normalized, &uuid) || !IsValidPskd(*secret)) {
+    if (!NormalizeEui64(eui64, normalized, &uuid) || !IsValidPskd(*secret) ||
+        (options.bridge_endpoint_version != 0 && options.bridge_endpoint_version != kBridgeEndpointVersion)) {
         SecureWipe(*secret);
         return EnrollmentStartOutcome::InternalError; // the HTTP layer validates first
     }
+    const bool deliver_endpoint = options.bridge_endpoint_version == kBridgeEndpointVersion;
 
     std::thread previous;
     {
@@ -168,6 +194,10 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
             }
             SecureWipe(*secret);
             return EnrollmentStartOutcome::Busy;
+        }
+        if (deliver_endpoint && config_.bridge_port == 0) {
+            SecureWipe(*secret);
+            return EnrollmentStartOutcome::BridgeEndpointUnavailable;
         }
         const auto now = NowSteady();
         ingest::PowerBaseState base;
@@ -189,6 +219,7 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
         session_.uuid = uuid;
         session_.state = EnrollmentState::Preparing;
         session_.joiner_entry = JoinerEntry::None;
+        session_.bridge_endpoint_requested = deliver_endpoint;
         session_.window_seconds = static_cast<int>(config_.window.count());
         session_.created_at_unix_ms = NowUnixMs();
         session_.expires_at_unix_ms =
@@ -205,8 +236,9 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
             SecureWipe(*s);
         });
         out = CopyLocked();
-        std::fprintf(stdout, "pogohome_api: enrollment %s: device %s started it for Power Base %s (%d s window)\n",
-                     ShortId(session_id).c_str(), device_id.c_str(), normalized.c_str(), session_.window_seconds);
+        std::fprintf(stdout, "pogohome_api: enrollment %s: device %s started it for Power Base %s (%d s window%s)\n",
+                     ShortId(session_id).c_str(), device_id.c_str(), normalized.c_str(), session_.window_seconds,
+                     deliver_endpoint ? ", with bridge endpoint delivery" : "");
     }
     if (previous.joinable()) {
         previous.join();
@@ -218,18 +250,59 @@ void EnrollmentManager::Worker(std::string &pskd)
 {
     std::string eui64;
     std::string id;
+    bool deliver_endpoint = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         eui64 = session_.eui64;
         id = ShortId(session_.session_id);
+        deliver_endpoint = session_.bridge_endpoint_requested;
+    }
+
+    // 0. The bridge endpoint, for a session that asked for one -- BEFORE
+    // anything is changed on the OTBR. Read-only, and like every
+    // Commissioner call made with no lock held. A session that fails here,
+    // or that was cancelled, expired or stopped meanwhile, goes on to
+    // neither the Commissioner nor the Joiner entry.
+    bool proceed = true;
+    if (deliver_endpoint) {
+        std::string address;
+        CommissionerStatus endpoint_status = commissioner_->QueryMeshLocalEid(address);
+        std::string canonical;
+        // The Commissioner's word is checked again here: this is the value
+        // that leaves the hub.
+        const bool usable =
+            endpoint_status == CommissionerStatus::Ok && ParseMeshLocalEid(address, nullptr, &canonical);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (IsFinalState(session_.state)) {
+            proceed = false; // it ended while the address was being read: nothing more happens
+        } else if (!usable) {
+            std::fprintf(stderr, "pogohome_api: enrollment %s: no bridge endpoint (%s) -- nothing was added to the OTBR\n",
+                         id.c_str(), CommissionerStatusName(endpoint_status));
+            FinishLocked(EnrollmentState::Failed, BridgeEndpointError(endpoint_status));
+            proceed = false;
+        } else if (NowSteady() >= session_.deadline) {
+            FinishLocked(EnrollmentState::Expired);
+            proceed = false;
+        } else {
+            session_.bridge_endpoint.version = kBridgeEndpointVersion;
+            session_.bridge_endpoint.address = canonical;
+            session_.bridge_endpoint.port = config_.bridge_port;
+            session_.has_bridge_endpoint = true;
+            // The address is not logged; the port is the program's own --port.
+            std::fprintf(stdout, "pogohome_api: enrollment %s: bridge endpoint fixed for this session (port %u)\n",
+                         id.c_str(), static_cast<unsigned>(config_.bridge_port));
+        }
     }
 
     // 1. The Commissioner. No lock is held during any Commissioner call.
     bool started = false;
-    CommissionerStatus status = commissioner_->EnsureActive(started);
+    CommissionerStatus status = CommissionerStatus::Ok;
+    if (proceed) {
+        status = commissioner_->EnsureActive(started);
+    }
     bool add_joiner = false;
     int timeout_s = 0;
-    {
+    if (proceed) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!IsFinalState(session_.state)) {
             if (status != CommissionerStatus::Ok) {
@@ -241,7 +314,11 @@ void EnrollmentManager::Worker(std::string &pskd)
                     std::fprintf(stdout, "pogohome_api: enrollment %s: started the OTBR Commissioner\n", id.c_str());
                 }
                 auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(session_.deadline - NowSteady());
-                if (remaining < config_.min_joiner_timeout) {
+                if (session_.bridge_endpoint_requested && !session_.has_bridge_endpoint) {
+                    // Cannot happen (step 0 either fixed it or ended the
+                    // session); a Joiner entry is never opened without it.
+                    FinishLocked(EnrollmentState::Failed, "bridge_endpoint_unavailable");
+                } else if (remaining < config_.min_joiner_timeout) {
                     FinishLocked(EnrollmentState::Failed, "window_too_short");
                 } else {
                     // The OTBR's own timeout ends with this session's window.

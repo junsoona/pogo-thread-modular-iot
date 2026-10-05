@@ -86,6 +86,49 @@ extern "C" {
 #define POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION 1u
 #define POWER_BASE_BRIDGE_CONFIG_ADDR_LEN 16u
 
+/*
+ * Enrollment endpoint policy: byte [5] of the "blob" (the byte that used to
+ * be "reserved, 0"), so it is under the same CRC as `enabled`, the address
+ * and the port, and cannot go missing on its own.
+ *
+ *   0  no policy. Every image made before this field existed, and every
+ *      image with a static address: enrollment works as it always did -- a
+ *      Joiner request needs no bridge endpoint, and the exporter uses what
+ *      this blob says (possibly "disabled").
+ *   1  ENDPOINT REQUIRED. The image deliberately carries no address
+ *      (tools/gen_power_base_ble_config.py --bridge-from-enrollment): this
+ *      board must be given the bridge endpoint WITH its enrollment. An
+ *      enrollment request without one is refused before anything is started
+ *      or erased, and a stored enrollment record without one is not resumed.
+ *      Only valid together with enabled=0.
+ *   anything else, or 1 together with enabled=1: not a policy this firmware
+ *      knows -- see POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID.
+ *
+ * "pb_bridge enabled=0" alone never means "endpoint required": an image may
+ * switch the exporter off on purpose, and such a board keeps enrolling the
+ * old way. The policy is only what this byte says.
+ *
+ * power_base_bridge_config_load() does not look at this byte (as before), so
+ * nothing changes for pb_thread modes 0 and 1, which never enroll.
+ */
+#define POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_OFFSET 5u
+#define POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_NONE 0u
+#define POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_ENDPOINT_REQUIRED 1u
+
+typedef enum {
+    /* No "pb_bridge" namespace at all, or an intact blob whose policy byte
+     * is 0: the pre-existing behaviour. */
+    POWER_BASE_BRIDGE_ENROLL_POLICY_NONE = 0,
+    /* Intact blob, enabled=0, policy byte 1. */
+    POWER_BASE_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED,
+    /* The policy cannot be trusted: the cfg partition or the namespace
+     * cannot be read, "blob"/"crc" are missing, the blob has another size or
+     * schema version, its CRC does not match, the policy byte is neither 0
+     * nor 1, or it is 1 while enabled=1. The caller must not start any NEW
+     * enrollment on such a board. */
+    POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+} power_base_bridge_enroll_policy_t;
+
 typedef struct {
     bool     enabled;
     uint8_t  host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN]; /* IPv6, only meaningful when enabled */
@@ -100,6 +143,44 @@ typedef struct {
  * comment for the exact compatibility/validation/boot-policy rules.
  */
 esp_err_t power_base_bridge_config_load(power_base_bridge_config_t *out);
+
+/*
+ * pb_thread:mode=2 only (power_base/main/app_main.c calls it nowhere else):
+ * what the prepared image says about enrolling this board without a bridge
+ * endpoint. Reads the same "pb_bridge" blob with the same integrity checks
+ * as power_base_bridge_config_load(); never writes; never logs the address.
+ */
+power_base_bridge_enroll_policy_t power_base_bridge_config_load_enroll_policy(void);
+const char *power_base_bridge_enroll_policy_name(power_base_bridge_enroll_policy_t policy);
+
+/*
+ * pb_thread:mode=2 only: replaces *cfg -- whatever the "cfg" partition's
+ * pb_bridge said, including "disabled" and "absent" -- with the Linux bridge
+ * endpoint that was delivered with this board's enrollment and stored in its
+ * version 2 enrollment record (components/power_base_enrollment). The caller
+ * (power_base/main/app_main.c's on_enrollment_ready()) calls this BEFORE the
+ * services start, so linux_bridge_exporter_init() -- which copies the address
+ * once -- is handed the delivered endpoint, this boot and after every
+ * reboot that restores the record.
+ *
+ * The cfg partition is not written: it stays a read-only prepared image.
+ *
+ * Failure policy, deliberately different from a bad cfg/pb_bridge (which
+ * only ever means "exporter off, everything else as usual"): if the
+ * delivered endpoint does not pass the same checks the loader applies
+ * (unspecified, multicast, link-local, port 0), *cfg becomes DISABLED and
+ * this returns ESP_ERR_INVALID_ARG. It never keeps or restores the address
+ * the prepared image had: a board enrolled with a delivered endpoint is
+ * never silently pointed at another host. The board itself keeps running;
+ * only the optional exporter stays off.
+ *
+ * A board whose enrollment delivered no endpoint (version 1 record, bench
+ * console, version 1 BLE start) and every mode 0/1 board never calls this;
+ * for them *cfg is exactly what power_base_bridge_config_load() returned.
+ */
+esp_err_t power_base_bridge_config_apply_delivered(power_base_bridge_config_t *cfg,
+                                                   const uint8_t host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN],
+                                                   uint16_t port);
 
 #ifdef __cplusplus
 }

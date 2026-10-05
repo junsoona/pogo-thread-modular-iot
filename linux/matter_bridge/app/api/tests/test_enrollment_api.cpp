@@ -50,6 +50,16 @@ std::string StartBody(const std::string &eui, const std::string &pskd)
     return "{\"eui64\":\"" + eui + "\",\"pskd\":\"" + pskd + "\"}";
 }
 
+// The same request asking for bridge endpoint delivery.
+std::string StartBodyWithEndpoint(const std::string &eui, const std::string &pskd, const std::string &version = "1")
+{
+    return "{\"eui64\":\"" + eui + "\",\"pskd\":\"" + pskd + "\",\"bridge_endpoint_version\":" + version + "}";
+}
+
+// The fake Commissioner's made-up EID with the fixture's ingest port.
+const char kEndpointJson[] =
+    "\"bridge_endpoint\":{\"version\":1,\"address\":\"fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79\",\"port\":5701}";
+
 struct Fixture {
     std::string state_dir;
     std::shared_ptr<TlsContext> tls;
@@ -58,6 +68,9 @@ struct Fixture {
     ingest::Registry registry;
     std::shared_ptr<EnrollmentManager> enrollment;
     std::unique_ptr<Server> server;
+    // What main.cpp hands over from --port. Deliberately not the default.
+    uint16_t bridge_port = 5701;
+    std::chrono::seconds window{120};
 
     // `requested`: enrollment configured; `with_manager`: it could start.
     bool Start(bool requested = true, bool with_manager = true)
@@ -74,6 +87,8 @@ struct Fixture {
         auth = std::make_shared<DeviceAuth>(dir);
         EnrollmentConfig enrollment_config;
         enrollment_config.poll_interval = std::chrono::milliseconds(10);
+        enrollment_config.bridge_port = bridge_port;
+        enrollment_config.window = window;
         enrollment = std::make_shared<EnrollmentManager>(registry, fake, enrollment_config);
 
         ServerConfig config;
@@ -362,5 +377,200 @@ void RunEnrollmentApiTests(int *failures)
         f.registry.apply_heartbeat(UuidOf(kOtherEui), 1000, 0);
         API_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(100),
                   "and the Registry keeps taking heartbeats meanwhile");
+    }
+
+    printf("\n-- scenario: bridge endpoint delivery over the API --\n");
+    {
+        Fixture f;
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        std::string b = f.Pair("iPhone");
+
+        HttpResponse r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd));
+        API_CHECK(r.status == 202, "POST with \"bridge_endpoint_version\":1 is accepted (202)");
+        const std::string id = JsonStringField(r.body, "session_id");
+        API_CHECK(JsonStringField(r.body, "state") == "preparing" &&
+                      r.body.find("\"bridge_endpoint\":null}") != std::string::npos,
+                  "the first answer is preparing with \"bridge_endpoint\":null -- not established yet");
+        API_CHECK(r.body.find(kPskd) == std::string::npos, "it does not echo the PSKd");
+        API_CHECK(WaitFor([&] { return f.StateOf(a, id) == "waiting_for_heartbeat"; }), "it reaches waiting_for_heartbeat");
+        HttpResponse g = f.GetSession(a, id);
+        API_CHECK(g.body.find(std::string(",") + kEndpointJson + "}") != std::string::npos,
+                  "the waiting session ends with bridge_endpoint {version 1, the OTBR's Mesh-Local EID, the real ingest port}");
+        API_CHECK(g.body.find("\"port\":5684") == std::string::npos, "the port is the configured one, not a built-in 5684");
+        API_CHECK(JsonStringField(g.body, "joiner_entry") == "allowed", "and the Joiner entry is open");
+
+        // Fixed for the session.
+        {
+            std::lock_guard<std::mutex> lock(f.fake->mutex);
+            f.fake->mleid_address = "fd99:1:2:3:4:5:6:7";
+        }
+        HttpResponse g2 = f.GetSession(a, id);
+        API_CHECK(g2.body.find(kEndpointJson) != std::string::npos && f.fake->mleid_calls.load() == 1,
+                  "a later GET reports the same endpoint; the address is not read again");
+        HttpResponse retry = f.Post(a, StartBodyWithEndpoint(kEui, kPskd));
+        API_CHECK(retry.status == 409 && retry.body.find("enrollment_in_progress") != std::string::npos &&
+                      retry.body.find(id) != std::string::npos && retry.body.find(kEndpointJson) != std::string::npos,
+                  "a repeated POST by the same device is 409 with the same session and the same endpoint");
+        API_CHECK(f.fake->add_calls.load() == 1, "and did not add a second Joiner");
+
+        // Nobody else sees it.
+        HttpResponse other = f.GetSession(b, id);
+        API_CHECK(other.status == 404 && other.body == "{\"error\":\"session_not_found\"}" &&
+                      other.body.find("fd11") == std::string::npos,
+                  "another paired device gets 404 session_not_found -- no address");
+        HttpResponse other_post = f.Post(b, StartBodyWithEndpoint(kEui, kPskd));
+        API_CHECK(other_post.status == 409 && other_post.body == "{\"error\":\"enrollment_in_progress\"}",
+                  "another device's POST is 409 without the session, so without the endpoint");
+        HttpResponse other_delete = f.Delete(b, id);
+        API_CHECK(other_delete.status == 404 && other_delete.body.find("fd11") == std::string::npos,
+                  "another device's DELETE is 404, no address");
+        HttpResponse unauth = f.GetSession("", id);
+        API_CHECK(unauth.status == 401 && unauth.body.find("fd11") == std::string::npos &&
+                      unauth.body.find("bridge_endpoint") == std::string::npos,
+                  "a request without a token is 401, no address");
+        HttpResponse plain = PlainHttpRequest(f.port(), HttpRequestText("GET", std::string(kPath) + "/" + id, a));
+        API_CHECK(plain.status == 403 && plain.body.find("fd11") == std::string::npos, "plain HTTP is 403, no address");
+        HttpResponse health = PlainHttpRequest(f.port(), HttpRequestText("GET", "/api/v1/health"));
+        HttpResponse snapshot = PlainHttpRequest(f.port(), HttpRequestText("GET", "/api/v1/snapshot"));
+        HttpResponse tls_health = TlsHttpRequest(f.port(), HttpRequestText("GET", "/api/v1/health", a));
+        API_CHECK(health.status == 200 && snapshot.status == 200 && tls_health.status == 200 &&
+                      health.body.find("fd11") == std::string::npos && snapshot.body.find("fd11") == std::string::npos &&
+                      tls_health.body.find("fd11") == std::string::npos &&
+                      health.body.find("bridge_endpoint") == std::string::npos &&
+                      snapshot.body.find("bridge_endpoint") == std::string::npos,
+                  "health and snapshot (plain, and TLS with a token) contain neither the address nor the field");
+
+        f.registry.apply_heartbeat(UuidOf(kEui), 1000, 0);
+        API_CHECK(WaitFor([&] { return f.StateOf(a, id) == "heartbeat_received"; }),
+                  "success is still only the heartbeat of that EUI-64");
+        HttpResponse done = f.GetSession(a, id);
+        API_CHECK(done.body.find(kEndpointJson) != std::string::npos, "the finished session still reports the same endpoint");
+        API_CHECK(f.Delete(a, id).status == 409, "DELETE after the end is 409 as before");
+    }
+
+    printf("\n-- scenario: a request without the option answers exactly as before --\n");
+    {
+        Fixture f;
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        HttpResponse r = f.Post(a, StartBody(kEui, kPskd));
+        const std::string id = JsonStringField(r.body, "session_id");
+        API_CHECK(r.status == 202 && r.body.find("bridge_endpoint") == std::string::npos,
+                  "the 202 answer has no bridge_endpoint key");
+        API_CHECK(WaitFor([&] { return f.StateOf(a, id) == "waiting_for_heartbeat"; }), "it reaches waiting_for_heartbeat");
+        HttpResponse g = f.GetSession(a, id);
+        const std::string tail = "\"started_by_device_id\":\"";
+        const size_t at = g.body.find(tail);
+        API_CHECK(g.body.find("bridge_endpoint") == std::string::npos && at != std::string::npos &&
+                      g.body.find("\"}", at) == g.body.size() - 2,
+                  "the session still ends with started_by_device_id: no new key for an old client");
+        API_CHECK(f.fake->mleid_calls.load() == 0, "and the OTBR's address was never read for it");
+    }
+
+    printf("\n-- scenario: the option is checked like the other fields --\n");
+    {
+        Fixture f;
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        HttpResponse r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd, "2"));
+        API_CHECK(r.status == 422 && r.body == "{\"error\":\"unsupported_bridge_endpoint_version\"}",
+                  "an endpoint format version this hub does not make is 422");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd, "0"));
+        API_CHECK(r.status == 422 && r.body == "{\"error\":\"unsupported_bridge_endpoint_version\"}", "so is version 0");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd, "\"1\""));
+        API_CHECK(r.status == 400 && r.body == "{\"error\":\"invalid_request\"}", "a string instead of an integer is 400");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd, "true"));
+        API_CHECK(r.status == 400, "a boolean is 400");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd, "1.0"));
+        API_CHECK(r.status == 400, "a fraction is 400");
+        // The client cannot supply the endpoint.
+        r = f.Post(a, std::string("{\"eui64\":\"") + kEui + "\",\"pskd\":\"" + kPskd +
+                          "\",\"bridge_endpoint\":{\"version\":1,\"address\":\"fd11::1\",\"port\":5684}}");
+        API_CHECK(r.status == 400 && r.body == "{\"error\":\"invalid_request\"}",
+                  "a client-supplied bridge_endpoint object is 400: the hub makes the endpoint");
+        r = f.Post(a, std::string("{\"eui64\":\"") + kEui + "\",\"pskd\":\"" + kPskd +
+                          "\",\"bridge_endpoint_version\":1,\"bridge_address\":\"fd11::1\"}");
+        API_CHECK(r.status == 400, "an extra address field beside the option is 400");
+        r = f.Post(a, std::string("{\"eui64\":\"") + kEui + "\",\"pskd\":\"" + kPskd + "\",\"bridge_port\":5684}");
+        API_CHECK(r.status == 400, "a third field that is not the option is 400");
+        r = f.Post(a, StartBodyWithEndpoint("*", kPskd));
+        API_CHECK(r.status == 422 && r.body == "{\"error\":\"invalid_eui64\"}", "the EUI-64 check is unchanged with the option");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, "j01nme"));
+        API_CHECK(r.status == 422 && r.body == "{\"error\":\"invalid_pskd\"}", "the PSKd check is unchanged with the option");
+        API_CHECK(f.fake->mleid_calls.load() == 0 && f.fake->ensure_calls.load() == 0 && f.fake->add_calls.load() == 0,
+                  "none of the refused requests reached the OTBR");
+    }
+
+    printf("\n-- scenario: endpoint failures over the API --\n");
+    {
+        Fixture f;
+        f.fake->mleid_result = CommissionerStatus::Timeout;
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        HttpResponse r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd));
+        const std::string id = JsonStringField(r.body, "session_id");
+        API_CHECK(r.status == 202, "the POST is accepted at once");
+        API_CHECK(WaitFor([&] { return f.StateOf(a, id) == "failed"; }), "the session fails");
+        HttpResponse g = f.GetSession(a, id);
+        API_CHECK(JsonStringField(g.body, "error") == "bridge_endpoint_timeout" &&
+                      g.body.find("\"bridge_endpoint\":null}") != std::string::npos &&
+                      JsonStringField(g.body, "joiner_entry") == "none",
+                  "with error bridge_endpoint_timeout, bridge_endpoint null and joiner_entry none");
+        API_CHECK(f.fake->add_calls.load() == 0 && f.fake->ensure_calls.load() == 0, "no Joiner was added for it");
+
+        // The next session can ask again (and now succeeds).
+        f.fake->mleid_result = CommissionerStatus::Ok;
+        API_CHECK(WaitFor([&] { return f.GetSession(a, id).body.find("\"finished\":true") != std::string::npos; }),
+                  "the failed session finishes");
+        r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd));
+        const std::string id2 = JsonStringField(r.body, "session_id");
+        API_CHECK(r.status == 202 && id2 != id && WaitFor([&] { return f.StateOf(a, id2) == "waiting_for_heartbeat"; }) &&
+                      f.GetSession(a, id2).body.find(kEndpointJson) != std::string::npos,
+                  "a new session reads the address again and gets its endpoint");
+    }
+    {
+        Fixture f;
+        f.bridge_port = 0; // a bridge that was not told its ingest port
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        HttpResponse r = f.Post(a, StartBodyWithEndpoint(kEui, kPskd));
+        API_CHECK(r.status == 503 && r.body == "{\"error\":\"enrollment_unavailable\",\"reason\":\"bridge_endpoint\"}",
+                  "without a known ingest port the option is refused: 503 enrollment_unavailable / bridge_endpoint");
+        API_CHECK(f.fake->mleid_calls.load() == 0 && f.fake->add_calls.load() == 0, "nothing reached the OTBR");
+        API_CHECK(f.Post(a, StartBody(kEui, kPskd)).status == 202, "a request without the option still starts there");
+    }
+
+    printf("\n-- scenario: a slow address read never blocks the API, and a cancel during it adds no Joiner --\n");
+    {
+        Fixture f;
+        f.fake->mleid_delay = std::chrono::milliseconds(1500);
+        API_CHECK(f.Start(), "the server starts");
+        std::string a = f.Pair("iPad");
+        const std::string id = JsonStringField(f.Post(a, StartBodyWithEndpoint(kEui, kPskd)).body, "session_id");
+        WaitFor([&] { return f.fake->mleid_in_progress.load(); });
+        auto t0 = std::chrono::steady_clock::now();
+        HttpResponse health = PlainHttpRequest(f.port(), HttpRequestText("GET", "/api/v1/health"));
+        HttpResponse snapshot = PlainHttpRequest(f.port(), HttpRequestText("GET", "/api/v1/snapshot"));
+        HttpResponse session = f.GetSession(a, id);
+        f.registry.apply_heartbeat(UuidOf(kOtherEui), 1000, 0);
+        auto took = std::chrono::steady_clock::now() - t0;
+        API_CHECK(health.status == 200 && snapshot.status == 200 && session.status == 200 && f.fake->mleid_in_progress.load() &&
+                      took < std::chrono::milliseconds(800),
+                  "health, snapshot, the session and the Registry answer while the address is being read");
+        API_CHECK(JsonStringField(session.body, "state") == "preparing" &&
+                      session.body.find("\"bridge_endpoint\":null}") != std::string::npos &&
+                      JsonStringField(session.body, "joiner_entry") == "none",
+                  "the session is preparing, bridge_endpoint null, no Joiner entry");
+        HttpResponse c = f.Delete(a, id);
+        API_CHECK(c.status == 200 && JsonStringField(c.body, "state") == "cancelled", "DELETE during the read cancels at once");
+        API_CHECK(WaitFor([&] { return f.GetSession(a, id).body.find("\"finished\":true") != std::string::npos; }),
+                  "the session finishes once the read returned");
+        HttpResponse done = f.GetSession(a, id);
+        API_CHECK(JsonStringField(done.body, "state") == "cancelled" &&
+                      done.body.find("\"bridge_endpoint\":null}") != std::string::npos &&
+                      JsonStringField(done.body, "joiner_entry") == "none" && f.fake->add_calls.load() == 0 &&
+                      f.fake->ensure_calls.load() == 0,
+                  "still cancelled, bridge_endpoint null, and no Joiner was ever added");
     }
 }

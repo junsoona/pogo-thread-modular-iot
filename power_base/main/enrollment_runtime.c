@@ -173,7 +173,8 @@ static void enrollment_task(void *arg)
 }
 #endif
 
-esp_err_t pb_enrollment_runtime_start(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enrollment_ready_cb_t ready)
+esp_err_t pb_enrollment_runtime_start(const uint8_t eui64[PB_ENROLL_EUI64_LEN],
+                                      pb_enroll_endpoint_policy_t endpoint_policy, pb_enrollment_ready_cb_t ready)
 {
     s_ready = ready;
     s_lock = xSemaphoreCreateMutex();
@@ -191,6 +192,10 @@ esp_err_t pb_enrollment_runtime_start(const uint8_t eui64[PB_ENROLL_EUI64_LEN], 
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     pb_enroll_ctl_init(&s_ctl, &k_ops, eui64);
+    /* Before the boot rule: it decides whether a record without a bridge
+     * endpoint may be resumed, and from here on refuses a request without
+     * one -- for the BLE worker and the bench console alike. */
+    pb_enroll_ctl_set_endpoint_policy(&s_ctl, endpoint_policy);
     pb_enroll_state_t state = pb_enroll_ctl_boot(&s_ctl);
     bool resumed = (state == PB_ENROLL_STATE_ENROLLED);
     if (resumed) {
@@ -235,12 +240,17 @@ void pb_enrollment_get_status(pb_enrollment_status_t *out)
     out->last = s_ctl.last;
     out->attempt = s_ctl.attempt;
     out->resumed = s_ctl.resumed;
+    out->endpoint_policy = s_ctl.endpoint_policy;
     memcpy(out->eui64, s_ctl.eui64, sizeof(out->eui64));
+    if (s_ctl.state == PB_ENROLL_STATE_ENROLLED && s_ctl.has_bridge_endpoint) {
+        out->has_bridge_endpoint = true;
+        out->bridge_endpoint = s_ctl.bridge_endpoint;
+    }
     xSemaphoreGive(s_lock);
     out->joiner_eui64_matches = s_joiner_eui64_matches;
 }
 
-esp_err_t pb_enrollment_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN])
+static esp_err_t request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     /* Drop any outcome left from an earlier attempt; the attempt number
@@ -248,9 +258,25 @@ esp_err_t pb_enrollment_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN])
     joiner_event_t stale;
     while (xQueueReceive(s_joiner_q, &stale, 0) == pdTRUE) {
     }
-    esp_err_t err = pb_enroll_ctl_request_join(&s_ctl, pskd, now_ms());
+    esp_err_t err = endpoint != NULL ? pb_enroll_ctl_request_join_with_endpoint(&s_ctl, pskd, endpoint, now_ms())
+                                     : pb_enroll_ctl_request_join(&s_ctl, pskd, now_ms());
     xSemaphoreGive(s_lock);
     return err;
+}
+
+esp_err_t pb_enrollment_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN])
+{
+    return request_join(pskd, NULL);
+}
+
+esp_err_t pb_enrollment_request_join_with_endpoint(char pskd[PB_ENROLL_PSKD_BUF_LEN],
+                                                   const pb_enroll_bridge_endpoint_t *endpoint)
+{
+    if (endpoint == NULL) {
+        pb_enroll_wipe(pskd, PB_ENROLL_PSKD_BUF_LEN);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return request_join(pskd, endpoint);
 }
 
 esp_err_t pb_enrollment_cancel(void)

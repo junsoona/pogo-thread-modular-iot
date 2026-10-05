@@ -331,7 +331,6 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
                                          const otCoapTxParameters *txParameters)
 {
     (void)instance;
-    (void)messageInfo;
     (void)txParameters;
     s_send_count++;
 
@@ -345,6 +344,12 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
     cap->uri_path[sizeof(cap->uri_path) - 1] = '\0';
     memcpy(cap->payload, message->payload, message->payload_len);
     cap->payload_len = message->payload_len;
+    memset(cap->peer_addr, 0, sizeof(cap->peer_addr));
+    cap->peer_port = 0;
+    if (messageInfo != NULL) {
+        memcpy(cap->peer_addr, messageInfo->mPeerAddr.mFields.m8, sizeof(cap->peer_addr));
+        cap->peer_port = messageInfo->mPeerPort;
+    }
 
     outcome_entry_t default_entry = {0};
     outcome_entry_t *e;

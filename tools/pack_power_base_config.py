@@ -61,6 +61,14 @@ the operator. Omitting both flags (the default) writes "pb_bridge:enabled=0"
 "pb_bridge" namespace at all (see that component's own compatibility
 policy).
 
+--require-enrollment-endpoint (only with --await-commissioning, never with
+--bridge-host/--bridge-port) additionally records, in byte 5 of the pb_bridge
+blob, that this board must be GIVEN the bridge endpoint with its enrollment:
+the firmware then refuses an enrollment that delivers none and does not
+resume one. Without the flag that byte is 0 and the board enrolls as it
+always did -- "pb_bridge:enabled=0" alone never means "endpoint required".
+tools/gen_power_base_ble_config.py --bridge-from-enrollment passes it.
+
 Optionally ALSO writes the "pb_ble_auth" namespace (components/
 power_base_ble_auth -- the per-board protocomm Security 2 salt/verifier
 record for BLE enrollment, see docs/power-base.md "BLE 등록 전달 경로"):
@@ -110,6 +118,11 @@ PB_THREAD_MODE_AWAIT_COMMISSIONING = 2
 PB_BRIDGE_NAMESPACE = "pb_bridge"
 PB_BRIDGE_SCHEMA_VERSION = 1
 PB_BRIDGE_BLOB_LEN = 24
+# Byte 5 of the pb_bridge blob (formerly "reserved, 0"), same constants as
+# POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_* in power_base_bridge_config.h.
+PB_BRIDGE_ENROLL_POLICY_OFFSET = 5
+PB_BRIDGE_ENROLL_POLICY_NONE = 0
+PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED = 1
 
 # Must match components/power_base_ble_auth/include/power_base_ble_auth/
 # power_base_ble_auth.h.
@@ -165,10 +178,16 @@ def validate_bridge_host(addr_str: str) -> bytes:
     return addr.packed
 
 
-def pack_pb_bridge_blob(enabled: bool, host_addr: bytes, port: int) -> bytes:
+def pack_pb_bridge_blob(enabled: bool, host_addr: bytes, port: int,
+                        enroll_policy: int = PB_BRIDGE_ENROLL_POLICY_NONE) -> bytes:
     """Matches power_base_bridge_config.c's CFG_BLOB_LEN=24 layout exactly:
-    schema_version(4) + enabled(1) + reserved(1) + host_addr(16) + port(2)."""
-    blob = struct.pack(">IBB", PB_BRIDGE_SCHEMA_VERSION, 1 if enabled else 0, 0) + host_addr + struct.pack(">H", port)
+    schema_version(4) + enabled(1) + enrollment endpoint policy(1) + host_addr(16) + port(2)."""
+    if enroll_policy not in (PB_BRIDGE_ENROLL_POLICY_NONE, PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED):
+        raise AssertionError(f"internal error: unknown enrollment endpoint policy {enroll_policy}")
+    if enroll_policy == PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED and (enabled or any(host_addr) or port != 0):
+        raise AssertionError("internal error: 'endpoint required' is only for an image without a bridge address")
+    blob = (struct.pack(">IBB", PB_BRIDGE_SCHEMA_VERSION, 1 if enabled else 0, enroll_policy) + host_addr +
+            struct.pack(">H", port))
     if len(blob) != PB_BRIDGE_BLOB_LEN:
         raise AssertionError(f"internal error: packed pb_bridge blob is {len(blob)} bytes, expected "
                               f"{PB_BRIDGE_BLOB_LEN}")
@@ -373,7 +392,8 @@ def verify_pb_thread_config(image_path: str, expected_mode: int, expected_tlvs_l
 
 
 def verify_pb_bridge_config(image_path: str, expect_enabled: bool, expected_host_addr: bytes = None,
-                             expected_port: int = None) -> None:
+                             expected_port: int = None,
+                             expected_enroll_policy: int = PB_BRIDGE_ENROLL_POLICY_NONE) -> None:
     """
     Re-parses the just-generated image and asserts the 'pb_bridge' namespace
     matches what this run requested. Not a secret the way Dataset TLVs are,
@@ -426,6 +446,12 @@ def verify_pb_bridge_config(image_path: str, expect_enabled: bool, expected_host
     if actual_enabled != expect_enabled:
         sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE}:enabled={actual_enabled} in {image_path}, "
                  f"expected {expect_enabled}")
+    # Always checked, also when 0 is expected: an image that was not asked to
+    # require the endpoint must not carry the policy.
+    actual_policy = actual_blob[PB_BRIDGE_ENROLL_POLICY_OFFSET]
+    if actual_policy != expected_enroll_policy:
+        sys.exit(f"verify_pb_bridge_config: {PB_BRIDGE_NAMESPACE} enrollment endpoint policy={actual_policy} in "
+                 f"{image_path}, expected {expected_enroll_policy}")
     if expect_enabled:
         actual_addr = actual_blob[6:22]
         actual_port = struct.unpack(">H", actual_blob[22:24])[0]
@@ -507,6 +533,11 @@ def main():
     ap.add_argument("--bridge-port", type=int, default=None, metavar="PORT",
                      help="The Linux OTBR host's CoAP ingest port (see linux/matter_bridge/ingest, default 5684 "
                           "in that program). Must be given together with --bridge-host.")
+    ap.add_argument("--require-enrollment-endpoint", action="store_true",
+                    help="Record in pb_bridge that this board must be given the bridge endpoint with its "
+                         "enrollment (policy byte = 1). Only with --await-commissioning and never with "
+                         "--bridge-host/--bridge-port: it is for an image that carries no bridge address on "
+                         "purpose. Without it the policy byte is 0 and enrollment works as before.")
     ap.add_argument("--ble-auth-record-file", default=None, metavar="PATH",
                     help="Path to a file (NEVER a literal value) holding the 420-byte pb_ble_auth record for ONE "
                          "board, as prepared by tools/gen_power_base_ble_config.py. Only with "
@@ -531,6 +562,17 @@ def main():
         bridge_host_bytes = validate_bridge_host(args.bridge_host)
         if not (0 < args.bridge_port <= 0xFFFF):
             sys.exit(f"refusing to pack: --bridge-port={args.bridge_port} is out of range (1..65535)")
+
+    enroll_policy = PB_BRIDGE_ENROLL_POLICY_NONE
+    if args.require_enrollment_endpoint:
+        if not args.await_commissioning:
+            sys.exit("refusing to pack: --require-enrollment-endpoint is only for --await-commissioning images "
+                     "(modes 0 and 1 never enroll)")
+        if args.bridge_host is not None:
+            sys.exit("refusing to pack: --require-enrollment-endpoint cannot be combined with "
+                     "--bridge-host/--bridge-port -- an image either carries a bridge address or requires one "
+                     "to be delivered")
+        enroll_policy = PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED
 
     with open(args.config_json, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -602,7 +644,7 @@ def main():
 
             f.write(f"{PB_BRIDGE_NAMESPACE},namespace,,\n")
             pb_bridge_blob = pack_pb_bridge_blob(bridge_host_bytes is not None, bridge_host_bytes or bytes(16),
-                                                  args.bridge_port or 0)
+                                                  args.bridge_port or 0, enroll_policy)
             pb_bridge_crc = crc16_ccitt(pb_bridge_blob)
             pb_bridge_blob_path = os.path.join(tmp, "pb_bridge_blob.bin")
             with open(pb_bridge_blob_path, "wb") as bf:
@@ -635,7 +677,8 @@ def main():
                              expected_tlvs_len=(len(external_tlvs) if external_tlvs is not None else 0),
                              expected_tlvs=external_tlvs)
     verify_pb_bridge_config(out_path, expect_enabled=(bridge_host_bytes is not None),
-                             expected_host_addr=bridge_host_bytes, expected_port=args.bridge_port)
+                             expected_host_addr=bridge_host_bytes, expected_port=args.bridge_port,
+                             expected_enroll_policy=enroll_policy)
     verify_pb_ble_auth(out_path, expected_record=ble_auth_record)
     if os.path.getsize(out_path) != args.size:
         sys.exit(f"generated image is {os.path.getsize(out_path)} bytes, expected the cfg partition size "
@@ -643,6 +686,8 @@ def main():
 
     bridge_note = (f"pb_bridge:enabled=1 port={args.bridge_port}" if bridge_host_bytes is not None
                    else "pb_bridge:enabled=0")
+    if enroll_policy == PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED:
+        bridge_note += " enrollment_endpoint=REQUIRED"
     if external_tlvs is not None:
         # A real secret (contains the Network Key) -- the generated image
         # itself must not be group/world-readable (see docs/power-base.md).

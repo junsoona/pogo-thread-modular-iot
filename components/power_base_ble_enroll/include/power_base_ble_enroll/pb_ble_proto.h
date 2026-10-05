@@ -6,7 +6,7 @@
  * docs/power-base.md "BLE 등록 전달 경로"; keep both in step.
  *
  * Every multi-byte integer is big-endian. Every request and response has a
- * fixed size except the start request, whose size is fixed by its own
+ * fixed size except the two start requests, whose size is fixed by their own
  * pskd_len field. A message of any other size is refused.
  *
  * protocomm endpoints (found by a client through the 0x2901 User Description
@@ -14,7 +14,10 @@
  *   "proto-ver"     version JSON, readable before authentication
  *   "prov-session"  Security 2 handshake (ESP-IDF components/protocomm)
  *   "pb-status"     identity + status, optionally issues a challenge
- *   "pb-start"      hands over the one-time Thread PSKd
+ *   "pb-start"      hands over the one-time Thread PSKd -- alone
+ *                   (PB_BLE_MSG_START_REQ) or with the Linux bridge endpoint
+ *                   (PB_BLE_MSG_START_EP_REQ, capability
+ *                   PB_BLE_CAP_BRIDGE_ENDPOINT_V1)
  *   "pb-cancel"     cancels the attempt this client started
  *
  * pb-status request (PB_BLE_STATUS_REQ_LEN = 20)
@@ -39,6 +42,36 @@
  *   [44..]  PSKd, ASCII
  * pb-start / pb-cancel response (PB_BLE_SHORT_RESP_LEN = 4)
  *   [0] version  [1] type  [2] code  [3] 0
+ *
+ * pb-start request WITH the bridge endpoint, message PB_BLE_MSG_START_EP_REQ
+ * (PB_BLE_START_EP_REQ_FIXED_LEN + pskd_len = 70..96). A separate message on
+ * the same endpoint; the version 1 request above keeps its bytes and meaning
+ * and nothing was appended to it.
+ *   [0] version  [1] PB_BLE_MSG_START_EP_REQ  [2] pskd_len (6..32)  [3] 0
+ *   [4..11] target EUI-64   [12..27] request id (not all zero)
+ *   [28..43] challenge from this session's last pb-status
+ *   [44]     bridge endpoint format, PB_BLE_BRIDGE_ENDPOINT_VERSION (1)
+ *   [45]     0 (reserved)
+ *   [46..47] bridge CoAP port, big-endian, 1..65535
+ *   [48..63] bridge IPv6 address, 16 bytes in network byte order: a Thread
+ *            Mesh-Local EID (fd00::/8, interface id not 0000:00ff:fe00:xxxx)
+ *   [64..]   PSKd, ASCII
+ * Its response is the short response with type PB_BLE_MSG_START_EP_RESP and
+ * the same codes as pb-start, plus PB_BLE_CODE_INVALID_ENDPOINT.
+ *
+ * Capability and old peers. "proto-ver" lists PB_BLE_CAP_BRIDGE_ENDPOINT_V1
+ * in pb_enroll.cap when the board takes PB_BLE_MSG_START_EP_REQ; a client
+ * sends that message only to a board that lists it. A board without it
+ * (older firmware: "pb_enroll":{"proto":1}, no cap) answers that message as
+ * any other unknown type on pb-start: PB_BLE_MSG_START_RESP with
+ * PB_BLE_CODE_MALFORMED, nothing started. A client that does not know the
+ * capability keeps using PB_BLE_MSG_START_REQ, which a board accepts
+ * unchanged -- unless its prepared image requires the bridge endpoint with
+ * the enrollment (an image made without a bridge address on purpose). Such a
+ * board answers PB_BLE_MSG_START_REQ with PB_BLE_CODE_UNAVAILABLE, a code
+ * every client already knows, instead of enrolling into Thread with nowhere
+ * to send to. On every other board that message enrolls as before, without
+ * a delivered endpoint.
  *
  * pb-cancel request (PB_BLE_CANCEL_REQ_LEN = 28)
  *   [0] version  [1] PB_BLE_MSG_CANCEL_REQ  [2] 0  [3] 0
@@ -67,9 +100,17 @@ extern "C" {
 #define PB_BLE_MSG_STATUS_REQ 0x01u
 #define PB_BLE_MSG_START_REQ 0x02u
 #define PB_BLE_MSG_CANCEL_REQ 0x03u
+#define PB_BLE_MSG_START_EP_REQ 0x04u /* pb-start with the bridge endpoint */
 #define PB_BLE_MSG_STATUS_RESP 0x81u
 #define PB_BLE_MSG_START_RESP 0x82u
 #define PB_BLE_MSG_CANCEL_RESP 0x83u
+#define PB_BLE_MSG_START_EP_RESP 0x84u
+
+/* What "proto-ver" lists in pb_enroll.cap for PB_BLE_MSG_START_EP_REQ. */
+#define PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "bridge_endpoint_v1"
+/* Byte [44] of PB_BLE_MSG_START_EP_REQ. */
+#define PB_BLE_BRIDGE_ENDPOINT_VERSION 1u
+#define PB_BLE_BRIDGE_ADDR_LEN 16
 
 #define PB_BLE_EUI64_LEN 8
 #define PB_BLE_REQUEST_ID_LEN 16
@@ -79,10 +120,12 @@ extern "C" {
 #define PB_BLE_STATUS_RESP_LEN 40
 #define PB_BLE_START_REQ_FIXED_LEN 44
 #define PB_BLE_START_REQ_MAX_LEN 76 /* PB_BLE_START_REQ_FIXED_LEN + PB_ENROLL_PSKD_MAX_LEN */
+#define PB_BLE_START_EP_REQ_FIXED_LEN 64
+#define PB_BLE_START_EP_REQ_MAX_LEN 96 /* PB_BLE_START_EP_REQ_FIXED_LEN + PB_ENROLL_PSKD_MAX_LEN */
 #define PB_BLE_CANCEL_REQ_LEN 28
 #define PB_BLE_SHORT_RESP_LEN 4
 /* Largest plaintext in either direction; Security 2 adds a 16-byte tag. */
-#define PB_BLE_MAX_REQUEST_LEN PB_BLE_START_REQ_MAX_LEN
+#define PB_BLE_MAX_REQUEST_LEN PB_BLE_START_EP_REQ_MAX_LEN
 #define PB_BLE_MAX_RESPONSE_LEN PB_BLE_STATUS_RESP_LEN
 
 /* pb-status request flags */
@@ -111,8 +154,20 @@ typedef enum {
     PB_BLE_CODE_NOT_WAITING = 0x18,        /* the board is not waiting for enrollment */
     PB_BLE_CODE_NO_SUCH_ATTEMPT = 0x19,    /* pb-cancel: that request id is not a cancellable attempt */
     PB_BLE_CODE_CLOSED = 0x1a,             /* BLE enrollment is closed for this boot */
-    PB_BLE_CODE_UNAVAILABLE = 0x1b,        /* this board cannot run a Joiner */
+    /* This board cannot run a Joiner for this request: it cannot run one at
+     * all (EUI-64 mismatch; pb-status then has F_JOINER_UNAVAILABLE), or its
+     * prepared image requires the bridge endpoint with the enrollment and
+     * the request is PB_BLE_MSG_START_REQ, which carries none (pb-status has
+     * NO F_JOINER_UNAVAILABLE then: PB_BLE_MSG_START_EP_REQ works), or the
+     * image's endpoint policy is unusable (no start is taken). Nothing was
+     * started, queued or erased, and the challenge was not used up. */
+    PB_BLE_CODE_UNAVAILABLE = 0x1b,
     PB_BLE_CODE_INTERNAL = 0x1c,
+    /* PB_BLE_MSG_START_EP_REQ only: unknown endpoint format, port 0, or an
+     * address that is not a Thread Mesh-Local EID (unspecified, loopback,
+     * IPv4-mapped/compatible, multicast, link-local, outside fd00::/8, or an
+     * RLOC/ALOC). Nothing started. */
+    PB_BLE_CODE_INVALID_ENDPOINT = 0x1d,
 } pb_ble_code_t;
 
 /* Lifecycle of the one BLE-started attempt the board remembers. */

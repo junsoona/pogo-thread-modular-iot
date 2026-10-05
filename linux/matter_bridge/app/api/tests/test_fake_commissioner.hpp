@@ -26,11 +26,21 @@ public:
     std::chrono::milliseconds ensure_delay{0};
     std::chrono::milliseconds add_delay{0};
     std::chrono::milliseconds remove_delay{0};
+    // The OTBR's Mesh-Local EID as the helper would report it. A made-up
+    // address in a made-up Mesh-Local Prefix.
+    Status mleid_result = Status::Ok;
+    std::string mleid_address = "fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79";
+    std::chrono::milliseconds mleid_delay{0};
 
     std::atomic<int> ensure_calls{0};
     std::atomic<int> add_calls{0};
     std::atomic<int> remove_calls{0};
+    std::atomic<int> mleid_calls{0};
+    // True while a QueryMeshLocalEid() call is inside its delay.
+    std::atomic<bool> mleid_in_progress{false};
     std::mutex mutex;
+    // Every call, in order: "mleid", "ensure", "add", "remove".
+    std::vector<std::string> order;
     std::vector<std::string> added;
     std::vector<std::string> pskds_seen;
     std::vector<int> add_timeouts;
@@ -42,8 +52,27 @@ public:
         return Status::Ok;
     }
 
+    Status QueryMeshLocalEid(std::string &address) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            order.push_back("mleid");
+        }
+        mleid_calls++;
+        mleid_in_progress = true;
+        std::this_thread::sleep_for(mleid_delay);
+        mleid_in_progress = false;
+        std::lock_guard<std::mutex> lock(mutex);
+        address = mleid_address;
+        return mleid_result;
+    }
+
     Status EnsureActive(bool &started) override
     {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            order.push_back("ensure");
+        }
         ensure_calls++;
         std::this_thread::sleep_for(ensure_delay);
         started = started_result;
@@ -54,6 +83,7 @@ public:
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
+            order.push_back("add");
             added.push_back(eui64);
             pskds_seen.push_back(pskd);
             add_timeouts.push_back(timeout_s);
@@ -68,6 +98,7 @@ public:
     {
         {
             std::lock_guard<std::mutex> lock(mutex);
+            order.push_back("remove");
             removed.push_back(eui64);
         }
         remove_calls++;

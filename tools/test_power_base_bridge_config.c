@@ -247,8 +247,209 @@ static void scenario_enabled_port_zero(void)
     check_zeroed_disabled(&out, "port=0");
 }
 
+/* ---- power_base_bridge_config_apply_delivered(): the endpoint an
+ *      enrollment delivered replaces whatever the prepared image said ---- */
+
+static void scenario_apply_delivered(void)
+{
+    printf("\n-- scenario: a delivered endpoint replaces the prepared image's pb_bridge, in RAM only --\n");
+    static const uint8_t image_addr[16] = {0xfd, 0x00, 0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+    static const uint8_t delivered[16] = {0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79};
+
+    /* Address-less image (pb_bridge enabled=0). */
+    nvs_sim_reset();
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, NULL, 0);
+    power_base_bridge_config_t cfg;
+    CHECK(power_base_bridge_config_load(&cfg) == ESP_OK && !cfg.enabled, "(setup) the address-less image loads as disabled");
+    CHECK(power_base_bridge_config_apply_delivered(&cfg, delivered, 5701) == ESP_OK && cfg.enabled &&
+              memcmp(cfg.host_addr, delivered, 16) == 0 && cfg.port == 5701,
+          "disabled image + delivered endpoint: enabled with exactly the delivered address and port");
+
+    /* No pb_bridge namespace at all. */
+    nvs_sim_reset();
+    nvs_sim_create_namespace(PARTITION, "power_base_cfg");
+    CHECK(power_base_bridge_config_load(&cfg) == ESP_OK && !cfg.enabled, "(setup) no pb_bridge namespace: disabled");
+    CHECK(power_base_bridge_config_apply_delivered(&cfg, delivered, 5701) == ESP_OK && cfg.enabled &&
+              memcmp(cfg.host_addr, delivered, 16) == 0,
+          "no pb_bridge namespace + delivered endpoint: enabled with the delivered address");
+
+    /* Image with its own static address. */
+    nvs_sim_reset();
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, true, image_addr, 5684);
+    CHECK(power_base_bridge_config_load(&cfg) == ESP_OK && cfg.enabled && memcmp(cfg.host_addr, image_addr, 16) == 0,
+          "(setup) an image with a static address loads it");
+    CHECK(power_base_bridge_config_apply_delivered(&cfg, delivered, 5701) == ESP_OK &&
+              memcmp(cfg.host_addr, delivered, 16) == 0 && cfg.port == 5701,
+          "static image + delivered endpoint: the delivered one is used, not the image's");
+    power_base_bridge_config_t again;
+    CHECK(power_base_bridge_config_load(&again) == ESP_OK && again.enabled &&
+              memcmp(again.host_addr, image_addr, 16) == 0 && again.port == 5684,
+          "the cfg partition itself was not changed (it is a read-only prepared image)");
+
+    /* A damaged pb_bridge in the image does not matter to a delivered one. */
+    nvs_sim_reset();
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, true, image_addr, 5684);
+    nvs_sim_put_u16(PARTITION, NS, "crc", 0x1234);
+    CHECK(power_base_bridge_config_load(&cfg) != ESP_OK && !cfg.enabled, "(setup) the image's pb_bridge is damaged");
+    CHECK(power_base_bridge_config_apply_delivered(&cfg, delivered, 5701) == ESP_OK && cfg.enabled &&
+              memcmp(cfg.host_addr, delivered, 16) == 0,
+          "damaged image pb_bridge + delivered endpoint: the delivered one is used");
+
+    printf("\n-- scenario: an unusable delivered endpoint disables the exporter -- never back to the image's address --\n");
+    static const struct {
+        uint8_t addr[16];
+        uint16_t port;
+        const char *what;
+    } bad[] = {
+        {{0}, 5701, "unspecified address"},
+        {{0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 5701, "multicast address"},
+        {{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8}, 5701, "link-local address"},
+        {{0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0x8c, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a, 0x79}, 0, "port 0"},
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        nvs_sim_reset();
+        put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, true, image_addr, 5684);
+        power_base_bridge_config_load(&cfg);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s: refused", bad[i].what);
+        CHECK(power_base_bridge_config_apply_delivered(&cfg, bad[i].addr, bad[i].port) != ESP_OK, msg);
+        check_zeroed_disabled(&cfg, bad[i].what);
+    }
+}
+
+/* ---- power_base_bridge_config_load_enroll_policy(): the explicit
+ *      "bridge endpoint required at enrollment" policy (blob byte 5) ---- */
+
+/* A 24-byte blob with every field chosen by the caller, sealed with its CRC. */
+static void put_blob_with_policy(uint32_t schema_version, bool enabled, uint8_t policy_byte, const uint8_t addr[16],
+                                 uint16_t port)
+{
+    uint8_t blob[BLOB_LEN] = {0};
+    blob[0] = (uint8_t)(schema_version >> 24);
+    blob[1] = (uint8_t)(schema_version >> 16);
+    blob[2] = (uint8_t)(schema_version >> 8);
+    blob[3] = (uint8_t)schema_version;
+    blob[4] = enabled ? 1 : 0;
+    blob[5] = policy_byte;
+    if (addr != NULL) {
+        memcpy(blob + 6, addr, 16);
+    }
+    blob[22] = (uint8_t)(port >> 8);
+    blob[23] = (uint8_t)port;
+    nvs_sim_put_blob(PARTITION, NS, "blob", blob, BLOB_LEN);
+    nvs_sim_put_u16(PARTITION, NS, "crc", pogo_crc16_ccitt(blob, BLOB_LEN));
+}
+
+static void scenario_enroll_policy(void)
+{
+    printf("\n-- scenario: enrollment endpoint policy -- explicit, never guessed from enabled=0 --\n");
+    static const uint8_t addr[16] = {0xfd, 0x00, 0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+    power_base_bridge_config_t cfg;
+
+    /* The cfg partition cannot be initialised. This must be the first load
+     * of the process: the component remembers a successful init. An
+     * unreadable policy is never "no policy". */
+    nvs_sim_reset();
+    nvs_sim_create_namespace(PARTITION, "power_base_cfg");
+    nvs_sim_force_next_init_error(ESP_FAIL);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "the cfg partition cannot be read: invalid (not 'no policy')");
+
+    /* What exists today: no policy. */
+    nvs_sim_reset();
+    nvs_sim_create_namespace(PARTITION, "power_base_cfg");
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_NONE,
+          "no pb_bridge namespace at all (legacy image): no policy");
+    nvs_sim_reset();
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, true, addr, 5684);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_NONE,
+          "an image with a static address (policy byte 0): no policy");
+    nvs_sim_reset();
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, NULL, 0);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_NONE,
+          "an image with the exporter switched off on purpose (enabled=0, policy byte 0): NO policy -- 'disabled' "
+          "is not 'endpoint required'");
+    nvs_sim_reset();
+    static const uint8_t garbage_multicast[16] = {0xFF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    put_valid_blob(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, garbage_multicast, 0);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_NONE,
+          "disabled with leftover address bytes (never validated, as before): no policy");
+
+    /* The address-less image of gen_power_base_ble_config.py --bridge-from-enrollment. */
+    nvs_sim_reset();
+    put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, 1, NULL, 0);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED,
+          "enabled=0 with policy byte 1: endpoint required");
+    CHECK(power_base_bridge_config_load(&cfg) == ESP_OK && !cfg.enabled,
+          "the ordinary loader reads the same image exactly as before: disabled, no error");
+
+    /* A policy that is there but is not one this firmware knows. */
+    for (unsigned v = 2; v <= 255; v += (v < 4 ? 1 : 251)) {
+        nvs_sim_reset();
+        put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, (uint8_t)v, NULL, 0);
+        CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+              "an unknown policy value (2, 3, 4, 255): invalid");
+    }
+    nvs_sim_reset();
+    put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, true, 1, addr, 5684);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "'endpoint required' together with a static address (enabled=1): invalid");
+    CHECK(power_base_bridge_config_load(&cfg) == ESP_OK && cfg.enabled && memcmp(cfg.host_addr, addr, 16) == 0,
+          "the ordinary loader (modes 0/1) does not look at the policy byte: that image still loads as enabled");
+
+    /* A policy that cannot be trusted because the blob around it cannot. */
+    nvs_sim_reset();
+    put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, 1, NULL, 0);
+    nvs_sim_put_u16(PARTITION, NS, "crc", 0x1234);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "CRC mismatch: invalid");
+    nvs_sim_reset();
+    put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, 0, NULL, 0);
+    {
+        /* One flipped bit in the policy byte itself, CRC left as it was. */
+        uint8_t blob[BLOB_LEN] = {0, 0, 0, 1, 0, 1};
+        nvs_sim_put_blob(PARTITION, NS, "blob", blob, BLOB_LEN);
+    }
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "a policy byte changed without its CRC (0 -> 1): invalid, not 'required'");
+    nvs_sim_reset();
+    put_blob_with_policy(POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION, false, 1, NULL, 0);
+    {
+        uint8_t blob[BLOB_LEN] = {0, 0, 0, 1, 0, 0};
+        nvs_sim_put_blob(PARTITION, NS, "blob", blob, BLOB_LEN);
+    }
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "a policy byte changed without its CRC (1 -> 0): invalid, not 'no policy'");
+    nvs_sim_reset();
+    put_blob_with_policy(2, false, 1, NULL, 0);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "another schema version: invalid");
+    nvs_sim_reset();
+    {
+        uint8_t short_blob[10] = {0, 0, 0, 1, 0, 1};
+        nvs_sim_put_blob(PARTITION, NS, "blob", short_blob, sizeof(short_blob));
+        nvs_sim_put_u16(PARTITION, NS, "crc", pogo_crc16_ccitt(short_blob, sizeof(short_blob)));
+    }
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "a blob of another size: invalid");
+    nvs_sim_reset();
+    nvs_sim_create_namespace(PARTITION, NS);
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "the namespace without its blob: invalid");
+    nvs_sim_reset();
+    {
+        uint8_t blob[BLOB_LEN] = {0, 0, 0, 1, 0, 1};
+        nvs_sim_put_blob(PARTITION, NS, "blob", blob, BLOB_LEN);
+    }
+    CHECK(power_base_bridge_config_load_enroll_policy() == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID,
+          "the blob without its CRC key: invalid");
+    nvs_sim_reset();
+}
+
 int main(void)
 {
+    scenario_enroll_policy();
+    scenario_apply_delivered();
     scenario_namespace_missing();
     scenario_explicit_disabled();
     scenario_valid_enabled();

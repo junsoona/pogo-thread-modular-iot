@@ -79,6 +79,10 @@ typedef struct {
     char uri_path[80];
     uint8_t payload[HOST_PB_BRIDGE_FULL_SIM_MAX_PAYLOAD];
     uint16_t payload_len;
+    /* Where the exporter addressed this send (otMessageInfo.mPeerAddr /
+     * mPeerPort), so a test can tell WHICH host it would have reached. */
+    uint8_t peer_addr[16];
+    uint16_t peer_port;
 } host_pb_bridge_full_sim_sent_t;
 
 /* How many outgoing sends have been captured (bounded by

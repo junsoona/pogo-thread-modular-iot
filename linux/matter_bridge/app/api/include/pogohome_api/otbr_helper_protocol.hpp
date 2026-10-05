@@ -10,6 +10,7 @@
 //   commissioner-start                        start it unless already active
 //   joiner-add <eui64> <timeout_s> <pskd>     allow one exact EUI-64
 //   joiner-remove <eui64>                     remove that one entry
+//   mesh-local-eid                            read the OTBR's own Mesh-Local EID
 //
 // Nothing else exists: no free-form OTBR CLI command, no Dataset or Network
 // Key read, no Commissioner stop, no wildcard Joiner, no shell. The request
@@ -21,6 +22,15 @@
 //           nothing after the newline.
 // Response: one line on stdout, "ok <word>[ <word>]" or "err <code>". It
 //           never contains the PSKd or raw OTBR output.
+//
+// mesh-local-eid is the one answer that carries a value: exactly
+// "ok mleid <address>", where <address> is one IPv6 literal that
+// ParseMeshLocalEid() accepts. It has its own parser
+// (ParseHelperMleidResponse); ParseHelperResponse still takes [a-z_] words
+// only, so no other answer may ever carry digits or colons. The helper runs
+// the fixed CLI command "ipaddr mleid" -- it reads no address list and
+// derives nothing from an RLOC or ALOC -- and answers "err invalid_address"
+// when the OTBR printed anything but that one address.
 //
 // This file has no OpenSSL or Matter dependency so the helper stays small.
 #pragma once
@@ -48,7 +58,7 @@ bool IsValidEui64(const std::string &eui64);
 // (the same rule OpenThread applies). Uppercase only.
 bool IsValidPskd(const std::string &pskd);
 
-enum class HelperOp { CommissionerState, CommissionerStart, JoinerAdd, JoinerRemove };
+enum class HelperOp { CommissionerState, CommissionerStart, JoinerAdd, JoinerRemove, MeshLocalEid };
 
 struct HelperRequest {
     HelperOp op = HelperOp::CommissionerState;
@@ -77,6 +87,25 @@ bool OtCliOutputComplete(const std::string &text);
 // The helper's one response line (without the newline), split into words.
 // False unless it is "ok ..." or "err <code>" with only [a-z_] words.
 bool ParseHelperResponse(const std::string &text, bool &ok, std::vector<std::string> &words);
+
+// A Thread Mesh-Local EID as text, the only form in which an address crosses
+// the helper boundary or reaches a client:
+//   - an IPv6 literal of [0-9a-f:] only, at most 39 characters: no zone id
+//     ('%'), no brackets, no port, no dotted IPv4 tail, no upper case, no
+//     surrounding whitespace;
+//   - inside fd00::/8, where Thread Mesh-Local Prefixes live -- so never the
+//     unspecified address, loopback, an IPv4-mapped or IPv4-compatible
+//     address, multicast, link-local or a global address;
+//   - whose interface identifier is not 0000:00ff:fe00:xxxx, the form of a
+//     Thread RLOC or ALOC (those move with the topology; the EID does not).
+// `bytes` gets the 16 bytes, `canonical` the RFC 5952 text. Both optional.
+bool ParseMeshLocalEid(const std::string &text, unsigned char (*bytes)[16] = nullptr, std::string *canonical = nullptr);
+
+// The mesh-local-eid answer: exactly "ok mleid <address>" (one optional
+// trailing newline), <address> accepted by ParseMeshLocalEid(). `address`
+// gets the canonical text. Anything else -- another word, a second address,
+// extra spaces, an address ParseMeshLocalEid() refuses -- is false.
+bool ParseHelperMleidResponse(const std::string &text, std::string &address);
 
 // Overwrites the string's bytes before clearing it (for the PSKd).
 void SecureWipe(std::string &s);

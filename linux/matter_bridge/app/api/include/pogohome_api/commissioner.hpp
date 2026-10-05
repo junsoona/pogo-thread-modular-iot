@@ -22,6 +22,7 @@ enum class CommissionerStatus {
     Unavailable,  // no OTBR to talk to, sudo refused, the helper is missing
     Timeout,      // the helper (or ot-ctl under it) ran out of time
     Failed,       // anything else: a malformed answer, an unexpected exit
+    Unsupported,  // the installed helper does not know this operation (an older build)
 };
 
 const char *CommissionerStatusName(CommissionerStatus status);
@@ -40,6 +41,11 @@ public:
     virtual CommissionerStatus AddJoiner(const std::string &eui64, std::string &pskd, int timeout_s) = 0;
     // Removes exactly `eui64`'s entry. NotFound means it was already gone.
     virtual CommissionerStatus RemoveJoiner(const std::string &eui64) = 0;
+    // The OTBR's own Mesh-Local EID as canonical IPv6 text
+    // (ParseMeshLocalEid() accepts it). Read-only: changes nothing on the
+    // OTBR. Failed when the answer is not exactly one such address;
+    // Unsupported when the installed helper predates this operation.
+    virtual CommissionerStatus QueryMeshLocalEid(std::string &address) = 0;
 };
 
 struct HelperCommissionerConfig {
@@ -58,11 +64,26 @@ public:
     CommissionerStatus EnsureActive(bool &started) override;
     CommissionerStatus AddJoiner(const std::string &eui64, std::string &pskd, int timeout_s) override;
     CommissionerStatus RemoveJoiner(const std::string &eui64) override;
+    CommissionerStatus QueryMeshLocalEid(std::string &address) override;
 
 private:
     // Runs the helper with `request` (wiped). On an "ok" answer fills
     // `words` (after "ok") and returns Ok.
     CommissionerStatus Call(std::string &request, std::chrono::milliseconds timeout, std::vector<std::string> &words);
+    // What one run of the helper gave back, unparsed.
+    struct HelperRun {
+        bool ran = false;
+        bool exited = false;
+        int exit_code = -1;
+        bool output_overflow = false;
+        std::string line;     // its stdout
+        std::string err_text; // its stderr
+    };
+    // Runs the helper with `request` (wiped). Ok only means it ran and
+    // ended within its time limit; the caller parses `out.line`.
+    CommissionerStatus Run(std::string &request, std::chrono::milliseconds timeout, HelperRun &out);
+    // Logs an answer no parser accepted and names its status.
+    static CommissionerStatus UnexpectedAnswer(const HelperRun &run);
 
     const HelperCommissionerConfig config_;
 };

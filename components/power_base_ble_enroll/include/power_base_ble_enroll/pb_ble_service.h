@@ -44,13 +44,20 @@ extern "C" {
 /* What "proto-ver" answers. ESP-IDF's provisioning clients read
  * prov.sec_ver (2 = Security 2) and prov.sec_patch_ver (1 = the AES-GCM IV
  * is an 8-byte session id followed by a big-endian counter that both sides
- * advance after every encrypt and decrypt). */
+ * advance after every encrypt and decrypt). pb_enroll.proto stays 1;
+ * pb_enroll.cap lists what this board takes beyond the first version 1
+ * messages (PB_BLE_MSG_START_EP_REQ). A client that does not know "cap"
+ * ignores it. Readable before authentication, so it is a hint for choosing
+ * the message, never a reason to trust anything. */
 #define PB_BLE_VERSION_JSON                                                                                          \
-    "{\"prov\":{\"ver\":\"v1.1\",\"sec_ver\":2,\"sec_patch_ver\":1,\"cap\":[]},\"pb_enroll\":{\"proto\":1}}"
+    "{\"prov\":{\"ver\":\"v1.1\",\"sec_ver\":2,\"sec_patch_ver\":1,\"cap\":[]},\"pb_enroll\":{\"proto\":1,"       \
+    "\"cap\":[\"" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "\"]}}"
 
 typedef struct {
     uint8_t eui64[PB_BLE_EUI64_LEN];
     bool joiner_eui64_ok;
+    /* The prepared image's enrollment endpoint policy (zero = OPTIONAL). */
+    pb_enroll_endpoint_policy_t endpoint_policy;
     /* Must stay valid until pb_ble_service_stop(): protocomm keeps the
      * pointers, not a copy. */
     const pb_ble_auth_cred_t *cred;

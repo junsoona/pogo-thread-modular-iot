@@ -39,6 +39,12 @@ CommissionerStatus StatusFromErrorCode(const std::string &code)
     if (code == "timeout") {
         return CommissionerStatus::Timeout;
     }
+    if (code == "invalid_request") {
+        // The helper refused the request line itself. The bridge only ever
+        // sends lines BuildHelperRequest() made, so this is a helper that
+        // does not know the operation.
+        return CommissionerStatus::Unsupported;
+    }
     return CommissionerStatus::Failed;
 }
 
@@ -61,15 +67,15 @@ const char *CommissionerStatusName(CommissionerStatus status)
         return "timeout";
     case CommissionerStatus::Failed:
         return "failed";
+    case CommissionerStatus::Unsupported:
+        return "unsupported";
     }
     return "failed";
 }
 
-CommissionerStatus HelperCommissioner::Call(std::string &request, std::chrono::milliseconds timeout,
-                                            std::vector<std::string> &words)
+CommissionerStatus HelperCommissioner::Run(std::string &request, std::chrono::milliseconds timeout, HelperRun &out)
 {
-    static std::mutex log_mutex;
-    words.clear();
+    out = HelperRun();
     if (request.empty() || config_.command.empty()) {
         SecureWipe(request);
         return CommissionerStatus::Failed;
@@ -91,19 +97,43 @@ CommissionerStatus HelperCommissioner::Call(std::string &request, std::chrono::m
                      static_cast<long long>(timeout.count()));
         return CommissionerStatus::Timeout;
     }
+    out.ran = true;
+    out.exited = run.exited;
+    out.exit_code = run.exit_code;
+    out.output_overflow = run.output_overflow;
+    out.line = run.out;
+    out.err_text = run.err;
+    return CommissionerStatus::Ok;
+}
+
+CommissionerStatus HelperCommissioner::UnexpectedAnswer(const HelperRun &run)
+{
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::fprintf(stderr, "pogohome_api: enrollment: unexpected OTBR helper answer (exit %d)%s%s\n",
+                 run.exited ? run.exit_code : -1, run.err_text.empty() ? "" : ": ",
+                 FirstLineForLog(run.err_text).c_str());
+    // sudo refusing (no rule, NoNewPrivileges, a password prompt) ends
+    // here too: nothing ran as root.
+    return run.exited && run.exit_code == 1 && run.line.empty() ? CommissionerStatus::Unavailable
+                                                                : CommissionerStatus::Failed;
+}
+
+CommissionerStatus HelperCommissioner::Call(std::string &request, std::chrono::milliseconds timeout,
+                                            std::vector<std::string> &words)
+{
+    words.clear();
+    HelperRun run;
+    CommissionerStatus status = Run(request, timeout, run);
+    if (status != CommissionerStatus::Ok) {
+        return status;
+    }
     bool ok = false;
-    if (run.output_overflow || !ParseHelperResponse(run.out, ok, words)) {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        std::fprintf(stderr, "pogohome_api: enrollment: unexpected OTBR helper answer (exit %d)%s%s\n",
-                     run.exited ? run.exit_code : -1, run.err.empty() ? "" : ": ",
-                     FirstLineForLog(run.err).c_str());
-        // sudo refusing (no rule, NoNewPrivileges, a password prompt) ends
-        // here too: nothing ran as root.
-        return run.exited && run.exit_code == 1 && run.out.empty() ? CommissionerStatus::Unavailable
-                                                                   : CommissionerStatus::Failed;
+    if (run.output_overflow || !ParseHelperResponse(run.line, ok, words)) {
+        return UnexpectedAnswer(run);
     }
     if (!ok) {
-        CommissionerStatus status = words.empty() ? CommissionerStatus::Failed : StatusFromErrorCode(words[0]);
+        status = words.empty() ? CommissionerStatus::Failed : StatusFromErrorCode(words[0]);
         words.clear();
         return status;
     }
@@ -181,6 +211,36 @@ CommissionerStatus HelperCommissioner::RemoveJoiner(const std::string &eui64)
         return CommissionerStatus::NotFound;
     }
     return CommissionerStatus::Failed;
+}
+
+CommissionerStatus HelperCommissioner::QueryMeshLocalEid(std::string &address)
+{
+    address.clear();
+    HelperRequest r;
+    r.op = HelperOp::MeshLocalEid;
+    std::string request = BuildHelperRequest(r);
+    HelperRun run;
+    CommissionerStatus status = Run(request, config_.call_timeout, run);
+    if (status != CommissionerStatus::Ok) {
+        return status;
+    }
+    if (run.output_overflow) {
+        return UnexpectedAnswer(run);
+    }
+    // The one answer that carries a value has its own strict parser; every
+    // other answer still has to be a fixed-vocabulary line.
+    if (ParseHelperMleidResponse(run.line, address)) {
+        return CommissionerStatus::Ok;
+    }
+    bool ok = false;
+    std::vector<std::string> words;
+    if (!ParseHelperResponse(run.line, ok, words)) {
+        return UnexpectedAnswer(run);
+    }
+    if (ok || words.empty()) {
+        return CommissionerStatus::Failed; // "ok <something else>" is not an address
+    }
+    return StatusFromErrorCode(words[0]);
 }
 
 } // namespace pogohome_api

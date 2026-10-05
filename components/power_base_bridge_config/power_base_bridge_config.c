@@ -16,7 +16,9 @@ static const char *TAG = "pb_bridge_config";
  *   offset  size  field
  *   0       4     schema_version (u32)
  *   4       1     enabled (u8 bool)
- *   5       1     reserved (u8, must be 0)
+ *   5       1     enrollment endpoint policy (u8): 0 none, 1 endpoint
+ *                 required (only with enabled=0); was "reserved, 0". Read by
+ *                 power_base_bridge_config_load_enroll_policy() only.
  *   6       16    host_addr (raw IPv6 bytes, network byte order as-is)
  *   22      2     port (u16)
  *   = 24 bytes total (CFG_BLOB_LEN)
@@ -195,5 +197,102 @@ esp_err_t power_base_bridge_config_load(power_base_bridge_config_t *out)
     } else {
         ESP_LOGI(TAG, "loaded: pb_bridge enabled=false -- bridge exporter will not start");
     }
+    return ESP_OK;
+}
+
+const char *power_base_bridge_enroll_policy_name(power_base_bridge_enroll_policy_t policy)
+{
+    switch (policy) {
+    case POWER_BASE_BRIDGE_ENROLL_POLICY_NONE: return "none";
+    case POWER_BASE_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED: return "endpoint_required";
+    case POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID: return "invalid";
+    }
+    return "invalid";
+}
+
+power_base_bridge_enroll_policy_t power_base_bridge_config_load_enroll_policy(void)
+{
+    if (ensure_partition() != ESP_OK) {
+        return POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition(POWER_BASE_BRIDGE_CONFIG_NVS_PARTITION, POWER_BASE_BRIDGE_CONFIG_NAMESPACE,
+                                            NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* A legacy image without any pb_bridge: no policy. */
+        return POWER_BASE_BRIDGE_ENROLL_POLICY_NONE;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: enrollment endpoint policy: cannot open namespace '%s': %s",
+                 POWER_BASE_BRIDGE_CONFIG_NAMESPACE, esp_err_to_name(err));
+        return POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID;
+    }
+
+    uint8_t blob[CFG_BLOB_LEN];
+    size_t blob_len = sizeof(blob);
+    uint16_t stored_crc = 0;
+    power_base_bridge_enroll_policy_t policy = POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID;
+    const char *why = NULL;
+    do {
+        /* The same integrity rules as the loader above: a policy byte is
+         * only believed inside a blob that is whole. */
+        if (nvs_get_blob(h, "blob", blob, &blob_len) != ESP_OK || blob_len != CFG_BLOB_LEN) {
+            why = "the pb_bridge blob is missing or has another size";
+            break;
+        }
+        if (nvs_get_u16(h, "crc", &stored_crc) != ESP_OK || pogo_crc16_ccitt(blob, blob_len) != stored_crc) {
+            why = "the pb_bridge blob does not match its CRC";
+            break;
+        }
+        if (rd_u32(blob + 0) != POWER_BASE_BRIDGE_CONFIG_SCHEMA_VERSION) {
+            why = "unsupported pb_bridge schema_version";
+            break;
+        }
+        const uint8_t value = blob[POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_OFFSET];
+        const bool enabled = blob[4] != 0;
+        if (value == POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_NONE) {
+            policy = POWER_BASE_BRIDGE_ENROLL_POLICY_NONE;
+        } else if (value == POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_ENDPOINT_REQUIRED && !enabled) {
+            policy = POWER_BASE_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED;
+        } else if (value == POWER_BASE_BRIDGE_CONFIG_ENROLL_POLICY_ENDPOINT_REQUIRED) {
+            why = "\"endpoint required\" together with a static address (enabled=1)";
+        } else {
+            why = "unknown enrollment endpoint policy value";
+        }
+    } while (0);
+    nvs_close(h);
+
+    if (policy == POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: enrollment endpoint policy cannot be used (%s) -- no new enrollment will be "
+                      "accepted on this board",
+                 why != NULL ? why : "unreadable");
+    } else {
+        ESP_LOGI(TAG, "enrollment endpoint policy: %s", power_base_bridge_enroll_policy_name(policy));
+    }
+    return policy;
+}
+
+esp_err_t power_base_bridge_config_apply_delivered(power_base_bridge_config_t *cfg,
+                                                   const uint8_t host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN],
+                                                   uint16_t port)
+{
+    power_base_bridge_config_t delivered;
+    memset(&delivered, 0, sizeof(delivered));
+    delivered.enabled = true;
+    memcpy(delivered.host_addr, host_addr, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN);
+    delivered.port = port;
+
+    /* Whatever the prepared image said is gone either way: on failure the
+     * exporter is off, not pointed back at the image's address. */
+    memset(cfg, 0, sizeof(*cfg));
+    esp_err_t err = validate_enabled_config(&delivered);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CONFIG_ERROR: the bridge endpoint delivered with the enrollment is not usable -- the bridge "
+                      "exporter stays off (the prepared image's pb_bridge is NOT used instead)");
+        return err;
+    }
+    *cfg = delivered;
+    ESP_LOGI(TAG, "pb_bridge: using the endpoint delivered with the enrollment, port=%u (host address never logged)",
+             (unsigned)port);
     return ESP_OK;
 }

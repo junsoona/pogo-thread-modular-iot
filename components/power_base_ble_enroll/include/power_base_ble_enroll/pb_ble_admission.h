@@ -42,9 +42,27 @@
  * worker takes it (or the request is cancelled / the queue was full); the
  * slot and the caller's decrypted request buffer are wiped on every path.
  * While an attempt is queued or running, a SHA-256 over the request
- * (domain | target | challenge | PSKd) is kept to recognise a retransmission;
- * it is wiped when the attempt ends. Nothing here logs a PSKd, a challenge
- * or a request id.
+ * (domain | message type | target | challenge | PSKd | bridge endpoint) is
+ * kept to recognise a retransmission; it is wiped when the attempt ends.
+ * Nothing here logs a PSKd, a challenge, a request id or a bridge address.
+ *
+ * Endpoint policy (pb_enroll_endpoint_policy_t, from the prepared image):
+ * with REQUIRED, PB_BLE_MSG_START_REQ -- the start without an endpoint -- is
+ * answered PB_BLE_CODE_UNAVAILABLE as soon as it is known to be a well-formed
+ * start for an open board; with INVALID every start is. That happens before
+ * the request digest, the request-id lookup and the challenge: nothing is
+ * queued, no attempt record is made, the challenge of the session stays
+ * usable, and a retransmission gets the same answer. A PB_BLE_MSG_START_EP_REQ
+ * sent afterwards -- with the same challenge and even the same request id --
+ * is judged as if the refused message had never arrived. The controller
+ * applies the same policy again when the worker reaches it.
+ *
+ * Bridge endpoint (PB_BLE_MSG_START_EP_REQ): checked here, in the BLE
+ * callback, against the same rules the controller applies
+ * (pb_enroll_bridge_endpoint_check()); the checked copy travels to the worker
+ * in the slot next to the PSKd and is dropped with it. The BLE side never
+ * writes it to NVS and never calls OpenThread with it; storing it is the
+ * controller's job, after the board has attached.
  */
 #pragma once
 
@@ -101,8 +119,12 @@ typedef struct {
 
 /* The real enrollment controller, as the worker reaches it. */
 typedef struct {
-    /* pb_enrollment_request_join(): `pskd` is wiped before it returns. */
-    esp_err_t (*request_join)(char pskd[PB_ENROLL_PSKD_BUF_LEN], void *ctx);
+    /* pb_enrollment_request_join(): `pskd` is wiped before it returns.
+     * `endpoint` is NULL for a version 1 start (nothing delivered), else the
+     * checked endpoint of a PB_BLE_MSG_START_EP_REQ; only valid during the
+     * call. */
+    esp_err_t (*request_join)(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                              void *ctx);
     esp_err_t (*cancel)(void *ctx);
     void (*get_status)(pb_ble_ctl_status_t *out, void *ctx);
     /* The owner's leaf mutex; both may be NULL in a single-threaded test. */
@@ -136,6 +158,8 @@ typedef struct {
     pb_ble_adm_ops_t ops;
     uint8_t eui64[PB_BLE_EUI64_LEN];
     bool joiner_eui64_ok;
+    /* OPTIONAL after pb_ble_adm_init(). */
+    pb_enroll_endpoint_policy_t endpoint_policy;
 
     /* Bumped whenever the Security 2 session changes: transport session
      * opened or closed, and every handshake message. A challenge is only
@@ -162,9 +186,12 @@ typedef struct {
     uint8_t rec_request_id[PB_BLE_REQUEST_ID_LEN];
     uint8_t rec_tag[PB_BLE_SHA256_LEN];
 
-    /* The PSKd of a QUEUED attempt. */
+    /* The PSKd of a QUEUED attempt, and the bridge endpoint that came with
+     * it (PB_BLE_MSG_START_EP_REQ only). Both leave together. */
     bool pskd_pending;
     char pskd[PB_ENROLL_PSKD_BUF_LEN];
+    bool endpoint_pending;
+    pb_enroll_bridge_endpoint_t endpoint;
 
     /* Bounded command queue to the worker. */
     pb_ble_cmd_t q[PB_BLE_CMD_QUEUE_LEN];
@@ -179,6 +206,10 @@ typedef struct {
 void pb_ble_adm_init(pb_ble_adm_t *a, const pb_ble_adm_ops_t *ops, const uint8_t eui64[PB_BLE_EUI64_LEN],
                      bool joiner_eui64_ok, uint32_t now_ms);
 
+/* What the prepared image says about a start without a bridge endpoint. Set
+ * once, right after pb_ble_adm_init() and before any transport is started. */
+void pb_ble_adm_set_endpoint_policy(pb_ble_adm_t *a, pb_enroll_endpoint_policy_t policy);
+
 /* ---- BLE side ---- */
 
 /* A transport session was opened or closed (connect / disconnect). Drops the
@@ -192,7 +223,9 @@ void pb_ble_adm_sec_request_end(pb_ble_adm_t *a, bool ok);
 
 /* Each writes the endpoint's response into `out` and returns its length
  * (PB_BLE_STATUS_RESP_LEN or PB_BLE_SHORT_RESP_LEN). `in` is the decrypted
- * request; handle_start() overwrites it with zeros before returning. */
+ * request; handle_start() overwrites it with zeros before returning.
+ * handle_start() takes both start messages and answers each with its own
+ * response type. */
 size_t pb_ble_adm_handle_status(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uint8_t out[PB_BLE_STATUS_RESP_LEN],
                                 uint32_t now_ms);
 size_t pb_ble_adm_handle_start(pb_ble_adm_t *a, uint8_t *in, size_t inlen, uint8_t out[PB_BLE_SHORT_RESP_LEN],
@@ -213,7 +246,8 @@ pb_ble_close_reason_t pb_ble_adm_worker_poll(pb_ble_adm_t *a, const pb_ble_worke
 /* True while a BLE-started attempt is queued or running. */
 bool pb_ble_adm_attempt_active(const pb_ble_adm_t *a);
 
-/* Wipes every secret held here (challenge, PSKd slot, request digest). */
+/* Wipes every secret held here (challenge, PSKd slot, request digest) and
+ * the queued bridge endpoint. */
 void pb_ble_adm_wipe(pb_ble_adm_t *a);
 
 #ifdef __cplusplus

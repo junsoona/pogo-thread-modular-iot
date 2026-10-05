@@ -18,6 +18,16 @@
 // "heartbeat_received" means this Linux bridge heard the Base. It does not
 // mean every sensor behind it works.
 //
+// Bridge endpoint delivery (optional, asked for per session): before step 1
+// the session reads the OTBR's own Mesh-Local EID through the Commissioner
+// interface (a read-only helper call) and pairs it with the ingest listener's
+// real port (EnrollmentConfig::bridge_port). That pair is the session's
+// bridge endpoint -- made by the hub, never taken from the client -- fixed
+// once and reported unchanged for the rest of the session. If it cannot be
+// established the session fails with a fixed code and NOTHING is added to
+// the OTBR: no Commissioner start, no Joiner entry. A session that did not
+// ask behaves exactly as before and never makes that call.
+//
 // Threading: all session state is under this class's own mutex. Commissioner
 // calls (which run a subprocess for seconds) happen on the session's worker
 // thread with NO lock held; the Registry is only read with its own short
@@ -61,6 +71,16 @@ const char *EnrollmentStateName(EnrollmentState state);
 const char *JoinerEntryName(JoinerEntry entry);
 bool IsFinalState(EnrollmentState state);
 
+// Where a Power Base must send its bridge traffic: this hub's OTBR
+// Mesh-Local EID and the ingest listener's port. Not a secret, but only ever
+// given to the paired device that owns the session.
+struct BridgeEndpoint {
+    int version = 1;     // kBridgeEndpointVersion
+    std::string address; // canonical IPv6 text accepted by ParseMeshLocalEid()
+    uint16_t port = 0;
+};
+constexpr int kBridgeEndpointVersion = 1;
+
 struct EnrollmentSession {
     std::string session_id; // 32 lowercase hex (128 random bits)
     std::string device_id;  // the paired device that started it
@@ -75,6 +95,13 @@ struct EnrollmentSession {
     int64_t heartbeat_received_at_unix_ms = 0; // 0 = not received
     // Final and the Joiner entry is settled (not Adding/Allowed/Removing).
     bool finished = false;
+    // The session was started with bridge endpoint delivery.
+    bool bridge_endpoint_requested = false;
+    // Set once, before the Joiner entry is added, and never changed after.
+    // Always true for a requested session that reached WaitingForHeartbeat;
+    // may be false while Preparing and for a session that ended first.
+    bool has_bridge_endpoint = false;
+    BridgeEndpoint bridge_endpoint;
 };
 
 struct EnrollmentConfig {
@@ -87,6 +114,15 @@ struct EnrollmentConfig {
     std::chrono::seconds min_joiner_timeout{10};
     std::function<int64_t()> now_unix_ms;
     std::function<std::chrono::steady_clock::time_point()> now_steady;
+    // The UDP port the bridge's ingest listener is really bound to (the
+    // program's --port). 0: not known, so no session can deliver an endpoint.
+    uint16_t bridge_port = 0;
+};
+
+struct EnrollmentStartOptions {
+    // 0: no bridge endpoint (the session behaves as before this option
+    // existed). kBridgeEndpointVersion: establish and report one.
+    int bridge_endpoint_version = 0;
 };
 
 enum class EnrollmentStartOutcome {
@@ -95,6 +131,9 @@ enum class EnrollmentStartOutcome {
     AlreadyConnected, // a Base with this EUI-64 is online right now
     Stopping,         // the bridge is shutting down
     InternalError,    // no randomness for the session id
+    // Bridge endpoint delivery was asked for but this bridge has no ingest
+    // port to report (EnrollmentConfig::bridge_port == 0). Nothing started.
+    BridgeEndpointUnavailable,
 };
 
 enum class EnrollmentCancelOutcome {
@@ -119,7 +158,7 @@ public:
     // wiped before this returns. On Busy, `out` is the running session only
     // if `device_id` started it (otherwise left empty).
     EnrollmentStartOutcome Start(const std::string &device_id, const std::string &eui64, std::string &pskd,
-                                 EnrollmentSession &out);
+                                 EnrollmentSession &out, const EnrollmentStartOptions &options = {});
     // False when there is no such session for this device (another device's
     // session is indistinguishable from a missing one).
     bool Get(const std::string &device_id, const std::string &session_id, EnrollmentSession &out);

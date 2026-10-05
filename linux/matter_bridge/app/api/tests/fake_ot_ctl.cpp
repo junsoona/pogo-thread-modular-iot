@@ -11,6 +11,8 @@
 //   mode     "" | unavailable (no session, like the real permission error)
 //            | hang (never answers) | echo (echoes each command, like a
 //            readline build does)
+//   mleid    what "ipaddr mleid" prints before "Done", verbatim (may be
+//            several lines, or empty); "ERROR" = answer Error 13 instead
 //   argv.log each run's arguments after argv[0], one line per run
 //   stdin.log every command line received (a test fake: the PSKd written
 //            here is a made-up test value)
@@ -80,6 +82,19 @@ void Handle(const std::string &line)
         if (state == "petitioning") {
             WriteFile("state", "active");
         }
+        return;
+    }
+    if (w.size() == 2 && w[0] == "ipaddr" && w[1] == "mleid") {
+        std::string mleid = ReadFile("mleid");
+        if (mleid == "ERROR") {
+            Print("Error 13: InvalidState\r\n");
+            return;
+        }
+        std::string out;
+        for (char c : mleid) {
+            out += c == '\n' ? std::string("\r\n") : std::string(1, c);
+        }
+        Print(out + (out.empty() ? "" : "\r\n") + "Done\r\n");
         return;
     }
     if (w.size() == 2 && w[0] == "commissioner" && w[1] == "start") {

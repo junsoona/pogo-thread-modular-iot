@@ -165,6 +165,13 @@ static int cmd_start(void)
     case ESP_ERR_INVALID_STATE:
         printf("pb_join: not waiting -- nothing started\n");
         return 1;
+    case ESP_ERR_NOT_ALLOWED:
+        /* cfg/pb_bridge's enrollment endpoint policy: this board must be given
+         * the bridge endpoint with its enrollment, which the console cannot do
+         * (or the policy is unusable). */
+        printf("pb_join: refused -- this board's prepared image requires the bridge endpoint with the enrollment "
+               "(BLE enrollment), or its endpoint policy is unusable -- nothing started, nothing erased\n");
+        return 1;
     default:
         print_status();
         return 1;

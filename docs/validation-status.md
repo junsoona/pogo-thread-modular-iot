@@ -639,6 +639,11 @@ SRP 식, IV 구성을 대조했을 뿐 실행하지 않았다.
 | 앱의 백그라운드·foreground 전환 중 경쟁 조건 | 미확인 | 조건을 나눠 시험한 실물 기록이 없다 |
 | 등록 뒤 재부팅 시 BLE를 다시 열지 않는지 | 실물 미확인(host·정적 확인만) | 네 기록에 등록 뒤의 재부팅이 없다 |
 
+2026-10-05 추가: 위 표는 2026-10-02 당시의 판정이다. "앱 → 허브 세션 → BLE start → `heartbeat_received`
+전 구간"과 "등록 뒤 재부팅 시 BLE를 다시 열지 않는지"에는 그 뒤의 실물 기록이 있다. 다른 빌드(주소 자동
+전달, `0x04` start)의 기록이며 아래 "허브 Thread 수신 주소 자동 전달"의 "실물 후속 검증 (2026-10-05)"에
+적었다.
+
 ### 다음 실물 시험 절차 (여분 보드 744dbdfffe65c00a만)
 
 2026-10-01에 적은 절차다. 이 가운데 3-b와 5)의 등록 성공·취소·창 만료는 2026-10-02에 실행됐다(위
@@ -728,6 +733,645 @@ handshake 성공과 `pb-status`의 EUI-64, 틀린 코드 5회 뒤 `auth_locked`,
 되돌리기: 1)의 백업을 `write-flash 0 <백업 파일>`로 같은 `$SPARE_PORT`에만 쓴다. BLE 시험
 빌드에는 `pb_join forget`이 없으므로 등록만 지우려면 3-b의 `erase-region 0x9000 0x6000`을 쓴다.
 
+## 허브 Thread 수신 주소 자동 전달 (BLE 등록) (2026-10-03)
+
+범위: BLE 등록 때 보드 exporter의 목적지(Linux bridge의 Thread 주소와 ingest port)를 준비 이미지에
+넣지 않고 허브 → 앱 → 보드로 전달하고, 보드가 그것을 등록 완료 record와 함께 저장해 재부팅 뒤에도
+복원하는 경로. 규약·저장 형식·호환 정책은 [`power-base.md`](power-base.md) "허브 Thread 수신 주소
+자동 전달", API는 [`pogohome-api-v1.md`](pogohome-api-v1.md) "Bridge endpoint delivery".
+
+**이 날 실행한 것은 Mac의 host test와 빌드뿐이다.** 보드에 기록하지 않았고(flash·시리얼 접근 없음),
+실제 BLE 연결, 실제 OTBR·`ot-ctl`, 운영 Linux 허브, 실제 Thread Joiner로는 한 번도 실행하지 않았다.
+운영 서비스는 배포·재시작하지 않았다. 아래 표의 어느 항목도 실물 통과가 아니다. 이전 날짜의 실물
+기록(2026-10-01~03)은 정적 주소 경로와 version 1 BLE start에 대한 것이며 이 기능의 근거가 아니다.
+
+2026-10-05 추가: 위 문단과 아래의 표, "실행하지 못한 것"은 2026-10-03 작성 당시의 판정이다. 그 뒤 여분
+보드 1대에서 실물 시험이 실행됐다. 지금의 판정은 아래 "실물 후속 검증 (2026-10-05)"의 "현재 상태 (실물
+시험 뒤)"를 본다. 이 절의 host test·빌드 결과는 그대로 유효한 별개의 근거다.
+
+기준: 펌웨어 저장소 `feature/unified-module-role-manager` @ `ff11a07`(+ 미커밋 변경), 앱 저장소
+`main` @ `056e02c`(+ 미커밋 변경). 커밋하지 않았다.
+
+### host test와 빌드 (Mac, Apple clang, ESP-IDF v6.1, Xcode)
+
+| 항목 | 결과 | 근거 |
+|---|---|---|
+| 목적지 규칙(보드): fd00::/8의 EID만. unspecified, loopback, IPv4-mapped·compatible, multicast, link-local, global, fc00::/8, RLOC, ALOC, port 0 거부. 거부 시 PSKd 삭제·Joiner 미시작·기존 표식 유지 | host 확인 | `tools/test_power_base_enrollment.c`(실제 `power_base_enrollment.c` + NVS simulator), 전체 206개 검사 |
+| record 버전 1은 이전과 바이트 단위로 같음. 버전 2는 56바이트 한 blob(주소 offset 32, port offset 48 big-endian, CRC가 목적지까지 덮음) | host 확인 | 같은 test. 예상 바이트는 test가 문서의 offset으로 따로 조립 |
+| pending 목적지 폐기: joining 취소, Joiner 실패 4종, guard 만료, attaching 취소, attach 시간 초과, Thread 시작 실패, 시도 교체(새 시도는 이전 목적지를 물려받지 않음) | host 확인 | 같은 test |
+| 가입한 네트워크의 Mesh-Local Prefix와 목적지 불일치 → 미등록(`dataset_mismatch`), record 없음 | host 확인 | 같은 test |
+| 저장 실패(commit 오류) → 미등록, 서비스 불가, 반쯤 쓰인 record 없음 | host 확인 | 같은 test |
+| 재부팅: 유효한 버전 2 record + 일치하는 Dataset이면 같은 목적지 복원. 1비트 변조 448가지, 1~70바이트의 다른 길이, 잘못된 버전·flags·예약 바이트, CRC가 맞는 port 0·RLOC·link-local·다른 prefix 주소, 다른 EUI-64, 다른 네트워크, Dataset 없음 → 모두 안전 대기, 목적지 미사용 | host 확인 | 같은 test |
+| 전원 차단 모사(boot마다 별도 process + flash 파일): joining 중, Joiner 성공 뒤, attach 뒤 record 전, commit 실패, record 쓰기를 55개 위치에서 자른 경우(짧은 blob·0xff 채움) → 다음 부팅은 안전 대기. commit된 뒤에는 매 부팅 같은 목적지 | host 확인 | 같은 test |
+| `0x04` start: golden vector가 실제 admission 코드에 그대로 들어가고 주소·port·PSKd가 문서의 offset에서 읽힘. 응답 `01840100`/`01841d00` | host 확인 | `tools/test_power_base_ble_admission.c`(실제 `pb_ble_admission.c`), 전체 295개 검사 |
+| `0x04` 길이: 한 요청을 0~104바이트로 자르거나 늘린 105가지 중 72바이트만 수락, 나머지는 `MALFORMED`이고 challenge 유지. 70·96바이트 경계, `pskd_len` 불일치, `[3]`·`[45]` 예약 바이트, request id 0, 두 layout을 서로의 type으로 보낸 경우, 모르는 type, version 2 | host 확인 | 같은 test |
+| `0x04` 내용 거부: 주소 10종, port 0, 목적지 형식 버전 0·2 → `INVALID_ENDPOINT`. 틀린·없는·만료된·이전 세션의 challenge, 다른 보드, Joiner 불가, 인증 실패 잠금 뒤(`CLOSED`). 모두 Joiner 미시작·slot 비움·record 없음 | host 확인 | 같은 test |
+| 같은 request id: 같은 목적지는 `DUPLICATE`, 다른 주소·다른 port·다른 PSKd·`0x02`로 보낸 같은 내용은 `REQUEST_CONFLICT`. 수락된 시도는 그대로이고 Joiner는 한 번 | host 확인 | 같은 test |
+| queued 취소 → slot의 목적지 즉시 삭제, worker 미호출. joining 실패·attaching 취소 → controller의 pending 삭제. 뒤이은 `0x02` 등록은 버전 1 record | host 확인 | 같은 test(worker가 실제 controller를 호출) |
+| BLE callback은 목적지를 검사·복사만 함. controller는 leaf lock 밖에서 worker가 호출 | host 확인 + 정적 확인 | 같은 test, `tools/test_power_base_ble_enrollment_paths.py` |
+| 로그에 PSKd·bridge 주소 없음 | host 확인 + 정적 확인 | 위 두 C test(stderr 캡처), paths test(7개 소스의 로그 문장) |
+| exporter가 실제로 보내는 목적지: 주소 없는 이미지에서 등록 직후와 재부팅 3회 모두 전달받은 주소·port로 heartbeat. 정적 주소가 있는 이미지에서도 전달받은 쪽 우선 | host 확인 | `tools/test_power_base_enrollment_exporter_endpoint.c`(실제 enrollment + bridge config + `linux_bridge_exporter.c` + CoAP simulator가 기록한 송신 주소·port), 28개 검사 |
+| 손상(주소 1비트, port 1비트, 잘린 쓰기)·다른 보드·prefix 밖 주소·port 0인 record, 다른 네트워크의 Dataset, Dataset 없음, commit 실패 → exporter 미시작. **이미지의 정적 주소로도 보내지 않음** | host 확인 | 같은 test |
+| 호환: 목적지 없는 등록(버전 1)은 정적 주소 이미지에서 그 주소로, 주소 없는 이미지에서 exporter off | host 확인 | 같은 test |
+| `power_base_bridge_config_apply_delivered()`: disabled·namespace 없음·정적·손상 이미지 위에 적용, `cfg`는 변하지 않음, 쓸 수 없는 목적지는 disabled(이미지 주소로 복귀 안 함) | host 확인 | `tools/test_power_base_bridge_config.c`, 전체 67개 검사 |
+| 배선: `on_enrollment_ready()`가 attach supervisor 시작 전에 목적지 적용, 적용 위치 1곳, exporter 시작 1곳, bench 콘솔은 목적지 미전달, `cfg` 읽기 전용, digest가 type·목적지 block을 포함 | 정적 확인 | `tools/test_power_base_ble_enrollment_paths.py`, 전체 95개 검사(새 BLE 빌드의 sdkconfig 포함) |
+| 위 test가 규칙 위반을 잡는지 | 확인 | 실제 소스의 사본에서 규칙을 하나씩 깨뜨린 11개 변형 중 10개 검출. 나머지 1개(digest에서 type 제외)는 목적지 block 유무가 이미 같은 구분을 하는 동치 변형이라 정적 검사로만 확인 |
+| 허브 helper `mesh-local-eid`: 인자 없는 요청 한 줄, 고정 명령 `ipaddr mleid`만 stdin으로 실행, `ok mleid <주소>` 전용 parser. 기존 parser는 `[a-z_]`만 받는 그대로 | host 확인 | `linux/matter_bridge/app/api/tests/test_otbr_helper.cpp`(실제 helper test build + fake `ot-ctl`) |
+| helper가 거부: 출력 없음, RLOC, ALOC, link-local, 주소 목록(그 안의 EID를 골라내지 않음), 같은 주소 2줄, 뒤에 다른 단어, IPv4, IPv4-mapped, 텍스트 → `err invalid_address`. OTBR 오류, 소켓 없음, 무응답 timeout. 구형 helper(`err invalid_request`) → Unsupported. 거짓 응답(link-local, 주소 2개, 다른 단어) → Failed | host 확인 | 같은 test |
+| 주소 텍스트 규칙(허브): zone id, 대괄호, port, URL, hostname, 대문자, 공백, 점 표기 거부 | host 확인 | 같은 test |
+| 세션: 목적지 조회 → Commissioner → Joiner 순서. 한 번 확정 후 GET·POST 재시도에서 같은 값(OTBR 주소가 바뀌어도). 실제 port 사용(5701로 시험). 다른 기기는 세션도 목적지도 못 봄 | host 확인 | `tests/test_enrollment.cpp`(실제 `EnrollmentManager` + Registry + fake Commissioner) |
+| 조회 실패 12가지(unavailable, invalid state, timeout, failed, unsupported, Ok이지만 link-local·RLOC·IPv4-mapped·IPv4·hostname·빈 값·zone id) → 고정 오류 코드로 실패, Commissioner·Joiner·remove 호출 0회 | host 확인 | 같은 test |
+| 조회 중 취소·만료·shutdown → 그 최종 상태 유지, 목적지 미부착, Joiner 추가 없음. 조회 중 Get·다른 Start·Registry heartbeat가 200 ms 안에 반환(잠금 없음) | host 확인 | 같은 test |
+| API: 옵션 없는 요청의 응답에는 `bridge_endpoint` key 없음(끝이 이전과 같음). 옵션 있는 세션은 preparing에서 `null`, waiting에서 목적지. 다른 기기 404, 토큰 없음 401, 평문 403, health·snapshot에 주소·필드 없음 | host 확인 | `tests/test_enrollment_api.cpp`(실제 `Server`, TLS loopback) |
+| API 검증: 버전 2·0 → 422, 문자열·bool·분수 → 400, 클라이언트가 보낸 `bridge_endpoint` 객체·주소·port 필드 → 400, ingest port를 모르는 bridge → 503 | host 확인 | 같은 test |
+| 허브 API 전체 | 870개 검사 통과 | Mac에서 CMake + Apple clang + Homebrew OpenSSL로 빌드. ingest의 ctest 7개도 통과 |
+| ESP-IDF 공식 Python Security 2 클라이언트 ↔ host로 빌드한 실제 protocomm + 실제 BLE 서비스: `proto-ver`의 capability, 인증 없는·평문 `0x04` 거부, `INVALID_ENDPOINT` 4종, 수락·중복·충돌, controller가 든 주소·port, 등록 뒤 record의 목적지 | host 확인(124개 검사) | `tools/test_power_base_ble_sec2_interop.py` + 새로 빌드한 `tools/host_ble_sec2`. `protobuf` 패키지를 임시 디렉터리에 설치해 실행 |
+| 앱 Swift codec: `0x04` 요청이 C와 같은 golden vector, `0x02`는 변함없음, 70~96바이트 전 길이, 응답 type `0x84`, 주소·literal 규칙, capability 해석, capability 없는 보드에는 start를 쓰지 않음 | host 확인 | 앱 `PowerBaseBLEKit` `swift test` |
+| Swift 클라이언트 ↔ 같은 host harness: Swift가 암호화해 보낸 `0x04`를 실제 C 서버가 받아 controller가 같은 주소·port를 듦, 중복·충돌, 등록 뒤 record, 취소·다른 네트워크 목적지 뒤 목적지 없음 | host 확인(53개 test, 건너뜀 0) | `HarnessInteropTests`(test용 자격 증명은 실제 준비 도구로 생성) |
+| 앱 controller: preparing 동안 미전달, waiting + 목적지에서 한 번 전달, 구형 보드는 허브 세션 전에 중단, 구형 허브는 재요청·추정 없이 중단, 목적지 없는 waiting·바뀐 목적지·사라진 목적지는 새 start 없이 정리, 답 유실 재전송은 같은 request id·PSKd·목적지 | sim 확인 | 앱 `PowerBaseEnrollmentBridgeEndpointTests`(scripted hub·board, iOS Simulator) |
+| 앱 등록 회귀(foreground permit, lifecycle, REQUEST_CONFLICT, 취소 거부, reconnect, 화면 이탈·허브 변경 정리, USB 콘솔 경로) | sim 확인 | 등록 관련 test class 14개의 190개 test 통과, 건너뜀 0(화면 렌더 test는 출력 디렉터리를 지정해 실행). 앱 전체 783개 중 774 통과, 실패 0, 건너뜀 9(렌더 7개와 실제 허브가 필요한 live 2개. 렌더 중 등록 화면 3개는 위에서 따로 실행) |
+| 준비 도구: `--bridge-from-enrollment` 이미지는 `pb_bridge`가 enabled=0·주소·port 0이고 나머지 namespace는 주소 있는 이미지와 바이트 단위로 같음. 다른 보드의 이미지와는 BLE 자격 증명만 다름. 출처 미지정·혼용·한쪽만·형식 오류·빈 문자열·hostname·URL 주소는 아무것도 쓰지 않고 거부 | host 확인(67개 검사) | `tools/test_gen_power_base_ble_config.py`(실제 도구 + ESP-IDF `nvs_parser`). 설정 코드는 test가 임시 디렉터리에 새로 만든 것만 사용 |
+| 기존 host test 재실행: thread config 46, boot sequencing 128, await 배선 32, await 생성기 18, no-root-api 16, exporter 8종(47·21·57·21·25·55·8·20) | 확인 | 모두 통과 |
+| ESP-IDF v6.1 `power_base` 기본 빌드(esp32h2) | 빌드 확인 | `0xd0f20` bytes, app 파티션 44% 여유. 경고 없음 |
+| ESP-IDF v6.1 `power_base` USB bench 빌드 | 빌드 확인 | `0xf2930` bytes, 35% 여유. 경고 없음 |
+| ESP-IDF v6.1 `power_base` BLE 시험 빌드 | 빌드 확인 | `0x155220` bytes. app 파티션 `0x177000`에 `0x21de0` bytes(9%) 여유. 경고 없음 |
+| 앱 빌드: iOS Simulator Debug·Release, iOS 기기용 Debug·Release, Mac Catalyst Debug·Release | 빌드 확인 | 기기용과 Catalyst는 서명 없이(`CODE_SIGNING_ALLOWED=NO`) 빌드만 |
+
+세 펌웨어 빌드, host harness, 허브 API, 앱은 모두 저장소 밖의 별도 출력 디렉터리와 별도
+`SDKCONFIG`·DerivedData로 빌드했다. 기존 `power_base/sdkconfig`와 기존 build 디렉터리는 쓰지 않았다.
+
+### 실행하지 못한 것
+
+| 항목 | 상태 |
+|---|---|
+| Linux GCC로 허브 API·helper 빌드와 test | **실행 불가**. 이 Mac에 Linux 환경이 없고 Docker도 동작하지 않았다. 위 허브 결과는 Apple clang 빌드다 |
+| connectedhomeip(GN) `pogo_matter_bridge` 빌드 | **실행 불가**. CHIP SDK 환경이 없다. `app/chip/main.cpp`의 변경(ingest port를 등록 설정에 넘기는 한 줄)은 컴파일해 보지 못했다 |
+| 실제 `ot-ctl ipaddr mleid`에 대한 helper 동작(stdin 방식, echo 여부, 출력 형식) | 미확인. fake `ot-ctl`로만 확인 |
+| 운영 허브에 새 bridge·새 root helper 설치, sudoers 규칙 그대로 동작하는지 | 미실행(배포·재시작하지 않음) |
+| 실제 보드에서 `0x04` 수락, 실제 `nvs_flash`의 56바이트 record 기록·복원, 실제 exporter의 송신 | 미확인(flash하지 않음) |
+| 실제 BLE로 `proto-ver`(capability 포함, 더 길어진 JSON)와 `0x04`(최대 96 + 16바이트) 교환 | 미확인 |
+| 앱 → 허브 세션 → BLE `0x04` → `heartbeat_received` 전 구간 | 미확인 |
+| Mac Catalyst에서 앱 test 실행 | 미실행(서명·provisioning 갱신이 필요해 빌드만 확인) |
+| BLE 시험 빌드의 app 파티션 여유(9%)와 등록 task stack(6144)의 실제 여유 | 미확인 |
+
+2026-10-05 추가: 위 표는 2026-10-03 작성 당시의 상태다. Linux 쪽 네 줄은 "후속 기록: Linux 배포 검증과
+실물 시험 산출물 준비 (2026-10-05)"의 ①에서, 실제 보드·BLE·전 구간에 관한 줄은 "실물 후속 검증
+(2026-10-05)"에서 다시 판정했다. Mac Catalyst의 앱 test 실행과 stack 여유 측정은 그 뒤에도 기록이 없다.
+
+### 후속 수정: 등록 시 목적지 필수 정책 (2026-10-04)
+
+위 2026-10-03 구현에서는 `--bridge-from-enrollment` 이미지의 보드가 목적지 없는 구형 start(`0x02`)로도
+Thread 가입과 버전 1 record 저장까지 끝낼 수 있었다(exporter는 꺼진 채 BLE 등록이 닫힘). 2026-10-03
+표의 "주소 없는 이미지에서 exporter off" 줄과 power-base.md의 호환 표가 그 동작을 문서로만 적고
+있었다. 이 후속 수정은 그 경로를 코드로 막는다. 규칙은 [`power-base.md`](power-base.md)
+"등록 시 목적지 필수 정책".
+
+**이 날 실행한 것도 Mac의 host test와 빌드뿐이다.** 보드·BLE·허브로는 실행하지 않았고 flash·erase·배포·
+재시작을 하지 않았다. 앱 저장소와 Linux 등록 API·OTBR helper는 수정하지 않았다.
+
+기준: 펌웨어 저장소 `ff11a07` + 2026-10-03의 미커밋 변경(40개 파일) 위에 추가. 커밋하지 않았다.
+
+| 항목 | 결과 | 근거 |
+|---|---|---|
+| 정책 읽기: namespace 없음·정적 주소·exporter를 일부러 끈 이미지(`enabled=0`, 5번 바이트 0)는 "정책 없음". `enabled=0` + 5번 바이트 1만 "필수". 모르는 값(2·3·4·255), 필수인데 `enabled=1`, CRC 불일치(정책 바이트만 0→1·1→0으로 바뀐 경우 포함), 다른 schema·크기, blob·crc 누락, 파티션 읽기 실패는 "사용할 수 없음" | host 확인 | `tools/test_power_base_bridge_config.c`(실제 `power_base_bridge_config.c` + NVS simulator), 전체 87개 검사 |
+| 기존 loader는 정책 바이트를 보지 않음: 같은 이미지를 이전과 똑같이 읽는다 | host 확인 + 정적 확인 | 같은 test, paths test |
+| controller, 정책 필수 + 목적지 없는 요청: `ESP_ERR_NOT_ALLOWED`. Joiner·Thread 호출 0회, 상태·마지막 결과·attempt 불변, PSKd 버퍼 삭제. 기존 버전 1 record와 Dataset이 바이트 단위로 그대로 | host 확인 | `tools/test_power_base_enrollment.c`(실제 `power_base_enrollment.c`), 전체 256개 검사 |
+| 거부 뒤 목적지 있는 요청: Joiner 시작(attempt 1), 등록 시 표식과 목적지가 한 56바이트 blob. 기존 record는 그 요청이 Joiner 전에 지움 | host 확인 | 같은 test |
+| 부팅, 정책 필수 + 유효한 버전 1 record + 일치하는 Dataset: 안전 대기(`marker_corrupt`), Thread 미시작, 서비스 불가, record·Dataset 불변. tick이 지나도 재개하지 않음 | host 확인 | 같은 test |
+| 부팅, 정책 필수 + 유효한 버전 2: 목적지 복원과 재개. 손상·다른 보드·다른 네트워크·Dataset 없음은 이전처럼 대기 | host 확인 | 같은 test |
+| 정책 없음: 목적지 없는 요청으로 이전과 같은 버전 1 record 등록, 버전 1 재개 그대로 | host 확인 | 같은 test |
+| 사용할 수 없는 정책: 목적지 유무와 관계없이 요청 거부(부작용 없음). 이미 등록된 버전 1·2는 이전처럼 재개 | host 확인 | 같은 test |
+| 재부팅(boot마다 별도 process + flash 파일): 구형 방식으로 등록된 보드에 정책이 생기면 매 부팅 대기, 정책 없이 다시 부팅하면 재개(부팅과 거부된 요청이 아무것도 지우지 않음), 목적지 있는 등록 뒤에는 매 부팅 그 목적지로 재개 | host 확인 | 같은 test |
+| BLE admission, 정책 필수 + `0x02`: 응답 `01 82 1b 00`(`UNAVAILABLE`). queue 0, 시도 record 없음, PSKd 미보관, challenge 유효 유지, worker·controller 호출 0회, Joiner 0회, 기존 record·Dataset 불변. 복호화 버퍼 삭제 | host 확인 | `tools/test_power_base_ble_admission.c`(실제 `pb_ble_admission.c` + 실제 controller), 전체 337개 검사 |
+| 재전송 3회도 `UNAVAILABLE`(`DUPLICATE`·`REQUEST_CONFLICT` 아님), cancel은 `NO_SUCH_ATTEMPT`. `pb-status`에 0x08 flag 없음 | host 확인 | 같은 test |
+| 거부 뒤 같은 challenge·같은 request id의 `0x04`: `ACCEPTED` → Joiner 1회 → 버전 2 record. challenge 없이 보낸 `0x02`, 다른 보드 EUI-64의 `0x02`도 `UNAVAILABLE`. 형식 오류·다른 version·닫힌 보드는 기존 코드(`MALFORMED`·`UNSUPPORTED_VERSION`·`CLOSED`) | host 확인 | 같은 test |
+| 사용할 수 없는 정책: `0x02`·`0x04` 모두 `UNAVAILABLE`. 정책 없음: `0x02`가 이전처럼 수락·등록 | host 확인 | 같은 test |
+| admission이 통과시켜도 controller가 단독으로 거부(Joiner 0회, record·Dataset 불변, 요청은 failed/0x80) | host 확인 | 같은 test(두 층의 정책을 다르게 설정) |
+| exporter까지: 정책 이미지에서 목적지 없는 등록 요청은 거부(Joiner·서비스·송신 없음), 목적지 있는 등록과 재부팅은 그 주소·port로 heartbeat. 구형 방식으로 등록된 보드가 정책 이미지로 부팅하면 서비스 미시작(exporter 없이 켜지지 않음), 정적 주소로도 보내지 않음. 모르는 정책 값의 이미지는 새 등록 거부, 버전 2는 재개. 정책 없는 이미지(namespace 없음·disabled·정적)는 이전 동작 | host 확인 | `tools/test_power_base_enrollment_exporter_endpoint.c`(실제 정책 loader + controller + exporter), 전체 49개 검사 |
+| 준비 도구: `--bridge-from-enrollment` 이미지의 `pb_bridge` blob이 `enabled=0`·정책 1·주소·port 0이고 CRC가 정책 바이트를 덮음. `--bridge-host/--bridge-port` 이미지는 정책 0. pack 도구의 `--require-enrollment-endpoint`는 mode 2 전용이고 주소와 함께 쓰면 거부. `--await-commissioning`만 준 이미지는 정책 0. 누락·충돌·잘못된 인자와 덮어쓰기 금지는 그대로 | host 확인(77개 검사) | `tools/test_gen_power_base_ble_config.py`(실제 도구가 만든 이미지를 ESP-IDF `nvs_parser`로 다시 읽음). `tools/test_pack_power_base_await_config.py` 18개도 통과 |
+| ESP-IDF 공식 Python Security 2 클라이언트 ↔ 새로 빌드한 host harness: 정책 필수 보드에서 유효한 challenge의 `0x02` → `UNAVAILABLE`, 아무것도 시작 안 됨, 같은 challenge·request id의 `0x04` → 수락·등록. 사용할 수 없는 정책은 둘 다 `UNAVAILABLE`. 정책 없으면 `0x02` 수락 | host 확인(141개 검사) | `tools/test_power_base_ble_sec2_interop.py`. harness에 부팅 전 정책을 정하는 명령(`Y`)을 추가했고, 그 명령을 모르는 구동기는 이전과 같은 보드를 얻는다 |
+| 앱 Swift 클라이언트 ↔ 같은 harness (앱 소스 변경 없음) | host 확인(53개 test, 건너뜀 0) | 앱 `PowerBaseBLEKit` `swift test` |
+| 배선: 정책은 mode 2 분기에서 한 번만 읽고 runtime에 전달, controller에는 boot 규칙 전에, admission에는 protocomm 생성 전에 설정. 두 층 모두 삭제·queue·Joiner보다 먼저 검사. 사용할 수 없는 정책이면 BLE를 열지 않음. bench 콘솔은 controller 경로 하나뿐 | 정적 확인 | `tools/test_power_base_ble_enrollment_paths.py`, 전체 107개 검사(새 BLE 빌드의 sdkconfig 포함) |
+| 수정 전에는 실패하는지 | 확인 | 수정 전 소스의 사본(정책 개념 없음)에 새 test를 돌리면 enrollment 23개, admission 25개, exporter 9개 검사가 실패. 수정 후 0개 |
+| 방어를 하나씩 깨뜨리면 잡는지 | 확인 | 실제 소스 사본에서 9개 변형(admission 통과, controller 통과, 부팅 재개, 두 층의 INVALID 무시, 필수+정적 허용, CRC 생략, `enabled=0`에서 필수 추정, challenge 소모 뒤 거부) 모두 검출 |
+| 기존 host test 재실행: thread config 46, boot sequencing 128, await 배선 32, no-root-api 16, exporter 47 | 확인 | 모두 통과 |
+| ESP-IDF v6.1 `power_base` 기본 / USB bench / BLE 시험 빌드(esp32h2) | 빌드 확인 | `0xd1540`(44% 여유) / `0xf31e0`(35%) / `0x155b00`(`0x21500` bytes, 9% 여유). 경고 없음. 별도 출력 디렉터리와 `SDKCONFIG` |
+
+실행하지 않은 것: 위 "실행하지 못한 것" 표가 그대로다(Linux GCC·CHIP 빌드 불가, 실물 전 구간 미확인).
+추가로, 실제 `nvs_flash`가 정책 바이트가 든 `pb_bridge` blob을 읽는지, 실제 BLE에서 구형 앱이
+`UNAVAILABLE`을 어떻게 보여 주는지는 확인하지 않았다. 앱은 이번에 수정하지 않았으므로 앱 test는 다시
+돌리지 않았다(Swift 패키지 interop만 새 harness로 재실행).
+
+실물 시험 전에 새로 만들어야 하는 것: ① 이 수정이 들어간 BLE 시험 펌웨어, ② 새 도구로 다시 만든 준비
+이미지(`--bridge-from-enrollment --existing-setup-code-file`; 이전 이미지는 정책이 없어 방어되지
+않는다). 아래 절차의 1)이 둘 다 만든다. 시험 1에 한 가지를 더한다: 구형 start만 아는 클라이언트(예:
+2026-10-03 이전 앱 빌드)로 먼저 시도해 보드 로그에 `start refused (code 0x1b) -- no Joiner started`가
+나오고 보드가 계속 대기·광고하는지 본 뒤, 새 앱으로 등록한다.
+
+2026-10-05 추가: 이 절의 "실행하지 않은 것"과 "실물 미확인"은 2026-10-04 작성 당시의 상태다. 그 뒤의
+실물 결과는 아래 "실물 후속 검증 (2026-10-05)"에 있다. 실제 `nvs_flash`가 정책 바이트를 읽는 것은 그
+시험의 보드 로그로 확인됐다. 위 문단의 "구형 start만 아는 클라이언트로 먼저 시도"는 실행되지 않았고,
+구형 start(`0x02`) 거부는 지금도 host 확인뿐이다.
+
+### 다음 실물 시험 절차 (준비만 했고 실행하지 않았다)
+
+2026-10-05 추가: 제목의 "실행하지 않았다"는 2026-10-04 작성 당시의 상태다. 2026-10-05에 시험 1과, 시험 2
+가운데 재시작 뒤 복원에 해당하는 부분이 실행됐다. 기록은 아래 1), 1-a)의 명령이 아니라 "후속 기록"
+②의 업데이트 도구로 했고, 시험 2의 재시작은 USB를 뽑았다 꽂는 전원 재연결이 아니라 모니터의 RTS
+재시작이었다. 결과와 경계는 "실물 후속 검증 (2026-10-05)". 아래 절차와 기대 로그는 당시 적은 그대로 둔다.
+
+대상은 여분 보드 `744dbdfffe65c00a`뿐이다. 운영 Base는 건드리지 않는다. **순서 0은 운영 Linux 허브에
+새 bridge와 새 root helper를 배포해야 하므로 운영자가 따로 결정한다.** 이 문서의 누구도 그 배포를
+하지 않았다. 설정 코드·PSKd·Dataset은 어떤 명령에도 인자로 넣지 않는다.
+
+```bash
+# 0) Linux 허브 (운영자 작업, 서비스 재시작 포함): 새 소스로 bridge와 helper를 빌드·설치한다.
+#    docs/pogohome-api-v1.md "Installing the OTBR helper" 2)~3)을 다시 수행 (sudoers 규칙은 그대로).
+#    설치 뒤 읽기 전용 확인:
+sudo ot-ctl ipaddr mleid                              # 주소 한 줄 + Done
+#    아래의 <USER>는 운영 Linux 계정 이름을 치환한 표기다.
+sudo -u <USER> sh -c "printf 'pogohome-otbr/1 mesh-local-eid\n' | sudo -n -- /usr/local/libexec/pogohome/pogohome-otbr-helper"
+#    기대: "ok mleid <위와 같은 주소>". "err invalid_request"면 helper가 구형이다.
+systemctl cat pogo-matter-bridge | grep -- --port     # 없으면 ingest port는 5684
+```
+
+```bash
+# 1) Mac: BLE 시험 빌드와 주소 없는 준비 이미지 (보드에 쓰지 않음)
+cd "/Users/junsoona/no-icloud/main project_1"
+source ~/.espressif/v6.1/esp-idf/export.sh
+export IDF_COMPONENT_MANAGER=0
+BLE_BUILD="$HOME/esp-builds/pogo_power_base_ble_enrollment"
+EUI=744dbdfffe65c00a
+CODES="$HOME/pogo-setup-codes"
+IMG="build/cfg_images/power_base_ble_${EUI}_config.bin"
+idf.py -C power_base -B "$BLE_BUILD" -D SDKCONFIG="$BLE_BUILD/sdkconfig" \
+  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ble_enrollment" build
+# 이 보드의 이미지와 설정 코드가 이미 있으면 그 코드로 다시 만든다(새 코드를 만들지 않는다):
+python tools/gen_power_base_ble_config.py --eui64 "$EUI" --bridge-from-enrollment \
+  --existing-setup-code-file "$CODES/$EUI.setup-code" && \
+test -s "$IMG" && echo "준비 이미지 확인: $IMG"
+# 기대 출력: "pb_bridge:enabled=0, NO address, enrollment endpoint REQUIRED (...)"
+# 2026-10-04 이전에 만든 주소 없는 이미지는 "목적지 필수" 정책이 없으므로 반드시 이 명령으로 다시 만든다.
+```
+
+**시험 1: 집별 주소 없는 준비 이미지 → 앱 BLE 등록 → 정확한 Base의 새 `heartbeat_received`**
+
+```bash
+# 1-a) Mac: 여분 보드 식별, 미등록 상태로 되돌리고 준비 이미지 + 시험 펌웨어 기록
+SPARE_PORT=/dev/cu.usbmodemXXXX
+python -m esptool --chip esp32h2 -p "$SPARE_PORT" read-mac    # 74:4d:bd:ff:fe:65:c0:0a 가 아니면 중단
+test -s "$IMG" && \
+python -m esptool --chip esp32h2 -p "$SPARE_PORT" --after no-reset erase-region 0x9000 0x6000 && \
+python -m esptool --chip esp32h2 -p "$SPARE_PORT" --after no-reset write-flash 0x187000 "$IMG" && \
+(cd "$BLE_BUILD" && python -m esptool --chip esp32h2 -p "$SPARE_PORT" -b 460800 \
+  --before default-reset --after hard-reset write-flash @flash_args) && \
+idf.py -C power_base -B "$BLE_BUILD" -D SDKCONFIG="$BLE_BUILD/sdkconfig" -p "$SPARE_PORT" monitor
+# 기대: "loaded: pb_bridge enabled=false", "enrollment endpoint policy: endpoint_required",
+#       "AWAIT_COMMISSIONING: enrollment endpoint policy = required", "boot: not enrolled (none)",
+#       "safe wait: BLE enrollment open as 'POGO-PB-744DBDFFFE65C00A'". exporter 로그는 나오면 안 된다.
+```
+
+1-b) 앱(DEBUG 빌드)의 BLE 등록 시험에서 이 보드를 골라 EUI-64와 설정 코드를 넣고 시작한다. 기록할 것:
+
+- 앱: 허브 세션이 `preparing` → `waiting_for_heartbeat`로 가고 화면에 `bridge_endpoint: [주소]:port`가
+  보인다. 그 주소가 0)의 `ipaddr mleid`와 같고 port가 허브의 ingest port와 같은지 대조한다.
+- 보드 로그: `start accepted (generation 1, with a bridge endpoint)` →
+  `Joiner started (attempt 1, bridge endpoint held in RAM)` → `Joiner succeeded` →
+  `enrolled: ... (v2, with the delivered bridge endpoint)` → `BLE enrollment stopped (enrolled)` →
+  `pb_bridge: using the endpoint delivered with the enrollment, port=<port>` →
+  `linux bridge exporter ready` → `power base ready`. 로그에 주소가 나오면 안 된다.
+- 허브: 그 세션이 `heartbeat_received`로 끝나고 journal에 `[heartbeat]`가 그 EUI-64로 찍힌다.
+  **성공 판정은 이것뿐이다.** 앱의 ACCEPTED, 보드의 enrolled는 성공이 아니다.
+- 허브 journal의 `pogohome_api: enrollment <id>: bridge endpoint fixed for this session (port N)` 한 줄과
+  Joiner 추가가 그 뒤에 오는 순서.
+
+**시험 2: 전원 재연결 → 등록 목적지 복원 → 같은 허브로 heartbeat 도착**
+
+시험 1이 `heartbeat_received`로 끝난 보드로 한다. 앱은 쓰지 않는다.
+
+```bash
+# 2-a) 허브에서 그 Base가 offline이 될 때까지 USB를 뽑아 둔 뒤 다시 꽂고 로그를 본다.
+idf.py -C power_base -B "$BLE_BUILD" -D SDKCONFIG="$BLE_BUILD/sdkconfig" -p "$SPARE_PORT" monitor
+# 기대: "loaded: pb_bridge enabled=false"(이미지에는 여전히 주소가 없다),
+#       "boot: enrollment marker and stored Dataset match -- rejoining that network (record v2: bridge endpoint restored)",
+#       "pb_bridge: using the endpoint delivered with the enrollment, port=<port>",
+#       "linux bridge exporter ready", "power base ready".
+#       "BLE enrollment" 로그와 POGO-PB-... 광고는 없어야 한다.
+```
+
+```bash
+# 2-b) 허브 (읽기 전용): 전원 재연결 뒤의 새 heartbeat
+journalctl -u pogo-matter-bridge --since "5 min ago" | grep -i heartbeat
+curl -s http://<허브>:8787/api/v1/snapshot    # 그 uuid의 Power Base가 online, last heartbeat가 재연결 뒤 시각
+```
+
+두 시험 모두 실패 시 보드 로그의 마지막 `pb_enroll`/`pb_bridge_config` 줄과 허브 세션의 `error`를 함께
+기록한다. 되돌리기는 위 "다음 실물 시험 절차"의 백업 복원, 등록만 지우려면
+`erase-region 0x9000 0x6000`.
+
+### 후속 기록: Linux 배포 검증과 실물 시험 산출물 준비 (2026-10-05)
+
+위 2026-10-03, 2026-10-04의 기록과 표는 고치지 않고 그대로 둔다. 이 절은 그 뒤에 생긴 두 가지를 따로
+적는다.
+
+- ① 운영 Linux 허브에 새 bridge와 새 OTBR helper를 빌드·설치·재시작하고 검증한 결과. **사용자가
+  Linux에서 직접 실행한 출력으로 확인한 것**이다. 이 문서를 고친 작업(Mac)에서는 Linux에 접속하지
+  않았고 그 명령들을 실행하지 않았다.
+- ② 여분 Power Base `744dbdfffe65c00a`용 실물 시험 산출물 준비. Mac에서 빌드·생성·대역 검증만 했다.
+  보드에는 접근하지 않았다(시리얼 접근, flash, erase, 실물 BLE 연결, 등록 시작·취소 없음).
+
+**Linux 배포 검증은 끝났고, Power Base 주소 자동 전달의 실물 검증은 아직 하나도 하지 않았다.** 이
+둘은 다른 것이다. ①에서 새 helper가 주소를 돌려준 것은 helper를 단독으로 호출한 결과다. 등록 세션이
+`bridge_endpoint`를 내주는지, 그 값이 BLE로 보드에 전달되는지, 보드가 그것을 저장하고 재부팅 뒤
+복원하는지의 근거가 아니다.
+
+추가(2026-10-05, 실물 시험 뒤): 위 굵은 문장과 이 절의 "현재 상태", "다음 실물 시험 순서"는 산출물 준비
+당시, 곧 실물 시험 전의 기록이다. 같은 날 이 산출물로 실물 시험이 실행됐고 결과는 아래 "실물 후속 검증
+(2026-10-05)"에 따로 적었다. 준비 당시의 판정과 표는 고치지 않았다. 나중에 바꾼 것은 ①의 운영 환경
+식별값을 치환 표기로 옮긴 것뿐이다(①의 설명).
+
+#### ① Linux 배포 검증 (사용자 실행, 사용자가 보고한 출력)
+
+검증 디렉터리: `/home/<USER>/pogo-hub-endpoint-verify-20261004/run2`
+
+이 절의 운영 환경 식별값은 치환해 적었다. `<OTBR_MLEID>`(허브 OTBR의 Mesh-Local EID), `<HUB_ID>`,
+`<SETTINGS_REVISION>`, `<USER>`(운영 Linux 계정), `<DEPLOY_TIMESTAMP>`(배포 백업 디렉터리 이름에 든
+시각)는 사용자가 보고한 출력의 원문이 아니라 치환 표기이고, 같은 표기는 같은 값을 가리킨다. 실제 값은
+이 문서에 싣지 않는다. 치환은 검증의 뜻을 바꾸지 않는다. helper가 돌려준 주소는 관리자가 `ot-ctl`로
+조회한 주소와 같았고, `hub_id`와 `settings.json`은 배포 전후에 보존됐으며, 배포 전의 백업이 만들어졌다.
+SHA-256, 날짜와 시각, 시험 보드의 EUI-64, port는 치환하지 않았다.
+
+| 항목 | 결과 | 비고 |
+|---|---|---|
+| A: 환경, 서비스 정보 | 환경 PASS, 서비스 정보 COMPLETE | |
+| B: B1~B10 | 모두 PASS | ingest·core·API 빌드와 test, GN/CHIP 빌드, 산출물 검사 |
+| 첫 실행(run1) | 실패 | SDK `activate.sh`가 설정되지 않은 `PW_ACTIVATE_SKIP_CHECKS`를 읽어 실패했다. run2는 그 변수를 빈 문자열로 정의했고 환경 검사를 유지한 채 통과했다. 영구 소스 수정은 하지 않았다 |
+| 새 bridge | SHA-256 `c277f4276a508012c44548e8c812cd9a2b66d1661c1879b018991f39fd71b913` | |
+| 설치한 새 helper(CMake 빌드) | SHA-256 `00624133798770d2eb148bc3e2e331083cdda0a451cc1326f844231684745800` | `root:root` 0755, 상위 디렉터리도 root 소유 |
+| sudo 규칙 | sudo 인증 캐시를 비운 상태에서 추가 인자를 붙인 실행이 차단됨 | sudoers는 이전과 동일 |
+| helper `commissioner-state` | `ok disabled` | |
+| helper `mesh-local-eid` | `ok mleid <OTBR_MLEID>` | 관리자가 실행한 `ot-ctl ipaddr mleid` 결과와 일치 |
+| 새 bridge 설치·재시작 | `BRIDGE-OK` | |
+| `hub_id` | `<HUB_ID>` | |
+| `settings_state`, `settings_revision` | `ready`, `<SETTINGS_REVISION>` | |
+| `power_base_enrollment` | `available` | |
+| TLS 인증서 지문, 실행 인자, unit·drop-in, sudoers | 이전과 동일 | |
+| 상태 보존 | `STATE-PRESERVED` | 서비스 정지 상태에서 state-dir 사본을 만든 뒤 교체했다. 사본과 비교해 `endpoint_map.bin`, `hub_id`, `devices.json`, `settings.json`, `tls_cert.pem`, `tls_key.pem`의 보존을 확인했다. `devices.json` 비교는 `last_used_at_unix_ms`의 정상적인 전진만 허용했다. `pairing.json`은 전후 모두 없었다 |
+| 서비스 최종 상태 | `ActiveState=active`, `MainPID=7071`, `NRestarts=0` | |
+| 백업 | `/var/backups/pogohome-deploy-<DEPLOY_TIMESTAMP>` | root 전용 |
+
+이 결과가 2026-10-03 "실행하지 못한 것" 표에서 해소한 항목:
+
+- Linux GCC로 허브 API·helper 빌드와 test: B가 통과했다.
+- connectedhomeip(GN) `pogo_matter_bridge` 빌드: B의 GN/CHIP 빌드가 통과했다. `app/chip/main.cpp`의
+  변경이 Linux에서 컴파일됐다는 근거는 이 통과다(해당 파일을 따로 짚은 출력은 보고에 없다).
+- 실제 `ot-ctl ipaddr mleid`에 대한 helper 동작: 주소 한 건을 돌려줬고 `ot-ctl`의 값과 같았다. 거부해야
+  하는 출력(RLOC, 주소 목록 등)을 실제 OTBR로 만든 기록은 없다. 그 부분은 host 확인 그대로다.
+- 운영 허브에 새 bridge·새 root helper 설치, sudoers 규칙 그대로 동작: 위 표.
+
+이 결과로 해소되지 않는 것: 같은 표의 나머지 줄 전부(실제 보드의 `0x04` 수락, 실제 `nvs_flash`의
+56바이트 record 기록·복원, 실제 exporter의 송신, 실제 BLE의 `proto-ver`·`0x04` 교환, 앱 → 허브 세션 →
+BLE `0x04` → `heartbeat_received` 전 구간, BLE 시험 빌드의 파티션·stack 여유). 보고된 출력에는 등록
+세션을 연 결과가 없다. 세션 응답의 `bridge_endpoint` 값과 그 port가 실제 ingest port인지도 아직 본 적이
+없다.
+
+#### ② 실물 시험 산출물 준비 (Mac, 실행한 것은 빌드·생성·대역 검증뿐)
+
+기준: 펌웨어 저장소 `feature/unified-module-role-manager` @ `ff11a07` + 미커밋 변경(수정 43개, 미추적
+1개), 앱 저장소 `main` @ `056e02c` + 미커밋 변경(수정 17개, 미추적 1개). HEAD만 빌드하지 않았고 과거
+시험 이미지를 다시 쓰지 않았다. 커밋·stage하지 않았다. 작업 전후에 두 저장소의 HEAD·브랜치·index와
+파일별 체크섬을 비교했고, 이 문서 외에는 달라진 파일이 없었다.
+
+산출물은 저장소 밖 `/Users/junsoona/esp-builds/pogo_bridge_endpoint_hwtest_20261005`에 있다(실행 안내는
+그 안의 `README.md`).
+
+| 항목 | 결과 | 근거 |
+|---|---|---|
+| ESP-IDF v6.1 `power_base` BLE 시험 빌드(esp32h2) | 빌드 확인, 경고 0 | 새 build 디렉터리와 새 `SDKCONFIG`(`sdkconfig.defaults;sdkconfig.ble_enrollment`에서 새로 생성). 기존 `power_base/sdkconfig`와 이전 build 디렉터리는 쓰지 않았다. `0x155b00`(1,399,552) bytes, factory `0x177000`에 `0x21500` bytes(9%) 여유 |
+| 최종 설정 | 확인 | `CONFIG_POWER_BASE_BLE_ENROLLMENT=y`, `CONFIG_POWER_BASE_BENCH_JOINER_CONSOLE` 꺼짐, `CONFIG_OPENTHREAD_JOINER=y`, `OPENTHREAD_CLI`·`CONSOLE_ENABLE`·`COMMISSIONER` 꺼짐, protocomm Security 2만 켜짐(0·1 꺼짐). 1785개 key가 build의 `sdkconfig.json`과 일치하고 2026-10-01 BLE 빌드의 sdkconfig와 차이 0 |
+| 이미지 | `power_base.bin` SHA-256 `2b535d759122e4ab8dc0e17affcda9a84cfa02ffaeebcb9627ddd1f518275a5b`, `power_base.elf` `f0cac123eceff253e66f05a2380ae7892ffe81408cfdebff2cbe58f23929b0a3`, `partition-table.bin` `89884ce7b6fe7d6a3146a7a53e919ebbc0171405ff85e8e8fb23b345ce264045` | `esptool image-info`(파일만): chip ID 16, 내장 ELF SHA-256 일치, 이미지 해시 유효. 이미지에 이 기능의 로그 문자열(`with a bridge endpoint`, `enrollment endpoint policy`, `record v2: bridge endpoint restored`)과 capability `bridge_endpoint_v1`이 있고 `pb_join`은 없다. 파티션 표는 2026-10-03 release의 것과 같은 파일이다 |
+| 준비 이미지(cfg) | 생성, 다시 읽어 확인 | 현재 `tools/gen_power_base_ble_config.py --eui64 744dbdfffe65c00a --bridge-from-enrollment --existing-setup-code-file …`. 기존 설정 코드는 도구가 파일에서 읽어 다시 썼다(새 코드를 만들지 않았고, 코드를 화면·로그·인자에 내지 않았다). 이미지 0600, 보관 디렉터리 0700. 생성 도구와 별개의 검사(ESP-IDF `nvs_parser`)로 확인: namespace 4개, `pb_thread`는 `mode`=2 하나뿐(Dataset 없음), `pb_bridge`는 enabled=0·주소 0·port 0·정책 1·CRC 유효, `pb_ble_auth`는 `744dbdfffe65c00a`에 묶이고 record CRC 유효, 배선 blob은 `configs/power_base.json`을 pack한 값과 같고 이 보드의 이전 이미지의 것과도 같다. 이미지 안에 허브의 현재 mesh-local EID나 그 prefix 바이트가 없다. salt는 새로 뽑으므로 `pb_ble_auth` 바이트는 이전 이미지와 다르다 |
+| 업데이트 도구(산출물 디렉터리의 `update/`) | 대역 검증 93개 검사 통과 | 가짜 esptool과 bytearray flash로만 실행했다(시리얼 포트를 열지 않음). 포트를 인자로만 받음, 다른 EUI-64(SGP41·PMS 포함)·다른 칩·Secure Download Mode·작은 flash·다른 파티션 표·해시 불일치·cfg 내용 위반(Dataset 있음, 정적 주소·port, 정책 없음, 다른 보드, 배선 변경)·미확인에서 erase·write 전에 중단, 중간 실패 시 뒤 단계와 재부팅을 하지 않음, 완전한 실행이 app·cfg·nvs 세 범위만 바꿈. 방어를 하나씩 깨뜨린 사본 11개 모두에서 자가검증이 실패하고, 바꾸지 않은 사본에서는 통과하는 것도 확인했다 |
+| 앱 기기용 Debug 빌드 | 빌드 확인 | 별도 DerivedData, `generic/platform=iOS`, `CODE_SIGNING_ALLOWED=NO`. arm64, `-DDEBUG`, `PowerBaseEnrollmentBLETestView`가 들어 있다. 서명이 없어 설치할 수 없는 산출물이고 설치·실행하지 않았다 |
+
+이번에 다시 실행하지 않은 것: 2026-10-03·04의 host test 전체와 앱 test. 그 결과는 위 표의 기록 그대로다.
+
+업데이트 도구는 2026-10-03의 "app만 쓰고 등록 정보를 보존하는" 도구와 다르다. 새 등록을 시험하려면
+미등록 상태가 필요하므로 app 기록, cfg 기록, **동적 nvs 초기화**를 한다. 전체 flash erase와
+bootloader·파티션 표·phy 영역 기록은 하지 않는다. 위 2026-10-04 절차의 1-a)는 고정 주소로
+`erase-region`·`write-flash`를 직접 실행하는 방식인데, 이번 시험에서는 그 대신 보드의 실제 파티션 표를
+읽어 대조한 뒤 진행하는 이 도구를 쓴다. 1), 1-a)가 가리키는 `$BLE_BUILD`와 `build/cfg_images`의 이미지도
+이번 시험의 대상이 아니다.
+
+#### 현재 상태 (산출물 준비 당시)
+
+아래 표의 "실물 미검증"은 산출물 준비 당시(실물 시험 전)의 판정이다. 실물 시험 뒤의 판정은 "실물 후속
+검증 (2026-10-05)"의 "현재 상태 (실물 시험 뒤)".
+
+| 구간 | 상태 |
+|---|---|
+| Linux: 새 bridge·helper의 빌드, 설치, 재시작, 상태 보존, sudo 규칙 | 검증(2026-10-05, 사용자 실행) |
+| Linux: 실제 OTBR에 대한 helper `mesh-local-eid` | 검증(사용자 실행, 주소 한 건) |
+| 허브 등록 세션이 `bridge_endpoint`로 현재 OTBR 주소와 실제 ingest port를 내주는지 | **실물 미검증** |
+| 실제 BLE로 `proto-ver` capability와 `0x04` 교환, 보드의 `0x04` 수락 | **실물 미검증** |
+| Joiner 성공 → Thread attach → record v2 저장(실제 `nvs_flash`) → exporter가 전달받은 목적지로 송신 | **실물 미검증** |
+| 허브 세션의 `heartbeat_received`와 정확한 UUID의 새 heartbeat | **실물 미검증** |
+| 전원 재연결 뒤 record v2 복원 → 목적지 적용 → exporter 재시작 → 새 heartbeat | **실물 미검증** |
+| 실제 `nvs_flash`가 정책 바이트가 든 `pb_bridge` blob을 읽는지 | **실물 미검증** |
+| 목적지 없는 구형 start(`0x02`) 거부 | host 확인(2026-10-04)뿐, **실물 미검증**. 구형 start만 보내는 실물 클라이언트를 준비하지 않았다(새 앱은 `0x02`로 바꿔 보내지 않는다). 2026-10-04에 적은 "구형 클라이언트로 먼저 시도"는 이번 준비에 포함되지 않았다 |
+| 업데이트 도구의 실제 esptool·보드 동작 | 미실행(대역만) |
+
+#### 다음 실물 시험 순서 (사용자 실행, 준비만 됨)
+
+"준비만 됨"은 준비 당시의 상태다. 아래 순서 가운데 1~4와 6이 2026-10-05에 실행됐다. 5의 대조는 자료가
+남지 않았다. 7은 앱 화면의 `heartbeat_received`까지이고 그 세션의 허브 journal은 자료가 없다. 8은 전원
+재연결이 아니라 RTS 재시작으로만 실행됐다("실물 후속 검증 (2026-10-05)").
+
+명령은 산출물 디렉터리의 `README.md`에 있다. 설정 코드·PSKd·Dataset·토큰은 어떤 명령에도 인자로 넣지
+않는다.
+
+1. 대상 보드와 포트를 직접 확인하고 센서 모듈을 분리한다. 마지막으로 확인된 Mac 포트는
+   `/dev/cu.usbmodem113301`이지만 현재 값인지는 확인하지 않았다.
+2. 업데이트 도구로 새 펌웨어와 새 cfg를 쓰고 동적 nvs를 초기화한다.
+3. 부팅 로그에서 미등록 안전 대기(`boot: not enrolled (none)`, `enrollment endpoint policy = required`)와
+   BLE 광고(`POGO-PB-744DBDFFFE65C00A`)를 확인한다.
+4. 서명해 설치한 새 Debug 앱의 BLE 등록 시험 화면에 대상 EUI-64와 기존 보드별 설정 코드를 입력한다.
+5. 등록을 시작하고, 허브 세션의 `bridge_endpoint`가 허브의 현재 OTBR 주소와 실제 ingest port인지
+   대조한다.
+6. 보드 로그에서 `start accepted (…, with a bridge endpoint)` → `Joiner succeeded` → attach →
+   `enrolled: … (v2, with the delivered bridge endpoint)` → `linux bridge exporter ready`를 확인한다.
+7. 앱의 `heartbeat_received`와, 허브에서 세션 시작 뒤 시각에 그 UUID로 찍힌 새 heartbeat를 확인한다.
+   보드의 enrolled 표시나 남아 있던 online 표시만으로는 성공이 아니다.
+8. 전원을 다시 연결해 `record v2: bridge endpoint restored` → 목적지 적용 → exporter 시작과, 재연결 뒤
+   시각의 새 heartbeat를 확인한다.
+
+### 실물 후속 검증 (2026-10-05)
+
+출처: 사용자가 2026-10-05(Asia/Seoul)에 여분 Power Base 1대에서 직접 실행한 시험의 기록이다. 터미널 기록
+4개(A~D: 업데이트 도구 출력과 `esp_idf_monitor --timestamps` 로그), 앱 최종 화면 1장(E), 사용자가
+Linux 허브에서 실행해 전달한 journal·snapshot 출력을 검토해 적었다. 이 문서를 고친 작업에서는 보드·시리얼·
+BLE·Linux에 접속하지 않았고 flash·erase·등록 시작·취소·서비스 조작을 하지 않았으며 host test와 빌드도
+다시 실행하지 않았다. 설정 코드, PSKd, Dataset, 토큰, private-cfg의 내용은 읽지 않았고 이 문서에 옮기지
+않았다.
+
+- A~D는 원문 파일을 읽었다. 시각은 monitor가 붙인 Mac 호스트 시각이고 괄호 안은 보드 uptime(초)이다.
+- E는 화면 파일이 이미 지워져 이 작업에서 직접 보지 못했다. 아래 E의 내용은 Codex가 검토한 사용자 제공
+  화면의 판독을 옮긴 것이다.
+- Linux 출력은 작업 지시에 옮겨 적힌 줄만 봤다. 줄 가운데 `…`로 생략된 부분은 받은 그대로다.
+
+보드 로그는 보드의 동작을, 허브 journal은 허브가 받은 것을, 앱 화면은 앱이 표시한 것을 보여 준다. 아래에서
+세 근거를 한 항목으로 합치지 않는다. 두 번의 등록(허브 세션 `60a15054`와 `74417a8e…`)도 합치지 않는다.
+
+#### 대상과 기록
+
+- 보드: 여분 Power Base 1대, EUI-64 `744dbdfffe65c00a`. 업데이트 도구가 eFuse의 EUI-64
+  `74:4d:bd:ff:fe:65:c0:0a`를 읽어 기대값과 같다고 출력했다(C). 센서 모듈은 분리했다(사용자 보고. 보드
+  로그의 `pogo_port ... WAIT_ATTACH`와 허브 heartbeat의 `node_count=0`이 이와 어긋나지 않는다).
+- 이미지: "후속 기록" ②의 산출물. 도구의 `Inputs verified` 출력(C)이 `power_base.bin` SHA-256
+  `2b535d759122e4ab8dc0e17affcda9a84cfa02ffaeebcb9627ddd1f518275a5b`, `power_base.elf` SHA-256
+  `f0cac123eceff253e66f05a2380ae7892ffe81408cfdebff2cbe58f23929b0a3`을 보였다. A·B·D의 부팅 로그는 모두
+  App version `mvp-pairing-v1-40-gff11a07-dirt…`, Compile time `Oct  5 2026 00:35:45`, ELF file SHA256
+  `f0cac123e...`이다. 2nd stage bootloader의 compile time은 세 부팅 모두 `Oct  1 2026 11:32:18`로, 이날
+  빌드한 것이 아니다.
+- 준비 cfg: 도구가 기록 전에 다시 읽어 출력한 값(C)은 `pb_thread mode=2 keys=['mode']`,
+  `pb_bridge enabled=0 policy=1 address-zero=True port=0`, `pb_ble_auth EUI-64=744dbdfffe65c00a`,
+  `wiring=verified`다. 곧 mode 2, Dataset 없음, bridge 주소·port 없음, 목적지 필수 정책 1이다.
+- 포트: A는 `/dev/cu.usbmodem1401`, B·C·D는 `/dev/cu.usbmodem113301`.
+
+| 기록 | 시각 | 내용 |
+|---|---|---|
+| A | 01:06:13 부팅 | 첫 적용(도구 출력의 뒷부분)과 미등록 부팅. 01:06:14의 BLE 대기에서 끝난다 |
+| B | 11:35:08 부팅 | 등록된 보드를 monitor가 RTS로 재시작한 부팅 |
+| C | 도구가 만든 백업 이름의 시각 02:42:33Z, 02:42:52Z | 두 번째 적용. 첫 실행은 중단, 다음 실행은 완료 |
+| D | 11:43:56 부팅 ~ 11:45:12 | 두 번째 적용 뒤의 미등록 부팅과 두 번째 등록 전체 |
+| E | 파일 이름의 시각 11:45:15 | 두 번째 등록의 앱 최종 화면 |
+
+A가 끝난 뒤부터 B가 시작하기 전까지의 보드 로그는 제공된 기록에 없다. 첫 번째 등록 시도의 보드 쪽 진행
+(start 수락, Joiner, record 저장)은 그 사이에 있었고, 그 로그를 본 적이 없다.
+
+#### 업데이트 도구의 실제 동작 (A, C)
+
+"후속 기록" ②에서 대역으로만 검증했던 도구가 실제 esptool과 실제 보드에서 실행됐다.
+
+- 기록 전 확인(C, 두 실행 모두): 입력 파일의 SHA-256, cfg 내용, 칩 `ESP32-H2 (revision v0.1)`, eFuse
+  EUI-64 일치, flash 4MB, `Partition table on the board matches: nvs 0x9000+0x6000, phy_init 0xf000+0x1000,
+  factory 0x10000+0x177000, cfg 0x187000+0x3000`. 이어서 보드의 현재 nvs와 cfg를 0700/0600의 private
+  디렉터리에 백업했다고 출력했다. 백업의 내용은 보지 않았다.
+- C의 첫 실행: `[2/3] CFG` 확인 줄에 `wirte-cfg`가 보이고 도구가
+  `ABORTED: 'write-cfg' not confirmed -- nothing was erased or written`으로 끝났다. 쓰기 전에 중단됐다.
+- C의 다음 실행과 A: 세 확인을 지나 app 1,399,552 bytes를 `0x10000`에 쓰고 `Hash of data verified`,
+  `app: written and verified at 0x10000`. cfg 12,288 bytes를 `0x187000`에 쓰고 `Hash of data verified`,
+  `cfg: written and verified at 0x187000`. `nvs: erased and verified blank at 0x9000 (24576 bytes)`.
+  RTS로 재시작한 뒤
+  `Done: app + cfg written, nvs erased, all verified; bootloader/partition table/phy_init unchanged; board reset.`
+- 보존 영역: 도구가 `NOT touched: bootloader 0x0..0x7fff, partition table 0x8000..0x8fff, phy_init
+  0xf000..0xffff`와 위 `Done` 줄을 출력했다. 이 영역의 보존은 도구 출력이 근거다. 위 bootloader compile
+  time이 이와 어긋나지 않는다. 이 문서를 고친 작업에서 flash를 다시 읽어 대조하지는 않았다.
+- 터미널에 보이는 입력: C의 두 실행 모두 `write-app` 확인 줄에는 `rite-app`이 보이고 도구는 다음 단계로
+  넘어갔다. 같은 기록에서 그보다 앞의 출력 두 줄 머리에 `w` 한 글자가 붙어 있다(`wChip:`, `wSaved`).
+  실제로 입력된 문자열이 무엇이었는지는 이 기록만으로 정하지 않는다. A에서는 세 확인 줄에 `write-app`,
+  `write-cfg`, `erase-nvs`가 보인다.
+
+다른 보드·다른 칩·다른 파티션 표·해시 불일치에서 도구가 중단하는지는 이번에 실물로 만들지 않았다. 그
+부분은 대역 검증 그대로다.
+
+#### 미등록 부팅 (A, D의 앞부분)
+
+두 번의 적용 뒤 부팅에서 같은 로그가 나왔다(A 01:06:13~14, D 11:43:56).
+
+- `pb_thread_config: loaded: mode=AWAIT_COMMISSIONING (Thread remains disabled)`
+- `pb_bridge_config: loaded: pb_bridge enabled=false -- bridge exporter will not start`
+- `pb_bridge_config: enrollment endpoint policy: endpoint_required`,
+  `AWAIT_COMMISSIONING: enrollment endpoint policy = required`
+- `pb_enroll: boot: not enrolled (none) -- Thread stays disabled`
+- `safe wait: BLE enrollment open as 'POGO-PB-744DBDFFFE65C00A' for up to 900 s`
+
+등록 전에는 서비스 시작, exporter, `power base ready` 로그가 없다(A는 기록 끝까지, D는 11:44:57 전까지).
+정책 줄은 실제 `nvs_flash`가 정책 바이트가 든 `pb_bridge` blob을 읽어 `endpoint_required`로 해석했다는
+근거다. 광고를 스캐너로 대조한 기록은 없다.
+
+#### 첫 번째 등록 세션 (허브 세션 `60a15054`): 성공이 아니다
+
+허브 journal(사용자 전달, 시각은 받은 자료에 없다):
+
+- `started … for Power Base 744dbdfffe65c00a (120 s window, with bridge endpoint delivery)`
+- `bridge endpoint fixed for this session (port 5684)`
+- `started the OTBR Commissioner`
+- `Joiner 744dbdfffe65c00a allowed for 120 s`
+- `cancelled by device …`
+- `cancelled`
+
+이 세션의 최종 상태는 `cancelled`다. **이 세션을 등록 성공으로 기록하지 않는다.** `heartbeat_received`에
+이르지 않았고, 이 세션의 앱 화면과 보드 로그는 제공된 자료에 없다.
+
+- `cancelled by device …`는 허브 등록 API의 취소 처리 경로가 찍는 줄이다(`enrollment.cpp`의 `Cancel()`).
+  페어링된 기기의 취소 요청으로 세션이 끝났다는 것까지가 journal의 내용이다. 그 경로는 이미 도착한
+  heartbeat가 있으면 취소하지 않으므로, 취소가 받아들여진 시점까지 허브는 이 세션에서 그 Base의 heartbeat를
+  받지 못했다.
+- 사용자는 이때 앱을 닫았다고 보고했다. 그 취소 요청이 왜 나갔는지는 기록에 없으며, 단순한 백그라운드
+  전환이 원인이라고 단정하지 않는다. 앱의 백그라운드·foreground 전환 중 동작은 이번에 조건을 나눠
+  시험하지 않았다.
+- 그런데도 보드에는 등록 결과가 남아 있었다(아래 B). 허브 세션이 취소로 끝난 것과 보드가 record를 저장한
+  것은 서로 다른 사실로 둔다. 보드가 언제 어떤 순서로 등록을 끝냈는지는 로그가 없어 적지 않는다.
+
+#### 등록된 보드의 RTS 재시작과 복원 (B)
+
+B는 monitor를 열 때 일어난 RTS 재시작이다(`rst:0x15 (USB_UART_HPSYS)`, `app_main: entry
+(reset_reason=11)`). **전원을 완전히 끊었다가 다시 넣은 시험이 아니다.**
+
+| 시각 (uptime 초) | 보드 로그 |
+|---|---|
+| 11:35:08 (0.44) | `pb_thread_config: loaded: mode=AWAIT_COMMISSIONING`, `loaded: pb_bridge enabled=false`(이미지에는 여전히 주소가 없다) |
+| 11:35:08 (0.49) | OpenThread가 저장된 `NetworkInfo`를 읽음(`role:router`) |
+| 11:35:08 (0.52) | `enrollment endpoint policy: endpoint_required`, `enrollment endpoint policy = required` |
+| 11:35:08 (0.53) | `stored-dataset start: Thread enabled on the stored complete Dataset (contents hidden)` |
+| 11:35:08 (0.53) | `boot: enrollment marker and stored Dataset match -- rejoining that network (record v2: bridge endpoint restored)` |
+| 11:35:08 (0.56) | `AWAIT_COMMISSIONING: enrolled -- enabling the power rail and the normal attach supervisor` |
+| 11:35:08 (0.56) | `pb_bridge: using the endpoint delivered with the enrollment, port=5684 (host address never logged)` |
+| 11:35:09 (0.96~0.98) | `Role detached -> router`, `thread radio: role=3(ROUTER)` |
+| 11:35:09 (0.99) | `starting services`, `CoAP power-base transport ready`, `linux bridge exporter ready ... port=5684 ... heartbeat_interval_ms=10000` |
+| 11:35:09 (1.00) | `pogo_port: port 1: WAIT_ATTACH`, `power base ready: uuid=..c00a otDeviceRole=3(ROUTER)` |
+
+- 보드는 `cfg`의 `pb_bridge`가 꺼진 상태에서, 저장돼 있던 version 2 record의 목적지를 복원해 적용했고
+  Thread ROUTER로 붙은 뒤 exporter를 다시 시작했다. 로그에 주소는 없다.
+- 이 record는 첫 번째 등록 시도에서 보드에 저장된 것이다. 정책이 `required`인 보드는 version 1 record를
+  재개하지 않으므로(host 확인), 이 재개 자체가 version 2 record가 실제 `nvs_flash`에 있었다는 근거다.
+  record의 바이트를 읽어 대조한 것은 아니다.
+- B에는 `BLE_INIT`, `protocomm_nimble`, `NimBLE`, `BLE enrollment` 로그가 한 줄도 없다. 등록된 보드는 이
+  재시작에서 BLE 등록을 다시 열지 않았다. 스캐너로 광고가 없음을 확인한 기록은 없다.
+
+재시작 뒤의 허브 journal(사용자 전달):
+
+```text
+2026-10-05T11:35:19+09:00 [heartbeat] pb=..c00a uptime_ms=10010 node_count=0
+2026-10-05T11:35:29+09:00 [heartbeat] pb=..c00a uptime_ms=20030 node_count=0
+2026-10-05T11:35:39+09:00 [heartbeat] pb=..c00a uptime_ms=30070 node_count=0
+2026-10-05T11:35:49+09:00 [heartbeat] pb=..c00a uptime_ms=40100 node_count=0
+2026-10-05T11:35:59+09:00 [heartbeat] pb=..c00a uptime_ms=50130 node_count=0
+2026-10-05T11:36:09+09:00 [heartbeat] pb=..c00a uptime_ms=60150 node_count=0
+2026-10-05T11:36:19+09:00 [heartbeat] pb=..c00a uptime_ms=70170 node_count=0
+```
+
+같은 시기의 snapshot 조회 결과(사용자 전달): `여분 Base: 744dbdfffe65c00a online: True`.
+
+- heartbeat 7건이 10초 간격으로 도착했고 `uptime_ms`가 10010에서 시작한다. 재시작 전부터 남아 있던
+  표시가 아니라 이 부팅(11:35:08~09) 뒤에 보드가 새로 보낸 heartbeat다.
+- journal은 UUID의 끝부분(`..c00a`)만 출력한다. 전체 UUID `744dbdfffe65c00a`를 확인한 것은 snapshot이다.
+
+#### 두 번째 적용과 두 번째 등록 (C, D, E)
+
+C의 완료된 실행으로 보드가 다시 미등록이 된 뒤(동적 nvs 초기화) D에서 한 번 더 등록했다.
+
+| 시각 (uptime 초) | 보드 로그 (D) |
+|---|---|
+| 11:43:56 (0.51) | 미등록 부팅, BLE 등록 창 열림(위 "미등록 부팅") |
+| 11:44:19 (22.89 → 23.54) | 연결, `mtu update event ... mtu=256`, Security 2 handshake 시작 로그 |
+| 11:44:21 (25.02) | 다시 광고. 이 연결에서는 start 로그가 없다 |
+| 11:44:45 → 11:44:46 (49.35 → 50.13) | 연결, MTU 256, handshake 시작 로그 |
+| 11:44:49 (53.01) | `pb_ble_adm: start accepted (generation 1, with a bridge endpoint) and queued for the enrollment worker -- not a Joiner result` |
+| 11:44:49 (53.05) | `pb_enroll: Joiner started (attempt 1, bridge endpoint held in RAM) -- this is not enrollment yet` |
+| 11:44:55 (59.29) | `pb_enroll: Joiner succeeded -- starting Thread on the joined credentials (not enrolled until attached)` |
+| 11:44:56 (60.40 → 60.44) | `Role detached -> child`, `thread radio: role=2(CHILD)` |
+| 11:44:56 (60.54) | `pb_enroll: enrolled: attached with a complete Active Dataset and the record is committed (v2, with the delivered bridge endpoint)` |
+| 11:44:56 (60.54) | `BLE enrollment closes for this boot (enrolled)`, 광고 중지, `terminate connection; conn_handle=0 hci_reason=19` |
+| 11:44:57 (60.60) | `E protocomm_nimble: Error setting advertisement data; rc = 30` |
+| 11:44:57 (60.60) | `BLE enrollment stopped (enrolled): advertising, connection and session are down` |
+| 11:44:57 (60.60) | `pb_bridge: using the endpoint delivered with the enrollment, port=5684 (host address never logged)` |
+| 11:44:57 (60.60 → 60.61) | `starting services`(CHILD), `CoAP power-base transport ready`, `linux bridge exporter ready ... port=5684` |
+| 11:44:57 (60.61) | `pogo_port: port 1: WAIT_ATTACH`, `power base ready: uuid=..c00a otDeviceRole=2(CHILD)` |
+| 11:45:12 (75.61) | `pogo_port: port 1: alive state=WAIT_ATTACH`. 기록은 여기서 끝난다 |
+
+- start 수락에서 Joiner 성공까지 약 6.3초, CHILD와 record 저장까지 약 7.5초였다. `rst:`는 기록 시작의
+  1회뿐이고 panic·재부팅 로그가 없다.
+- 11:44:54에 `MeshForwarder-: Failed to send IPv6 UDP msg ... error:Abort` notice가 1건 있다. 원인은
+  확인하지 않았다. 그 1초 뒤 Joiner가 성공했다.
+- BLE 종료 과정에 `Error setting advertisement data; rc = 30`이 1건 있다. 같은 기록에서 등록은 끝났고
+  (record 저장, BLE 종료, 서비스 시작) 그 오류 뒤의 단계도 진행됐다. 2026-10-02의 세 기록에도 같은 오류가
+  있었다. 원인은 확인하지 않았고 이번에 고치지 않았다.
+- 11:44:19의 첫 연결이 start 없이 끝난 이유는 보드 로그에 없다.
+- 기록이 CHILD 상태에서 끝나므로 ROUTER 승격은 이 기록에 없다. 보드 로그는 exporter의 "시작"까지만
+  보여 주고, heartbeat가 허브에 도착했는지는 보드 로그에 없다.
+- 두 번째 세션의 허브 journal은 제공된 자료에 없다.
+
+앱 최종 화면(E, Codex가 검토한 사용자 제공 화면의 판독):
+
+- 초록색 "허브가 신호를 받아 등록 확인"
+- `state: heartbeat_received`
+- `eui64: 744dbdfffe65c00a`
+- `joiner_entry: removed`
+- `session: 74417a8e…`(화면에 보이는 부분만)
+- `board: running / attaching`도 함께 남아 있다.
+
+`heartbeat_received`와 `joiner_entry: removed`는 허브 세션의 상태를 앱이 표시한 것이고, 같은 EUI-64다.
+세션 id는 첫 번째 세션(`60a15054`)과 다르다. `board: running / attaching`은 보드가 마지막으로 알려 준
+진행 표시가 화면에 남은 것으로, 허브의 성공 결과와 구분한다. 이 표시는 이번 작업에서 고치지 않았다.
+
+#### 근거 수준과 검증 경계
+
+확인된 것: 허브 → 앱 → 보드의 목적지 전달, 실제 `nvs_flash`의 version 2 저장, RTS 재시작 뒤의 복원,
+허브의 heartbeat 수신(B 뒤의 journal·snapshot), 앱의 최종 성공 표시(E).
+
+근거가 간접인 것:
+
+- `0x04` start와 `proto-ver` capability: 실제 BLE 패킷을 캡처한 자료는 없다. 근거는 보드 로그와 소스다.
+  보드는 복호화한 요청의 type이 `0x04`이고 그 요청을 수락했을 때만 `with a bridge endpoint`를 찍는다
+  (`pb_ble_admission.c`). 앱은 `proto-ver`가 `bridge_endpoint_v1`을 싣지 않은 보드에는 그 start를 보내지
+  않고 구형 start로 바꿔 보내지도 않는다(앱 `PowerBaseBLEBoardClient`). 그래서 capability 광고와 `0x04`
+  교환이 실제 BLE에서 이뤄졌다고 본다. MTU는 256이었다.
+- 전달된 주소의 값: 등록 API 응답의 `bridge_endpoint` JSON 원문과 앱 화면의 주소·port 줄을 따로 캡처한
+  자료가 없다. 시험 시점에 전달된 주소가 OTBR의 Mesh-Local EID(준비 당시 ①의 `<OTBR_MLEID>` 포함)와
+  정확히 같은지 직접 대조하지 않았다. 간접 근거는 세 가지다. 첫 세션의 journal이 port 5684로 목적지를 확정했다고
+  찍었다. 보드는 전달받은 주소가 가입한 네트워크의 Mesh-Local Prefix 안에 있고 다시 읽은 record가 같을
+  때만 `record is committed (v2, ...)`를 찍는다(`power_base_enrollment.c`). 그 목적지로 보낸 heartbeat가
+  허브에 도착했다. 보드 로그의 port는 5684다.
+- 두 번째 등록의 허브 수신: 앱 화면이 표시한 허브 세션 상태(E)가 근거이고, 그 세션의 journal 원문은 없다.
+  journal 원문이 있는 것은 B의 재시작 뒤 구간이다.
+
+이번 실물 시험으로 검증되지 않은 것:
+
+- 재시작 복원은 첫 번째 등록의 보드 상태에서 확인했다. 두 번째 등록 뒤에 다시 재시작한 기록은 없다.
+- 물리 전원 차단 뒤의 복원. A와 B의 시리얼 포트 이름이 다르지만(`usbmodem1401` → `usbmodem113301`), 그
+  사이에 전원이 끊겼는지와 그때의 부팅 로그는 기록에 없으므로 근거로 쓰지 않는다.
+- 목적지 없는 구형 start(`0x02`)의 거부. 구형 start를 보내는 실물 클라이언트로 시험하지 않았다.
+- 기본 MTU 23에서의 `proto-ver`·`0x04` 교환.
+- 두 Base의 동시 등록.
+- 앱의 백그라운드·foreground 전환 중 경쟁 조건. 첫 세션의 취소가 그 사례인지도 정해지지 않았다.
+- 등록 뒤 허브 주소가 바뀌는 경우의 자동 갱신. 이 기능은 구현돼 있지 않다.
+- 인증 실패 잠금, 창 만료 뒤의 동작, 사용할 수 없는 정책 값의 이미지, 손상된 record의 거부(host 확인뿐).
+- BLE 시험 빌드의 stack·heap 여유(측정하지 않았다).
+
+이 시험은 센서 측정, POGO 체인, Matter endpoint 값의 검증이 아니다. 모듈을 분리한 상태였고
+heartbeat의 `node_count`는 0이었다.
+
+시험 이미지와 현재 소스: 시험 이미지는 `ff11a07` + 미커밋 변경을 2026-10-05 00:35:45에 빌드한 것이다.
+산출물 준비 때 남긴 저장소 체크섬(00:33, 00:49 KST)과 이 문서를 고치기 직전의 체크섬을 대조했다. 추적
+파일 전체의 digest가 00:49의 것과 같고, 00:33과 00:49 사이에 달라진 파일은 이 문서 하나다. 곧 빌드 전후와
+지금의 펌웨어 소스 파일은 내용이 같다. 이미지를 다시 빌드해 바이트를 비교한 것은 아니고, ESP-IDF·툴체인·
+`sdkconfig`는 이 대조의 범위 밖이다. 앱 저장소도 같은 두 시점과 digest가 같다. 사용자가 기기에 설치한
+서명 빌드가 정확히 어느 시점의 소스로 만들어졌는지는 기록에 없다.
+
+#### 현재 상태 (실물 시험 뒤)
+
+| 구간 | 상태 | 근거와 경계 |
+|---|---|---|
+| Linux: 새 bridge·helper의 빌드, 설치, 재시작, 상태 보존, sudo 규칙, 실제 OTBR의 `mesh-local-eid` | 검증(사용자 실행) | "후속 기록" ① 그대로 |
+| 업데이트 도구의 실제 esptool·보드 동작 | 실물 확인(사용자 실행, 도구 출력) | 칩·EUI-64·파티션 확인, app·cfg 기록과 해시 검증, nvs 초기화와 빈 영역 검증, 확인 문구 불일치 시 쓰기 전 중단. 보존 영역은 도구 출력이 근거. 잘못된 대상에서의 중단은 대역 검증뿐 |
+| 실제 `nvs_flash`가 정책 바이트가 든 `pb_bridge` blob을 읽는지 | 실물 확인(보드 로그 A·B·D) | `endpoint_required`. 다른 정책 값은 host 확인뿐 |
+| 주소 없는 이미지의 미등록 안전 대기와 BLE 등록 창 | 실물 확인(보드 로그 A·D) | 스캐너 대조 없음 |
+| 허브 등록 세션이 목적지를 확정해 내주는지 | 실물 확인(일부) | 첫 세션 journal의 `bridge endpoint fixed for this session (port 5684)`. 응답 JSON 원문과 주소의 직접 대조는 없다 |
+| 실제 BLE로 `proto-ver` capability와 `0x04` 교환, 보드의 `0x04` 수락 | 실물 확인(보드 로그와 소스에 따른 간접 근거, 1회) | 패킷 캡처 없음. MTU 256만 |
+| Joiner 성공 → Thread attach → record v2 저장(실제 `nvs_flash`) → 전달받은 목적지 적용 → exporter 시작 | 실물 확인(보드 로그 D, 1회) | record 바이트를 읽어 대조하지는 않았다 |
+| 허브 세션의 `heartbeat_received` | 실물 확인(앱 화면 E의 판독) | 두 번째 세션. 이 작업에서 화면을 직접 보지 못했고 그 세션의 journal 원문은 없다 |
+| 정확한 UUID의 새 heartbeat | 실물 확인(B 재시작 뒤의 journal 7건과 snapshot) | journal은 UUID 끝부분만, 전체 UUID는 snapshot |
+| 등록된 보드의 재시작 뒤 record v2 복원 → 목적지 적용 → exporter 재시작 → 새 heartbeat | RTS 재시작 1회 실물 확인(B) | 첫 번째 등록의 보드 상태. **물리 전원 차단·재투입은 실물 미확인** |
+| 등록 뒤 재시작에서 BLE 등록을 다시 열지 않는지 | 실물 확인(보드 로그 B, RTS 재시작 1회) | 스캐너 확인 없음 |
+| 첫 번째 허브 세션 `60a15054` | `cancelled`. 성공 아님 | 취소 요청이 나간 이유는 미확정 |
+| 목적지 없는 구형 start(`0x02`) 거부 | host 확인뿐, **실물 미확인** | |
+| 기본 MTU 23, 두 Base 동시 등록, 백그라운드 경쟁 조건 | **실물 미확인** | |
+| 등록 뒤 허브 주소 변경의 자동 갱신·재등록 | 미구현 | |
+| BLE 종료 중 `Error setting advertisement data; rc = 30` | 관측(D 1건) | 원인 미확인, 미수정. 등록 완료와 서비스 시작은 진행됐다 |
+| 앱 화면에 남는 `board: running / attaching` | 관측(E) | 미수정 |
+
 ## Linux Matter Bridge
 
 Matter SDK는 connectedhomeip v1.6.0.0으로 고정했다. module UUID마다 동적 endpoint 하나를
@@ -790,8 +1434,9 @@ TX short write/EIO 처리와 RX `ESP_FAIL + EIO` 처리에 제한된 재시도�
 | Matter 제품 인증 | 범위 밖 |
 | Apple Home/Google Home용 전용 앱 | 미구현 |
 | 실제 RF 강제 조건의 Thread multi-hop | 미확인 |
-| Power Base 등록 PSKd의 BLE 전달 | 펌웨어·통신 규약과 앱의 DEBUG 전용 등록 시험 화면까지 구현. 여분 보드 1대에서 등록 성공·취소·창 만료를 실물 확인(2026-10-02, "BLE 등록 실물 후속 검증"). 제품용(Release) 등록 화면은 미구현. 기본 MTU 23, 인증 실패 잠금, 등록 뒤 재부팅은 실물 미확인 |
-| Power Base 등록의 QR 흐름, 허브 주소 자동 전달 | 미구현. Bridge 주소는 준비 이미지에 직접 넣는다 |
+| Power Base 등록 PSKd의 BLE 전달 | 펌웨어·통신 규약과 앱의 DEBUG 전용 등록 시험 화면까지 구현. 여분 보드 1대에서 등록 성공·취소·창 만료를 실물 확인(2026-10-02, "BLE 등록 실물 후속 검증"). 제품용(Release) 등록 화면은 미구현. 기본 MTU 23과 인증 실패 잠금은 실물 미확인. 등록 뒤 재시작에서 BLE 등록을 다시 열지 않는 것은 주소 자동 전달 빌드의 RTS 재시작 1회에서 보드 로그로 확인(2026-10-05, "실물 후속 검증"). 물리 전원 재투입 뒤는 실물 미확인 |
+| Power Base 등록의 허브 주소 자동 전달 | 구현(2026-10-03, 위 "허브 Thread 수신 주소 자동 전달"). host test·빌드 확인과 Linux 배포 검증(사용자 실행)에 더해, 2026-10-05에 여분 보드 1대에서 실물 확인("실물 후속 검증 (2026-10-05)"): 허브 → 앱 → 보드의 목적지 전달(`0x04` 수락은 보드 로그와 소스에 따른 간접 근거), record v2 저장, RTS 재시작 뒤의 복원과 새 heartbeat, 앱의 `heartbeat_received`. **실물 미확인**: 물리 전원 차단 뒤의 복원, 구형 start(`0x02`) 거부, 기본 MTU 23, 두 Base 동시 등록, 백그라운드 경쟁 조건, 세션의 `bridge_endpoint` 원문과 OTBR 주소의 직접 대조. 최초 전달과 재부팅 복원까지이고, 등록 뒤 허브 주소가 바뀌는 경우의 자동 갱신·재등록은 미구현. 제품용(Release) 등록 화면도 미구현(위 줄) |
+| Power Base 등록의 QR 흐름 | 미구현 |
 
 ## 기록 원칙
 

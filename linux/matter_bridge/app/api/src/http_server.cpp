@@ -415,6 +415,22 @@ std::string EnrollmentSessionJson(const EnrollmentSession &s)
     out += s.heartbeat_received_at_unix_ms > 0 ? std::to_string(s.heartbeat_received_at_unix_ms) : "null";
     out += ",\"started_by_device_id\":";
     AppendJsonStringLiteral(out, s.device_id);
+    // Only a session that asked for bridge endpoint delivery has this key, so
+    // every other session's JSON is what it was before the option existed.
+    // null: not established (yet) -- possible while "preparing" and for a
+    // session that ended before it was.
+    if (s.bridge_endpoint_requested) {
+        out += ",\"bridge_endpoint\":";
+        if (s.has_bridge_endpoint) {
+            out += "{\"version\":" + std::to_string(s.bridge_endpoint.version);
+            out += ",\"address\":";
+            AppendJsonStringLiteral(out, s.bridge_endpoint.address);
+            out += ",\"port\":" + std::to_string(static_cast<unsigned>(s.bridge_endpoint.port));
+            out += '}';
+        } else {
+            out += "null";
+        }
+    }
     out += '}';
     return out;
 }
@@ -940,8 +956,11 @@ void Server::HandleEnrollmentRoute(Stream &stream, Request &request, std::string
 
 void Server::HandleEnrollmentStart(Stream &stream, Request &request, const DeviceRecord &device)
 {
-    // {"eui64": "<16 hex>", "pskd": "<6..32 of 0-9 A-Z without I O Q Z>"}.
-    // Error answers never echo either value.
+    // {"eui64": "<16 hex>", "pskd": "<6..32 of 0-9 A-Z without I O Q Z>"},
+    // optionally with "bridge_endpoint_version": 1 to have this hub's bridge
+    // endpoint established and reported with the session. The client never
+    // sends an address or a port: the endpoint is made here.
+    // Error answers never echo any value.
     JsonValue root;
     std::string parse_error;
     JsonParseLimits limits;
@@ -957,11 +976,24 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
     };
     const JsonValue *eui = parsed && root.IsObject() ? root.Find("eui64") : nullptr;
     const JsonValue *pskd_value = parsed && root.IsObject() ? root.Find("pskd") : nullptr;
+    const JsonValue *endpoint_version = parsed && root.IsObject() ? root.Find("bridge_endpoint_version") : nullptr;
+    // Exactly the two fields, or those two and the option; the option must
+    // be a plain integer.
+    const size_t expected_members = endpoint_version != nullptr ? 3 : 2;
     if (eui == nullptr || !eui->IsString() || pskd_value == nullptr || !pskd_value->IsString() ||
-        root.object_members.size() != 2) {
+        root.object_members.size() != expected_members || (endpoint_version != nullptr && !endpoint_version->IsInteger())) {
         wipe_json();
         SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
         return;
+    }
+    EnrollmentStartOptions options;
+    if (endpoint_version != nullptr) {
+        if (endpoint_version->int_value != kBridgeEndpointVersion) {
+            wipe_json();
+            SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("unsupported_bridge_endpoint_version"));
+            return;
+        }
+        options.bridge_endpoint_version = kBridgeEndpointVersion;
     }
     std::string eui64;
     if (!NormalizeEui64(eui->string_value, eui64)) {
@@ -978,7 +1010,7 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
     wipe_json();
 
     EnrollmentSession session;
-    EnrollmentStartOutcome outcome = config_.enrollment->Start(device.id, eui64, pskd, session);
+    EnrollmentStartOutcome outcome = config_.enrollment->Start(device.id, eui64, pskd, session, options);
     SecureWipe(pskd);
     switch (outcome) {
     case EnrollmentStartOutcome::Started: {
@@ -1002,6 +1034,10 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
         return;
     case EnrollmentStartOutcome::InternalError:
         SendJsonResponse(stream, 500, "Internal Server Error", ErrorJson("internal_error"));
+        return;
+    case EnrollmentStartOutcome::BridgeEndpointUnavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable",
+                         ErrorJson("enrollment_unavailable", "reason", "bridge_endpoint"));
         return;
     }
 }

@@ -5,8 +5,10 @@
 
 static const char *TAG = "pb_ble_adm";
 
-/* Domain separation for the request digest (see pb_ble_admission.h). */
-static const uint8_t k_tag_domain[16] = {'p', 'b', '-', 'b', 'l', 'e', '-', 's', 't', 'a', 'r', 't', '-', 'v', '1', 0};
+/* Domain separation for the request digest (see pb_ble_admission.h). The
+ * digest never leaves this file; "v2" is its second layout (message type and
+ * bridge endpoint added). */
+static const uint8_t k_tag_domain[16] = {'p', 'b', '-', 'b', 'l', 'e', '-', 's', 't', 'a', 'r', 't', '-', 'v', '2', 0};
 
 /* pb-status puts these on the wire as numbers (docs/power-base.md lists
  * them): they must never be renumbered. */
@@ -26,11 +28,20 @@ _Static_assert(PB_ENROLL_RESULT_NONE == 0 && PB_ENROLL_RESULT_MARKER_CORRUPT == 
                "pb_enroll_result_t is part of the BLE wire format");
 _Static_assert(PB_BLE_START_REQ_MAX_LEN == PB_BLE_START_REQ_FIXED_LEN + PB_ENROLL_PSKD_MAX_LEN,
                "pb-start maximum length");
+_Static_assert(PB_BLE_START_EP_REQ_MAX_LEN == PB_BLE_START_EP_REQ_FIXED_LEN + PB_ENROLL_PSKD_MAX_LEN,
+               "pb-start (bridge endpoint) maximum length");
+_Static_assert(PB_BLE_BRIDGE_ADDR_LEN == PB_ENROLL_BRIDGE_ADDR_LEN, "bridge address length");
 
 #define REQ_TARGET_OFFSET 4
 #define REQ_ID_OFFSET 12
 #define START_CHALLENGE_OFFSET 28
-#define START_PSKD_OFFSET PB_BLE_START_REQ_FIXED_LEN
+/* PB_BLE_MSG_START_EP_REQ only. */
+#define START_EP_VERSION_OFFSET 44
+#define START_EP_RESERVED_OFFSET 45
+#define START_EP_PORT_OFFSET 46
+#define START_EP_ADDR_OFFSET 48
+/* version + reserved + port + address, as they are on the wire */
+#define START_EP_BLOCK_LEN (PB_BLE_START_EP_REQ_FIXED_LEN - START_EP_VERSION_OFFSET)
 
 /* ---- small helpers ---- */
 
@@ -80,10 +91,13 @@ static void drop_challenge(pb_ble_adm_t *a)
     pb_enroll_wipe(a->ch, sizeof(a->ch));
 }
 
+/* The PSKd slot and the bridge endpoint that travels with it. */
 static void drop_pskd(pb_ble_adm_t *a)
 {
     a->pskd_pending = false;
     pb_enroll_wipe(a->pskd, sizeof(a->pskd));
+    a->endpoint_pending = false;
+    pb_enroll_wipe(&a->endpoint, sizeof(a->endpoint));
 }
 
 static void drop_tag(pb_ble_adm_t *a)
@@ -143,20 +157,31 @@ static size_t short_resp(uint8_t out[PB_BLE_SHORT_RESP_LEN], uint8_t type, uint8
     return PB_BLE_SHORT_RESP_LEN;
 }
 
-/* SHA-256(domain | target | challenge | pskd_len | pskd). */
-static bool request_tag(const pb_ble_adm_t *a, const uint8_t *req, size_t pskd_len, uint8_t out[PB_BLE_SHA256_LEN])
+/* SHA-256(domain | message type | target | challenge | pskd_len | pskd |
+ * endpoint block). The endpoint block is bytes [44..63] of a
+ * PB_BLE_MSG_START_EP_REQ and absent for PB_BLE_MSG_START_REQ, so the same
+ * request id with another message type, address or port never has the
+ * digest of the request that was accepted. */
+static bool request_tag(const pb_ble_adm_t *a, const uint8_t *req, size_t pskd_offset, size_t pskd_len,
+                        uint8_t out[PB_BLE_SHA256_LEN])
 {
-    uint8_t buf[sizeof(k_tag_domain) + PB_BLE_EUI64_LEN + PB_BLE_CHALLENGE_LEN + 1 + PB_ENROLL_PSKD_MAX_LEN];
+    uint8_t buf[sizeof(k_tag_domain) + 1 + PB_BLE_EUI64_LEN + PB_BLE_CHALLENGE_LEN + 1 + PB_ENROLL_PSKD_MAX_LEN +
+                START_EP_BLOCK_LEN];
     size_t n = 0;
     memcpy(&buf[n], k_tag_domain, sizeof(k_tag_domain));
     n += sizeof(k_tag_domain);
+    buf[n++] = req[1];
     memcpy(&buf[n], &req[REQ_TARGET_OFFSET], PB_BLE_EUI64_LEN);
     n += PB_BLE_EUI64_LEN;
     memcpy(&buf[n], &req[START_CHALLENGE_OFFSET], PB_BLE_CHALLENGE_LEN);
     n += PB_BLE_CHALLENGE_LEN;
     buf[n++] = (uint8_t)pskd_len;
-    memcpy(&buf[n], &req[START_PSKD_OFFSET], pskd_len);
+    memcpy(&buf[n], &req[pskd_offset], pskd_len);
     n += pskd_len;
+    if (req[1] == PB_BLE_MSG_START_EP_REQ) {
+        memcpy(&buf[n], &req[START_EP_VERSION_OFFSET], START_EP_BLOCK_LEN);
+        n += START_EP_BLOCK_LEN;
+    }
     bool ok = a->ops.sha256(buf, n, out, a->ops.ctx);
     pb_enroll_wipe(buf, sizeof(buf));
     return ok;
@@ -185,6 +210,11 @@ void pb_ble_adm_init(pb_ble_adm_t *a, const pb_ble_adm_ops_t *ops, const uint8_t
     a->rec_phase = PB_BLE_REC_NONE;
     a->ctl.state = PB_ENROLL_STATE_WAITING;
     a->ctl.last = PB_ENROLL_RESULT_NONE;
+}
+
+void pb_ble_adm_set_endpoint_policy(pb_ble_adm_t *a, pb_enroll_endpoint_policy_t policy)
+{
+    a->endpoint_policy = policy;
 }
 
 bool pb_ble_adm_attempt_active(const pb_ble_adm_t *a)
@@ -308,12 +338,23 @@ static uint8_t start_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uin
     if (in[0] != PB_BLE_PROTO_VERSION) {
         return PB_BLE_CODE_UNSUPPORTED_VERSION;
     }
-    if (inlen < PB_BLE_START_REQ_FIXED_LEN || inlen > PB_BLE_START_REQ_MAX_LEN || in[1] != PB_BLE_MSG_START_REQ ||
-        in[3] != 0) {
+    if (inlen < 2) {
+        return PB_BLE_CODE_MALFORMED;
+    }
+    /* Two messages share this endpoint; the type byte names the layout. */
+    const bool with_endpoint = (in[1] == PB_BLE_MSG_START_EP_REQ);
+    if (!with_endpoint && in[1] != PB_BLE_MSG_START_REQ) {
+        return PB_BLE_CODE_MALFORMED;
+    }
+    const size_t fixed_len = with_endpoint ? PB_BLE_START_EP_REQ_FIXED_LEN : PB_BLE_START_REQ_FIXED_LEN;
+    if (inlen < fixed_len || inlen > fixed_len + PB_ENROLL_PSKD_MAX_LEN || in[3] != 0) {
         return PB_BLE_CODE_MALFORMED;
     }
     size_t pskd_len = in[2];
-    if (inlen != PB_BLE_START_REQ_FIXED_LEN + pskd_len) {
+    if (inlen != fixed_len + pskd_len) {
+        return PB_BLE_CODE_MALFORMED;
+    }
+    if (with_endpoint && in[START_EP_RESERVED_OFFSET] != 0) {
         return PB_BLE_CODE_MALFORMED;
     }
     const uint8_t *request_id = &in[REQ_ID_OFFSET];
@@ -323,16 +364,26 @@ static uint8_t start_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uin
     if (a->closed != PB_BLE_OPEN) {
         return PB_BLE_CODE_CLOSED;
     }
+    /* The prepared image's endpoint policy: a start that must not enroll this
+     * board is turned away here -- before the digest, the request-id lookup
+     * and the challenge, so it leaves no trace: no record, nothing queued,
+     * the session's challenge still usable for the start that is allowed. */
+    if (a->endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_INVALID ||
+        (a->endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_REQUIRED && !with_endpoint)) {
+        return PB_BLE_CODE_UNAVAILABLE;
+    }
 
     uint8_t tag[PB_BLE_SHA256_LEN];
-    if (!request_tag(a, in, pskd_len, tag)) {
+    if (!request_tag(a, in, fixed_len, pskd_len, tag)) {
         pb_enroll_wipe(tag, sizeof(tag));
         return PB_BLE_CODE_INTERNAL;
     }
 
     /* A request id this board already knows: either the same request again
      * (answered without starting anything) or a different one reusing the
-     * id (refused). The attempt in progress is not touched either way. */
+     * id (refused). The attempt in progress is not touched either way. The
+     * digest covers the message type and the bridge endpoint, so the same id
+     * with another address or port is a conflict, never a duplicate. */
     if (a->rec_phase != PB_BLE_REC_NONE && ct_equal(request_id, a->rec_request_id, PB_BLE_REQUEST_ID_LEN)) {
         bool same = rec_active(a) && ct_equal(tag, a->rec_tag, sizeof(tag));
         pb_enroll_wipe(tag, sizeof(tag));
@@ -346,6 +397,18 @@ static uint8_t start_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uin
     bool ch_expired = ch_present && time_reached(now_ms, a->ch_issued_ms + PB_BLE_CHALLENGE_TTL_MS);
     drop_challenge(a);
 
+    /* The endpoint as this request states it; used only if every check
+     * below passes. */
+    pb_enroll_bridge_endpoint_t endpoint;
+    memset(&endpoint, 0, sizeof(endpoint));
+    bool endpoint_ok = true;
+    if (with_endpoint) {
+        memcpy(endpoint.addr, &in[START_EP_ADDR_OFFSET], PB_BLE_BRIDGE_ADDR_LEN);
+        endpoint.port = (uint16_t)(((uint16_t)in[START_EP_PORT_OFFSET] << 8) | in[START_EP_PORT_OFFSET + 1]);
+        endpoint_ok = in[START_EP_VERSION_OFFSET] == PB_BLE_BRIDGE_ENDPOINT_VERSION &&
+                      pb_enroll_bridge_endpoint_check(&endpoint) == PB_ENROLL_ENDPOINT_OK;
+    }
+
     uint8_t code;
     if (!ct_equal(&in[REQ_TARGET_OFFSET], a->eui64, PB_BLE_EUI64_LEN)) {
         code = PB_BLE_CODE_WRONG_TARGET;
@@ -353,8 +416,10 @@ static uint8_t start_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uin
         code = PB_BLE_CODE_CHALLENGE_INVALID;
     } else if (ch_expired) {
         code = PB_BLE_CODE_CHALLENGE_EXPIRED;
-    } else if (!pb_enroll_pskd_is_valid((const char *)&in[START_PSKD_OFFSET], pskd_len)) {
+    } else if (!pb_enroll_pskd_is_valid((const char *)&in[fixed_len], pskd_len)) {
         code = PB_BLE_CODE_INVALID_PSKD;
+    } else if (!endpoint_ok) {
+        code = PB_BLE_CODE_INVALID_ENDPOINT;
     } else if (!a->joiner_eui64_ok) {
         code = PB_BLE_CODE_UNAVAILABLE;
     } else if (rec_active(a)) {
@@ -371,30 +436,39 @@ static uint8_t start_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen, uin
         a->rec_cancel_requested = false;
         memcpy(a->rec_request_id, request_id, PB_BLE_REQUEST_ID_LEN);
         memcpy(a->rec_tag, tag, sizeof(tag));
-        memset(a->pskd, 0, sizeof(a->pskd));
-        memcpy(a->pskd, &in[START_PSKD_OFFSET], pskd_len);
+        drop_pskd(a); /* also clears an endpoint left from an earlier attempt */
+        memcpy(a->pskd, &in[fixed_len], pskd_len);
         a->pskd_pending = true;
+        if (with_endpoint) {
+            a->endpoint = endpoint;
+            a->endpoint_pending = true;
+        }
         (void)q_push(a, PB_BLE_CMD_START, a->rec_gen); /* space was checked above */
         code = PB_BLE_CODE_ACCEPTED;
     }
     pb_enroll_wipe(tag, sizeof(tag));
+    pb_enroll_wipe(&endpoint, sizeof(endpoint));
     return code;
 }
 
 size_t pb_ble_adm_handle_start(pb_ble_adm_t *a, uint8_t *in, size_t inlen, uint8_t out[PB_BLE_SHORT_RESP_LEN],
                                uint32_t now_ms)
 {
+    /* The answer's type follows the message that was sent, when that much of
+     * it is this protocol version's; anything else is answered as pb-start. */
+    const bool ep_message =
+        in != NULL && inlen >= 2 && in[0] == PB_BLE_PROTO_VERSION && in[1] == PB_BLE_MSG_START_EP_REQ;
     uint8_t code = start_admit(a, in, inlen, now_ms);
     if (in != NULL) {
         pb_enroll_wipe(in, inlen);
     }
     if (code == PB_BLE_CODE_ACCEPTED) {
-        ESP_LOGI(TAG, "start accepted (generation %u) and queued for the enrollment worker -- not a Joiner result",
-                 (unsigned)a->rec_gen);
+        ESP_LOGI(TAG, "start accepted (generation %u, %s) and queued for the enrollment worker -- not a Joiner result",
+                 (unsigned)a->rec_gen, ep_message ? "with a bridge endpoint" : "no bridge endpoint");
     } else if (code != PB_BLE_CODE_DUPLICATE) {
         ESP_LOGW(TAG, "start refused (code 0x%02x) -- no Joiner started", (unsigned)code);
     }
-    return short_resp(out, PB_BLE_MSG_START_RESP, code);
+    return short_resp(out, ep_message ? PB_BLE_MSG_START_EP_RESP : PB_BLE_MSG_START_RESP, code);
 }
 
 static uint8_t cancel_admit(pb_ble_adm_t *a, const uint8_t *in, size_t inlen)
@@ -526,14 +600,21 @@ pb_ble_close_reason_t pb_ble_adm_worker_poll(pb_ble_adm_t *a, const pb_ble_worke
     for (int pass = 0; pass < PB_BLE_CMD_QUEUE_LEN; pass++) {
         pb_ble_cmd_t cmd = {0};
         char pskd[PB_ENROLL_PSKD_BUF_LEN] = {0};
+        pb_enroll_bridge_endpoint_t endpoint;
+        bool have_endpoint = false;
         bool run_start = false;
         bool run_cancel = false;
+        memset(&endpoint, 0, sizeof(endpoint));
 
         w_lock(w);
         bool have = q_pop(a, &cmd);
         if (have && cmd.gen == a->rec_gen) {
             if (cmd.kind == PB_BLE_CMD_START && a->rec_phase == PB_BLE_REC_QUEUED && a->pskd_pending) {
                 memcpy(pskd, a->pskd, sizeof(pskd));
+                /* The checked copy the BLE callback left; from here on only
+                 * the controller holds it. */
+                have_endpoint = a->endpoint_pending;
+                endpoint = a->endpoint;
                 drop_pskd(a);
                 a->rec_phase = PB_BLE_REC_STARTING;
                 run_start = true;
@@ -549,8 +630,9 @@ pb_ble_close_reason_t pb_ble_adm_worker_poll(pb_ble_adm_t *a, const pb_ble_worke
         }
 
         if (run_start) {
-            esp_err_t err = w->request_join(pskd, w->ctx);
+            esp_err_t err = w->request_join(pskd, have_endpoint ? &endpoint : NULL, w->ctx);
             pb_enroll_wipe(pskd, sizeof(pskd));
+            pb_enroll_wipe(&endpoint, sizeof(endpoint));
             memset(&st, 0, sizeof(st));
             w->get_status(&st, w->ctx);
             w_lock(w);

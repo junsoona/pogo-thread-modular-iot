@@ -197,15 +197,18 @@ Thread를 켠다. 자세한 규칙은 아래 "앱 등록 대기 상태와 Joiner
 |---|---|
 | `power_base_cfg` | POGO 포트, timeout, 전원 제어 |
 | `pb_thread` | Dataset mode(0 STANDALONE, 1 EXTERNAL_OTBR, 2 AWAIT_COMMISSIONING)와 external Active TLV(mode 1만) |
-| `pb_bridge` | Linux host IPv6 주소와 port |
+| `pb_bridge` | Linux host IPv6 주소와 port. BLE 등록에서 목적지를 전달받는 보드의 준비 이미지에는 주소가 없고(`enabled=0`, 주소·port 모두 0) 대신 "등록 시 목적지 필수" 정책이 들어 있다(blob의 5번 바이트 = 1, 아래 "등록 시 목적지 필수 정책") |
 | `pb_ble_auth` | BLE 등록용 보드별 Security 2 salt·verifier(mode 2의 BLE 시험 이미지에만 있음). 설정 코드 자체는 저장하지 않는다 |
 
 기존 `power_base_cfg` blob은 44바이트 schema v1을 유지한다. `pb_thread` namespace가
 없으면 STANDALONE으로 동작해 기존 이미지와 호환된다. `pb_bridge`가 없거나
 `enabled=0`이면 exporter만 비활성화하고 나머지 기능은 정상 부팅한다.
 
-동적 `nvs` 파티션에는 OpenThread 저장값 외에 mode 2의 등록 완료 표식(`pb_enroll/done`,
-36바이트, 비밀값 없음)이 있다.
+동적 `nvs` 파티션에는 OpenThread 저장값 외에 mode 2의 등록 완료 record(`pb_enroll/done`,
+비밀값 없음)가 있다. 버전 1은 완료 표식만 담은 36바이트이고, 버전 2는 등록할 때 전달받은 Linux
+bridge 목적지(IPv6 주소·port)를 같은 blob에 함께 담은 56바이트다. `cfg`는 준비 이미지 영역이라
+펌웨어가 쓰지 않는다(`power_base_bridge_config.c`는 읽기 전용으로만 연다). 자세한 내용은 아래
+"허브 Thread 수신 주소 자동 전달".
 
 bridge가 enabled인데 주소가 unspecified, multicast, link-local이거나 port가 0이면 exporter를
 비활성화하고 명확한 설정 오류를 남긴다. POGO와 Thread 자체는 계속 동작한다.
@@ -309,17 +312,18 @@ EXTERNAL_OTBR(1)의 부팅 동작은 바뀌지 않는다.
 | 단계 | 상태 |
 |---|---|
 | USB 콘솔 시험 경로 | 구현. 여분 보드의 USB-Serial/JTAG 콘솔에 앱 DEBUG 시험이 보여 준 PSKd를 입력한다. `sdkconfig.bench_joiner`로 만든 시험 빌드에만 있다. 여분 보드 1대에서 등록·재부팅 재가입을 실물로 확인했다는 보고가 있다([`validation-status.md`](validation-status.md)). |
-| Bridge 주소 | 준비 이미지(`pb_bridge`)에 운영자가 OTBR의 Mesh-Local 주소와 ingest 포트를 직접 넣는다. Dataset과 분리돼 있고 코드·기본값에 특정 집 주소가 없다. |
+| Bridge 주소 | 두 가지 중 하나다. ① 준비 이미지(`pb_bridge`)에 운영자가 OTBR의 Mesh-Local 주소와 ingest 포트를 직접 넣는다(USB 콘솔 경로와 version 1 BLE start는 이것만 쓴다). ② BLE 등록 때 허브가 만든 목적지를 앱이 보드에 전달한다(아래 "허브 Thread 수신 주소 자동 전달". host·빌드 확인에 더해 2026-10-05에 여분 보드 1대에서 실물 확인, 범위는 아래 "허브 주소 자동 전달" 줄). 어느 쪽이든 코드·기본값에 특정 집 주소가 없다. |
 | 앱 DEBUG 시험 | PogoHome의 DEBUG 전용 "Power Base 등록 시험"이 허브 등록 세션(EUI-64, 일회용 PSKd, 120초 창)을 연다. 성공 판정은 허브가 그 EUI-64의 **새** heartbeat를 받았을 때뿐이다. |
-| BLE 전달 경로(펌웨어·통신 규약) | 구현, **실물 BLE 미검증**. `sdkconfig.ble_enrollment`로 만든 시험 빌드에만 있다. 아래 "BLE 등록 전달 경로". 앱의 BLE 화면은 아직 없다. |
-| QR, 허브 주소 자동 전달 | 미구현. Bridge 주소는 여전히 준비 이미지에 직접 넣으므로 보드 준비에는 터미널이 필요하다. |
+| BLE 전달 경로(펌웨어·통신 규약) | 구현. `sdkconfig.ble_enrollment`로 만든 시험 빌드에만 있다. 아래 "BLE 등록 전달 경로". 앱 쪽은 DEBUG 전용 BLE 등록 시험 화면까지 구현됐고, 제품용(Release) 등록 화면은 미구현이다. 여분 보드 1대에서 실물 확인: 등록 성공·취소·광고 창 만료(2026-10-02, 보드 로그), 주소 자동 전달 빌드의 등록과 앱 화면의 `heartbeat_received`(2026-10-05). 기본 MTU 23, 인증 실패 잠금, 물리 전원 재투입 뒤의 동작은 **실물 미확인**. 근거와 경계는 [`validation-status.md`](validation-status.md) "BLE 등록 실물 후속 검증 (2026-10-02)"과 "실물 후속 검증 (2026-10-05)". |
+| 허브 주소 자동 전달 | 구현. host test와 빌드(2026-10-03, 2026-10-04), Linux 배포 검증(2026-10-05, 사용자 실행)에 더해 2026-10-05에 여분 보드 1대에서 실물 확인: 허브 → 앱 → 보드의 목적지 전달(`0x04` 수락과 capability는 보드 로그와 소스에 따른 간접 근거이고 패킷 캡처는 없다), record v2 저장, RTS 재시작 뒤의 복원과 새 heartbeat, 앱 화면의 `heartbeat_received`. **실물 미확인**: 물리 전원 차단 뒤의 복원, 구형 start(`0x02`) 거부, 기본 MTU 23, 두 Base 동시 등록, 백그라운드 경쟁 조건, 세션의 `bridge_endpoint` 원문과 OTBR 주소의 직접 대조. 근거와 경계는 [`validation-status.md`](validation-status.md) "실물 후속 검증 (2026-10-05)". 최초 전달과 재부팅 복원까지다. 등록 뒤 허브 주소가 바뀌는 경우(OTBR 교체, 네트워크 재구성)의 자동 갱신·재등록은 없다. |
+| QR | 미구현. 보드별 준비 이미지(BLE 자격 증명)와 설정 코드 전달에는 여전히 터미널이 필요하다. |
 | 제품 빌드(`sdkconfig.defaults`) | Joiner, 콘솔 명령, BLE가 모두 없다. mode 2 보드는 안전 대기만 한다. |
 
 **동작 규칙** (`components/power_base_enrollment`, `power_base/main/enrollment_runtime.c`)
 
 1. 부팅: Thread 스택만 초기화하고 끈다. 전원 레일, exporter, POGO downstream,
    DETECT_OUT은 켜지 않는다. `pb_bridge`가 있어도 마찬가지다.
-2. 자동 재가입은 동적 NVS의 완료 표식(`pb_enroll/done`)이 유효하고(크기·magic·버전·CRC-32),
+2. 자동 재가입은 동적 NVS의 완료 표식(`pb_enroll/done`, record 버전 1 또는 2)이 유효하고(크기·magic·버전·CRC-32),
    이 보드의 EUI-64로 기록됐고, OpenThread가 저장한 Active Dataset이 완전하며(Active
    Timestamp, Network Key, Network Name, Extended PAN ID, Mesh-Local Prefix, PAN ID,
    Channel) 표식의 Extended PAN ID·Mesh-Local Prefix와 같을 때만 한다. 그 밖에는 모두
@@ -402,10 +406,12 @@ Joiner, 완료 표식, 서비스 시작 로직은 위 "동작 규칙" 그대로�
 (`pb_enrollment_request_join()`/`pb_enrollment_cancel()`만 호출한다). Wi-Fi provisioning과
 Thread Dataset 전달은 하지 않는다.
 
-**범위와 한계.** 이번 단계는 펌웨어와 규약까지다. 실제 BLE 링크로는 한 번도 실행하지 않았다
-(검증 범위는 [`validation-status.md`](validation-status.md) "Power Base BLE 등록 전달 경로").
-Bridge 주소·포트는 여전히 준비 이미지의 `pb_bridge`에 직접 넣으므로, BLE 등록이 있어도 처음
-준비(이미지 생성·기록)에는 터미널이 필요하다. 허브 주소 자동 전달과 QR 흐름은 후속 범위다.
+**범위와 한계.** 이 절의 규약 v1 start(`0x02`)는 PSKd만 전달한다. 실물 검증 범위는
+[`validation-status.md`](validation-status.md) "Power Base BLE 등록 전달 경로"와 그 후속 기록을
+따른다. Bridge 주소·포트를 BLE로 전달하는 start(`0x04`)는 아래 "허브 Thread 수신 주소 자동
+전달"에 따로 적는다(2026-10-03 추가. 추가 당시에는 실물 미검증이었고 2026-10-05에 여분 보드 1대에서
+실물 시험이 실행됐다. 확인된 범위와 남은 미확인 항목은 그 절의 "검증 상태"에 적었다). 보드별 준비
+이미지(BLE 자격 증명)의 생성·기록에는 여전히 터미널이 필요하고, QR 흐름은 후속 범위다.
 
 **구성 요소**
 
@@ -547,7 +553,10 @@ flash 암호화는 쓰지 않는다.
   read는 Read Blob으로 처리된다(NimBLE이 offset마다 callback에서 전체 값을 받아 잘라 준다).
   Command0/Response0은 어떤 iOS MTU에서도 한 PDU에 들어가지 않으므로 long write/read가 반드시
   필요하다. CoreBluetooth의 `writeValue(.withResponse)`/`readValue`가 자동으로 한다.
-  **이 경로는 실물로 확인하지 않았다.** `pb-*` 메시지는 최대 92바이트(요청)·56바이트(응답)다.
+  이 절을 처음 쓸 때 이 경로는 실물로 확인하지 않은 것이었다. 그 뒤 MTU 256으로 갱신된 연결에서
+  handshake에 이어 인증된 start가 수락됐으므로(2026-10-02, 2026-10-05의 보드 로그) MTU 256에서는
+  실물에서 동작한 것으로 본다. handshake 성립을 직접 알리는 로그 줄은 없어 간접 근거다. **기본 MTU
+  23에서는 실물로 확인하지 않았다.** `pb-*` 메시지는 최대 92바이트(요청)·56바이트(응답)다.
 - 알려진 클라이언트 제약: ESP-IDF는 client public key가 정확히 384바이트가 아니면 거부한다.
   공식 iOS·Python 클라이언트는 앞자리 0바이트를 떼고 보내므로 약 1/256 확률로 handshake가
   거부된다(인증 실패 1회로 계산된다). 새 연결로 다시 시도하면 된다.
@@ -555,7 +564,10 @@ flash 암호화는 쓰지 않는다.
 #### 통신 규약 v1 (`pb_ble_proto.h`)
 
 모든 메시지는 Security 2 세션 안의 평문이다(전송 시 AES-GCM). 다중 바이트 정수는 big-endian.
-`pb-start`만 길이가 `pskd_len`에 따라 달라지고 나머지는 고정 길이다. 길이가 다르면 `MALFORMED`.
+`pb-start`의 두 메시지만 길이가 `pskd_len`에 따라 달라지고 나머지는 고정 길이다. 길이가 다르면
+`MALFORMED`. `pb-start` endpoint는 메시지 두 가지를 받는다: 아래의 `0x02`(PSKd만)와
+"허브 Thread 수신 주소 자동 전달"의 `0x04`(PSKd + bridge 목적지). `0x02`의 바이트 형식과 의미는
+그대로이며 뒤에 덧붙인 필드가 없다.
 
 `pb-status` 요청(20바이트)
 
@@ -606,6 +618,7 @@ request id는 응답에 나오지 않는다(0x01 flag만 보인다).
 `[12..27]` request id.
 
 `pb-start`/`pb-cancel` 응답(4바이트): `[0]`=1, `[1]`=0x82/0x83, `[2]`=code, `[3]`=0.
+`0x04` start의 응답은 `[1]`=0x84다.
 
 | code | 이름 | 뜻 |
 |---|---|---|
@@ -623,8 +636,9 @@ request id는 응답에 나오지 않는다(0x01 flag만 보인다).
 | 0x18 | NOT_WAITING | 보드가 대기 상태가 아니다 |
 | 0x19 | NO_SUCH_ATTEMPT | cancel: 그 request id는 취소할 수 있는 시도가 아니다 |
 | 0x1a | CLOSED | 이번 부팅의 BLE 등록이 닫혔다(등록 완료, 잠금, 광고 창 종료) |
-| 0x1b | UNAVAILABLE | 이 보드는 Joiner를 실행할 수 없다 |
+| 0x1b | UNAVAILABLE | 이 보드는 이 요청으로 Joiner를 실행할 수 없다. ① Joiner 자체가 불가(EUI-64 불일치, `pb-status` flag 0x08), ② 준비 이미지가 "등록 시 목적지 필수"인데 목적지 없는 `0x02` start를 받음(flag 0x08은 서지 않는다. `0x04`는 된다), ③ 준비 이미지의 정책을 믿을 수 없음(어떤 start도 받지 않음). 아무것도 시작·저장·삭제하지 않고 challenge도 소모하지 않는다 |
 | 0x1c | INTERNAL | 난수·해시 실패 |
+| 0x1d | INVALID_ENDPOINT | `0x04` start 전용: 목적지 형식 버전이 1이 아니거나, port 0, 또는 주소가 Thread Mesh-Local EID가 아니다 |
 
 `pb_enroll_result_t` 값: 0 none, 1 marker_corrupt, 2 marker_foreign, 3 marker_read_error,
 4 dataset_missing, 5 dataset_mismatch, 6 marker_clear_failed, 7 joiner_start_failed,
@@ -634,14 +648,20 @@ request id는 응답에 나오지 않는다(0x01 flag만 보인다).
 
 **start 처리 순서** (어느 단계에서 거부돼도 Joiner는 시작되지 않는다)
 
-1. 형식 검사 → `UNSUPPORTED_VERSION`/`MALFORMED`. challenge는 소모하지 않는다.
-2. 이미 아는 request id: 진행 중인 시도와 내용(대상·challenge·PSKd의 SHA-256)이 같으면
-   `DUPLICATE`, 다르거나 이미 끝난 시도면 `REQUEST_CONFLICT`. 진행 중인 시도는 그대로다.
+1. 형식 검사 → `UNSUPPORTED_VERSION`/`MALFORMED`. challenge는 소모하지 않는다. 이어서 BLE 등록이
+   닫혔으면 `CLOSED`, 준비 이미지의 정책이 이 메시지를 허용하지 않으면 `UNAVAILABLE`
+   ("등록 시 목적지 필수 정책"). 이 둘도 challenge를 소모하지 않고 시도 record를 만들지 않는다.
+2. 이미 아는 request id: 진행 중인 시도와 내용(메시지 type·대상·challenge·PSKd, `0x04`면
+   목적지 형식 버전·port·주소까지의 SHA-256)이 같으면 `DUPLICATE`, 다르거나 이미 끝난 시도면
+   `REQUEST_CONFLICT`. 진행 중인 시도는 그대로다. 같은 request id에 다른 주소·다른 port·다른
+   메시지 type을 보내면 `DUPLICATE`가 아니라 `REQUEST_CONFLICT`다.
 3. 새 요청이면 이 시점에 세션의 challenge를 소모한다(결과와 무관하게 1회용).
-4. 대상 EUI-64 → challenge 일치 → 만료 → PSKd 형식 → Joiner 가능 여부 → 진행 중인 시도
-   (`BUSY`) → 대기 상태(`NOT_WAITING`) → queue 여유(`BUSY`) 순으로 검사한다.
-5. 통과하면 시도 record를 만들고 PSKd를 한 slot에 넣은 뒤 `START(generation)`를 queue에 넣고
-   `ACCEPTED`를 준다. 복호화된 요청 버퍼는 모든 경로에서 지운다.
+4. 대상 EUI-64 → challenge 일치 → 만료 → PSKd 형식 → (`0x04`만) 목적지 형식 버전·주소·port
+   (`INVALID_ENDPOINT`) → Joiner 가능 여부 → 진행 중인 시도(`BUSY`) → 대기 상태(`NOT_WAITING`) →
+   queue 여유(`BUSY`) 순으로 검사한다.
+5. 통과하면 시도 record를 만들고 PSKd를(`0x04`면 검증한 목적지 사본도) 한 slot에 넣은 뒤
+   `START(generation)`를 queue에 넣고 `ACCEPTED`를 준다. 복호화된 요청 버퍼는 모든 경로에서 지운다.
+   BLE callback은 여기까지만 한다: NVS에 쓰지 않고 OpenThread를 호출하지 않는다.
 
 challenge는 발급한 Security 2 세션에 묶인다. 연결·해제와 모든 handshake 메시지가 epoch를
 올리고 challenge를 지우므로 이전 연결이나 재handshake 이전의 challenge는 쓸 수 없다.
@@ -694,6 +714,199 @@ queue의 각 명령에는 시도 generation이 붙어 있어서, 취소·종료�
 - BLE로는 factory reset, Dataset·Network Key 읽기, 콘솔 실행을 제공하지 않는다. endpoint는
   위 다섯 개뿐이다.
 
+#### 허브 Thread 수신 주소 자동 전달 (bridge endpoint, 2026-10-03 추가)
+
+보드의 exporter가 보내는 목적지(Linux bridge의 IPv6 주소와 CoAP ingest port)를 준비 이미지에
+넣지 않고, 등록할 때 허브 → 앱 → 보드로 전달하는 경로다.
+
+**검증 상태.** 2026-10-03에 이 절을 추가할 때는 host test와 빌드로만 확인했고 실물 보드·BLE·허브로는
+실행하지 않았다. 그 뒤의 결과는 다음과 같다([`validation-status.md`](validation-status.md) "허브 Thread
+수신 주소 자동 전달"의 "후속 기록"과 "실물 후속 검증 (2026-10-05)").
+
+- Linux 허브(2026-10-05, 사용자 실행): 새 bridge와 helper의 빌드·설치·상태 보존, 실제 OTBR에 대한
+  `mesh-local-eid` 조회를 검증했다.
+- 여분 보드 1대(2026-10-05, 사용자 실행): 허브 → 앱 → 보드의 목적지 전달, version 2 record 저장, 전달받은
+  목적지로 exporter 시작, RTS 재시작 뒤의 복원과 허브의 새 heartbeat 수신, 앱 화면의
+  `heartbeat_received`를 실물로 확인했다. `0x04` 수락과 `proto-ver` capability는 보드 로그와 소스에 따른
+  간접 근거이고 BLE 패킷 캡처는 없다. 그 시험의 첫 허브 세션은 `cancelled`로 끝났고 성공으로 세지
+  않는다.
+- 실물 미확인: 물리 전원 차단 뒤의 복원(확인한 것은 RTS 재시작이다), 목적지 없는 구형 start(`0x02`)의
+  거부, 기본 MTU 23, 두 Base 동시 등록, 앱의 백그라운드 경쟁 조건, 세션 응답의 `bridge_endpoint` 원문과
+  OTBR 주소의 직접 대조.
+- 미구현: 등록 뒤 허브 주소가 바뀌는 경우의 자동 갱신·재등록, 제품용(Release) 등록 화면, QR 흐름.
+
+**흐름**
+
+1. 앱이 BLE로 보드를 인증하고 `proto-ver`의 capability를 확인한다.
+2. 앱이 선택·페어링한 허브에 등록 세션을 만들면서 목적지를 요청한다
+   (`"bridge_endpoint_version": 1`, [`pogohome-api-v1.md`](pogohome-api-v1.md)).
+3. 허브가 자기 OTBR의 Mesh-Local EID(`ot-ctl ipaddr mleid`)와 실제 ingest port(`--port`)를 그
+   세션의 목적지로 한 번 확정한다. 확정하기 전에는 Joiner를 열지 않는다.
+4. 세션이 목적지와 함께 `waiting_for_heartbeat`가 되면 앱이 challenge를 받고 `0x04` start로
+   PSKd와 목적지를 보드에 전달한다.
+5. 보드는 목적지를 RAM에만 들고 Joiner → attach를 진행하고, 가입한 네트워크의 Mesh-Local
+   Prefix가 목적지의 앞 64비트와 같을 때만 완료 표식과 **한 blob으로** 저장한다.
+6. exporter가 그 목적지로 시작한다. 재부팅하면 record에서 복원한다.
+7. 최종 성공은 그대로 허브의 `heartbeat_received`뿐이다.
+
+목적지는 클라이언트가 고르는 값이 아니다. 앱은 주소를 입력받지 않고, 허브의 Wi-Fi 주소·HTTP API
+URL·Bonjour 주소·IPv4 주소에서 만들지 않으며, 허브 세션 응답의 값을 엄격하게 해석해 그대로 전달한다.
+
+**capability.** `proto-ver`의 `pb_enroll`에 목록이 생겼다. `proto`는 1 그대로다.
+
+```json
+{"prov":{"ver":"v1.1","sec_ver":2,"sec_patch_ver":1,"cap":[]},"pb_enroll":{"proto":1,"cap":["bridge_endpoint_v1"]}}
+```
+
+`bridge_endpoint_v1`은 "이 보드는 `pb-start`의 `0x04` 메시지(목적지 형식 버전 1)를 받는다"는
+뜻이다. `proto-ver`는 인증 전에 읽히므로 어떤 메시지를 보낼지 고르는 근거일 뿐 신뢰의 근거가 아니다.
+Security 2·patch 1 검사는 그대로다.
+
+**`pb-start` 요청, 목적지 포함(type `0x04`, 64 + `pskd_len` = 70~96바이트)**
+
+| offset | 길이 | 내용 |
+|---|---|---|
+| 0 | 1 | version = 1 |
+| 1 | 1 | type = 0x04 |
+| 2 | 1 | `pskd_len` (6~32) |
+| 3 | 1 | 0 (예약) |
+| 4 | 8 | 대상 EUI-64 |
+| 12 | 16 | request id. 모두 0이면 안 됨 |
+| 28 | 16 | 이 세션의 마지막 `pb-status`가 발급한 challenge |
+| 44 | 1 | 목적지 형식 버전 = 1 |
+| 45 | 1 | 0 (예약) |
+| 46 | 2 | port, **big-endian**, 1~65535 |
+| 48 | 16 | IPv6 주소, network byte order |
+| 64 | `pskd_len` | PSKd(ASCII) |
+
+응답은 4바이트 `[0]`=1, `[1]`=**0x84**, `[2]`=code, `[3]`=0. code는 `0x02` start와 같고
+`INVALID_ENDPOINT`(0x1d)가 더 있다. 길이, `[3]`·`[45]` 예약 바이트, type, request id 0은
+`MALFORMED`(challenge를 소모하지 않음). 목적지 형식 버전 ≠ 1, port 0, 주소 규칙 위반은
+`INVALID_ENDPOINT`(새 요청이므로 challenge는 소모).
+
+주소 규칙(보드 `pb_enroll_bridge_endpoint_check()`, 허브 `ParseMeshLocalEid()`, 앱
+`PowerBaseBLEBridgeEndpoint`가 같은 규칙을 각자 검사한다):
+
+- fd00::/8 안의 주소여야 한다(Thread Mesh-Local Prefix가 있는 범위). 따라서 unspecified(`::`),
+  loopback(`::1`), IPv4-mapped(`::ffff:a.b.c.d`), IPv4-compatible, multicast(ff00::/8),
+  link-local(fe80::/10), global 주소는 거부한다.
+- interface id가 `0000:00ff:fe00:xxxx`이면 거부한다. Thread의 RLOC·ALOC 형식이고 topology에 따라
+  바뀐다. 목적지는 EID여야 한다.
+- 텍스트(허브 응답, helper 응답)는 `0-9 a-f :`로만 된 IPv6 literal만 받는다. zone id(`%`), 대괄호,
+  port, 점 표기 IPv4 꼬리, 대문자, 공백, URL, hostname은 거부한다.
+
+golden vector(C와 Swift가 같은 바이트를 만들고 해석하는지 양쪽 test에 같은 값이 있다:
+`tools/test_power_base_ble_admission.c`, 앱 `PowerBaseBLEKit`의 `CodecTests.swift`):
+
+```
+대상 6055f9fffe001234, request id a0..af, challenge c0..cf,
+목적지 버전 1, port 5684(0x1634), 주소 fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79, PSKd "J01NME7K"
+요청 01040800 6055f9fffe001234 a0a1a2a3a4a5a6a7a8a9aaabacadaeaf c0c1c2c3c4c5c6c7c8c9cacbcccdcecf
+     0100 1634 fd112233445500008c1f2e3d4c5b6a79 4a30314e4d45374b
+응답 01840100 (ACCEPTED), 01841d00 (INVALID_ENDPOINT)
+```
+
+**구형과의 호환**
+
+| 조합 | 동작 |
+|---|---|
+| 구형 클라이언트(`0x02`만 앎) + 새 보드, 정책 없는 이미지(정적 주소 이미지, 이전 도구로 만든 이미지) | 그대로 동작한다. `proto-ver`의 `cap`은 모르는 key라 무시된다. 보드는 목적지 없이 등록하고(record 버전 1) exporter는 준비 이미지의 `pb_bridge`를 쓴다 |
+| 구형 클라이언트(`0x02`만 앎) + 새 보드, `--bridge-from-enrollment` 이미지("목적지 필수" 정책) | 보드가 `0x02` start를 `UNAVAILABLE`(0x1b)로 거부한다. Joiner를 시작하지 않고 등록 record·Dataset을 건드리지 않는다. 보드는 대기 상태 그대로이고 BLE 등록도 열려 있어, 새 앱이 `0x04`로 등록할 수 있다. (2026-10-04 이전에는 이 조합에서 보드가 목적지 없이 등록돼 exporter 없이 BLE가 닫혔다) |
+| 정책이 **없는** 주소 없는 이미지(2026-10-04 이전 도구의 `--bridge-from-enrollment`, 또는 `pb_bridge`를 일부러 끈 이미지) + `0x02` | 정책이 없으므로 이전처럼 목적지 없이 등록된다(exporter off). 자동 전달용 이미지는 새 도구로 다시 만들어야 방어된다 |
+| 새 앱 + 구형 보드(`cap` 없음) | 앱은 허브 세션을 만들기 전에 "보드 펌웨어 업데이트 필요"로 끝낸다. `0x04`도 `0x02`도 보내지 않는다. (보냈더라도 구형 보드는 모르는 type이므로 `0x82`/`MALFORMED`로 답하고 아무것도 시작하지 않는다) |
+| 새 앱 + 구형 허브 | 허브가 옵션을 모르면 `400 invalid_request`로 거부하고 세션을 만들지 않는다. 앱은 "허브 업데이트 필요"로 끝내며 옵션 없이 다시 요청하지 않고 주소를 추정하지 않는다 |
+| 새 허브 + 구형 root helper | 세션이 `failed`/`bridge_endpoint_unsupported`로 끝난다. Joiner는 추가되지 않는다 |
+| USB 콘솔 시험(`pb_join`) | 바뀌지 않았다. 목적지를 전달하지 않는다 |
+
+**보드의 저장 (record 버전 2)**
+
+`pb_enroll/done` key 하나에 두 버전이 있고, 크기와 버전 바이트가 서로 맞아야 한다.
+
+| offset | 버전 1 (36바이트) | 버전 2 (56바이트) |
+|---|---|---|
+| 0 | magic `PBE1` | magic `PBE1` |
+| 4 | version 1 | version 2 |
+| 5 | 0 | flags = 0x01(목적지 있음). 다른 값은 corrupt |
+| 6..7 | 0 | 0 |
+| 8 | EUI-64 | EUI-64 |
+| 16 | Extended PAN ID | Extended PAN ID |
+| 24 | Mesh-Local Prefix | Mesh-Local Prefix |
+| 32 | CRC-32(LE, `[0..31]`) | bridge IPv6 주소 16바이트 |
+| 48 | | port, big-endian |
+| 50 | | 0(2바이트) |
+| 52 | | CRC-32(LE, `[0..51]`) |
+
+- 이번 시도의 목적지는 가입 완료 전에는 controller의 RAM(`pending_endpoint`)에만 있다. 취소,
+  Joiner 실패, guard·attach 시간 초과, Thread 시작 실패는 모두 그것을 버린다. 새 시도는 이전
+  시도의 목적지를 물려받지 않는다.
+- attach했고 Dataset이 완전해졌을 때, 목적지의 앞 64비트가 **실제 가입한** 네트워크의 Mesh-Local
+  Prefix와 다르면 등록하지 않는다(`dataset_mismatch`, Thread 정지, record 없음).
+- 표식과 목적지는 한 blob·한 CRC·한 commit이다. 서로 다른 시도의 값이 섞일 수 없고, 쓰는 도중
+  전원이 끊기면 다음 부팅은 그 record를 corrupt로 보고 안전 대기한다. 목적지가 있는 record는 쓴
+  뒤 다시 읽어 같은지 확인하고, 저장·확인이 실패하면 등록으로 처리하지 않는다
+  (`marker_write_failed`, 서비스 미시작).
+- 부팅 시 record를 길이 → magic·버전·flags·예약 바이트·CRC → EUI-64 → (버전 2) 주소 규칙·port·
+  "주소가 record의 Mesh-Local Prefix 안" 순으로 검사하고, 그다음 저장된 Dataset과 네트워크를
+  대조한다. 하나라도 어긋나면 안전 대기다.
+- 복원한 목적지는 `on_enrollment_ready()`가 attach supervisor를 시작하기 **전에**
+  `power_base_bridge_config_apply_delivered()`로 `s_bridge_cfg`에 넣는다. `start_services_once()`는
+  기존처럼 한 번만 실행되고 그 값으로 `linux_bridge_exporter_init()`을 부른다.
+- 전달받은 목적지가 있으면 준비 이미지의 `pb_bridge`보다 우선한다(이미지에 정적 주소가 있어도).
+
+**등록 시 목적지 필수 정책 (2026-10-04 추가)**
+
+주소 없는 준비 이미지의 보드가 목적지를 받지 못한 채 등록 완료되는 것을 막는 명시적 정책이다.
+`pb_bridge.enabled=0`만으로는 판단하지 않는다(exporter를 일부러 끈 이미지와 구분할 수 없다).
+
+- **저장 형식.** `cfg`의 `pb_bridge` blob(24바이트, schema 1) **5번 바이트**. 이전에는 "예약, 0"이었다.
+  blob의 CRC16(`crc` key)이 `enabled`·주소·port와 함께 이 바이트도 덮는다. 새 key나 schema 변경은 없다.
+
+  | 값 | 뜻 |
+  |---|---|
+  | 0 | 정책 없음. 이전에 만든 모든 이미지와 정적 주소 이미지. 등록 동작은 이전 그대로다 |
+  | 1 | 등록 시 목적지 필수. `enabled=0`일 때만 유효하다. `gen_power_base_ble_config.py --bridge-from-enrollment`가 기록한다 |
+  | 그 밖의 값, 또는 1인데 `enabled=1` | 사용할 수 없는 정책 |
+
+- **구형 설정 호환 기준.** `pb_bridge` namespace가 없거나, blob이 온전하고 5번 바이트가 0이면 "정책 없음"이다.
+  blob·`crc`가 없거나 크기·schema·CRC가 맞지 않으면 정책을 읽을 수 없으므로 "사용할 수 없는 정책"이다.
+  `power_base_bridge_config_load()`는 이 바이트를 보지 않으므로 mode 0·1과 exporter 설정 해석은 바뀌지
+  않았다. 정책은 mode 2 경로(`app_main.c`의 AWAIT_COMMISSIONING 분기)에서만 읽는다.
+- **거부하는 시점** (정책 = 필수, 요청에 목적지가 없을 때)
+
+  | 진입점 | 시점 | 결과 |
+  |---|---|---|
+  | BLE `0x02` start (`pb_ble_admission.c`) | 형식 검사와 `CLOSED` 검사 직후. digest 계산, request id 조회, challenge 확인보다 먼저 | `UNAVAILABLE`(0x1b), 응답 type 0x82. queue에 넣지 않고 시도 record를 만들지 않는다. challenge는 그대로 유효하다. 재전송해도 같은 답이다(`DUPLICATE`·`REQUEST_CONFLICT`가 아니다). 뒤이은 `0x04`는 같은 challenge, 같은 request id로도 받는다 |
+  | controller (`pb_enroll_ctl_request_join()`): BLE worker, bench 콘솔, 직접 호출 | 상태 검사 직후. PSKd 형식 검사, 기존 record 삭제, attempt 증가, Joiner 시작보다 먼저 | `ESP_ERR_NOT_ALLOWED`. 상태·마지막 결과·record·Dataset 불변, PSKd 버퍼만 지운다. BLE worker를 거쳤다면 그 요청은 `failed`/0x80(start 거부됨)으로 보고된다 |
+  | bench 콘솔 `pb_join start` | 위 controller 검사 | "refused" 안내. 아무것도 시작하지 않는다 |
+  | 등록 완료 직전(`pb_enroll_ctl_tick()`) | 도달할 수 없는 경로의 마지막 방어 | 목적지 없이 attach했으면 버전 1 record를 쓰지 않고 대기로 돌아간다 |
+
+  `UNAVAILABLE`은 기존 코드다. 구형 클라이언트는 이것을 "보드가 Joiner를 실행할 수 없음"으로 표시하고
+  시도를 끝낸다. `pb-status`의 0x08 flag는 세우지 않는다(세우면 `0x04`를 보낼 새 앱도 막힌다).
+- **사용할 수 없는 정책**이면 새 등록을 모두 막는다: BLE를 열지 않고(`enrollment_ble.c`), admission은
+  `0x02`·`0x04` 모두 `UNAVAILABLE`, controller는 목적지 유무와 관계없이 `ESP_ERR_NOT_ALLOWED`.
+- **부팅.**
+
+  | 정책 | record | 동작 |
+  |---|---|---|
+  | 필수 | 유효한 버전 1(목적지 없음) | 재개하지 않는다. Thread를 켜지 않고 서비스(exporter 포함)를 시작하지 않는 안전 대기. 결과는 기존 값 `marker_corrupt`(1)로 보고한다(이 보드 설정이 받아들이지 않는 record 버전). **부팅은 record와 Dataset을 지우지 않는다.** 이후 목적지가 있는 정상 요청이 들어오면 기존 절차대로 record를 먼저 지우고 진행한다 |
+  | 필수 | 유효한 버전 2 + 일치하는 Dataset | 이전처럼 재개하고 목적지를 복원해 exporter 시작 전에 적용한다 |
+  | 필수 | 손상·다른 보드·다른 네트워크 | 이전처럼 안전 대기. 정적 주소로 대체하지 않는다 |
+  | 없음 | 버전 1 / 버전 2 | 이전 그대로 재개 |
+  | 사용할 수 없음 | 버전 1 / 버전 2 | 이전 그대로 재개(이미 등록된 보드를 `cfg` 손상 때문에 내리지 않는다). 새 등록만 막힌다 |
+
+**실패 정책의 구분**
+
+| 경우 | 동작 |
+|---|---|
+| mode 0·1, 그리고 record 버전 1로 등록한 mode 2(정적 `pb_bridge`, bench) | 이전과 같다. `pb_bridge`가 없거나 `enabled=0`이거나 손상이면 exporter만 꺼지고 나머지는 정상 부팅한다. record를 읽지 않는 mode 0·1에는 이번 변경이 영향을 주지 않는다 |
+| record 버전 2가 손상·다른 보드용·다른 네트워크용·주소 규칙 위반 | 등록되지 않은 것으로 본다: Thread를 켜지 않고 서비스(exporter 포함)를 시작하지 않는 안전 대기. **준비 이미지의 정적 주소로 exporter를 켜지 않는다.** 보드가 멈추는 것은 아니다. BLE 시험 빌드는 BLE 등록을 다시 열고, 새 시도는 기존 record를 먼저 지운 뒤 진행한다 |
+| 전달받은 목적지를 `s_bridge_cfg`에 적용하지 못함(검사는 record 단계에서 끝나므로 정상 경로에서는 일어나지 않는다) | exporter만 끈다. 이미지의 주소로 되돌리지 않는다. 나머지 서비스는 그대로 시작한다 |
+
+**이번 범위가 아닌 것.** 등록 뒤 허브의 Mesh-Local EID나 port가 바뀌는 경우(OTBR 교체, 네트워크
+재구성, `--port` 변경)를 보드가 스스로 따라가지 않는다. 최초 전달과 재부팅 복원만 있다. 그런 경우
+지금은 동적 NVS를 지우고 다시 등록해야 한다. record 버전 2가 있는 보드에 이전 펌웨어를 쓰면 그
+펌웨어는 56바이트 record를 corrupt로 보고 안전 대기한다.
+
 #### 준비 이미지 (BLE)
 
 보드 1대마다 한 번 실행한다. 설정 코드는 인자·환경변수로 받지 않고 화면에도 출력하지 않는다.
@@ -706,13 +919,27 @@ CODES="$HOME/pogo-setup-codes"
 IMG="build/cfg_images/power_base_ble_${EUI}_config.bin"
 mkdir -p "$CODES" && chmod 700 "$CODES" && \
 python tools/gen_power_base_ble_config.py \
-  --eui64 "$EUI" --bridge-host "$OTBR_MLEID" --bridge-port 5684 \
+  --eui64 "$EUI" --bridge-from-enrollment \
   --setup-code-file "$CODES/$EUI.setup-code" && \
 test -s "$IMG" && echo "준비 이미지 확인: $IMG"      # 0600, 12288바이트
 ```
 
+Bridge 주소를 어디서 받을지는 반드시 하나를 고른다. 기본값은 없다.
+
+- `--bridge-from-enrollment`: 이미지에 주소를 넣지 않고(`pb_bridge` `enabled=0`, 주소·port 모두
+  0) "등록 시 목적지 필수" 정책(5번 바이트 = 1)을 함께 기록한다. 이 정책이 있는 보드는 목적지 없는
+  등록(`0x02` start, bench 콘솔)을 거부한다. 2026-10-04 이전 도구로 만든 주소 없는 이미지에는 정책이
+  없으므로 `--existing-setup-code-file`로 다시 만든다. 보드는 BLE 등록 때 목적지를 받는다. 이 이미지는 집마다 다르지 않고, 보드마다 다른 것은 BLE
+  자격 증명뿐이다. `bridge_endpoint_v1` capability가 있는 펌웨어와 그 경로를 쓰는 앱이 필요하다.
+- `--bridge-host <주소> --bridge-port <port>`: 이전처럼 이미지에 주소를 넣는다. 정책은 기록하지
+  않으며(5번 바이트 0) 등록 방식은 이전과 같다.
+- 둘 다 없거나, 둘을 섞거나, host·port 중 하나만 주면 아무것도 쓰지 않고 거부한다.
+  `--bridge-from-enrollment`가 임의 주소를 만들지 않고, 잘못 입력한 주소(형식 오류, 빈 문자열,
+  hostname, URL)를 "주소 없음"으로 바꿔 처리하지 않는다.
+
 - 이미지에는 `power_base_cfg`, `pb_thread:mode=2`(Dataset 없음), `pb_bridge`, `pb_ble_auth`가
-  들어간다. salt/verifier는 ESP-IDF 공식 SRP-6a 코드
+  들어간다. 전기적 설정, mode 2, 보드별 BLE 자격 증명은 두 방식에서 같다(주소 없는 이미지는
+  `pb_bridge`만 다르다). salt/verifier는 ESP-IDF 공식 SRP-6a 코드
   (`examples/protocols/esp_local_ctrl/scripts/security/srp6a.py`)로 계산하고, 도구가 식으로 한 번
   더 대조한 뒤 ESP-IDF `nvs_parser`로 완성 이미지를 다시 읽어 네 namespace와 크기를 검사한다.
   검사를 통과한 이미지만 최종 이름을 얻는다.
@@ -725,22 +952,33 @@ test -s "$IMG" && echo "준비 이미지 확인: $IMG"      # 0600, 12288바이�
 
 #### 앱이 지켜야 할 순서 (후속 앱 구현용)
 
-허브 인증 토큰, 허브 주소, Dataset은 보드에 보내지 않는다. 보드가 받는 것은 PSKd뿐이다.
+허브 인증 토큰, 허브의 Wi-Fi·API 주소, Dataset은 보드에 보내지 않는다. 보드가 받는 것은 PSKd와,
+자동 전달 경로에서는 허브 세션이 알려 준 Thread 목적지(Mesh-Local EID와 ingest port)뿐이다.
+앱의 DEBUG BLE 등록 시험은 2026-10-03부터 자동 전달 경로(`0x04`)만 쓴다. `0x02`로 몰래 바꿔
+보내지 않는다.
 
 1. **BLE 인증과 보드 확인.** 이름 prefix `POGO-PB-`로 찾아 연결 → `proto-ver` 확인
    (`sec_ver=2`, `sec_patch_ver=1`) → username = 예상 EUI-64(소문자 16진수), password = 설정
    코드로 Security 2 handshake → `pb-status`의 EUI-64가 예상 값과 같은지 확인. 다르면 중단한다.
-   상태가 `waiting`이 아니거나 0x08 flag가 있으면 진행하지 않는다.
+   상태가 `waiting`이 아니거나 0x08 flag가 있으면 진행하지 않는다. `proto-ver`의
+   `pb_enroll.cap`에 `bridge_endpoint_v1`이 없으면 보드 펌웨어 업데이트가 필요하다고 표시하고
+   **허브 세션을 만들지 않는다.**
    ESPProvision을 쓰면 `ESPProvisionManager.shared.createESPDevice(deviceName:,
    transport: .ble, security: .secure2, proofOfPossession: 코드, username: EUI-64, …)`로 얻은
    `ESPDevice`에 `connect()` → `sendData(path: "pb-status", data:)`. (API 이름은 위 commit 기준이며
    앱에서 직접 실행해 확인한 것은 아니다.)
 2. **허브 세션.** 현재 선택·페어링된 허브에 `POST /api/v1/power-base-enrollments`
-   (`eui64`, 새 난수 PSKd). `409 power_base_already_connected` 등 오류면 보드에 아무것도 보내지
-   않는다.
-3. **허브가 받아들인 뒤 전달.** 세션이 `waiting_for_heartbeat`(`joiner_entry: allowed`)가 된 것을
-   확인하고, 그때 `pb-status`(challenge 발급) → 60초 안에 `pb-start`(대상 EUI-64, 새 request id,
-   challenge, 그 PSKd). challenge를 허브 세션보다 먼저 받아 두지 않는다.
+   (`eui64`, 새 난수 PSKd, `bridge_endpoint_version: 1`). `409 power_base_already_connected` 등
+   오류면 보드에 아무것도 보내지 않는다. 허브가 옵션을 거부하면(`400 invalid_request`,
+   `422 unsupported_bridge_endpoint_version`) 허브 업데이트가 필요하다고 표시하고 끝낸다. 옵션
+   없이 다시 요청하거나 주소를 추정하지 않는다.
+3. **허브가 받아들인 뒤 전달.** 세션이 `waiting_for_heartbeat`(`joiner_entry: allowed`)이고
+   `bridge_endpoint`가 있는 것을 확인한다. 응답의 목적지는 엄격하게 해석하고(형식 버전 1, 위 주소
+   규칙, port 1~65535) 그 허브·세션·EUI-64와 묶어 보관한다. 그때 `pb-status`(challenge 발급) →
+   60초 안에 `pb-start` `0x04`(대상 EUI-64, 새 request id, challenge, 그 PSKd, 그 목적지).
+   challenge를 허브 세션보다 먼저 받아 두지 않는다. `waiting_for_heartbeat`인데 목적지가 없거나,
+   같은 세션의 이후 응답에서 목적지가 달라지면 새 start를 보내지 않고 세션·요청을 정리한다.
+   답을 못 받은 start를 다시 보낼 때도 같은 request id·같은 PSKd·같은 목적지다.
 4. **진행 표시.** `ACCEPTED`는 "보드가 요청을 받았다"는 뜻이다. 이후 `pb-status`(request id
    포함)의 queued → running(joining → attaching)을 진행 상태로만 보여 준다. phase가 failed면
    결과 코드를 보여 주고 새 허브 세션·새 request id로 다시 시작한다. 연결이 끊겨도 보드는
@@ -760,8 +998,9 @@ Linux Bridge 한 인스턴스가 모든 Base의 CoAP 메시지를 같은 포트(
   `power_base_otbr_bridge_config.bin`을 두 번째 Base에도 그대로 쓸 수 있다.
 - 모듈의 소속 Base는 POGO 유선 `SET_COLLECTOR`로 정해진다. 모듈은 그 Base의 Mesh-Local EID로만
   보고하므로, 같은 종류의 센서가 두 Base에 있어도 섞이지 않는다.
-- 이 절차는 운영용 경로다. 앱 등록은 위의 mode 2 시험 경로(USB 콘솔 PSKd 입력, 또는 실물
-  미검증인 BLE 시험 빌드; 모두 여분 보드용)만 있고, 앱의 BLE 화면과 QR 전달은 아직 없다. Linux API의 센서 데이터 경로는 읽기 전용이며, 등록 세션
+- 이 절차는 운영용 경로다. 앱 등록은 위의 mode 2 시험 경로(USB 콘솔 PSKd 입력, 또는 BLE 시험 빌드와
+  앱의 DEBUG BLE 등록 시험; 모두 여분 보드용이고 실물 결과도 여분 보드 1대의 것뿐이다)만 있고,
+  제품용(Release) 등록 화면과 QR 전달은 아직 없다. Linux API의 센서 데이터 경로는 읽기 전용이며, 등록 세션
   경로는 TLS·페어링된 기기 전용이다(`pogohome-api-v1.md`).
 
 절차:

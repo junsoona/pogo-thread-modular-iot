@@ -16,6 +16,12 @@ NVS parser to check the BLE-enrollment prepare rules:
     is explicit and needs a 0600 file;
   - bad EUI-64 / bridge values and a code file inside the repository are
     refused with nothing written;
+  - --bridge-from-enrollment makes an image with NO bridge address (pb_bridge
+    enabled=0, address and port all zero) AND the explicit policy "endpoint
+    required at enrollment" (policy byte 1), otherwise the same image; an
+    image with --bridge-host/--bridge-port carries no policy (byte 0);
+    the bridge source must be stated, the two ways cannot be mixed, and a
+    mistyped address is an error, never "no address";
   - the pack tool's new flag does not change images made without it, and is
     refused outside mode 2.
 
@@ -248,6 +254,87 @@ def main():
         refused("IPv4 bridge address", *eui, "--bridge-host", "192.0.2.1", "--bridge-port", str(PORT))
         refused("bridge port 0", *eui, "--bridge-host", BRIDGE, "--bridge-port", "0")
         refused("bridge port 70000", *eui, "--bridge-host", BRIDGE, "--bridge-port", "70000")
+        print("\n-- address-less image: the bridge endpoint comes with the enrollment --")
+        code_n = os.path.join(tmp, "noaddr.setup-code")
+        out_n = os.path.join(tmp, "noaddr")
+        r = run_gen("--eui64", EUI, "--bridge-from-enrollment", "--setup-code-file", code_n, "--out-dir", out_n)
+        image_n = os.path.join(out_n, f"power_base_ble_{EUI_NORM}_config.bin")
+        check(r.returncode == 0 and os.path.isfile(image_n) and os.path.getsize(image_n) == pack.CFG_PARTITION_SIZE and
+              mode_of(image_n) == 0o600 and mode_of(code_n) == 0o600,
+              "--bridge-from-enrollment: image written, cfg partition size, image and code file mode 0600")
+        ns_n = read_namespaces(image_n)
+        check(set(ns_n) == {"power_base_cfg", "pb_thread", "pb_bridge", "pb_ble_auth"},
+              "it holds the same four namespaces")
+        blob_n = ns_n["pb_bridge"].get("blob")
+        check(blob_n == (1).to_bytes(4, "big") + bytes([0, 1]) + bytes(18),
+              "pb_bridge: schema 1, enabled=0, policy byte 1 (endpoint required), 16 address bytes and the port all zero")
+        check(blob_n[pack.PB_BRIDGE_ENROLL_POLICY_OFFSET] == pack.PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED == 1 and
+              pack.PB_BRIDGE_ENROLL_POLICY_OFFSET == 5,
+              "the policy is the explicit byte the firmware reads (offset 5, value 1), not inferred from enabled=0")
+        check(ns_n["pb_bridge"].get("crc") == pack.crc16_ccitt(blob_n),
+              "the pb_bridge CRC covers the policy byte")
+        check(verified(pack.verify_pb_bridge_config, image_n, expect_enabled=False,
+                       expected_enroll_policy=pack.PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED),
+              "the pack tool's own verifier reads it as disabled with the policy")
+        check(not verified(pack.verify_pb_bridge_config, image_n, expect_enabled=False),
+              "(and that verifier does notice a policy that was not expected)")
+        check("REQUIRED" in r.stdout, "the output says the endpoint is required at enrollment")
+        static_blob = ns["pb_bridge"].get("blob")
+        check(static_blob[4] == 1 and static_blob[pack.PB_BRIDGE_ENROLL_POLICY_OFFSET] == 0 and
+              verified(pack.verify_pb_bridge_config, image_a, expect_enabled=True,
+                       expected_host_addr=ipaddress.IPv6Address(BRIDGE).packed, expected_port=PORT),
+              "the image with --bridge-host/--bridge-port carries NO policy (byte 0): it enrolls the old way")
+        check(ns_n["power_base_cfg"] == ns["power_base_cfg"] and ns_n["pb_thread"] == ns["pb_thread"],
+              "the electrical config and pb_thread:mode=2 (no Dataset) are byte-identical to the image with an address")
+        check(verified(pack.verify_pb_thread_config, image_n, expected_mode=pack.PB_THREAD_MODE_AWAIT_COMMISSIONING,
+                       expected_tlvs_len=0),
+              "pb_thread: mode 2 with an empty Dataset")
+        rec_n = ns_n["pb_ble_auth"]["cred"]
+        code_n_text = open(code_n).read().strip()
+        check(len(rec_n) == 420 and rec_n[8:16].hex() == EUI_NORM and
+              rec_n[32:416] == expected_verifier(EUI_NORM, code_n_text, rec_n[16:32]) and
+              zlib.crc32(rec_n[:416]) == int.from_bytes(rec_n[416:420], "little"),
+              "the board's own BLE credential is prepared exactly as with an address")
+        image_n_bytes = open(image_n, "rb").read()
+        static_addr = ipaddress.IPv6Address(BRIDGE).packed
+        check(static_addr not in image_n_bytes and code_n_text.encode() not in image_n_bytes,
+              "no bridge address and no setup code anywhere in the image")
+        check(code_n_text not in r.stdout + r.stderr and rec_n[16:32].hex() not in r.stdout + r.stderr and
+              "NO address" in r.stdout,
+              "the output says the image has no address, and shows neither the setup code nor the salt")
+        out_n2 = os.path.join(tmp, "noaddr2")
+        r = run_gen("--eui64", EUI2, "--bridge-from-enrollment", "--setup-code-file", os.path.join(tmp, "noaddr2.code"),
+                    "--out-dir", out_n2)
+        ns_n2 = read_namespaces(os.path.join(out_n2, f"power_base_ble_{EUI2}_config.bin"))
+        check(r.returncode == 0 and ns_n2["pb_bridge"] == ns_n["pb_bridge"] and
+              ns_n2["power_base_cfg"] == ns_n["power_base_cfg"] and ns_n2["pb_thread"] == ns_n["pb_thread"] and
+              ns_n2["pb_ble_auth"]["cred"][8:16].hex() == EUI2,
+              "another board's address-less image differs only in its own BLE credential: nothing per-home is in it")
+        r = run_gen("--eui64", EUI, "--bridge-from-enrollment", "--existing-setup-code-file", code_n, "--out-dir", out_n)
+        check(r.returncode == 0 and read_namespaces(image_n)["pb_bridge"] == ns_n["pb_bridge"],
+              "rebuilding with --existing-setup-code-file keeps it address-less")
+
+        print("\n-- the bridge source must be stated; a typed address is never ignored --")
+        eui_only = ["--eui64", EUI2, "--setup-code-file", "@CODE@", "--out-dir", "@OUT@"]
+        refused("neither --bridge-from-enrollment nor an address (no default address is made up)", *eui_only)
+        refused("--bridge-from-enrollment together with a valid address and port", *eui_only, "--bridge-from-enrollment",
+                "--bridge-host", BRIDGE, "--bridge-port", str(PORT))
+        refused("--bridge-from-enrollment together with --bridge-host only", *eui_only, "--bridge-from-enrollment",
+                "--bridge-host", BRIDGE)
+        refused("--bridge-from-enrollment together with --bridge-port only", *eui_only, "--bridge-from-enrollment",
+                "--bridge-port", str(PORT))
+        refused("--bridge-from-enrollment together with a MALFORMED address (not treated as \"no address\")", *eui_only,
+                "--bridge-from-enrollment", "--bridge-host", "fd00:db8::zz", "--bridge-port", str(PORT))
+        refused("an empty --bridge-host is an error, not \"no address\"", *eui_only, "--bridge-host", "",
+                "--bridge-port", str(PORT))
+        refused("a malformed --bridge-host", *eui_only, "--bridge-host", "fd00:db8:1:2::12345", "--bridge-port", str(PORT))
+        refused("a hostname as --bridge-host", *eui_only, "--bridge-host", "hub.local", "--bridge-port", str(PORT))
+        refused("a URL as --bridge-host", *eui_only, "--bridge-host", "coap://[fd00:db8::1]:5684", "--bridge-port",
+                str(PORT))
+        refused("the unspecified address as --bridge-host", *eui_only, "--bridge-host", "::", "--bridge-port", str(PORT))
+        refused("a multicast --bridge-host", *eui_only, "--bridge-host", "ff03::1", "--bridge-port", str(PORT))
+        refused("a non-numeric --bridge-port", *eui_only, "--bridge-host", BRIDGE, "--bridge-port", "abc")
+
         in_repo = os.path.join(ROOT_DIR, "build", "pb_test_should_not_exist.setup-code")
         r = run_gen("--eui64", EUI2, "--bridge-host", BRIDGE, "--bridge-port", str(PORT), "--setup-code-file", in_repo,
                     "--out-dir", os.path.join(tmp, "refused_repo"))
@@ -255,6 +342,30 @@ def main():
         r = run_gen("--eui64", EUI2, "--bridge-host", BRIDGE, "--bridge-port", str(PORT), "--out-dir",
                     os.path.join(tmp, "refused_nocode"))
         check(r.returncode != 0, "no setup-code option at all is refused (a code is never passed as a value)")
+
+        print("\n-- pack tool: the endpoint policy is explicit, mode-2 only, and never combined with an address --")
+        pol = os.path.join(tmp, "pol.bin")
+        r = subprocess.run([sys.executable, PACK, CONFIG_JSON, pol, "--await-commissioning",
+                            "--require-enrollment-endpoint"], capture_output=True, text=True)
+        check(r.returncode == 0 and read_namespaces(pol)["pb_bridge"]["blob"] == (1).to_bytes(4, "big") + bytes([0, 1]) + bytes(18)
+              and "enrollment_endpoint=REQUIRED" in r.stdout,
+              "--await-commissioning --require-enrollment-endpoint: enabled=0 with policy byte 1")
+        nopol = os.path.join(tmp, "nopol.bin")
+        r = subprocess.run([sys.executable, PACK, CONFIG_JSON, nopol, "--await-commissioning"], capture_output=True,
+                           text=True)
+        check(r.returncode == 0 and read_namespaces(nopol)["pb_bridge"]["blob"] == (1).to_bytes(4, "big") + bytes(20) and
+              "REQUIRED" not in r.stdout,
+              "--await-commissioning alone (exporter off on purpose): policy byte 0 -- 'no address' is not 'required'")
+        legacy = os.path.join(tmp, "legacy.bin")
+        r = subprocess.run([sys.executable, PACK, CONFIG_JSON, legacy], capture_output=True, text=True)
+        check(r.returncode == 0 and read_namespaces(legacy)["pb_bridge"]["blob"][5] == 0,
+              "a mode 0 image: policy byte 0, as before")
+        for what, extra in (("without --await-commissioning", ["--require-enrollment-endpoint"]),
+                            ("with a static address", ["--await-commissioning", "--require-enrollment-endpoint",
+                                                       "--bridge-host", BRIDGE, "--bridge-port", str(PORT)])):
+            bad_out = os.path.join(tmp, "pol_refused.bin")
+            r = subprocess.run([sys.executable, PACK, CONFIG_JSON, bad_out, *extra], capture_output=True, text=True)
+            check(r.returncode != 0 and not os.path.exists(bad_out), f"--require-enrollment-endpoint {what}: refused")
 
         print("\n-- pack tool: the new flag is optional and mode-2 only --")
         plain = os.path.join(tmp, "await_bridge.bin")

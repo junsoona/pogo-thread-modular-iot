@@ -691,11 +691,19 @@ USB-Serial/JTAG console (`pb_join start`, bench build with
 `power_base/sdkconfig.bench_joiner`), runs the Joiner, attaches, records its
 enrollment and then starts the normal exporter, whose heartbeat is what ends
 a session as `heartbeat_received` (see [`power-base.md`](power-base.md) "앱
-등록 대기 상태와 Joiner 가입"). The Linux bridge address comes from the
-board's prepared `pb_bridge` image, not from this API. What does not exist:
-a product transport for the PSKd (BLE/QR) and a release app UI. Host tests
-use a fake Commissioner and a fake `ot-ctl`; nothing here has enrolled a real
-board yet.
+등록 대기 상태와 Joiner 가입"). On that path the Linux bridge address comes
+from the board's prepared `pb_bridge` image, not from this API. A session may
+instead ask the hub for its **bridge endpoint** (see "Bridge endpoint
+delivery" below, added 2026-10-03): the hub then reports its own OTBR
+Mesh-Local EID and ingest port with the session, and the app's DEBUG BLE test
+hands them to the board with the PSKd. When it was added, that path had been
+run in host tests and builds only -- not on a board, over BLE, or against the
+operating hub. Since then (2026-10-05) the hub side was built, installed and
+checked on the operating host, and the path was run on one spare board; what
+that confirmed and what it did not is listed under "Still to verify on the
+operating host and a spare board" below.
+What does not exist: a QR flow and a release app UI. Host tests use a fake
+Commissioner and a fake `ot-ctl`.
 
 ### Enabling
 
@@ -730,7 +738,8 @@ credentials unreadable → `503 auth_unavailable`. Every answer has
 | `GET /api/v1/power-base-enrollments/<session_id>` | `200` + session |
 | `DELETE /api/v1/power-base-enrollments/<session_id>` | cancels: `200` + session (`state: "cancelled"`) |
 
-Request (`Content-Length` only, at most 256 bytes, exactly these two fields):
+Request (`Content-Length` only, at most 256 bytes, exactly these two fields,
+or these two and the option described under "Bridge endpoint delivery"):
 
 ```json
 {"eui64": "744dbdfffe65d357", "pskd": "J01NME7K2"}
@@ -755,16 +764,19 @@ Session:
  "started_by_device_id": "0123456789abcdef"}
 ```
 
+A session started without the bridge endpoint option has exactly these fields
+-- no `bridge_endpoint` key -- so an existing client sees what it always saw.
+
 `state`:
 
 | state | meaning |
 |---|---|
-| `preparing` | making sure the Commissioner is active, then adding the Joiner entry |
+| `preparing` | (with the bridge endpoint option: reading the hub's bridge endpoint, then) making sure the Commissioner is active, then adding the Joiner entry |
 | `waiting_for_heartbeat` | the OTBR allows this EUI-64 as a Joiner; the bridge has not yet received a new heartbeat from it |
 | `heartbeat_received` | final. The bridge's Registry received a heartbeat from a Power Base with this EUI-64 **after** the session started. It means this Linux bridge heard the Base over Thread; it does **not** mean its modules or sensors work -- watch the snapshot for that |
 | `cancelled` | final. The starting device cancelled it |
 | `expired` | final. The window ended without a new heartbeat. The board may still have joined Thread (e.g. firmware that joins but does not report); the hub cannot tell |
-| `failed` | final. `error` says why: `otbr_unavailable` (helper, sudo or OTBR not reachable), `otbr_timeout`, `commissioner_rejected` (e.g. another Commissioner holds the role), `joiner_rejected`, `helper_failed`, `window_too_short`, `bridge_stopping` |
+| `failed` | final. `error` says why: `otbr_unavailable` (helper, sudo or OTBR not reachable), `otbr_timeout`, `commissioner_rejected` (e.g. another Commissioner holds the role), `joiner_rejected`, `helper_failed`, `window_too_short`, `bridge_stopping`; with the bridge endpoint option also `bridge_endpoint_unavailable`, `bridge_endpoint_timeout`, `bridge_endpoint_invalid`, `bridge_endpoint_unsupported` (see below) |
 
 Joiner success, a Commissioner command succeeding or the board reaching
 Thread `child`/`router` are never reported as success by themselves.
@@ -790,6 +802,8 @@ Errors (never echoing the EUI-64 or PSKd sent):
 | `413` | `request_too_large` | body over 256 bytes |
 | `422` | `invalid_eui64` | including `*` |
 | `422` | `invalid_pskd` | |
+| `422` | `unsupported_bridge_endpoint_version` | `bridge_endpoint_version` is an integer other than `1` |
+| `503` | `enrollment_unavailable` (`reason`: `bridge_endpoint`) | the option was given but this bridge does not know its ingest port. Nothing started |
 | `409` | `enrollment_in_progress` | a session is running or still cleaning up. To the device that started it, the answer also has `"session": {…}` (so a repeated POST finds its session); others get only the error |
 | `409` | `power_base_already_connected` | a Base with this EUI-64 is online in the Registry right now |
 | `409` | `session_already_final` + `"session"` | DELETE after the session ended |
@@ -797,11 +811,92 @@ Errors (never echoing the EUI-64 or PSKd sent):
 | `503` | `enrollment_unavailable` (`reason`: `startup`/`stopping`) | |
 | `500` | `internal_error` | no randomness for a session id |
 
+### Bridge endpoint delivery (2026-10-03)
+
+A Power Base sends its data to the Linux bridge's CoAP ingest listener over
+Thread. Until now that destination was written into the board's prepared
+image. A session can instead carry it, so that the app hands it to the board
+during BLE enrollment:
+
+```json
+{"eui64": "744dbdfffe65d357", "pskd": "J01NME7K2", "bridge_endpoint_version": 1}
+```
+
+`bridge_endpoint_version` is the explicit request. It must be the integer `1`
+(any other integer: `422 unsupported_bridge_endpoint_version`; any other
+type: `400 invalid_request`). The client sends **no** address and no port --
+a `bridge_endpoint` object, an address or a port in the request is `400
+invalid_request`. The hub makes the endpoint:
+
+- **address**: this hub's OTBR Mesh-Local EID, read at session time through
+  the root helper's `mesh-local-eid` operation, i.e. exactly what `ot-ctl
+  ipaddr mleid` prints. It is never the first of an address list, never an
+  RLOC or ALOC, and never the API's own LAN address, URL or Bonjour name.
+- **port**: the UDP port the ingest listener is bound to (the program's
+  `--port`), not a constant in the API code.
+
+Such a session's JSON has one more key, after `started_by_device_id`:
+
+```json
+"bridge_endpoint": {"version": 1, "address": "fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79", "port": 5684}
+```
+
+- `version`: `1`. A client must refuse any other value.
+- `address`: one IPv6 literal in canonical lower-case text. Always inside
+  fd00::/8 and never with the interface id `0000:00ff:fe00:xxxx` (the hub
+  refuses anything else from its own OTBR and fails the session instead).
+- `port`: 1..65535.
+
+Rules:
+
+- **`preparing` may have `"bridge_endpoint": null`.** The endpoint is read on
+  the session's own thread after the `202`; until then, and for a session
+  that ended before it was read, the value is `null`.
+- **`waiting_for_heartbeat` always has it.** The Joiner entry is added only
+  after the endpoint is fixed. The order is: read the endpoint → make sure
+  the Commissioner is active → add the Joiner. Nothing is added to the OTBR
+  first and taken back.
+- **Fixed once per session.** Every later `GET`, and the `409
+  enrollment_in_progress` answer to a repeated `POST` by the same device,
+  reports the same value, even if the OTBR's address changed meanwhile. A new
+  session reads it again.
+- **If it cannot be established the session fails and no Joiner is added**
+  (`joiner_entry: "none"`, the Commissioner is not started either):
+
+  | `error` | when |
+  |---|---|
+  | `bridge_endpoint_unavailable` | helper, sudo or OTBR not reachable, or the OTBR refused the command |
+  | `bridge_endpoint_timeout` | the helper (or `ot-ctl`) did not answer in time (8 s) |
+  | `bridge_endpoint_invalid` | the helper answered, but not with exactly one usable Mesh-Local EID (Thread not running, a list, an RLOC, a link-local address, …) |
+  | `bridge_endpoint_unsupported` | the installed root helper predates the `mesh-local-eid` operation (it answers `err invalid_request`). Install the current helper |
+
+- **A cancel, the deadline or a shutdown during the read wins.** The session
+  stays `cancelled` / `expired` / `failed bridge_stopping`; the address that
+  arrives afterwards is not attached and nothing further is done.
+- **Nobody else sees it.** The endpoint is only in the session JSON, which
+  only the paired device that started the session can read over TLS; another
+  device gets `404 session_not_found` as before. `GET /api/v1/health`,
+  snapshots, SSE and every unauthenticated or error answer contain neither
+  the address nor the field.
+- No lock of the API server, the Registry or the session is held while the
+  helper reads the address.
+
+A bridge older than this option accepts exactly two fields and answers `400
+invalid_request` to a request that has the option; nothing is started. A
+client that needs the endpoint must stop there -- not retry without the
+option, and not substitute an address of its own.
+
+What this does not do: tell a board that is already enrolled about a later
+change of the hub's address or port.
+
 ### Session lifetime
 
 1. `POST` checks the request, refuses if a session is running or the Base is
    online, records the Registry's heartbeat counter, and answers `202`
    (`preparing`) at once. Everything slow happens on the session's own thread.
+   (With the bridge endpoint option, that thread first reads the endpoint;
+   if that fails or the session ended meanwhile, steps 2, 3 and 5 do not
+   happen.)
 2. The helper makes sure the Commissioner is active. If it already was (for
    anything else), it is left as it is; the bridge **never stops** the
    Commissioner, also not one it started (stopping is not among the
@@ -851,29 +946,88 @@ Joiner table until the entry is removed or expires.
 
 ### Installing the OTBR helper (operator procedure -- review before applying)
 
-The bridge runs as a normal user (`User=junsoo-na`), and the OTBR's control
-socket `/run/openthread-wpan0.sock` is `root:root 0755`, so `ot-ctl` fails for
+The bridge runs as a normal user (the unit's `User=`; the examples below
+call that account `$BRIDGE_USER` and step 4 shows how to read it), and the
+OTBR's control socket `/run/openthread-wpan0.sock` is `root:root 0755`, so `ot-ctl` fails for
 that user (`connect session failed: Permission denied`). Opening the socket
 (chmod 777), running the bridge as root or allowing `sudo ot-ctl *` would each
 give the bridge -- and anything that compromises it -- the whole OTBR CLI,
 including the Network Key and Dataset. Instead the bridge may run exactly one
-root-owned program with no arguments, which can only do the four operations
-above. Nothing in this repository applies any of this; the running service is
+root-owned program with no arguments, which can only do five operations:
+read the Commissioner state, start the Commissioner unless active, add one
+exact Joiner, remove that one Joiner, and (added 2026-10-03) read the OTBR's
+own Mesh-Local EID with the fixed command `ipaddr mleid`. It still takes no
+free-form CLI command, reads no Dataset or Network Key, adds no wildcard
+Joiner and never stops a Commissioner; the sudoers rule below ("that exact
+path, no arguments") is unchanged. A helper installed before that date must
+be rebuilt and reinstalled (steps 2 and 3) before a session can deliver a
+bridge endpoint; until then such sessions fail with
+`bridge_endpoint_unsupported` and the four earlier operations keep working. Nothing in this repository applies any of this; the running service is
 not changed until an operator does so.
 
 1. **Check the OTBR on the host** (as an admin):
 
    ```sh
    command -v ot-ctl; ls -l "$(command -v ot-ctl)"     # expect a root-owned file, e.g. /usr/sbin/ot-ctl
-   sudo ot-ctl commissioner state                        # disabled | active ...  Done
-   printf 'commissioner state\n' | sudo ot-ctl           # the SAME answer through stdin, then ot-ctl exits
+   sudo ot-ctl commissioner state                        # disabled | active ...  Done   (argument mode, for comparison)
    ```
 
-   The third line is the helper's whole transport. If it prints nothing,
-   hangs, or needs a command-line argument to work, stop here: this
-   `ot-ctl` build does not take commands on stdin, and the helper must not be
-   used with it (passing the PSKd as an argument would expose it). Also check
-   that `commissioner` exists (`sudo ot-ctl help | grep commissioner`).
+   Then the helper's whole transport: the command on **stdin**, with stdin
+   kept open until the answer has arrived. The helper does exactly that (it
+   closes `ot-ctl`'s stdin only after `Done` or `Error ...`), so the test must
+   do it too. It is bounded: stdin is held open for 3 s and the whole run is
+   ended after 10 s at the latest.
+
+   ```sh
+   sudo -v                                   # authenticate first, so that no password prompt delays ot-ctl's start
+   T="$(mktemp)"
+   { printf 'commissioner state\n'; sleep 3; } | sudo timeout 10 ot-ctl > "$T" 2>&1; RC=$?
+   ANSWER="$(tr -d '\r' < "$T" | sed 's/^\(> \)*//')"; rm -f "$T"
+   printf '%s\n' "$ANSWER"
+   if printf '%s\n' "$ANSWER" | grep -qxE 'disabled|petition|petitioning|active' &&
+      printf '%s\n' "$ANSWER" | grep -qx 'Done'; then
+     echo "ANSWERED on stdin: a state line and Done (exit status $RC)"
+   elif printf '%s\n' "$ANSWER" | grep -q '^Error '; then
+     echo "COMMAND REFUSED by the OTBR: stdin reached it, the command failed (exit status $RC)"
+   else
+     echo "NO ANSWER within the hold time (exit status $RC) -- not a verdict yet, see below"
+   fi
+   ```
+
+   How to read it. The verdict is the output, never the exit status alone:
+
+   - **A state line (`disabled`, `active`, ...) and `Done`**: stdin works.
+     Exit status `0` then means `ot-ctl` ended by itself when stdin was
+     closed; `124` means the answer came but `ot-ctl` was still running when
+     `timeout` ended it. Both are "answered". The helper does not depend on
+     `ot-ctl` exiting by itself: after the answer it closes stdin, waits a
+     short grace time and ends the process.
+   - **`Error <n>: ...`**: the command reached the OTBR and was refused
+     there. That is a failed command, not a stdin problem. Read the error
+     (and check that `commissioner` exists: `sudo ot-ctl help | grep commissioner`).
+   - **Neither** (nothing, or only the echoed command): no answer arrived
+     while stdin was open. Run it again with a longer hold
+     (`sleep 8` and `timeout 15`) before concluding anything. An exit status
+     of `0` here is not a success, and `connect session failed` in the output
+     means the OTBR was not reachable at all.
+
+   Do not use `printf 'commissioner state\n' | sudo ot-ctl` as the test (an
+   earlier version of this procedure did). It closes stdin at once. On the
+   operating host that form only echoed the command and printed no answer,
+   while the same `ot-ctl` answered `active` and `Done` when stdin was kept
+   open for a moment (operator's test). So a failure of the close-at-once
+   form does not show that an `ot-ctl` build cannot take commands on stdin.
+
+   Stop only if a run with stdin held open, also with the longer hold, still
+   gives no answer, or if this `ot-ctl` works with a command-line argument
+   only. The helper must not be used with such a build, and passing the PSKd
+   as an argument instead is never an option (it would be visible in the
+   process list).
+
+   Status of this example: the bounded commands above were written for this
+   document and have **not been run** on any host. What was observed on the
+   operating host is only what the "Do not use ..." paragraph reports; the
+   exact command line of the operator's held-open test is not recorded here.
 
 2. **Build** the helper on the host (CMake, no Matter SDK needed; or take it
    from `tools/build_matter_bridge.sh`'s output, which assumes
@@ -894,18 +1048,96 @@ not changed until an operator does so.
    sudo install -o root -g root -m 0755 build/pogohome-otbr-helper /usr/local/libexec/pogohome/pogohome-otbr-helper
    ```
 
-4. **Allow exactly that command** to the bridge's account. `""` means "no
-   arguments allowed"; `!log_input`/`!log_output` keep sudo's I/O logging (if
-   enabled on this host) from recording stdin, where the PSKd travels:
+4. **Allow exactly that command** to the bridge's account.
+
+   First the account. It is the unit's `User=`, the same account
+   "Operating" above calls `BRIDGE_USER`. Read it from the service; if you set
+   it by hand instead, it is an example value that you must replace with your
+   own account name.
 
    ```sh
-   sudo tee /etc/sudoers.d/pogohome-otbr-helper >/dev/null <<'SUDOERS'
-   Defaults!/usr/local/libexec/pogohome/pogohome-otbr-helper !log_input, !log_output
-   junsoo-na ALL=(root) NOPASSWD: /usr/local/libexec/pogohome/pogohome-otbr-helper ""
-   SUDOERS
-   sudo chmod 0440 /etc/sudoers.d/pogohome-otbr-helper
-   sudo visudo -cf /etc/sudoers.d/pogohome-otbr-helper
+   BRIDGE_USER="$(systemctl show -p User --value pogo-matter-bridge.service)"
+   if [ -z "$BRIDGE_USER" ] || [ "$BRIDGE_USER" = root ]; then
+     echo "STOP: no User= in the unit (the bridge runs as root), or the unit was not found" >&2
+     unset BRIDGE_USER
+   elif printf '%s\n' "$BRIDGE_USER" | grep -qxE '[a-z_][a-z0-9_-]*' &&
+        [ "$(id -u -- "$BRIDGE_USER" 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+     echo "bridge account: $BRIDGE_USER"
+   else
+     echo "STOP: unexpected account name, unknown account, or uid 0 -- check the unit by hand" >&2
+     unset BRIDGE_USER
+   fi
    ```
+
+   If this prints `STOP`, do not go on with the steps below. They are for a
+   bridge that runs as a normal account. An empty `User=` means the bridge
+   runs as root (or the unit name is different on this host): a sudoers rule
+   for root restricts nothing, and a bridge running as root already has the
+   whole OTBR CLI, which is what this procedure exists to avoid. Fix the unit
+   first. The commands below use `${BRIDGE_USER:?...}`, which refuses to run
+   while the variable is unset.
+
+   Then the rule. One line, and it is the whole permission: that one account,
+   as root, without a password, the one root-owned helper path, and `""`,
+   which means "no arguments allowed". No wildcard, no second command and no
+   `ot-ctl` entry belong in this file. Write it to a temporary file, let
+   `visudo` check that file, and install it only if the check passed. A file
+   with a syntax error must never be written into `/etc/sudoers.d` first: it
+   can make `sudo` unusable for everyone.
+
+   ```sh
+   HELPER=/usr/local/libexec/pogohome/pogohome-otbr-helper
+   RULE="${BRIDGE_USER:?set BRIDGE_USER as shown above} ALL=(root) NOPASSWD: $HELPER \"\"" &&
+   SUDOERS_TMP="$(mktemp)" &&
+   printf '%s\n' "$RULE" > "$SUDOERS_TMP" &&
+   cat "$SUDOERS_TMP"      # read it: it must start with the account's NAME, not with the text $BRIDGE_USER
+   ```
+
+   ```sh
+   [ "$(grep -Fxc -- "${RULE:?}" "${SUDOERS_TMP:?}")" -eq 1 ] &&
+   sudo visudo -cf "$SUDOERS_TMP" &&
+   sudo install -o root -g root -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/pogohome-otbr-helper &&
+   sudo visudo -cf /etc/sudoers.d/pogohome-otbr-helper
+   rm -f "$SUDOERS_TMP"
+   ```
+
+   The line is written with `printf` on purpose. In a here-document whose
+   delimiter is quoted (`<<'SUDOERS'`) the shell does not expand
+   `$BRIDGE_USER`, and the file would then hold the literal text
+   `$BRIDGE_USER` instead of the account. The `grep` line above refuses to
+   install anything but the expected line.
+
+   **sudo implementations.** Check which one the host has:
+   `sudo --version | head -n 1`.
+
+   - **sudo-rs.** The operating host had sudo-rs `0.2.13-0ubuntu1.2`. The
+     rule that was installed and verified there is the single line above,
+     in the form
+     `<bridge-user> ALL=(root) NOPASSWD: /usr/local/libexec/pogohome/pogohome-otbr-helper ""`,
+     and nothing else. An earlier version of this procedure also wrote
+     `Defaults!/usr/local/libexec/pogohome/pogohome-otbr-helper !log_input, !log_output`;
+     on that host `visudo` rejected that line as an unknown setting and the
+     check failed. Do not add it there. What this sudo implementation can or
+     cannot record of a command's input was not examined here; this document
+     makes no statement about it.
+   - **The original sudo (sudo.ws) with I/O logging.** I/O logging
+     (`log_input`, `log_output`) is off unless the host's sudoers turns it
+     on. If it is on, it would record the helper's stdin, where the PSKd
+     travels. Only in that case write the temporary file with this command
+     instead of the `printf` above, then continue with the same check and
+     install block:
+
+     ```sh
+     printf 'Defaults!%s !log_input, !log_output\n%s\n' "$HELPER" "${RULE:?}" > "${SUDOERS_TMP:?}" &&
+     cat "$SUDOERS_TMP"
+     ```
+
+     The file then has two lines, and the `grep` check still matches the
+     rule line once. (The `!` characters are inside single quotes so that an
+     interactive shell does not treat them as history expansion.) This variant was not installed on the operating host,
+     so it is not verified there. It is not a required line for every host,
+     and neither variant is a guarantee about what the rest of the system
+     logs.
 
    The unit must allow `sudo` to raise privileges:
    `systemctl show -p NoNewPrivileges -p RestrictSUIDSGID pogo-matter-bridge.service`
@@ -913,15 +1145,60 @@ not changed until an operator does so.
    unit needs them on, use a root-run socket-activated service for the helper
    instead of sudo (not implemented here).
 
-5. **Try it as the bridge's user** (nothing changes on the OTBR):
+5. **Try it as the bridge's user** (nothing changes on the OTBR). Same shell
+   as step 4, so `BRIDGE_USER` and `HELPER` are still set.
+
+   `as_bridge` runs a command line as the bridge's account. If you are logged
+   in as that account yourself, it must not go through `sudo -u`: that would
+   authenticate you and cache sudo credentials for the very account under
+   test.
 
    ```sh
-   sudo -u junsoo-na sh -c "printf 'pogohome-otbr/1 commissioner-state\n' | sudo -n -- /usr/local/libexec/pogohome/pogohome-otbr-helper"
-   # ok disabled | ok petitioning | ok active
-   sudo -u junsoo-na sudo -n -- /usr/local/libexec/pogohome/pogohome-otbr-helper extra-arg   # must be refused by sudo
-   sudo -u junsoo-na sudo -n /usr/sbin/ot-ctl state                                          # must be refused by sudo
-   journalctl -t pogohome-otbr-helper -n 5                                                  # audit lines, no PSKd
+   as_bridge() {
+     if [ "$(id -un)" = "${BRIDGE_USER:?set BRIDGE_USER as shown above}" ]; then sh -c "$1"
+     else sudo -u "$BRIDGE_USER" sh -c "$1"; fi
+   }
    ```
+
+   The two refusals first, each right after the bridge account's cached sudo
+   credentials were removed. `sudo -n` never asks for a password, so with no
+   cached credentials only a `NOPASSWD` rule can let a command through. With
+   cached credentials, an account that also has password-protected sudo
+   rights is let through, and the test then looks as if the rule were too
+   wide although it is not. The administrator's own cached credentials say
+   nothing about the bridge account either way.
+
+   ```sh
+   as_bridge 'sudo -K'; as_bridge "sudo -n -- $HELPER extra-arg"; echo "exit status $?"
+   as_bridge 'sudo -K'; as_bridge 'sudo -n /usr/sbin/ot-ctl state'; echo "exit status $?"
+   ```
+
+   Both must be refused **by sudo**: a refusal message from sudo (its wording
+   differs between sudo implementations), a non-zero exit status, and no
+   output from the program. If the first prints `ok ...` or `err ...`, the
+   helper ran, so sudo allowed the extra argument. If the second prints a
+   state or `Done`, sudo allowed `ot-ctl`. Either means the sudoers
+   configuration of this host gives that account more than the one rule;
+   find out where before going on.
+
+   Then the allowed call:
+
+   ```sh
+   as_bridge "printf 'pogohome-otbr/1 commissioner-state\n' | sudo -n -- $HELPER"
+   # ok disabled | ok petitioning | ok active
+   as_bridge "printf 'pogohome-otbr/1 mesh-local-eid\n' | sudo -n -- $HELPER"
+   # ok mleid <the same address `sudo ot-ctl ipaddr mleid` prints>   (read-only; a helper built before 2026-10-03 answers: err invalid_request)
+   journalctl -t pogohome-otbr-helper -n 5      # audit lines, no PSKd
+   ```
+
+   Recorded from the operating host (run by the operator, see
+   [`validation-status.md`](validation-status.md)): with the sudo
+   authentication cache cleared, the call with an extra argument was blocked;
+   `commissioner-state` answered `ok disabled`; `mesh-local-eid` answered the
+   address `ot-ctl ipaddr mleid` printed. The refusal of a direct `ot-ctl`
+   call is not in that record. The `as_bridge` wrapper and the exact command
+   lines above were written for this document and have not been run on any
+   host.
 
 6. **Enable it in the bridge** by adding
    `--api-enroll-helper /usr/local/libexec/pogohome/pogohome-otbr-helper` to
@@ -958,6 +1235,36 @@ Host tests prove the logic against fakes only. Before relying on it:
   (procedure: [`validation-status.md`](validation-status.md) "Power Base 앱
   등록(mode 2)"), and that a wrong PSKd, a closed window or a missing OTBR
   ends the session `expired`.
+- Bridge endpoint delivery (2026-10-03). **As recorded on 2026-10-03:** it
+  had not been run on the Linux host at all: neither the GCC/Matter build of
+  the changed sources, nor the rebuilt helper's `mesh-local-eid` against the
+  real `ot-ctl` (including whether this `ot-ctl` build echoes the command,
+  which the helper tolerates only as the exact line `ipaddr mleid`), nor a
+  session with `bridge_endpoint_version`. That sentence describes that day
+  only. **Follow-up (2026-10-05, run by the operator)**, recorded in
+  [`validation-status.md`](validation-status.md) "허브 Thread 수신 주소 자동
+  전달" under "후속 기록: Linux 배포 검증과 실물 시험 산출물 준비
+  (2026-10-05)" and "실물 후속 검증 (2026-10-05)":
+  - The hub API, the helper and their tests were built and passed with the
+    host's GCC, and the GN/CHIP bridge build passed.
+  - The new bridge and the new helper were installed on the operating hub.
+    The hub's state (hub id, paired devices, settings, TLS files, endpoint
+    map) was preserved, and the sudoers rule was left as it was.
+  - The installed helper's `mesh-local-eid` returned one address from the
+    real OTBR, the same one `ot-ctl ipaddr mleid` printed there.
+  - A session started with `bridge_endpoint_version` fixed its endpoint (the
+    bridge's journal: `bridge endpoint fixed for this session (port 5684)`).
+    That session ended `cancelled` and is not counted as a success. In a
+    second session the app showed `heartbeat_received` for the spare board's
+    EUI-64.
+
+  Not confirmed by that follow-up: the session's `bridge_endpoint` JSON was
+  not captured, and the address delivered during the test was not compared
+  with the OTBR's address directly. The second session's journal lines were
+  not collected. The answers the helper must refuse (an RLOC, an address
+  list, ...) were not produced against the real OTBR; that part is still
+  host tests only. Whether this `ot-ctl` build echoes the command was not
+  reported separately.
 - Journal output: `pogohome_api: enrollment ...` and `[heartbeat] ...` go to
   stdout, which stdio block-buffers under systemd, so they could appear late
   or not at all in `journalctl` while stderr lines appeared at once. The
@@ -969,8 +1276,11 @@ Host tests prove the logic against fakes only. Before relying on it:
 
 - Registering a Power Base end to end as a product. The hub side, the app's
   DEBUG test and a bench-only firmware path (PSKd typed on the spare board's
-  USB console, bridge address pre-set in its `cfg` image) exist; delivering
-  the PSKd over BLE/QR and a release app flow do not. Operating Bases are
+  USB console, bridge address pre-set in its `cfg` image) exist. So does a
+  DEBUG-only BLE path that delivers the PSKd and the hub's bridge endpoint
+  (a firmware test build and the app's DEBUG BLE test; run on one spare
+  board, see [`validation-status.md`](validation-status.md)). A QR flow and
+  a release app flow do not exist. Operating Bases are
   still added by flashing firmware and `cfg` (see [`power-base.md`](power-base.md)
   "여러 Power Base 추가").
 - The PogoHome iOS app (`pogo-sensor-ios`, a separate repository) connecting

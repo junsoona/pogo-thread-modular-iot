@@ -20,14 +20,54 @@
  *                          this Base's heartbeat. Nothing here claims it.
  *
  * Completion marker (dynamic "nvs" partition, namespace "pb_enroll", key
- * "done"): one 36-byte blob -- magic, version, this board's EUI-64, the
- * joined network's Extended PAN ID and Mesh-Local Prefix, CRC-32. It holds
- * no secret (no PSKd, no Network Key, nothing derived from either). It is
+ * "done"): one blob -- magic, version, this board's EUI-64, the joined
+ * network's Extended PAN ID and Mesh-Local Prefix, CRC-32. It holds no
+ * secret (no PSKd, no Network Key, nothing derived from either). It is
  * written only after milestone 2 and erased before every new Joiner attempt.
  * At boot, mode 2 resumes Thread only if the marker is valid, belongs to
  * this EUI-64, and the Active Dataset OpenThread stored is complete and
  * matches the marker's network; anything else is the safe wait. A Dataset
  * left over from a STANDALONE test has no marker, so it is never resumed.
+ *
+ * Two record versions share that one key, told apart by size and version:
+ *   version 1 (36 bytes)  the marker alone. Written by an enrollment that
+ *                         delivered no bridge endpoint (bench console, the
+ *                         version 1 BLE start); the exporter then uses the
+ *                         prepared image's cfg/pb_bridge exactly as before.
+ *   version 2 (56 bytes)  the marker AND the Linux bridge endpoint (IPv6
+ *                         address + port) delivered with that enrollment, in
+ *                         the same blob and under the same CRC, so the
+ *                         "enrolled" fact and the endpoint can never come
+ *                         from two different attempts and a write cut short
+ *                         leaves neither.
+ * A delivered endpoint lives only in RAM (pb_enroll_ctl_t.pending_endpoint)
+ * until milestone 2: cancel, any failure and a replaced attempt drop it. It
+ * is stored only if it lies inside the Mesh-Local Prefix of the network the
+ * board actually joined. A version 2 record whose endpoint does not pass
+ * pb_enroll_bridge_endpoint_check(), or lies outside the record's own
+ * Mesh-Local Prefix, is CORRUPT -- the board waits; it never falls back to
+ * the cfg address.
+ *
+ * Endpoint policy (pb_enroll_endpoint_policy_t, from the prepared image --
+ * see power_base_bridge_config.h): a board whose image carries no bridge
+ * address ON PURPOSE must be given the endpoint with its enrollment.
+ *   OPTIONAL  (default; every image without the policy) nothing below applies.
+ *   REQUIRED  a Joiner request without an endpoint is refused with
+ *             ESP_ERR_NOT_ALLOWED before anything is started or erased, by
+ *             whatever transport it came (BLE, bench console, a direct
+ *             call); and at boot a valid version 1 record -- an enrollment
+ *             without an endpoint -- is not resumed: Thread and the services
+ *             stay off (reported as marker_corrupt: a record version this
+ *             board's configuration does not accept). Nothing is erased by
+ *             booting; the next accepted request clears the old record as
+ *             always. A valid version 2 record resumes as usual.
+ *   INVALID   the image's policy cannot be trusted: every NEW Joiner request
+ *             is refused the same way, with or without an endpoint. Boot is
+ *             as with OPTIONAL: an already enrolled board is not taken down
+ *             because its cfg image went bad.
+ * What is NOT here: following a hub whose address changes
+ * later (OTBR replaced, network re-formed). The endpoint is delivered once
+ * and restored at boot; nothing refreshes it.
  *
  * Threading: pb_enroll_ctl_* are not internally locked. The caller serialises
  * every call (power_base/main uses one mutex) and never calls them from the
@@ -53,7 +93,10 @@ extern "C" {
 
 #define PB_ENROLL_NVS_NAMESPACE "pb_enroll"
 #define PB_ENROLL_NVS_KEY "done"
-#define PB_ENROLL_MARKER_LEN 36
+#define PB_ENROLL_MARKER_LEN 36    /* record version 1 */
+#define PB_ENROLL_MARKER_V2_LEN 56 /* record version 2: with the bridge endpoint */
+
+#define PB_ENROLL_BRIDGE_ADDR_LEN 16
 
 /* OpenThread's Joiner ends on its own within about a minute (one discovery
  * scan, then bounded DTLS/entrust timeouts) and does not wait for the
@@ -86,17 +129,62 @@ typedef struct {
     pb_enroll_network_id_t id; /* meaningful only when complete */
 } pb_enroll_dataset_info_t;
 
+/* Where the Linux bridge's ingest listener is, as a client delivered it with
+ * the enrollment: the OTBR's Mesh-Local EID and its CoAP port. Not a secret. */
+typedef struct {
+    uint8_t addr[PB_ENROLL_BRIDGE_ADDR_LEN]; /* IPv6, network byte order */
+    uint16_t port;
+} pb_enroll_bridge_endpoint_t;
+
+typedef enum {
+    PB_ENROLL_ENDPOINT_OK = 0,
+    PB_ENROLL_ENDPOINT_UNSPECIFIED,    /* :: */
+    PB_ENROLL_ENDPOINT_LOOPBACK,       /* ::1 */
+    PB_ENROLL_ENDPOINT_IPV4_EMBEDDED,  /* ::ffff:a.b.c.d (mapped) or ::a.b.c.d (compatible) */
+    PB_ENROLL_ENDPOINT_MULTICAST,      /* ff00::/8 */
+    PB_ENROLL_ENDPOINT_LINK_LOCAL,     /* fe80::/10 */
+    PB_ENROLL_ENDPOINT_NOT_MESH_LOCAL, /* not in fd00::/8, where Thread Mesh-Local Prefixes live */
+    PB_ENROLL_ENDPOINT_LOCATOR,        /* IID 0000:00ff:fe00:xxxx: an RLOC or ALOC, not an EID */
+    PB_ENROLL_ENDPOINT_PORT_ZERO,
+} pb_enroll_endpoint_check_t;
+
+/* What a delivered endpoint must be before any network is known: a Thread
+ * Mesh-Local EID (never an RLOC/ALOC, which moves with the topology) and a
+ * non-zero port. Pure; never logs the address. */
+pb_enroll_endpoint_check_t pb_enroll_bridge_endpoint_check(const pb_enroll_bridge_endpoint_t *ep);
+const char *pb_enroll_endpoint_check_name(pb_enroll_endpoint_check_t check);
+/* True when the endpoint's first 64 bits are `id`'s Mesh-Local Prefix. */
+bool pb_enroll_bridge_endpoint_in_network(const pb_enroll_bridge_endpoint_t *ep, const pb_enroll_network_id_t *id);
+
+/* The stored record: the marker, and for version 2 the endpoint with it. */
+typedef struct {
+    pb_enroll_network_id_t id;
+    bool has_bridge_endpoint; /* version 2 */
+    pb_enroll_bridge_endpoint_t bridge_endpoint;
+} pb_enroll_record_t;
+
 typedef enum {
     PB_ENROLL_MARKER_ABSENT = 0,
     PB_ENROLL_MARKER_VALID,
-    PB_ENROLL_MARKER_CORRUPT,    /* wrong size, magic, version or CRC */
+    /* Wrong size, magic, version, flags, reserved bytes or CRC; or a version
+     * 2 record whose endpoint is not usable for its own network. */
+    PB_ENROLL_MARKER_CORRUPT,
     PB_ENROLL_MARKER_FOREIGN,    /* intact, but for another EUI-64 */
     PB_ENROLL_MARKER_READ_ERROR, /* NVS itself failed */
 } pb_enroll_marker_status_t;
 
-pb_enroll_marker_status_t pb_enroll_marker_load(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enroll_network_id_t *out);
-/* set_blob + commit. On failure the caller must not treat the board as
+/* Either version. *out is zeroed unless the result is VALID. */
+pb_enroll_marker_status_t pb_enroll_record_load(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enroll_record_t *out);
+/* set_blob + commit of ONE blob: version 1 without an endpoint (the same 36
+ * bytes as before), version 2 with one. ESP_ERR_INVALID_ARG for an endpoint
+ * that fails the check or lies outside rec->id's Mesh-Local Prefix (nothing
+ * is written). On any other failure the caller must not treat the board as
  * enrolled; the stored value is then unspecified (see pb_enroll_ctl_tick). */
+esp_err_t pb_enroll_record_store(const uint8_t eui64[PB_ENROLL_EUI64_LEN], const pb_enroll_record_t *rec);
+
+/* The marker part only, of either record version. */
+pb_enroll_marker_status_t pb_enroll_marker_load(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enroll_network_id_t *out);
+/* A version 1 record. Same failure contract as pb_enroll_record_store(). */
 esp_err_t pb_enroll_marker_store(const uint8_t eui64[PB_ENROLL_EUI64_LEN], const pb_enroll_network_id_t *id);
 /* ESP_OK also when there was nothing to erase. */
 esp_err_t pb_enroll_marker_clear(void);
@@ -109,7 +197,10 @@ typedef enum {
     PB_ENROLL_RESULT_MARKER_FOREIGN,
     PB_ENROLL_RESULT_MARKER_READ_ERROR,
     PB_ENROLL_RESULT_DATASET_MISSING,      /* marker valid, stored Dataset incomplete/absent */
-    PB_ENROLL_RESULT_DATASET_MISMATCH,     /* marker valid, stored Dataset is another network */
+    /* Boot: marker valid, stored Dataset is another network. An attempt that
+     * carried a bridge endpoint: the network the board joined is not the one
+     * that endpoint lies in (its /64 is not the joined Mesh-Local Prefix). */
+    PB_ENROLL_RESULT_DATASET_MISMATCH,
     PB_ENROLL_RESULT_MARKER_CLEAR_FAILED,  /* could not erase the old marker: join refused */
     PB_ENROLL_RESULT_JOINER_START_FAILED,
     PB_ENROLL_RESULT_JOINER_SECURITY,      /* DTLS failed: wrong PSKd or not authorised */
@@ -172,17 +263,40 @@ typedef struct {
     void *ctx;
 } pb_enroll_ops_t;
 
+typedef enum {
+    PB_ENROLL_ENDPOINT_POLICY_OPTIONAL = 0,
+    PB_ENROLL_ENDPOINT_POLICY_REQUIRED,
+    PB_ENROLL_ENDPOINT_POLICY_INVALID,
+} pb_enroll_endpoint_policy_t;
+
+const char *pb_enroll_endpoint_policy_name(pb_enroll_endpoint_policy_t policy);
+
 typedef struct {
     pb_enroll_ops_t ops;
     uint8_t eui64[PB_ENROLL_EUI64_LEN];
+    /* OPTIONAL after pb_enroll_ctl_init(); see the top comment. */
+    pb_enroll_endpoint_policy_t endpoint_policy;
     pb_enroll_state_t state;
     pb_enroll_result_t last;
     bool resumed;          /* ENROLLED came from the boot rule, not a Joiner */
     uint32_t attempt;      /* incremented per accepted Joiner start */
     uint32_t deadline_ms;  /* JOINING guard or ATTACHING deadline */
+    /* The endpoint delivered with the attempt in progress. RAM only; set
+     * while JOINING/ATTACHING, dropped on every way back to WAITING. */
+    bool pending_endpoint;
+    pb_enroll_bridge_endpoint_t pending_ep;
+    /* ENROLLED only: the endpoint stored with this enrollment (this boot's
+     * attempt, or the version 2 record a resume read). False = none was
+     * delivered; the exporter keeps the prepared image's cfg/pb_bridge. */
+    bool has_bridge_endpoint;
+    pb_enroll_bridge_endpoint_t bridge_endpoint;
 } pb_enroll_ctl_t;
 
 void pb_enroll_ctl_init(pb_enroll_ctl_t *c, const pb_enroll_ops_t *ops, const uint8_t eui64[PB_ENROLL_EUI64_LEN]);
+
+/* What the prepared image says about enrolling without a bridge endpoint.
+ * Call after pb_enroll_ctl_init() and before pb_enroll_ctl_boot(). */
+void pb_enroll_ctl_set_endpoint_policy(pb_enroll_ctl_t *c, pb_enroll_endpoint_policy_t policy);
 
 /* Applies the boot rule once. Returns ENROLLED (Thread started on the stored
  * Dataset) or WAITING (Thread untouched: it stays disabled). */
@@ -191,8 +305,20 @@ pb_enroll_state_t pb_enroll_ctl_boot(pb_enroll_ctl_t *c);
 /* `pskd` is a NUL-terminated buffer of PB_ENROLL_PSKD_BUF_LEN bytes; it is
  * wiped before this returns, whatever the outcome. ESP_OK: the Joiner is
  * running. ESP_ERR_INVALID_ARG: malformed PSKd (state unchanged).
- * ESP_ERR_INVALID_STATE: not WAITING. ESP_FAIL: see c->last. */
+ * ESP_ERR_INVALID_STATE: not WAITING. ESP_FAIL: see c->last.
+ * ESP_ERR_NOT_ALLOWED: the endpoint policy refuses this request (REQUIRED:
+ * this one, which has no endpoint; INVALID: every request) -- state, last
+ * result, stored record and Dataset are untouched and no Joiner ran.
+ * No bridge endpoint: enrolling writes a version 1 record. */
 esp_err_t pb_enroll_ctl_request_join(pb_enroll_ctl_t *c, char pskd[PB_ENROLL_PSKD_BUF_LEN], uint32_t now_ms);
+
+/* The same, for an attempt that also delivers the bridge endpoint (copied;
+ * kept in RAM until enrolled, then stored in the version 2 record).
+ * ESP_ERR_INVALID_ARG also for an endpoint that fails
+ * pb_enroll_bridge_endpoint_check() -- nothing is started or erased.
+ * ESP_ERR_NOT_ALLOWED only under an INVALID endpoint policy. */
+esp_err_t pb_enroll_ctl_request_join_with_endpoint(pb_enroll_ctl_t *c, char pskd[PB_ENROLL_PSKD_BUF_LEN],
+                                                   const pb_enroll_bridge_endpoint_t *endpoint, uint32_t now_ms);
 
 /* JOINING/ATTACHING -> WAITING (CANCELLED). ESP_ERR_INVALID_STATE otherwise. */
 esp_err_t pb_enroll_ctl_cancel(pb_enroll_ctl_t *c);

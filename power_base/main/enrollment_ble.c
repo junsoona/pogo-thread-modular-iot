@@ -9,8 +9,9 @@
  *   - components/power_base_ble_enroll (Security 2 session + admission), and
  *   - the enrollment controller in enrollment_runtime.c, reached through
  *     pb_enrollment_request_join()/pb_enrollment_cancel() exactly like the
- *     bench console reaches it. There is no second Joiner, marker or service
- *     start path.
+ *     bench console reaches it -- or, for a start that delivers the Linux
+ *     bridge endpoint, pb_enrollment_request_join_with_endpoint(). There is
+ *     no second Joiner, marker or service start path.
  *
  * Authentication is protocomm Security 2 with this board's own salt and
  * verifier (components/power_base_ble_auth). A BLE connection, the
@@ -81,9 +82,16 @@ static protocomm_t *s_pc;
 /* protocomm keeps pointers into this; wiped once the transport is down. */
 static pb_ble_auth_cred_t s_cred;
 
-static esp_err_t ctl_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], void *ctx)
+/* Enrollment task (pb_ble_adm_worker_poll()), never a BLE callback. A start
+ * that delivered the bridge endpoint hands the checked copy to the
+ * controller, which keeps it in RAM until the board is enrolled. */
+static esp_err_t ctl_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                                  void *ctx)
 {
     (void)ctx;
+    if (endpoint != NULL) {
+        return pb_enrollment_request_join_with_endpoint(pskd, endpoint);
+    }
     return pb_enrollment_request_join(pskd);
 }
 
@@ -115,6 +123,15 @@ esp_err_t pb_enrollment_ble_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (st.endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_INVALID) {
+        /* No start could be taken anyway (the admission rules and the
+         * controller both refuse): do not advertise an enrollment that
+         * cannot happen. */
+        ESP_LOGE(TAG, "BLE enrollment not offered: the enrollment endpoint policy in 'cfg' (pb_bridge) is not "
+                      "usable -- prepare this board again with tools/gen_power_base_ble_config.py");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     pb_ble_auth_status_t load_status = pb_ble_auth_load(st.eui64, &s_cred);
     if (load_status != PB_BLE_AUTH_OK) {
         pb_enroll_wipe(&s_cred, sizeof(s_cred));
@@ -126,6 +143,9 @@ esp_err_t pb_enrollment_ble_start(void)
 
     pb_ble_service_config_t svc = {
         .joiner_eui64_ok = st.joiner_eui64_matches,
+        /* REQUIRED: the start without a bridge endpoint is refused in the
+         * BLE callback already; the controller refuses it again. */
+        .endpoint_policy = st.endpoint_policy,
         .cred = &s_cred,
         .ctl =
             {

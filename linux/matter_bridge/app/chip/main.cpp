@@ -538,6 +538,11 @@ int main(int argc, char *argv[])
             helper.command = {"/usr/bin/sudo", "-n", "--", gAppConfig.api_enroll_helper};
             pogohome_api::EnrollmentConfig enrollment;
             enrollment.window = std::chrono::seconds(gAppConfig.api_enroll_window_s);
+            // The port the ingest CoAP listener is really started on below
+            // (--port, the same value handed to ingest::Server). A session
+            // that delivers a bridge endpoint reports this, with the OTBR's
+            // own Mesh-Local EID read through the helper at that time.
+            enrollment.bridge_port = gAppConfig.port;
             gEnrollment = std::make_shared<pogohome_api::EnrollmentManager>(
                 gRegistry, std::make_shared<pogohome_api::HelperCommissioner>(helper), enrollment);
             api_config.enrollment = gEnrollment;

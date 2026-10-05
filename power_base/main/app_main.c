@@ -565,6 +565,35 @@ static void start_attach_supervisor(void)
 static void on_enrollment_ready(void)
 {
     ESP_LOGI(TAG, "AWAIT_COMMISSIONING: enrolled -- enabling the power rail and the normal attach supervisor");
+
+    /*
+     * Where the exporter sends to. An enrollment that delivered the Linux
+     * bridge endpoint stored it in the same record as the completion marker
+     * (version 2); it is in the controller's state both right after such an
+     * enrollment and after every reboot that resumed from that record. It
+     * replaces s_bridge_cfg HERE -- before start_attach_supervisor(), i.e.
+     * before start_services_once() can hand s_bridge_cfg to
+     * linux_bridge_exporter_init(), which copies the address exactly once.
+     * No other task reads s_bridge_cfg before that.
+     *
+     * No delivered endpoint (version 1 record: bench console, version 1 BLE
+     * start): s_bridge_cfg stays what the prepared image's cfg/pb_bridge
+     * gave at boot, as before.
+     */
+    pb_enrollment_status_t enrollment;
+    pb_enrollment_get_status(&enrollment);
+    if (enrollment.has_bridge_endpoint) {
+        if (power_base_bridge_config_apply_delivered(&s_bridge_cfg, enrollment.bridge_endpoint.addr,
+                                                     enrollment.bridge_endpoint.port) != ESP_OK) {
+            ESP_LOGW(TAG, "pb_bridge: delivered endpoint rejected -- the optional Linux bridge exporter will not "
+                          "start this boot; it does not fall back to the prepared image's address");
+        }
+    } else {
+        ESP_LOGI(TAG, "pb_bridge: this enrollment delivered no bridge endpoint -- the prepared image's cfg/pb_bridge "
+                      "applies (enabled=%d)",
+                 (int)s_bridge_cfg.enabled);
+    }
+
     apply_power_rail_sequencing();
     start_attach_supervisor();
 }
@@ -681,7 +710,26 @@ void app_main(void)
          * attach_supervisor_task()/start_services_once() path as modes 0/1. */
         ESP_ERROR_CHECK(thread_manager_stop());
         ESP_LOGW(TAG, "AWAIT_COMMISSIONING: Thread and downstream services are disabled until enrolled");
-        if (pb_enrollment_runtime_start(s_own_uuid, on_enrollment_ready) != ESP_OK) {
+        /*
+         * Whether this board may be enrolled WITHOUT being given the Linux
+         * bridge endpoint. Read here, in the mode 2 branch only -- modes 0/1
+         * never enroll and never look at it. An image made without a bridge
+         * address on purpose says "endpoint required": such a board is never
+         * enrolled (or resumed) into a state where the services run with
+         * nowhere to send to. An image without the policy behaves as before.
+         */
+        pb_enroll_endpoint_policy_t endpoint_policy;
+        switch (power_base_bridge_config_load_enroll_policy()) {
+        case POWER_BASE_BRIDGE_ENROLL_POLICY_NONE: endpoint_policy = PB_ENROLL_ENDPOINT_POLICY_OPTIONAL; break;
+        case POWER_BASE_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED:
+            endpoint_policy = PB_ENROLL_ENDPOINT_POLICY_REQUIRED;
+            break;
+        case POWER_BASE_BRIDGE_ENROLL_POLICY_INVALID:
+        default: endpoint_policy = PB_ENROLL_ENDPOINT_POLICY_INVALID; break;
+        }
+        ESP_LOGI(TAG, "AWAIT_COMMISSIONING: enrollment endpoint policy = %s",
+                 pb_enroll_endpoint_policy_name(endpoint_policy));
+        if (pb_enrollment_runtime_start(s_own_uuid, endpoint_policy, on_enrollment_ready) != ESP_OK) {
             halt_forever("ENROLLMENT_RUNTIME_FAILED: could not create the enrollment runtime");
         }
         return;

@@ -1,5 +1,9 @@
 #include "pogohome_api/otbr_helper_protocol.hpp"
 
+#include <arpa/inet.h>
+#include <cstring>
+#include <netinet/in.h>
+
 namespace pogohome_api {
 
 namespace {
@@ -20,6 +24,8 @@ const char *OpName(HelperOp op)
         return "joiner-add";
     case HelperOp::JoinerRemove:
         return "joiner-remove";
+    case HelperOp::MeshLocalEid:
+        return "mesh-local-eid";
     }
     return "";
 }
@@ -61,6 +67,7 @@ bool ValidRequest(const HelperRequest &r)
     switch (r.op) {
     case HelperOp::CommissionerState:
     case HelperOp::CommissionerStart:
+    case HelperOp::MeshLocalEid:
         return r.eui64.empty() && r.pskd.empty() && r.timeout_s == 0;
     case HelperOp::JoinerAdd:
         return IsValidEui64(r.eui64) && IsValidPskd(r.pskd) && r.timeout_s >= kMinJoinerTimeoutSeconds &&
@@ -157,6 +164,8 @@ bool ParseHelperRequest(const std::string &raw, HelperRequest &out)
         r.op = HelperOp::CommissionerState;
     } else if (op == "commissioner-start" && words.size() == 2) {
         r.op = HelperOp::CommissionerStart;
+    } else if (op == "mesh-local-eid" && words.size() == 2) {
+        r.op = HelperOp::MeshLocalEid;
     } else if (op == "joiner-add" && words.size() == 5) {
         r.op = HelperOp::JoinerAdd;
         r.eui64 = words[2];
@@ -251,6 +260,83 @@ bool ParseHelperResponse(const std::string &text, bool &ok, std::vector<std::str
         return false;
     }
     words.assign(parts.begin() + 1, parts.end());
+    return true;
+}
+
+bool ParseMeshLocalEid(const std::string &text, unsigned char (*bytes)[16], std::string *canonical)
+{
+    // The shortest literal is "::" (refused below anyway); the longest is
+    // eight groups of four digits with seven colons.
+    if (text.size() < 2 || text.size() > 39) {
+        return false;
+    }
+    for (char c : text) {
+        // No '%' (zone id), '.', brackets, upper case, spaces or anything else.
+        if (!(IsLowerHexDigit(c) || c == ':')) {
+            return false;
+        }
+    }
+    in6_addr addr{};
+    if (inet_pton(AF_INET6, text.c_str(), &addr) != 1) {
+        return false;
+    }
+    const unsigned char *a = addr.s6_addr;
+    // Named one by one although "fd00::/8" below already excludes them: each
+    // is something a caller might otherwise be handed by mistake.
+    static const unsigned char zero16[16] = {0};
+    if (std::memcmp(a, zero16, 16) == 0) {
+        return false; // unspecified
+    }
+    if (std::memcmp(a, zero16, 15) == 0 && a[15] == 1) {
+        return false; // loopback
+    }
+    if (std::memcmp(a, zero16, 10) == 0 && ((a[10] == 0xff && a[11] == 0xff) || (a[10] == 0 && a[11] == 0))) {
+        return false; // IPv4-mapped / IPv4-compatible
+    }
+    if (a[0] == 0xff) {
+        return false; // multicast
+    }
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) {
+        return false; // link-local
+    }
+    if (a[0] != 0xfd) {
+        return false; // not where a Thread Mesh-Local Prefix can be
+    }
+    if (a[8] == 0 && a[9] == 0 && a[10] == 0 && a[11] == 0xff && a[12] == 0xfe && a[13] == 0) {
+        return false; // an RLOC or ALOC, not the EID
+    }
+    char printed[INET6_ADDRSTRLEN] = {0};
+    if (inet_ntop(AF_INET6, &addr, printed, sizeof(printed)) == nullptr) {
+        return false;
+    }
+    if (bytes != nullptr) {
+        std::memcpy(*bytes, a, 16);
+    }
+    if (canonical != nullptr) {
+        *canonical = printed;
+    }
+    return true;
+}
+
+bool ParseHelperMleidResponse(const std::string &text, std::string &address)
+{
+    address.clear();
+    std::string line = text;
+    if (!line.empty() && line.back() == '\n') {
+        line.pop_back();
+    }
+    static const char kPrefix[] = "ok mleid ";
+    const size_t prefix_len = sizeof(kPrefix) - 1;
+    if (line.size() <= prefix_len || line.size() > kMaxHelperResponseBytes || line.compare(0, prefix_len, kPrefix) != 0) {
+        return false;
+    }
+    std::string canonical;
+    // The rest must be the address and nothing else: ParseMeshLocalEid takes
+    // no space, no second word, no newline.
+    if (!ParseMeshLocalEid(line.substr(prefix_len), nullptr, &canonical)) {
+        return false;
+    }
+    address = canonical;
     return true;
 }
 

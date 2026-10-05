@@ -60,6 +60,10 @@ static uint8_t g_eui64[8];
 static uint32_t g_now = 1000;
 static pb_ble_auth_cred_t g_cred;
 static protocomm_t *g_pc;
+/* The prepared image's enrollment endpoint policy for the next 'I' (boot):
+ * OPTIONAL unless a 'Y' command set it, so drivers that do not know the
+ * command get the board they always got. */
+static pb_enroll_endpoint_policy_t g_endpoint_policy = PB_ENROLL_ENDPOINT_POLICY_OPTIONAL;
 
 static const pb_enroll_network_id_t k_net = {
     .ext_pan_id = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88},
@@ -120,9 +124,13 @@ static const pb_enroll_ops_t k_ot_ops = {
 
 /* ---- what enrollment_ble.c supplies on the board ---- */
 
-static esp_err_t ctl_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], void *ctx)
+static esp_err_t ctl_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                                  void *ctx)
 {
     (void)ctx;
+    if (endpoint != NULL) {
+        return pb_enroll_ctl_request_join_with_endpoint(&g_ctl, pskd, endpoint, g_now);
+    }
     return pb_enroll_ctl_request_join(&g_ctl, pskd, g_now);
 }
 
@@ -215,6 +223,7 @@ static void cmd_init(const uint8_t *p, size_t len)
     nvs_sim_reset();
     memset(&g_ot, 0, sizeof(g_ot));
     pb_enroll_ctl_init(&g_ctl, &k_ot_ops, g_eui64);
+    pb_enroll_ctl_set_endpoint_policy(&g_ctl, g_endpoint_policy); /* enrollment_runtime.c */
     pb_enroll_ctl_boot(&g_ctl);
 
     pb_ble_auth_status_t st = pb_ble_auth_parse(&p[9], len - 9, g_eui64, &g_cred);
@@ -225,6 +234,7 @@ static void cmd_init(const uint8_t *p, size_t len)
     }
     pb_ble_service_config_t cfg = {
         .joiner_eui64_ok = joiner_ok,
+        .endpoint_policy = g_endpoint_policy, /* enrollment_ble.c */
         .cred = &g_cred,
         .ctl = {.request_join = ctl_request_join, .cancel = ctl_cancel, .get_status = ctl_get_status, .ctx = NULL},
         .now_ms = harness_now_ms,
@@ -265,11 +275,27 @@ static void cmd_request(const uint8_t *p, size_t len)
 }
 
 /* 'S': state last attempt(4) joiner_starts(4) joiner_stops(4) thread_enabled
- *      services_allowed marker_status last_pskd(33) */
+ *      services_allowed marker_status last_pskd(33)
+ *      then, about the bridge endpoint (addresses are 16 bytes, ports
+ *      big-endian):
+ *        pending(1) pending_addr(16) pending_port(2)   held in RAM by the controller
+ *        active(1)  active_addr(16)  active_port(2)    of an ENROLLED controller
+ *        stored(1)  stored_addr(16)  stored_port(2)    in the version 2 record */
+static void put_endpoint(uint8_t *p, bool present, const pb_enroll_bridge_endpoint_t *ep)
+{
+    p[0] = present;
+    if (present) {
+        memcpy(&p[1], ep->addr, PB_ENROLL_BRIDGE_ADDR_LEN);
+        p[17] = (uint8_t)(ep->port >> 8);
+        p[18] = (uint8_t)ep->port;
+    }
+}
+
 static void cmd_stats(void)
 {
-    uint8_t s[17 + PB_ENROLL_PSKD_BUF_LEN];
-    pb_enroll_network_id_t id;
+    uint8_t s[17 + PB_ENROLL_PSKD_BUF_LEN + 3 * 19];
+    memset(s, 0, sizeof(s));
+    pb_enroll_record_t rec;
     s[0] = (uint8_t)g_ctl.state;
     s[1] = (uint8_t)g_ctl.last;
     put_u32(&s[2], g_ctl.attempt);
@@ -277,8 +303,12 @@ static void cmd_stats(void)
     put_u32(&s[10], g_ot.joiner_stop_calls);
     s[14] = g_ot.thread_enabled;
     s[15] = pb_enroll_ctl_services_allowed(&g_ctl);
-    s[16] = (uint8_t)pb_enroll_marker_load(g_eui64, &id);
+    s[16] = (uint8_t)pb_enroll_record_load(g_eui64, &rec);
     memcpy(&s[17], g_ot.last_pskd, PB_ENROLL_PSKD_BUF_LEN);
+    uint8_t *e = &s[17 + PB_ENROLL_PSKD_BUF_LEN];
+    put_endpoint(&e[0], g_ctl.pending_endpoint, &g_ctl.pending_ep);
+    put_endpoint(&e[19], g_ctl.state == PB_ENROLL_STATE_ENROLLED && g_ctl.has_bridge_endpoint, &g_ctl.bridge_endpoint);
+    put_endpoint(&e[38], rec.has_bridge_endpoint, &rec.bridge_endpoint);
     reply(0, s, sizeof(s));
 }
 
@@ -341,6 +371,14 @@ void app_main(void)
             reply(0, NULL, 0);
             break;
         case 'S': cmd_stats(); break;
+        case 'Y': /* policy(1): 0 optional, 1 required, 2 invalid -- before 'I' only */
+            if (len != 1 || buf[0] > PB_ENROLL_ENDPOINT_POLICY_INVALID || g_pc != NULL) {
+                reply(0xff, NULL, 0);
+                break;
+            }
+            g_endpoint_policy = (pb_enroll_endpoint_policy_t)buf[0];
+            reply(0, NULL, 0);
+            break;
         case 'D': /* what enrollment_ble.c does after the transport stopped */
             pb_ble_service_stop();
             g_pc = NULL;

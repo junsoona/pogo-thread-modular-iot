@@ -14,14 +14,19 @@
 //     (the OTBR removes the entry by itself when that time runs out, even if
 //     the bridge never comes back to remove it);
 //   - remove that one EUI-64's entry ("NotFound" -- already expired or
-//     auto-removed after a successful join -- counts as removed).
+//     auto-removed after a successful join -- counts as removed);
+//   - read the OTBR's own Mesh-Local EID (the fixed CLI command
+//     "ipaddr mleid", no arguments): the address a Power Base sends its
+//     bridge traffic to. It reads no address list, no RLOC, no Dataset.
 //
 // How it talks to the OTBR: it runs ot-ctl (a fixed, root-owned path; no
 // PATH lookup, no shell) with NO command arguments and writes the single
 // CLI command to ot-ctl's stdin, so the PSKd never appears in any process's
 // argument list. It keeps that stdin open until ot-ctl has printed "Done" or
 // "Error ...", then closes it. The helper never prints, logs or stores the
-// PSKd or ot-ctl's raw output; its stdout is one fixed-vocabulary line.
+// PSKd or ot-ctl's raw output; its stdout is one fixed-vocabulary line --
+// for mesh-local-eid, "ok mleid" followed by the one address ot-ctl printed,
+// after it passed ParseMeshLocalEid() and re-printed in canonical form.
 //
 // Build-time settings (defaults match the operating host):
 //   POGOHOME_OT_CTL_PATH       "/usr/sbin/ot-ctl"
@@ -95,8 +100,9 @@ bool OtCtlLooksSafe()
 #endif
 }
 
-// One CLI command through ot-ctl's stdin. `command` is wiped.
-CliResult RunCli(std::string command)
+// One CLI command through ot-ctl's stdin. `command` is wiped. Unless
+// `keep_lines`, every output line but a Commissioner state word is wiped.
+CliResult RunCli(std::string command, bool keep_lines = false)
 {
     CliResult result;
     std::vector<std::string> argv = {POGOHOME_OT_CTL_PATH};
@@ -131,8 +137,9 @@ CliResult RunCli(std::string command)
         result.status = CliStatus::Unavailable;
     }
     for (auto &line : result.output.lines) {
-        // Only the Commissioner state word is ever looked at.
-        if (line != "disabled" && line != "petition" && line != "petitioning" && line != "active") {
+        // Only the Commissioner state word is ever looked at -- except for
+        // "ipaddr mleid", whose one line is the answer (no PSKd was sent).
+        if (!keep_lines && line != "disabled" && line != "petition" && line != "petitioning" && line != "active") {
             SecureWipe(line);
         }
     }
@@ -246,6 +253,33 @@ int DoJoinerRemove(const HelperRequest &request)
     return Respond(CliFailure(r), 1);
 }
 
+// The OTBR's Mesh-Local EID: what "ipaddr mleid" prints, and only if it
+// printed exactly one line that is such an address.
+int DoMeshLocalEid()
+{
+    static const char kCommand[] = "ipaddr mleid";
+    CliResult r = RunCli(kCommand, true);
+    if (r.status != CliStatus::Done) {
+        return Respond(CliFailure(r), 1);
+    }
+    // A readline build of ot-ctl echoes the command before its output. Only
+    // a line that is exactly the command this helper sent is set aside;
+    // everything else counts.
+    std::vector<std::string> lines;
+    for (const auto &line : r.output.lines) {
+        if (line != kCommand) {
+            lines.push_back(line);
+        }
+    }
+    std::string canonical;
+    if (lines.size() != 1 || !ParseMeshLocalEid(lines[0], nullptr, &canonical)) {
+        // Thread not started, several lines, an RLOC, anything unexpected:
+        // nothing is passed on and nothing is guessed.
+        return Respond("err invalid_address", 1);
+    }
+    return Respond(("ok mleid " + canonical).c_str(), 0);
+}
+
 // Reads the whole request (up to EOF), at most kMaxHelperRequestBytes + 1.
 bool ReadRequest(std::string &raw)
 {
@@ -291,6 +325,8 @@ const char *OpName(HelperOp op)
         return "joiner-add";
     case HelperOp::JoinerRemove:
         return "joiner-remove";
+    case HelperOp::MeshLocalEid:
+        return "mesh-local-eid";
     }
     return "?";
 }
@@ -351,6 +387,8 @@ int main(int argc, char **)
         return DoJoinerAdd(request);
     case HelperOp::JoinerRemove:
         return DoJoinerRemove(request);
+    case HelperOp::MeshLocalEid:
+        return DoMeshLocalEid();
     }
     return Respond("err internal", 1);
 }

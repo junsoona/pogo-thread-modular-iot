@@ -185,6 +185,7 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
     cfg->ctl.get_status(&st, cfg->ctl.ctx);
     leaf_lock(NULL);
     pb_ble_adm_init(&s_adm, &adm_ops, cfg->eui64, cfg->joiner_eui64_ok, now_ms());
+    pb_ble_adm_set_endpoint_policy(&s_adm, cfg->endpoint_policy);
     s_adm.ctl = st;
     leaf_unlock(NULL);
 

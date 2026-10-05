@@ -112,6 +112,10 @@ class Harness:
     def init(self, eui_hex, record, joiner_ok=True):
         return self.cmd("I", bytes.fromhex(eui_hex) + bytes([1 if joiner_ok else 0]) + record)[0]
 
+    def set_endpoint_policy(self, policy):
+        """Before init(): the prepared image's enrollment endpoint policy (0 optional, 1 required, 2 invalid)."""
+        return self.cmd("Y", bytes([policy]))[0] == 0
+
     def connect(self, session):
         return self.cmd("O", struct.pack(">I", session))[0] == 0
 
@@ -141,9 +145,17 @@ class Harness:
     def stats(self):
         s = self.cmd("S")[1]
         state, last, attempt, starts, stops, thread, services, marker = struct.unpack(">BBIIIBBB", s[:17])
+        def endpoint(off):
+            # present(1) address(16) port(2, big-endian)
+            if len(s) < off + 19 or s[off] == 0:
+                return None
+            return (bytes(s[off + 1:off + 17]), struct.unpack(">H", s[off + 17:off + 19])[0])
+
         return {"state": state, "last": last, "attempt": attempt, "joiner_starts": starts, "joiner_stops": stops,
                 "thread": thread, "services": services, "marker": marker,
-                "pskd": s[17:].split(b"\0")[0].decode()}
+                "pskd": s[17:50].split(b"\0")[0].decode(),
+                # the bridge endpoint: held in RAM by the controller / of an enrolled controller / in the record
+                "pending_ep": endpoint(50), "active_ep": endpoint(69), "stored_ep": endpoint(88)}
 
     def stop_service(self):
         self.cmd("D")
@@ -210,6 +222,13 @@ class Client:
         err, resp = self.call("pb-start", body)
         return (err, None) if err != ESP_OK else (err, resp[2])
 
+    def start_ep(self, target_hex, request_id, challenge, pskd, addr, port, ep_version=1):
+        """pb-start WITH the bridge endpoint (PB_BLE_MSG_START_EP_REQ). -> (esp_err, response type, code)"""
+        body = (bytes([1, 0x04, len(pskd), 0]) + bytes.fromhex(target_hex) + request_id + challenge +
+                bytes([ep_version, 0]) + struct.pack(">H", port) + addr + pskd.encode())
+        err, resp = self.call("pb-start", body)
+        return (err, None, None) if err != ESP_OK else (err, resp[1], resp[2])
+
     def cancel(self, target_hex, request_id):
         err, resp = self.call("pb-cancel", bytes([1, 0x03, 0, 0]) + bytes.fromhex(target_hex) + request_id)
         return (err, None) if err != ESP_OK else (err, resp[2])
@@ -274,8 +293,10 @@ def main():
         pack.verify_pb_bridge_config(image, expect_enabled=True,
                                      expected_host_addr=ipaddress.IPv6Address(BRIDGE).packed, expected_port=PORT)
 
-        def boot(rec=record, eui=EUI, joiner_ok=True):
+        def boot(rec=record, eui=EUI, joiner_ok=True, endpoint_policy=None):
             h = Harness(log_path)
+            if endpoint_policy is not None and not h.set_endpoint_policy(endpoint_policy):
+                raise RuntimeError("the harness did not take the endpoint policy (rebuild tools/host_ble_sec2)")
             return h, h.init(eui, rec, joiner_ok)
 
         def client(h, session, password=setup_code, username=EUI):
@@ -491,6 +512,137 @@ def main():
         h.quit()
 
         # ------------------------------------------------------------------
+        print("\n-- pb-start with the bridge endpoint, sent by ESP-IDF's official client --")
+        h, _ = boot()
+        h.connect(1)
+        err, ver = h.request(1, "proto-ver", b"ESP")
+        info = json.loads(ver.decode())
+        check(info["pb_enroll"] == {"proto": 1, "cap": ["bridge_endpoint_v1"]} and info["prov"]["cap"] == [],
+              "proto-ver: pb_enroll.proto is still 1 and pb_enroll.cap lists bridge_endpoint_v1; prov is unchanged")
+        ep_addr = ipaddress.IPv6Address("fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79").packed  # inside the harness's network
+        ep_port = 5701
+        rid_ep = bytes(range(0x70, 0x80))
+        plain = (bytes([1, 0x04, len(PSKD), 0]) + bytes.fromhex(EUI) + rid_ep + bytes(16) + bytes([1, 0]) +
+                 struct.pack(">H", ep_port) + ep_addr + PSKD.encode())
+        err, resp = h.request(1, "pb-start", plain)
+        check(err != ESP_OK and resp == b"" and h.stats()["pending_ep"] is None,
+              "plaintext endpoint start before any handshake: refused by protocomm, nothing taken")
+        bad = client(h, 1, password=wrong_code)
+        ok, _ = bad.handshake()
+        check(not ok, "(a client with the wrong setup code does not get a session)")
+        try:
+            err, _ = bad.call("pb-start", plain)
+        except Exception:
+            err = -1  # the official client has no session keys to encrypt with
+        h.poll()
+        check(err != ESP_OK and h.stats()["joiner_starts"] == 0 and h.stats()["pending_ep"] is None and
+              h.stats()["marker"] == 0,
+              "an endpoint start without an authenticated session: refused; no Joiner, nothing kept or stored")
+
+        c = client(h, 1)
+        check(c.handshake()[0], "the right setup code authenticates")
+        _, st = c.status(issue=True)
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD, ep_addr, 0)
+        check(err == ESP_OK and rtype == 0x84 and code == 0x1d, "port 0: answered 0x84 / INVALID_ENDPOINT (0x1d)")
+        _, st = c.status(issue=True)
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD,
+                                      ipaddress.IPv6Address("fe80::8c1f:2e3d:4c5b:6a79").packed, ep_port)
+        check(code == 0x1d, "a link-local address: INVALID_ENDPOINT")
+        _, st = c.status(issue=True)
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD,
+                                      ipaddress.IPv6Address("::ffff:192.168.1.10").packed, ep_port)
+        check(code == 0x1d, "an IPv4-mapped address: INVALID_ENDPOINT")
+        _, st = c.status(issue=True)
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD, ep_addr, ep_port, ep_version=2)
+        check(code == 0x1d, "endpoint format version 2: INVALID_ENDPOINT")
+        h.poll()
+        check(h.stats()["joiner_starts"] == 0 and h.stats()["pending_ep"] is None,
+              "none of the refused endpoint starts reached the Joiner or the controller")
+
+        _, st = c.status(issue=True)
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD, ep_addr, ep_port)
+        check(err == ESP_OK and rtype == 0x84 and CODE[code] == "ACCEPTED", "a valid endpoint start: 0x84 / ACCEPTED")
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD, ep_addr, ep_port)
+        check(CODE[code] == "DUPLICATE", "the same request again: DUPLICATE")
+        err, rtype, code = c.start_ep(EUI, rid_ep, st["challenge"], PSKD, ep_addr, ep_port + 1)
+        check(CODE[code] == "REQUEST_CONFLICT", "the same request id with another port: REQUEST_CONFLICT")
+        err, code = c.start(EUI, rid_ep, st["challenge"], PSKD)
+        check(CODE[code] == "REQUEST_CONFLICT", "the same request id as the version 1 message: REQUEST_CONFLICT")
+        check(h.poll() == CLOSE_OPEN, "the worker runs it")
+        s = h.stats()
+        check(s["joiner_starts"] == 1 and s["pskd"] == PSKD and s["pending_ep"] == (ep_addr, ep_port) and
+              s["stored_ep"] is None and s["marker"] == 0,
+              "one Joiner; the controller holds exactly that address and port in RAM; nothing is stored yet")
+        h.joiner_done(0)  # PB_ENROLL_JOINER_OK
+        h.poll()
+        h.tick(True, True)
+        check(h.poll() == CLOSE_ENROLLED, "attached with the complete Dataset: enrolled")
+        s = h.stats()
+        check(s["marker"] == 1 and s["stored_ep"] == (ep_addr, ep_port) and s["active_ep"] == (ep_addr, ep_port) and
+              s["pending_ep"] is None and s["services"] == 1,
+              "the enrollment record holds the delivered endpoint, and it is the one the services would be given")
+        h.quit()
+
+        print("\n-- a board whose image REQUIRES the endpoint: the official client's 0x02 start is refused --")
+        POLICY_REQUIRED, POLICY_INVALID = 1, 2
+        h, st0 = boot(endpoint_policy=POLICY_REQUIRED)
+        check(st0 == AUTH_OK, "the service starts for a board with the endpoint-required policy")
+        h.connect(1)
+        c = client(h, 1)
+        check(c.handshake()[0], "the right setup code authenticates")
+        _, st = c.status(issue=True)
+        check(CODE[st["code"]] == "OK" and st["state"] == STATE_WAITING and not (st["flags"] & 0x08),
+              "pb-status: waiting, and not 'Joiner unavailable'")
+        rid_old = bytes(range(0x90, 0xa0))
+        err, code = c.start(EUI, rid_old, st["challenge"], PSKD)
+        check(err == ESP_OK and CODE[code] == "UNAVAILABLE",
+              "the start WITHOUT an endpoint (0x02), with a valid challenge: UNAVAILABLE (0x1b)")
+        err, code = c.start(EUI, rid_old, st["challenge"], PSKD)
+        check(CODE[code] == "UNAVAILABLE", "sent again: UNAVAILABLE again")
+        h.poll()
+        s = h.stats()
+        check(s["joiner_starts"] == 0 and s["state"] == STATE_WAITING and s["marker"] == 0 and s["attempt"] == 0 and
+              s["pending_ep"] is None and s["pskd"] == "",
+              "nothing reached the worker or the controller: no Joiner, no record, no PSKd")
+        _, q = c.status(request_id=rid_old)
+        check(not (q["flags"] & 0x03) and q["phase"] == 0, "the board knows nothing under that request id")
+        err, rtype, code = c.start_ep(EUI, rid_old, st["challenge"], PSKD, ep_addr, ep_port)
+        check(err == ESP_OK and rtype == 0x84 and CODE[code] == "ACCEPTED",
+              "the endpoint start (0x04) with the SAME challenge and request id: ACCEPTED -- the refusal used up nothing")
+        check(h.poll() == CLOSE_OPEN and h.stats()["joiner_starts"] == 1 and h.stats()["pending_ep"] == (ep_addr, ep_port),
+              "one Joiner, with the endpoint")
+        h.joiner_done(0)
+        h.poll()
+        h.tick(True, True)
+        check(h.poll() == CLOSE_ENROLLED and h.stats()["stored_ep"] == (ep_addr, ep_port) and h.stats()["marker"] == 1,
+              "enrolled with the endpoint in the record")
+        h.quit()
+
+        h, _ = boot(endpoint_policy=POLICY_INVALID)
+        h.connect(1)
+        c = client(h, 1)
+        check(c.handshake()[0], "(a board with an unusable policy: the admission code is exercised directly here; the "
+                                "board itself does not open BLE)")
+        _, st = c.status(issue=True)
+        err, code = c.start(EUI, rid_old, st["challenge"], PSKD)
+        err2, rtype, code2 = c.start_ep(EUI, rid_old, st["challenge"], PSKD, ep_addr, ep_port)
+        h.poll()
+        check(CODE[code] == "UNAVAILABLE" and CODE[code2] == "UNAVAILABLE" and rtype == 0x84 and
+              h.stats()["joiner_starts"] == 0 and h.stats()["marker"] == 0,
+              "unusable policy: both start messages are UNAVAILABLE and nothing is started")
+        h.quit()
+
+        h, _ = boot()  # no policy: what every image without it gets
+        h.connect(1)
+        c = client(h, 1)
+        c.handshake()
+        _, st = c.status(issue=True)
+        err, code = c.start(EUI, rid_old, st["challenge"], PSKD)
+        check(CODE[code] == "ACCEPTED" and h.poll() == CLOSE_OPEN and h.stats()["joiner_starts"] == 1 and
+              h.stats()["pending_ep"] is None,
+              "without the policy the 0x02 start is accepted and started exactly as before")
+        h.quit()
+
         print("\n-- authentication attempt limit --")
         h, _ = boot()
         h.connect(1)

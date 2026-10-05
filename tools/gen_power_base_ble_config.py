@@ -7,11 +7,39 @@ It writes one cfg image for exactly one board:
 
     power_base_cfg   board GPIO/timeouts from configs/power_base.json (unchanged)
     pb_thread        mode=2 (AWAIT_COMMISSIONING), NO Thread Dataset
-    pb_bridge        the Linux bridge's IPv6 address and CoAP port you pass
+    pb_bridge        one of two things, and you must say which:
+                       --bridge-from-enrollment   NO address in the image
+                         (pb_bridge enabled=0, address and port all zero) AND
+                         the policy "bridge endpoint required at enrollment"
+                         (pb_bridge policy byte = 1). The board gets the Linux
+                         bridge's address and port from the app during BLE
+                         enrollment and stores them itself; it refuses an
+                         enrollment that does not deliver them.
+                       --bridge-host/--bridge-port   the address and port you
+                         pass, as before.
     pb_ble_auth      protocomm Security 2 salt + verifier for this board's
                      EUI-64 (components/power_base_ble_auth)
 
 and one setup-code file for the person who will enroll that board.
+
+The bridge address
+  - There is no default and no fallback. Give exactly one of
+    --bridge-from-enrollment, or --bridge-host together with --bridge-port.
+    Neither, both, or half of the pair is refused with nothing written.
+  - --bridge-from-enrollment never invents an address: the image is the same
+    for every home. An address you did type is never dropped to make an
+    address-less image: a malformed --bridge-host is an error, and so is
+    --bridge-host next to --bridge-from-enrollment.
+  - An address-less image needs firmware and an app that deliver the endpoint
+    (BLE capability "bridge_endpoint_v1"). The image says so itself: it
+    records the policy "endpoint required at enrollment", and firmware that
+    knows the policy refuses the first BLE start (the one without an endpoint)
+    with UNAVAILABLE and refuses the bench console too -- nothing is started,
+    so the board cannot end up enrolled with nowhere to send to. An image with
+    --bridge-host/--bridge-port carries no such policy and enrolls the old way.
+  - An address-less image made by an earlier version of this tool has no
+    policy and is NOT protected. Make it again (--existing-setup-code-file
+    keeps the board's setup code).
 
 The setup code
   - is 128 random bits from the operating system's CSPRNG (`secrets`),
@@ -37,6 +65,14 @@ Requires the ESP-IDF environment (nvs_partition_gen.py, nvs_parser, srp6a.py):
     source ~/.espressif/v6.1/esp-idf/export.sh
 
 Usage (every value is yours; nothing is defaulted to a particular home):
+    # no home-specific address in the image (delivered during BLE enrollment):
+    python tools/gen_power_base_ble_config.py \\
+        --eui64 <16 hex digits of THIS board> \\
+        --bridge-from-enrollment \\
+        --setup-code-file "$HOME/pogo-setup-codes/<eui64>.setup-code" \\
+        [--out-dir build/cfg_images]
+
+    # or, as before, the address written into the image:
     python tools/gen_power_base_ble_config.py \\
         --eui64 <16 hex digits of THIS board> \\
         --bridge-host <Linux OTBR mesh-local address> --bridge-port <ingest port> \\
@@ -166,13 +202,46 @@ def build_record(eui64_hex: str, salt: bytes, verifier: bytes) -> bytes:
     return record
 
 
+def verify_no_bridge_address(image_path: str) -> None:
+    """The address-less image must really hold no address and must say that
+    one has to be delivered: pb_bridge's blob is schema 1, enabled=0, policy
+    byte 1 (endpoint required at enrollment), address and port all zero."""
+    tool_dir = os.path.join(os.environ.get("IDF_PATH", ""), "components", "nvs_flash", "nvs_partition_tool")
+    if tool_dir not in sys.path:
+        sys.path.insert(0, tool_dir)
+    import nvs_parser  # noqa: E402 -- IDF_PATH-dependent
+    with open(image_path, "rb") as f:
+        partition = nvs_parser.NVS_Partition(os.path.basename(image_path), bytearray(f.read()))
+    ns_id = None
+    blob = None
+    for page in partition.pages:
+        for entry in page.entries:
+            if entry.key == pack.PB_BRIDGE_NAMESPACE and entry.metadata["namespace"] == 0 and entry.data:
+                ns_id = entry.data.get("value")
+            elif (ns_id is not None and entry.metadata["namespace"] == ns_id and entry.key == "blob"
+                  and entry.metadata["type"] == "blob_data"):
+                raw = bytearray()
+                for child in entry.children:
+                    raw += child.raw
+                blob = bytes(raw[:entry.data.get("size")])
+    expected = ((1).to_bytes(4, "big") + bytes([0, pack.PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED]) + bytes(18))
+    if blob != expected:
+        sys.exit("generated image's pb_bridge is not the address-less blob (enabled=0, endpoint required, address "
+                 "and port zero)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eui64", required=True, help="This board's EUI-64, 16 hex digits.")
-    ap.add_argument("--bridge-host", required=True, metavar="IPV6_ADDR",
-                    help="The Linux OTBR host's mesh-local address (`sudo ot-ctl ipaddr mleid` on that host).")
-    ap.add_argument("--bridge-port", required=True, type=int, metavar="PORT",
-                    help="The Linux bridge's CoAP ingest port.")
+    ap.add_argument("--bridge-from-enrollment", action="store_true",
+                    help="Write NO bridge address into the image (pb_bridge enabled=0, all zero): the board receives "
+                         "the Linux bridge's address and port during BLE enrollment. Cannot be combined with "
+                         "--bridge-host/--bridge-port.")
+    ap.add_argument("--bridge-host", default=None, metavar="IPV6_ADDR",
+                    help="The Linux OTBR host's mesh-local address (`sudo ot-ctl ipaddr mleid` on that host). Needs "
+                         "--bridge-port. Not with --bridge-from-enrollment.")
+    ap.add_argument("--bridge-port", default=None, type=int, metavar="PORT",
+                    help="The Linux bridge's CoAP ingest port. Needs --bridge-host.")
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--setup-code-file", metavar="PATH",
                        help="Where to write the NEW setup code (mode 0600). Must not exist; must be outside this "
@@ -189,9 +258,24 @@ def main():
         sys.exit("IDF_PATH is not set -- source the ESP-IDF v6.1 export.sh first")
 
     eui64 = normalize_eui64(args.eui64)
-    pack.validate_bridge_host(args.bridge_host)
-    if not (0 < args.bridge_port <= 0xFFFF):
-        die(f"--bridge-port={args.bridge_port} is out of range (1..65535)")
+
+    # Which pb_bridge this image gets. Decided from what was typed, never
+    # from whether a typed value happens to be usable: a bad or half-given
+    # address is an error, not "no address".
+    static_given = args.bridge_host is not None or args.bridge_port is not None
+    if args.bridge_from_enrollment and static_given:
+        die("--bridge-from-enrollment cannot be combined with --bridge-host/--bridge-port: either the image carries "
+            "no bridge address, or the one you pass -- nothing was written")
+    if not args.bridge_from_enrollment and not static_given:
+        die("say where the bridge address comes from: --bridge-from-enrollment (no address in the image; delivered "
+            "during BLE enrollment) or --bridge-host <addr> --bridge-port <port>. There is no default address")
+    with_static_address = not args.bridge_from_enrollment
+    if with_static_address:
+        if args.bridge_host is None or args.bridge_port is None:
+            die("--bridge-host and --bridge-port must be given together")
+        pack.validate_bridge_host(args.bridge_host)
+        if not (0 < args.bridge_port <= 0xFFFF):
+            die(f"--bridge-port={args.bridge_port} is out of range (1..65535)")
 
     code_path = args.setup_code_file or args.existing_setup_code_file
     if is_inside_repo(code_path):
@@ -237,11 +321,17 @@ def main():
             fd = os.open(record_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(record)
-            result = subprocess.run(
-                [sys.executable, os.path.join(TOOLS_DIR, "pack_power_base_config.py"), args.config, partial_path,
-                 "--await-commissioning", "--bridge-host", args.bridge_host, "--bridge-port", str(args.bridge_port),
-                 "--ble-auth-record-file", record_path],
-                capture_output=True, text=True)
+            pack_cmd = [sys.executable, os.path.join(TOOLS_DIR, "pack_power_base_config.py"), args.config,
+                        partial_path, "--await-commissioning", "--ble-auth-record-file", record_path]
+            if with_static_address:
+                # No policy: a board with a static address enrolls as before.
+                pack_cmd += ["--bridge-host", args.bridge_host, "--bridge-port", str(args.bridge_port)]
+            else:
+                # pb_bridge enabled=0 with an all-zero address and port, AND
+                # the explicit policy that an enrollment must deliver the
+                # endpoint -- "no address" alone would not say that.
+                pack_cmd += ["--require-enrollment-endpoint"]
+            result = subprocess.run(pack_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             sys.stderr.write(result.stdout + result.stderr)
             sys.exit("image generation failed -- nothing usable was written")
@@ -250,9 +340,14 @@ def main():
         import ipaddress
         pack.verify_pb_thread_config(partial_path, expected_mode=pack.PB_THREAD_MODE_AWAIT_COMMISSIONING,
                                      expected_tlvs_len=0)
-        pack.verify_pb_bridge_config(partial_path, expect_enabled=True,
-                                     expected_host_addr=ipaddress.IPv6Address(args.bridge_host).packed,
-                                     expected_port=args.bridge_port)
+        if with_static_address:
+            pack.verify_pb_bridge_config(partial_path, expect_enabled=True,
+                                         expected_host_addr=ipaddress.IPv6Address(args.bridge_host).packed,
+                                         expected_port=args.bridge_port)
+        else:
+            pack.verify_pb_bridge_config(partial_path, expect_enabled=False,
+                                         expected_enroll_policy=pack.PB_BRIDGE_ENROLL_POLICY_ENDPOINT_REQUIRED)
+            verify_no_bridge_address(partial_path)
         pack.verify_pb_ble_auth(partial_path, expected_record=record)
         if os.path.getsize(partial_path) != pack.CFG_PARTITION_SIZE:
             sys.exit(f"generated image is {os.path.getsize(partial_path)} bytes, expected "
@@ -271,8 +366,11 @@ def main():
             if os.path.exists(partial_path):
                 os.remove(partial_path)
 
+    bridge_note = (f"pb_bridge:enabled=1 port={args.bridge_port}" if with_static_address
+                   else "pb_bridge:enabled=0, NO address, enrollment endpoint REQUIRED (delivered during BLE "
+                        "enrollment; an enrollment without it is refused)")
     print(f"wrote {image_path} ({os.path.getsize(image_path)} bytes, mode 0600): power_base_cfg + "
-          f"pb_thread:mode=AWAIT_COMMISSIONING (no Dataset) + pb_bridge:enabled=1 port={args.bridge_port} + "
+          f"pb_thread:mode=AWAIT_COMMISSIONING (no Dataset) + {bridge_note} + "
           f"pb_ble_auth for EUI-64 {eui64} (salt/verifier never printed)")
     print(f"setup code: {'written to' if created_code_file else 'reused from'} {code_path} (mode 0600) -- not "
           f"displayed. Security 2 username: {eui64}")
