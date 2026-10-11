@@ -143,6 +143,19 @@ static uint8_t s_join_result_role;
 static int s_join_result_retries;
 static TickType_t s_join_result_deadline;
 
+/* See child_service_get_upstream_generation(). Written by this component's
+ * own task only, read from others (a single aligned 32-bit load). */
+static volatile uint32_t s_upstream_generation;
+
+static void begin_new_upstream_generation(void)
+{
+    uint32_t next = s_upstream_generation + 1;
+    if (next == 0) {
+        next = 1; /* 0 stays "no session was ever joined" */
+    }
+    s_upstream_generation = next;
+}
+
 static int dedup_index_for(uint8_t msg_type)
 {
     switch (msg_type) {
@@ -914,6 +927,10 @@ static void child_service_task(void *arg)
                 ESP_LOGI(TAG, "Thread join succeeded, otDeviceRole=%u(%s)", role, thread_manager_role_to_str(role));
                 begin_join_result_retry(true, role);
                 s_state = CS_STATE_JOINED;
+                /* The new generation exists before anything may act on
+                 * "upstream ready": whoever sees ready already sees the new
+                 * number. */
+                begin_new_upstream_generation();
                 role_manager_set_upstream_ready(true);
                 sensor_service_set_thread_joined(true); /* unblocks sensor_service's wireless sample hand-off */
             } else if (s_join_deadline != 0 && (int32_t)(xTaskGetTickCount() - s_join_deadline) >= 0) {
@@ -1034,6 +1051,11 @@ void child_service_on_role_change(module_role_t new_role, module_role_t old_role
 uint8_t child_service_get_own_topology_depth(void)
 {
     return s_topology_depth;
+}
+
+uint32_t child_service_get_upstream_generation(void)
+{
+    return s_upstream_generation;
 }
 
 void child_service_get_parent_uuid(uint8_t out_uuid[POGO_UUID_LEN])

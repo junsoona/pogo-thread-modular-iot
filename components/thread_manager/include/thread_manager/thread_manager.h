@@ -145,10 +145,20 @@ esp_err_t thread_manager_get_factory_eui64(uint8_t out_eui64[8]);
 
 /*
  * otInstanceErasePersistentInfo(): wipes OpenThread's own settings (Dataset,
- * network info) in the dynamic NVS. Thread must be disabled. The caller
- * restarts the chip afterwards. Only for an explicit operator command.
+ * network info) in the dynamic NVS. Thread must be disabled (OpenThread
+ * refuses otherwise). The caller restarts the chip afterwards. Only for an
+ * explicit operator command or an authenticated unenroll.
+ *
+ * ESP_OK means OpenThread accepted the call. It does NOT prove the store is
+ * empty: the ESP-IDF port ends in nvs_erase_all() + nvs_commit() and returns
+ * nothing. A caller that must know reads the store back (the NVS partition
+ * below, namespace "openthread").
  */
 esp_err_t thread_manager_erase_persistent_info(void);
+
+/* The NVS partition OpenThread's settings are kept in (the port_config this
+ * component passes to esp_openthread). */
+#define THREAD_MANAGER_OT_STORAGE_PARTITION "nvs"
 
 /*
  * ROOT: identical underlying behavior to thread_manager_start_as_always_on_ftd()

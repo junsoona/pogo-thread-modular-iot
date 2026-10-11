@@ -1,5 +1,8 @@
 # ESP32-H2 USB RCP와 Linux OTBR
 
+> 공개용 기록: 보드 식별값·계정·포트·주소는 예시로 바꿨습니다. 명령 실행 시 자신의 실제 값으로 바꾸세요. 원본 근거는 비공개로 보존했습니다.
+
+
 `rcp/`는 Linux OTBR용 ESP32-H2 Radio Co-Processor 펌웨어다. USB Serial/JTAG를
 Spinel 전송에 사용하며 센서 모듈, Power Base, 공용 `components/`와 독립된 ESP-IDF
 프로젝트다.
@@ -45,7 +48,7 @@ ESP32-H2의 USB 포트는 순수 Spinel byte stream으로 사용한다. RCP가 �
 ## 빌드
 
 ```bash
-cd "/Users/junsoona/no-icloud/main project_1"
+cd "$HOME/pogo-thread-modular-iot"
 source ~/.espressif/v6.1/esp-idf/export.sh
 
 idf.py -C rcp -B ~/esp-builds/pogo_rcp set-target esp32h2
@@ -58,6 +61,25 @@ idf.py -C rcp -B ~/esp-builds/pogo_rcp build
 python3 tools/test_rcp_config.py
 ```
 
+### 버전과 빌드 식별 (2026-10-06)
+
+RCP의 제품 버전은 `versions.json`의 `rcp`이고 ESP-IDF app description에 들어간다. 어떤 소스로
+만들었는지(commit, dirty, 소스 지문)는 `rcp/main/rcp_build_info.c`의 문자열 하나로 이미지에
+들어간다([`versioning.md`](versioning.md)). manifest까지 만드는 빌드는 다음과 같다.
+
+```bash
+tools/pogo_version.py build-firmware --component rcp --variant default --out ~/esp-builds/<새 디렉터리>
+tools/pogo_version.py appdesc ~/esp-builds/<새 디렉터리>/artifact/pogo_rcp.bin
+```
+
+- 이 정보는 **`.bin` 파일에서만** 읽는다. 운영 RCP는 로그를 내지 않고(USB가 Spinel 링크),
+  Spinel property나 콘솔 명령으로 내보내지도 않는다. 실행 중인 RCP가 어떤 빌드인지는 설치 기록
+  (`docs/release-records/`)으로만 안다.
+- `rcp/main/esp_ot_rcp.c`와 Spinel 경로는 이 변경으로 바뀌지 않았다. RCP는 여전히 다른 프로젝트의
+  컴포넌트를 쓰지 않는다(`tools/test_rcp_config.py`가 검사한다).
+- 2026-10-06 현재 이 구성의 RCP를 보드에 기록하거나 OTBR에 연결해 보지 않았다(빌드와 정적
+  검사만).
+
 ## 플래시
 
 RCP port는 실행 중인 `otbr-agent`가 점유한다. Linux에서 agent를 먼저 중지하고 보드를
@@ -67,7 +89,7 @@ Mac:
 
 ```bash
 source ~/.espressif/v6.1/esp-idf/export.sh
-RCP_PORT=/dev/cu.usbmodem1401
+RCP_PORT=/dev/cu.usbmodemXXXX
 
 idf.py -C rcp -B ~/esp-builds/pogo_rcp \
   -p "$RCP_PORT" flash
@@ -143,6 +165,27 @@ sudo fuser -v "$TTY"
 sudo lsof "$TTY"
 ```
 
+**허브의 Thread 쪽 주소 (2026-10-09 기록).** Power Base가 허브에 보내는 목적지는 `sudo ot-ctl ipaddr mleid`가
+출력하는 Mesh-Local EID다. 이 값은 otbr-agent의 설정 파일에 들어 있어 재시작으로는 바뀌지 않지만, 설정이
+지워지거나 새로 만들어지면(공장 초기화, RCP 교체로 설정 파일이 새로 생김) **같은 Dataset을 다시 넣어도 뒤
+64비트가 달라진다.** Power Base 0.3.0과 Linux bridge 0.3.0은 그 경우 보드가 허브를 다시 찾는다
+([`power-base-management.md`](power-base-management.md) 12절). 그 기능이 기대는 것 두 가지를 OTBR에서 읽기
+전용으로 확인할 수 있다:
+
+```bash
+# wpan0에 Mesh-Local EID와 함께 locator 주소(…:0:ff:fe00:<RLOC16>)가 올라와 있는가.
+# bridge는 이 목록에서 EID를 고르고, 보드는 locator 주소로 먼저 묻는다.
+ip -6 addr show dev wpan0
+
+# OTBR이 Network Data에 자기 RLOC16으로 무엇을 내고 있는가(prefix, route, service).
+# 아무것도 없어도 OTBR이 leader나 router이면 보드는 router table에서 찾는다.
+sudo ot-ctl netdata show
+sudo ot-ctl rloc16
+sudo ot-ctl state
+```
+
+이 문서를 쓴 시점에 운영 OTBR에서 위 출력을 확인하지는 않았다(근거는 OpenThread posix platform의 소스다).
+
 ## Active Dataset 백업
 
 Thread 네트워크가 정상 상태일 때 Linux host에서 Dataset을 저장한다.
@@ -160,7 +203,7 @@ Dataset 파일에는 Network Key가 들어 있다. 화면이나 Git에 내용을
 Mac에서 Power Base 설정을 만들려면 안전한 경로로 복사한다.
 
 ```bash
-scp junsoo-na@<LINUX_IP>:/home/junsoo-na/otbr-active-dataset.hex \
+scp <USER>@<LINUX_IP>:/home/<USER>/otbr-active-dataset.hex \
   "$HOME/otbr-active-dataset.hex"
 chmod 600 "$HOME/otbr-active-dataset.hex"
 ```
@@ -170,7 +213,7 @@ chmod 600 "$HOME/otbr-active-dataset.hex"
 Power Base bridge 설정 이미지를 만든다.
 
 ```bash
-cd "/Users/junsoona/no-icloud/main project_1"
+cd "$HOME/pogo-thread-modular-iot"
 source ~/.espressif/v6.1/esp-idf/export.sh
 
 OTBR_MLEID='<OTBR_MESH_LOCAL_EID>'

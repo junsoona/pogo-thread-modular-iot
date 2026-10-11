@@ -98,6 +98,12 @@ add_executable(ingest_registry_multi_power_base_test tests/test_registry_multi_p
 target_link_libraries(ingest_registry_multi_power_base_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_registry_multi_power_base_test COMMAND ingest_registry_multi_power_base_test)
 
+# Power Base management milestone: blocked Bases, Base removal, the
+# management resource and its payload-carrying ACK (docs/power-base-management.md).
+add_executable(ingest_power_base_block_test tests/test_power_base_block.cpp src/server.cpp)
+target_link_libraries(ingest_power_base_block_test PRIVATE ingest_core Threads::Threads)
+add_test(NAME ingest_power_base_block_test COMMAND ingest_power_base_block_test)
+
 add_executable(ingest_loopback_test tests/test_loopback.cpp src/server.cpp)
 target_link_libraries(ingest_loopback_test PRIVATE ingest_core Threads::Threads)
 add_test(NAME ingest_loopback_test COMMAND ingest_loopback_test)

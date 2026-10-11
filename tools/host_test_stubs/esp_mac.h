@@ -17,6 +17,9 @@
 #pragma once
 
 #include <string.h>
+#ifdef HOST_ESP_MAC_LAST_BYTE_ENV
+#include <stdlib.h>
+#endif
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -27,6 +30,15 @@ static inline esp_err_t esp_efuse_mac_get_default(uint8_t *mac)
 {
     static const uint8_t fixed_mac[8] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01};
     memcpy(mac, fixed_mac, 8);
+#ifdef HOST_ESP_MAC_LAST_BYTE_ENV
+    /* Opt-in (tools/test_module_upstream_regeneration.c's chain mode): one
+     * process per board, each given its own last EUI-64 byte in the
+     * environment variable this macro names. */
+    const char *last = getenv(HOST_ESP_MAC_LAST_BYTE_ENV);
+    if (last != NULL) {
+        mac[7] = (uint8_t)strtoul(last, NULL, 0);
+    }
+#endif
     return ESP_OK;
 }
 

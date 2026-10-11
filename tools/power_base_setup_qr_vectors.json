@@ -1,0 +1,538 @@
+{
+  "about": "Test vectors of the Power Base setup QR code (firmware repository docs/power-base.md, 'QR \uc124\uc815 \ucf54\ub4dc'). Every EUI-64 and setup code here is made up for testing and is public: none belongs to a board. The same file, byte for byte, is used by the generator's tests (firmware repository, tools/) and by the app's parser tests (app repository, Packages/PowerBaseBLEKit).",
+  "format": "POGO-PB",
+  "format_version": 1,
+  "payload_bytes": 53,
+  "valid": [
+    {
+      "name": "ascii-letters",
+      "eui64": "00124b0001a2b3c4",
+      "setup_code_hex": "6162636465666768696a6b6c6d6e6f70",
+      "setup_code": "MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA"
+    },
+    {
+      "name": "counting-bytes",
+      "eui64": "6055f9fffe001234",
+      "setup_code_hex": "000102030405060708090a0b0c0d0e0f",
+      "setup_code": "AAAQEAYEAUDAOCAJBIFQYDIOB4",
+      "payload": "POGO-PB:1:6055f9fffe001234:AAAQEAYEAUDAOCAJBIFQYDIOB4"
+    },
+    {
+      "name": "all-zero-code-minimal-eui",
+      "eui64": "0000000000000001",
+      "setup_code_hex": "00000000000000000000000000000000",
+      "setup_code": "AAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "payload": "POGO-PB:1:0000000000000001:AAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "all-ones-code",
+      "eui64": "a1b2c3d4e5f60718",
+      "setup_code_hex": "ffffffffffffffffffffffffffffffff",
+      "setup_code": "77777777777777777777777774",
+      "payload": "POGO-PB:1:a1b2c3d4e5f60718:77777777777777777777777774"
+    },
+    {
+      "name": "high-bytes",
+      "eui64": "fedcba9876543210",
+      "setup_code_hex": "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "setup_code": "6DY7F47U6X3PP6HZ7L57Z7P674",
+      "payload": "POGO-PB:1:fedcba9876543210:6DY7F47U6X3PP6HZ7L57Z7P674"
+    },
+    {
+      "name": "last-quantum-bits-set",
+      "eui64": "00124b0001a2b3d9",
+      "setup_code_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a07",
+      "setup_code": "LJNFUWS2LJNFUWS2LJNFUWS2A4",
+      "payload": "POGO-PB:1:00124b0001a2b3d9:LJNFUWS2LJNFUWS2LJNFUWS2A4"
+    }
+  ],
+  "invalid_payloads": [
+    {
+      "name": "empty",
+      "payload": "",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "plain-setup-code",
+      "payload": "MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "plain-eui64",
+      "payload": "00124b0001a2b3c4",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "eui-and-code-without-prefix",
+      "payload": "00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "https-url",
+      "payload": "https://example.com/pb?eui=00124b0001a2b3c4&code=MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "url-with-payload-inside",
+      "payload": "https://example.com/POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "custom-scheme-url",
+      "payload": "pogohome://powerbase/00124b0001a2b3c4",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "matter-onboarding",
+      "payload": "MT:Y.K9042C00KA0648G00",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "homekit-setup",
+      "payload": "X-HM://0024Y2S8X1ABC",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "hub-pairing-code",
+      "payload": "ABCD-EFGH-JKLM",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "wifi-config",
+      "payload": "WIFI:T:WPA;S:example;P:example-password;;",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "ble-advertised-name",
+      "payload": "POGO-PB-00124B0001A2B3C4",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "lower-case-prefix",
+      "payload": "pogo-pb:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "leading-space",
+      "payload": " POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "leading-newline",
+      "payload": "\nPOGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "leading-bom",
+      "payload": "\ufeffPOGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "prefix-semicolon",
+      "payload": "POGO-PB;1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "prefix-fullwidth-p",
+      "payload": "\uff30OGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "prefix-cyrillic-o",
+      "payload": "P\u041eGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "prefix-non-breaking-hyphen",
+      "payload": "POGO\u2011PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "prefix-fullwidth-colon",
+      "payload": "POGO-PB\uff1a1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "not_power_base_code"
+    },
+    {
+      "name": "payload-twice",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOAPOGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "version-2",
+      "payload": "POGO-PB:2:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "version-0",
+      "payload": "POGO-PB:0:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "version-10",
+      "payload": "POGO-PB:10:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "version-01",
+      "payload": "POGO-PB:01:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "version-empty",
+      "payload": "POGO-PB::00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "version-letter",
+      "payload": "POGO-PB:v1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "version-with-space",
+      "payload": "POGO-PB:1 :00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "version-arabic-indic-digit",
+      "payload": "POGO-PB:\u0661:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "version-without-fields",
+      "payload": "POGO-PB:1",
+      "error": "malformed"
+    },
+    {
+      "name": "version-only",
+      "payload": "POGO-PB:1:",
+      "error": "malformed"
+    },
+    {
+      "name": "code-one-short",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPO",
+      "error": "malformed"
+    },
+    {
+      "name": "code-one-long",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOAA",
+      "error": "malformed"
+    },
+    {
+      "name": "eui-one-short",
+      "payload": "POGO-PB:1:00124b0001a2b3c:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "eui-one-long",
+      "payload": "POGO-PB:1:00124b0001a2b3c40:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "trailing-newline",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA\n",
+      "error": "malformed"
+    },
+    {
+      "name": "trailing-crlf",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA\r\n",
+      "error": "malformed"
+    },
+    {
+      "name": "trailing-space",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA ",
+      "error": "malformed"
+    },
+    {
+      "name": "trailing-nul",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA\u0000",
+      "error": "malformed"
+    },
+    {
+      "name": "extra-field",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA:1",
+      "error": "malformed"
+    },
+    {
+      "name": "extra-empty-field",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA:",
+      "error": "malformed"
+    },
+    {
+      "name": "separator-semicolon-after-version",
+      "payload": "POGO-PB:1;00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "separator-semicolon-before-code",
+      "payload": "POGO-PB:1:00124b0001a2b3c4;MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "separator-missing-before-code",
+      "payload": "POGO-PB:1:00124b0001a2b3c4MFRGGZDFMZTWQ2LKNNWG23TPOAA",
+      "error": "malformed"
+    },
+    {
+      "name": "fields-swapped",
+      "payload": "POGO-PB:1:MFRGGZDFMZTWQ2LKNNWG23TPOA:00124b0001a2b3c4",
+      "error": "malformed"
+    },
+    {
+      "name": "padded-code",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA======",
+      "error": "malformed"
+    },
+    {
+      "name": "code-kelvin-sign-for-k",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2L\u212aNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "code-fullwidth-letter",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:\uff2dFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "eui-fullwidth-digit",
+      "payload": "POGO-PB:1:\uff100124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "malformed"
+    },
+    {
+      "name": "code-combining-mark",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPO\u0301",
+      "error": "malformed"
+    },
+    {
+      "name": "eui-upper-case",
+      "payload": "POGO-PB:1:00124B0001A2B3C4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-one-upper-case-digit",
+      "payload": "POGO-PB:1:00124B0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-all-zero",
+      "payload": "POGO-PB:1:0000000000000000:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-not-hex",
+      "payload": "POGO-PB:1:00124g0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-with-colon",
+      "payload": "POGO-PB:1:00:12:4b:00:01:a:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-with-space",
+      "payload": "POGO-PB:1:00124b00 1a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-with-tab",
+      "payload": "POGO-PB:1:00124b00\t1a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "eui-with-nul",
+      "payload": "POGO-PB:1:00124b00\u00001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_eui64"
+    },
+    {
+      "name": "code-lower-case",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:mfrggzdfmztwq2lknnwg23tpoa",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-one-lower-case-letter",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:mFRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-digit-0",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:0FRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-digit-1",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:1FRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-digit-8",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:8FRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-digit-9",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:9FRGGZDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-with-space",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGG DFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-with-hyphen",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGG-DFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-with-newline",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGG\nDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-with-nul",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGG\u0000DFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-with-del",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGG\u007fDFMZTWQ2LKNNWG23TPOA",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-ends-with-padding",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPO=",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-padding-bits-01",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOB",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-padding-bits-10",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOC",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-padding-bits-11",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOD",
+      "error": "invalid_setup_code"
+    },
+    {
+      "name": "code-padding-bits-all-ones",
+      "payload": "POGO-PB:1:00124b0001a2b3c4:77777777777777777777777777",
+      "error": "invalid_setup_code"
+    }
+  ],
+  "generator_rejects": {
+    "eui64": [
+      {
+        "name": "fifteen-digits",
+        "value": "00124b0001a2b3c"
+      },
+      {
+        "name": "seventeen-digits",
+        "value": "00124b0001a2b3c40"
+      },
+      {
+        "name": "not-hex",
+        "value": "00124g0001a2b3c4"
+      },
+      {
+        "name": "all-zero",
+        "value": "0000000000000000"
+      },
+      {
+        "name": "all-ones",
+        "value": "ffffffffffffffff"
+      },
+      {
+        "name": "hex-prefix",
+        "value": "0x124b0001a2b3c4"
+      },
+      {
+        "name": "with-colons",
+        "value": "00:12:4b:00:01:a2:b3:c4"
+      },
+      {
+        "name": "leading-space",
+        "value": " 0124b0001a2b3c4"
+      },
+      {
+        "name": "arabic-indic-digit",
+        "value": "\u06600124b0001a2b3c4"
+      },
+      {
+        "name": "empty",
+        "value": ""
+      }
+    ],
+    "setup_code_file_content": [
+      {
+        "name": "empty",
+        "content": ""
+      },
+      {
+        "name": "only-newline",
+        "content": "\n"
+      },
+      {
+        "name": "lower-case",
+        "content": "mfrggzdfmztwq2lknnwg23tpoa\n"
+      },
+      {
+        "name": "one-short",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPO\n"
+      },
+      {
+        "name": "one-long",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOAA\n"
+      },
+      {
+        "name": "padding-bits",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOB\n"
+      },
+      {
+        "name": "padded",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOA======\n"
+      },
+      {
+        "name": "crlf",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOA\r\n"
+      },
+      {
+        "name": "two-newlines",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOA\n\n"
+      },
+      {
+        "name": "leading-space",
+        "content": " MFRGGZDFMZTWQ2LKNNWG23TPOA\n"
+      },
+      {
+        "name": "trailing-space",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOA \n"
+      },
+      {
+        "name": "two-codes",
+        "content": "MFRGGZDFMZTWQ2LKNNWG23TPOA\nMFRGGZDFMZTWQ2LKNNWG23TPOA\n"
+      },
+      {
+        "name": "with-nul",
+        "content": "MFRGG\u0000DFMZTWQ2LKNNWG23TPOA\n"
+      },
+      {
+        "name": "kelvin-sign",
+        "content": "MFRGGZDFMZTWQ2L\u212aNNWG23TPOA\n"
+      },
+      {
+        "name": "whole-payload",
+        "content": "POGO-PB:1:00124b0001a2b3c4:MFRGGZDFMZTWQ2LKNNWG23TPOA\n"
+      }
+    ],
+    "accepted_setup_code_file_content": [
+      "<setup_code>",
+      "<setup_code>\\n"
+    ],
+    "accepted_eui64": "16 ASCII hex digits, either case; written lower case into the code"
+  }
+}

@@ -46,6 +46,9 @@ constexpr uint8_t CoapCode(uint8_t cls, uint8_t detail)
 constexpr uint8_t kCoapCodePost = CoapCode(0, 2);
 constexpr uint8_t kCoapCodeChanged = CoapCode(2, 4);            // 2.04
 constexpr uint8_t kCoapCodeValid = CoapCode(2, 3);              // 2.03
+constexpr uint8_t kCoapCodeContent = CoapCode(2, 5);            // 2.05, an answer with a payload
+constexpr uint8_t kCoapCodeUnauthorized = CoapCode(4, 1);       // 4.01
+constexpr uint8_t kCoapCodeForbidden = CoapCode(4, 3);          // 4.03
 constexpr uint8_t kCoapCodeBadRequest = CoapCode(4, 0);         // 4.00
 constexpr uint8_t kCoapCodeNotFound = CoapCode(4, 4);           // 4.04
 constexpr uint8_t kCoapCodeMethodNotAllowed = CoapCode(4, 5);   // 4.05
@@ -95,5 +98,12 @@ ParseStatus coap_parse(const uint8_t *data, size_t len, CoapMessage &out);
 // response code, no options, no payload (this ingest program's own
 // responses never need to carry one).
 std::vector<uint8_t> coap_build_ack(const CoapMessage &request, uint8_t response_code);
+
+// The same Acknowledgement carrying `payload` (a piggybacked response, RFC
+// 7252 5.2.1): the payload marker 0xFF and the bytes. An empty payload gives
+// exactly coap_build_ack(request, response_code). Used only for the Power
+// Base management resource; the data resources never answer with a payload.
+std::vector<uint8_t> coap_build_ack(const CoapMessage &request, uint8_t response_code,
+                                    const std::vector<uint8_t> &payload);
 
 } // namespace ingest

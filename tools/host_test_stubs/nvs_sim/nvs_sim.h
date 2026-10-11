@@ -54,6 +54,48 @@ void nvs_sim_force_next_commit_error(esp_err_t err);
  * power cycle. Returns false if the file exists but cannot be read. */
 bool nvs_sim_set_backing_file(const char *path);
 
+/*
+ * Fault injection for one kind of call (added for
+ * tools/test_power_base_reenroll.c; nothing changes for a test that does not
+ * call it). The `nth` matching call from now on (1 = the next one) of `op`
+ * -- on `key`, or on any key when `key` is NULL; COMMIT has no key -- goes
+ * wrong, once:
+ *   err != ESP_OK   the call returns `err` and changes nothing;
+ *   err == ESP_OK   SET_BLOB / ERASE_KEY / ERASE_ALL only: the call returns
+ *                   ESP_OK and changes nothing (a write or an erase that
+ *                   claims success and did not happen -- what a read-back is
+ *                   there to catch).
+ * One pending fault per kind of call. nvs_sim_reset() clears them all.
+ */
+typedef enum {
+    NVS_SIM_OP_SET_BLOB = 0,
+    NVS_SIM_OP_GET_BLOB,
+    NVS_SIM_OP_ERASE_KEY,
+    NVS_SIM_OP_COMMIT,
+    /* nvs_entry_find(); `key` is ignored. With err != ESP_OK the namespace
+     * "could not be read". */
+    NVS_SIM_OP_ENTRY_FIND,
+    /* nvs_erase_all(); `key` is ignored. */
+    NVS_SIM_OP_ERASE_ALL,
+    NVS_SIM_OP_COUNT,
+} nvs_sim_op_t;
+
+void nvs_sim_inject(nvs_sim_op_t op, const char *key, int nth, esp_err_t err);
+
+/* Power loss: the process ends (exit code NVS_SIM_POWER_CUT_EXIT) right
+ * before the `nth` nvs_commit() from now on would have written the backing
+ * file -- so that commit and everything after it never happened. 0 = off. */
+#define NVS_SIM_POWER_CUT_EXIT 77
+void nvs_sim_power_cut_at_commit(int nth);
+
+/* How many nvs_commit() calls returned ESP_OK since the last nvs_sim_reset()
+ * / nvs_sim_set_backing_file(). */
+int nvs_sim_commit_count(void);
+
+/* Reads a blob straight out of the store, for assertions (no fault applies).
+ * Returns its length, or -1 when the namespace or key is absent. */
+int nvs_sim_peek_blob(const char *partition, const char *ns, const char *key, void *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

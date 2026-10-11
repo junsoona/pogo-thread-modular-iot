@@ -58,6 +58,24 @@
  * again. Either way on_enrollment_ready() then runs step 3 and step 7 once,
  * so steps 8-13 (including the exporter and DETECT_OUT) never run before.
  *
+ * Local re-enrollment (mode 2 only, enrollment_reenroll.c,
+ * components/power_base_reenroll, docs/power-base.md "BOOT 버튼 로컬 재등록"):
+ * right after Thread is disabled and before anything looks at the enrollment
+ * record, pb_reenroll_runtime_boot() decides, in this order:
+ *   a. a local reset that was journaled and not finished is carried on now
+ *      (then the chip restarts; if it still cannot be finished the board
+ *      stops: nothing is resumed and no join is accepted);
+ *   b. a reset journal that cannot be read stops the board the same way;
+ *   c. a one-shot window request left by the button is used up, and --
+ *      only in a build with the button, and only when there is an enrollment
+ *      to reset -- this boot becomes a "window boot": the enrollment is NOT
+ *      resumed, on_enrollment_ready() never runs, and only the BLE service
+ *      is up for 120 s. The window ends in a restart.
+ * Otherwise the boot goes on exactly as before. A remote release an earlier
+ * boot started (pb_mgmt_runtime_finish_pending_release) is finished after
+ * (a)/(b) and is never overtaken by a window: (c) opens none for a board
+ * whose record says UNENROLLING or RELEASED.
+ *
  * Boot sequence:
  *   1. nvs_flash_init()            -- dynamic "nvs" partition (OpenThread's
  *                                      own Active Dataset, see
@@ -86,6 +104,12 @@
  *                                      and SET_COLLECTOR) and its topology-
  *                                      registry key. Never regenerated,
  *                                      never logged in full.
+ *   4b. pb_mgmt_runtime_prepare_released_start() -- AWAIT_COMMISSIONING
+ *                                      only, and only on a board whose
+ *                                      enrollment record is a final release:
+ *                                      erases OpenThread's two stores and
+ *                                      reads them back BEFORE OpenThread
+ *                                      starts (enrollment_mgmt.h).
  *   5. thread_manager_init()       -- OpenThread FTD stack up, no network yet.
  *   6. thread_manager_start_as_always_on_ftd() (STANDALONE) or
  *      thread_manager_start_as_always_on_ftd_with_dataset() (EXTERNAL_OTBR)
@@ -212,6 +236,9 @@
 #include "linux_bridge_exporter/linux_bridge_exporter.h"
 #include "thread_manager/thread_manager.h"
 #include "enrollment_runtime.h"
+#include "enrollment_mgmt.h"
+#include "enrollment_reenroll.h"
+#include "pogo_build_info/pogo_build_info.h"
 
 static const char *TAG = "power_base_main";
 
@@ -248,6 +275,10 @@ static uint32_t s_collector_generation;
  * runs -- guards against it ever being called twice (see
  * attach_supervisor_task()). */
 static volatile bool s_services_started;
+/* Set once, by pb_quiesce_for_unenroll(), when an authenticated unenroll
+ * command is being carried out (docs/power-base-management.md). Never
+ * cleared: the board restarts when the release is done. */
+static volatile bool s_unenrolling;
 
 static void halt_forever(const char *why)
 {
@@ -313,6 +344,9 @@ static bool role_is_attached(otDeviceRole role)
 static bool pb_provisioning_allowed(void *ctx)
 {
     (void)ctx;
+    if (s_unenrolling) {
+        return false; /* no new downstream session while this Base is being unenrolled */
+    }
     return role_is_attached(thread_manager_get_role());
 }
 
@@ -348,7 +382,7 @@ static const char *pb_role_name(void *ctx)
 static bool pb_get_collector(pogo_collector_endpoint_t *out, void *ctx)
 {
     (void)ctx;
-    if (!role_is_attached(thread_manager_get_role())) {
+    if (s_unenrolling || !role_is_attached(thread_manager_get_role())) {
         return false;
     }
     otIp6Address mleid;
@@ -376,6 +410,75 @@ static void port_event_dispatcher(pogo_port_id_t port_id, pogo_port_event_t even
          * see docs/power-base.md's detach handling. */
         power_base_transport_on_direct_downstream_detached();
     }
+}
+
+/*
+ * Management task (enrollment_mgmt.c), once, right after an authenticated
+ * unenroll command passed every check and before anything is written:
+ * nothing new may start on this Base any more. A session already under way
+ * is not unwound piece by piece -- the chip restarts when the release is
+ * stored, which ends every task and callback at once -- but from here on no
+ * provisioning session starts, no collector is handed out, the exporter
+ * sends nothing, and the downstream port (and with it DETECT_OUT) is off, so
+ * the first module sees this Base go away like a physical detach. Nothing
+ * here touches a sensor module's own flash or Dataset.
+ */
+static void pb_quiesce_for_unenroll(void)
+{
+    s_unenrolling = true;
+    linux_bridge_exporter_suspend();
+    if (s_services_started) {
+        esp_err_t err = pogo_port_disable(POGO_PORT_DOWNSTREAM);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unenroll: pogo_port_disable failed (%s) -- continuing; the restart releases the port",
+                     esp_err_to_name(err));
+        }
+    }
+    ESP_LOGW(TAG, "unenroll: downstream provisioning, collector, exporter and the POGO downstream port are stopped");
+}
+
+/*
+ * Management task (enrollment_mgmt.c): the hub answered with this
+ * enrollment's key from an endpoint other than the stored one, and that
+ * endpoint is already in the enrollment record, read back. The record, the
+ * management poll (which uses its own copy of the record) and the exporter
+ * are the three things that send to the hub; this moves the third and what
+ * the status reports. The exporter then sends its heartbeat, the whole
+ * topology and the latest samples again, to the new endpoint
+ * (linux_bridge_exporter.h). Nothing here touches Thread, POGO or a sensor
+ * module: for them the hub's address is not a fact at all.
+ */
+static void pb_hub_endpoint_moved(const pb_enroll_bridge_endpoint_t *endpoint)
+{
+    pb_enrollment_note_bridge_endpoint(endpoint);
+    if (!s_bridge_cfg.enabled) {
+        return; /* this boot runs without the exporter: only the record and the poll had the address */
+    }
+    esp_err_t err = linux_bridge_exporter_set_destination(endpoint->addr, endpoint->port);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "pb_bridge: the exporter could not be moved to the hub's new endpoint (%s) -- the record holds "
+                      "it; the next boot starts the exporter there",
+                 esp_err_to_name(err));
+    }
+}
+
+/* Management task, right before the record would be rewritten for a new hub
+ * endpoint: not while this board is on its way out of its enrollment. */
+static bool pb_locate_allowed(void)
+{
+    return !s_unenrolling && !pb_enrollment_busy();
+}
+
+/*
+ * Button task (enrollment_reenroll.c), after a qualifying long press and
+ * before anything is written: what only this file and the enrollment runtime
+ * know. A long press during a Joiner run, an attach, a queued BLE start or a
+ * remote unenroll is ignored -- the user can press again afterwards.
+ */
+static void pb_reenroll_probe(pb_reenroll_gate_input_t *in)
+{
+    in->remote_unenroll_active = s_unenrolling;
+    in->enrollment_busy = pb_enrollment_busy();
 }
 
 static void stale_sweep_task(void *arg)
@@ -487,6 +590,23 @@ static void start_services_once(otDeviceRole role)
     ESP_LOGI(TAG, "power base ready: uuid=..%02x%02x otDeviceRole=%u(%s) stale_sweep=running -- awaiting the "
                   "first sensor module",
              s_own_uuid[6], s_own_uuid[7], (unsigned)role, thread_manager_role_to_str(role));
+
+    /*
+     * Remote unenroll (docs/power-base-management.md). Only a mode 2 board
+     * enrolled with a management credential (record version 3) polls its
+     * hub; every other board -- modes 0/1, record versions 1 and 2 -- starts
+     * nothing here and behaves exactly as before. A failure to start is not
+     * a reason to stop the Base: it only means it cannot be unenrolled
+     * remotely in this boot.
+     */
+    if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        esp_err_t mgmt_err =
+            pb_mgmt_runtime_start(s_own_uuid, pb_quiesce_for_unenroll, pb_hub_endpoint_moved, pb_locate_allowed);
+        if (mgmt_err != ESP_OK) {
+            ESP_LOGW(TAG, "management poll could not start (%s) -- continuing without remote unenroll this boot",
+                     esp_err_to_name(mgmt_err));
+        }
+    }
 }
 
 /*
@@ -606,6 +726,9 @@ void app_main(void)
      * board, that points at USB re-enumeration / power / monitor-connection,
      * not firmware logic. */
     ESP_LOGI(TAG, "app_main: entry (reset_reason=%d)", (int)esp_reset_reason());
+    /* Which image this is: component, product version, build id (once per
+     * boot; docs/versioning.md). */
+    pogo_build_info_log();
 
     if (!pogo_crc16_selftest()) {
         ESP_LOGE(TAG, "CRC16 self-test failed -- refusing to start");
@@ -698,6 +821,16 @@ void app_main(void)
         s_collector_generation = 1; /* purely informational field -- 0 is never handed out, no semantic meaning either way */
     }
 
+    if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
+        /* Must come before OpenThread exists: a released board erases its
+         * network stores and reads them back here, so that the key OpenThread
+         * makes for itself when it starts is made on an empty store and is
+         * not mistaken for -- or laid over by -- a network's key an erase
+         * left behind (enrollment_mgmt.h). Nothing happens on any other
+         * record. */
+        pb_mgmt_runtime_prepare_released_start(s_own_uuid);
+    }
+
     ESP_ERROR_CHECK(thread_manager_init());
 
     if (s_thread_cfg.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING) {
@@ -710,6 +843,32 @@ void app_main(void)
          * attach_supervisor_task()/start_services_once() path as modes 0/1. */
         ESP_ERROR_CHECK(thread_manager_stop());
         ESP_LOGW(TAG, "AWAIT_COMMISSIONING: Thread and downstream services are disabled until enrolled");
+        /*
+         * Local re-enrollment, before anything looks at the enrollment
+         * record (see this file's top comment). In a build without the
+         * button, on a board that never used it, this reads two absent NVS
+         * keys and returns NORMAL.
+         */
+        const bool reenroll_enabled = pb_reenroll_runtime_configure(s_own_uuid, &s_cfg);
+        bool reenroll_recovery = false;
+        const pb_reenroll_boot_action_t reenroll_boot = pb_reenroll_runtime_boot(&reenroll_recovery);
+        if (reenroll_boot == PB_REENROLL_BOOT_SAFE_STOP) {
+            ESP_LOGE(TAG, "AWAIT_COMMISSIONING: stopped by an unfinished or unreadable local reset -- Thread, the "
+                          "services and BLE enrollment stay off; the stored enrollment is not resumed");
+            if (reenroll_enabled && pb_reenroll_runtime_start_button(NULL) != ESP_OK) {
+                ESP_LOGE(TAG, "re-enrollment button could not be started in the stopped state");
+            }
+            return;
+        }
+        /*
+         * A release that an earlier boot started and could not finish
+         * (docs/power-base-management.md, section 4) is finished first: the
+         * record already says this board is not enrolled, so nothing below
+         * could resume it, but the hub is still owed the completion proof
+         * and the stored Dataset must go. That call restarts the chip when
+         * it had something to finish; otherwise it returns at once.
+         */
+        pb_mgmt_runtime_finish_pending_release(s_own_uuid);
         /*
          * Whether this board may be enrolled WITHOUT being given the Linux
          * bridge endpoint. Read here, in the mode 2 branch only -- modes 0/1
@@ -729,8 +888,33 @@ void app_main(void)
         }
         ESP_LOGI(TAG, "AWAIT_COMMISSIONING: enrollment endpoint policy = %s",
                  pb_enroll_endpoint_policy_name(endpoint_policy));
+#if CONFIG_POWER_BASE_REENROLL_BUTTON
+        if (reenroll_boot == PB_REENROLL_BOOT_WINDOW) {
+            /* The window boot: no boot rule, no resume, no services. The
+             * button is not watched in it -- the window is already open. */
+            ESP_LOGW(TAG, "AWAIT_COMMISSIONING: re-enrollment window boot%s",
+                     reenroll_recovery ? " (to replace a reset journal or record that cannot be read)" : "");
+            if (pb_enrollment_runtime_start_reenroll_window(s_own_uuid, endpoint_policy) != ESP_OK) {
+                /* Nothing was changed; the request is used up, so a restart
+                 * is an ordinary boot. */
+                ESP_LOGE(TAG, "re-enrollment window could not be created -- restarting into the ordinary boot");
+                vTaskDelay(pdMS_TO_TICKS(300));
+                esp_restart();
+            }
+            return;
+        }
+#else
+        (void)reenroll_recovery;
+#endif
         if (pb_enrollment_runtime_start(s_own_uuid, endpoint_policy, on_enrollment_ready) != ESP_OK) {
             halt_forever("ENROLLMENT_RUNTIME_FAILED: could not create the enrollment runtime");
+        }
+        if (reenroll_enabled) {
+            esp_err_t button_err = pb_reenroll_runtime_start_button(pb_reenroll_probe);
+            if (button_err != ESP_OK) {
+                ESP_LOGE(TAG, "re-enrollment button could not be started (%s) -- the board runs as usual without it",
+                         esp_err_to_name(button_err));
+            }
         }
         return;
     }

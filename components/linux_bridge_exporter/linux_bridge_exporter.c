@@ -369,9 +369,27 @@ typedef struct {
     TickType_t next_send_allowed_tick;
 } pending_sample_slot_t;
 
+/* Set once by linux_bridge_exporter_suspend() and never cleared: the board
+ * is being unenrolled, nothing more is exported in this boot. */
+static volatile bool s_suspended;
+
 static uint8_t s_power_base_uuid[TOPOLOGY_UUID_LEN];
+/*
+ * Where requests go. Written at init and by
+ * linux_bridge_exporter_set_destination() (another task), read by the
+ * exporter task for every attempt -- all three under s_dest_lock.
+ * s_dest_generation goes up with every change: an attempt remembers the
+ * number it was sent under, and an answer that comes back under another
+ * number is not that destination's (see send_one_attempt()).
+ * s_resync_requested asks the exporter task to give the (new) destination
+ * everything again on its next pass.
+ */
+static portMUX_TYPE s_dest_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t s_host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN];
 static uint16_t s_host_port;
+static uint32_t s_dest_generation;
+static bool s_resync_requested;
+static volatile bool s_started;
 static uint32_t s_start_tick_ms;
 static QueueHandle_t s_topology_queue;
 static SemaphoreHandle_t s_pending_samples_mutex;
@@ -399,6 +417,43 @@ static TickType_t exporter_now_ms(void)
 void linux_bridge_exporter_test_set_clock(TickType_t (*now_ms_fn)(void))
 {
     s_test_clock_fn = now_ms_fn;
+}
+
+esp_err_t linux_bridge_exporter_set_destination(const uint8_t host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN],
+                                                 uint16_t port)
+{
+    if (host_addr == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* What power_base_bridge_config refuses for an enabled exporter:
+     * unspecified, multicast (ff00::/8), link-local (fe80::/10), port 0. */
+    static const uint8_t unspecified[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN] = {0};
+    if (port == 0 || memcmp(host_addr, unspecified, sizeof(unspecified)) == 0 || host_addr[0] == 0xff ||
+        (host_addr[0] == 0xfe && (host_addr[1] & 0xc0) == 0x80)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_dest_lock);
+    const bool changed = s_host_port != port || memcmp(s_host_addr, host_addr, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN) != 0;
+    if (changed) {
+        memcpy(s_host_addr, host_addr, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN);
+        s_host_port = port;
+        s_dest_generation++;
+        s_resync_requested = true;
+    }
+    taskEXIT_CRITICAL(&s_dest_lock);
+    if (changed) {
+        ESP_LOGW(TAG, "destination changed: port=%u (host address never logged) -- full resync requested",
+                 (unsigned)port);
+    }
+    return ESP_OK;
+}
+
+void linux_bridge_exporter_suspend(void)
+{
+    s_suspended = true;
 }
 
 /* See this file's own top comment: same token-staleness guard pattern as
@@ -460,7 +515,13 @@ static export_send_result_t send_one_attempt(const char *uri_path, const uint8_t
     persist_removed_journal_if_dirty();
 
     otIp6Address dest_addr;
+    uint16_t dest_port;
+    uint32_t dest_generation;
+    taskENTER_CRITICAL(&s_dest_lock);
     memcpy(dest_addr.mFields.m8, s_host_addr, sizeof(dest_addr.mFields.m8));
+    dest_port = s_host_port;
+    dest_generation = s_dest_generation;
+    taskEXIT_CRITICAL(&s_dest_lock);
 
     uint32_t my_token;
     taskENTER_CRITICAL(&s_send_lock);
@@ -485,7 +546,7 @@ static export_send_result_t send_one_attempt(const char *uri_path, const uint8_t
             if (err == OT_ERROR_NONE) {
                 otMessageInfo info = {0};
                 info.mPeerAddr = dest_addr;
-                info.mPeerPort = s_host_port;
+                info.mPeerPort = dest_port;
                 otCoapTxParameters tx = {
                     .mAckTimeout = EXPORTER_ACK_TIMEOUT_MS,
                     .mAckRandomFactorNumerator = COAP_RESPONSE_TIMING_ACK_RANDOM_FACTOR_NUM,
@@ -516,6 +577,15 @@ static export_send_result_t send_one_attempt(const char *uri_path, const uint8_t
     }
     if (s_send_result != OT_ERROR_NONE || !s_send_got_message) {
         return EXPORT_SEND_TRANSIENT_FAILURE; /* OT-layer send/ack error */
+    }
+    taskENTER_CRITICAL(&s_dest_lock);
+    const bool destination_changed = dest_generation != s_dest_generation;
+    taskEXIT_CRITICAL(&s_dest_lock);
+    if (destination_changed) {
+        /* Whatever was answered, it was answered by the endpoint this
+         * exporter has left since: not a delivery to the hub's current one.
+         * The caller's retry goes to the new endpoint. */
+        return EXPORT_SEND_TRANSIENT_FAILURE;
     }
     uint8_t code_class = (uint8_t)(s_send_response_code >> 5);
     if (code_class == 2) {
@@ -1293,6 +1363,11 @@ static void exporter_task(void *arg)
     TickType_t last_heartbeat = exporter_now_ms();
 
     while (1) {
+        if (s_suspended) {
+            /* Unenrolling: nothing is read, sent or persisted any more. */
+            vTaskDelay(pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS));
+            continue;
+        }
         topo_evt_payload_t evt;
         bool have_evt = xQueueReceive(s_topology_queue, &evt, pdMS_TO_TICKS(EXPORTER_POLL_TICK_MS)) == pdTRUE;
         /* Before anything below can send -- see this function's own doc
@@ -1314,6 +1389,25 @@ static void exporter_task(void *arg)
          * meaningfully lengthens the loop when nothing is dirty. */
         drain_pending_samples();
 
+        taskENTER_CRITICAL(&s_dest_lock);
+        const bool resync_now = s_resync_requested;
+        s_resync_requested = false;
+        taskEXIT_CRITICAL(&s_dest_lock);
+        if (resync_now) {
+            /* The hub is at a new endpoint (linux_bridge_exporter_set_destination()):
+             * it gets this Base's heartbeat first -- that is what registers
+             * a Base there -- and then everything the periodic resync
+             * sends. Both periods start over from here. */
+            ESP_LOGI(TAG, "the hub's endpoint changed -- sending heartbeat, full topology, latest samples and pending "
+                          "removals to the new one");
+            send_heartbeat();
+            do_full_topology_resync();
+            do_full_sample_resync();
+            do_full_removed_resync();
+            last_resync = exporter_now_ms();
+            last_heartbeat = last_resync;
+        }
+
         TickType_t now = exporter_now_ms();
         if ((now - last_resync) >= pdMS_TO_TICKS(CONFIG_LINUX_BRIDGE_EXPORTER_FULL_RESYNC_INTERVAL_MS)) {
             do_full_topology_resync();
@@ -1334,12 +1428,18 @@ static void exporter_task(void *arg)
 static void observer_on_sample_stored(const sensor_sample_t *sample, void *ctx)
 {
     (void)ctx;
+    if (s_suspended) {
+        return;
+    }
     mark_sample_pending(sample->module_uuid, 0, true);
 }
 
 static void observer_on_topology_applied(const topology_registry_entry_t *entry, void *ctx)
 {
     (void)ctx;
+    if (s_suspended) {
+        return;
+    }
     /* Correction pass (this follow-up, item 2: rapid detach/reattach race).
      * A real, successful topology_registry_apply_report() for this
      * module_uuid is, unconditionally, proof that it is CURRENTLY present
@@ -1370,6 +1470,9 @@ static void observer_on_topology_applied(const topology_registry_entry_t *entry,
 static void observer_on_node_offline(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
 {
     (void)ctx;
+    if (s_suspended) {
+        return;
+    }
     enqueue_topology_event(uuid, TOPOLOGY_EVT_SNAPSHOT,
                             "topology queue full -- dropped one TOPOLOGY (offline) export event (the next "
                             "periodic full resync recovers it)");
@@ -1385,6 +1488,11 @@ static void observer_on_node_offline(const uint8_t uuid[TOPOLOGY_UUID_LEN], void
 static void observer_on_node_removed(const uint8_t uuid[TOPOLOGY_UUID_LEN], void *ctx)
 {
     (void)ctx;
+    if (s_suspended) {
+        /* The whole Base is leaving its hub; the hub removes this Base's
+         * modules itself when it verifies the completion proof. */
+        return;
+    }
     if (mark_removed_pending(uuid)) {
         ESP_LOGI(TAG, "removal ..%02x%02x: tombstone pending for Linux", uuid[6], uuid[7]);
     }
@@ -1406,9 +1514,14 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
     }
 
     memcpy(s_power_base_uuid, power_base_uuid, TOPOLOGY_UUID_LEN);
+    taskENTER_CRITICAL(&s_dest_lock);
     memcpy(s_host_addr, cfg->host_addr, POWER_BASE_BRIDGE_CONFIG_ADDR_LEN);
     s_host_port = cfg->port;
+    s_dest_generation = 0;
+    s_resync_requested = false;
+    taskEXIT_CRITICAL(&s_dest_lock);
     s_start_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    s_suspended = false;
     s_send_token = 0;
     s_last_send_fail_warn_tick = 0;
     memset(s_pending_samples, 0, sizeof(s_pending_samples));
@@ -1470,6 +1583,7 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
         .on_node_removed = observer_on_node_removed,
     };
     power_base_transport_set_bridge_observer(&observer);
+    s_started = true;
 
     ESP_LOGI(TAG, "linux bridge exporter ready: resources='/%s','/%s','/%s' port=%u topology_queue_len=%d "
                   "pending_samples_max=%d resync_interval_ms=%u heartbeat_interval_ms=%u "

@@ -63,6 +63,28 @@ uint8_t child_service_get_own_topology_depth(void);
 void child_service_get_parent_uuid(uint8_t out_uuid[POGO_UUID_LEN]);
 bool child_service_get_parent_is_power_base(void);
 
+/*
+ * UPSTREAM provisioning generation: how many provisioning sessions from this
+ * module's parent have been carried through to a Thread join (0 until the
+ * first). It goes up by one, and only then, at the moment a session reaches
+ * JOINED -- that is the point from which this module holds a new collector
+ * endpoint, Dataset, depth and parent, all from the same session. Nothing
+ * else moves it: not a role change (LEAF <-> INTERMEDIATE re-applies the link
+ * mode with the SAME Dataset), not OpenThread's own role changes (a ROUTER
+ * promotion, a radio detach and re-attach), not a retransmitted request.
+ *
+ * It exists for whoever derived something from "what this module was given":
+ * parent_service (what it handed to the module docked below, see
+ * parent_service_context_t.get_upstream_generation) and topology_reporter
+ * (its ATTACHED registration). Those compare the number they last acted on
+ * with the current one, so a new session is noticed however briefly
+ * role_manager_is_upstream_ready() was false in between, and however late
+ * they look.
+ *
+ * Readable from any task. Never 0 again once it has left 0.
+ */
+uint32_t child_service_get_upstream_generation(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -20,6 +20,8 @@ test 구성:
 - `ingest_registry_snapshot_test`: snapshot/generation/wait
 - `ingest_loopback_test`: 실제 IPv6 UDP socket과 interface 검사
 - `ingest_ack_transport_static_test`: ACK source와 `sendmsg()` 회귀 검사
+- `ingest_power_base_block_test`: 삭제된 Power Base의 차단(`4.03`), Base와 그 아래 노드의 제거,
+  `pogo/v1/mgmt` 요청의 handler 전달과 payload가 실린 ACK
 
 ## 실행
 
@@ -57,7 +59,21 @@ Power Base UUID allowlist는 고정된 장치 목록을 운영할 필요가 생�
 | 2.03 Valid | 정확한 중복 |
 | 4.00 Bad Request | 잘못된 envelope/payload 또는 resource 불일치 |
 | 4.02 Bad Option | 알 수 없는 critical CoAP option |
-| 4.04 Not Found | topology가 없는 UUID의 SAMPLE |
+| 2.05 Content | `pogo/v1/mgmt`의 인증된 답(payload 포함). 아래 "관리 resource" |
+| 4.01 Unauthorized | `pogo/v1/mgmt`: MAC·등록 세대·hub 불일치 |
+| 4.03 Forbidden | 등록을 해제해 차단된 Power Base의 SAMPLE·TOPOLOGY·HEARTBEAT·removal. Registry는 바뀌지 않는다 |
+| 4.04 Not Found | topology가 없는 UUID의 SAMPLE. 관리 handler가 없는 server의 `pogo/v1/mgmt` |
 | 4.05 Method Not Allowed | Confirmable이지만 POST가 아님 |
 | 4.12 Precondition Failed | offline, bitmap 불일치, 오래된 generation/sequence |
 | 5.03 Service Unavailable | bounded registry가 가득 참 |
+
+## 관리 resource (`pogo/v1/mgmt`)
+
+`ServerConfig::management`에 handler를 주면 `pogo/v1/mgmt`의 Confirmable POST payload를 그대로 넘기고,
+handler가 준 응답 코드와 payload를 ACK에 실어 보낸다. 이 메시지는 `bridge_export_proto`가 아니며 ingest는
+내용을 해석하지 않고 Registry에도 적용하지 않는다. 형식과 인증은
+[`docs/power-base-management.md`](../../../docs/power-base-management.md)에 있고 구현은
+`app/api`의 `PowerBaseManagement`다. 독립 `ingest_server`는 handler 없이 실행되므로 `4.04`로 답한다.
+
+`Registry::set_power_base_blocked()`로 차단한 Base의 데이터 메시지는 `4.03`이고, 차단은 관리 handler
+쪽에서만 걸고 푼다. 차단은 자리를 만들려고 버려지지 않으며, 그 보드의 새 인증된 등록 세대만 푼다.

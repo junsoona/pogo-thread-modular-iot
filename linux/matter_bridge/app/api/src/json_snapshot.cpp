@@ -209,11 +209,19 @@ std::vector<ingest::NodeState> ResolveModuleOwners(const std::vector<ingest::Nod
 std::string BuildSnapshotJson(const std::vector<ingest::NodeState> &nodes, uint64_t registry_generation,
                                int64_t generated_at_unix_ms)
 {
-    return BuildSnapshotJson(ingest::RegistryView{nodes, {}}, registry_generation, generated_at_unix_ms);
+    ingest::RegistryView view;
+    view.nodes = nodes;
+    return BuildSnapshotJson(view, registry_generation, generated_at_unix_ms);
 }
 
 std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
                                int64_t generated_at_unix_ms)
+{
+    return BuildSnapshotJson(view, registry_generation, generated_at_unix_ms, nullptr);
+}
+
+std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
+                               int64_t generated_at_unix_ms, const SnapshotManagement *management)
 {
     const std::vector<ingest::NodeState> modules = ResolveModuleOwners(view.nodes);
 
@@ -243,6 +251,61 @@ std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registr
             }
         }
     }
+    // A managed Base that has not been heard from since the bridge started
+    // is still this hub's to unenroll: listed offline, without modules.
+    std::vector<std::string> base_hex;
+    for (const auto &b : bases) {
+        base_hex.push_back(FormatUuidHex(b.uuid));
+    }
+    std::vector<std::string> silent_managed;
+    if (management != nullptr) {
+        for (const std::string &managed : management->managed_power_bases) {
+            if (std::find(base_hex.begin(), base_hex.end(), managed) == base_hex.end() &&
+                std::find(silent_managed.begin(), silent_managed.end(), managed) == silent_managed.end()) {
+                silent_managed.push_back(managed);
+            }
+        }
+    }
+    auto is_managed = [&](const std::string &hex) {
+        return management != nullptr && std::find(management->managed_power_bases.begin(),
+                                                  management->managed_power_bases.end(),
+                                                  hex) != management->managed_power_bases.end();
+    };
+    // What a managed Base's entry says of management.
+    auto managed_fields = [&](const std::string &hex) {
+        const bool self_confirming = std::find(management->self_confirming_power_bases.begin(),
+                                               management->self_confirming_power_bases.end(),
+                                               hex) != management->self_confirming_power_bases.end();
+        return std::string(",\"management\":\"supported\",\"erase_confirmation\":") +
+               (self_confirming ? "\"automatic\"" : "\"manual\"");
+    };
+
+    // The registration a request to take this Base out of the list names.
+    auto record_field = [&](const std::string &hex) {
+        if (management == nullptr || !management->forget_supported) {
+            return std::string();
+        }
+        for (const auto &entry : management->records) {
+            if (entry.first == hex) {
+                std::string field = ",\"record\":";
+                AppendJsonString(field, entry.second);
+                return field;
+            }
+        }
+        return std::string();
+    };
+    // What a request for this Base's removal names besides the registration.
+    auto removal_serial_field = [&](const std::string &hex) {
+        if (management == nullptr) {
+            return std::string();
+        }
+        for (const auto &entry : management->removal_serials) {
+            if (entry.first == hex) {
+                return std::string(",\"removal_serial\":") + std::to_string(entry.second);
+            }
+        }
+        return std::string();
+    };
 
     std::string out;
     out += "{\"schema_version\":";
@@ -257,13 +320,32 @@ std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registr
             out += ',';
         }
         out += "{\"uuid\":";
-        AppendJsonString(out, FormatUuidHex(bases[i].uuid));
+        AppendJsonString(out, base_hex[i]);
         out += ",\"online\":";
         out += bases[i].online ? "true" : "false";
         out += ",\"module_count\":";
         out += std::to_string(bases[i].module_count);
         out += ",\"online_module_count\":";
         out += std::to_string(bases[i].online_module_count);
+        if (management != nullptr) {
+            out += is_managed(base_hex[i]) ? managed_fields(base_hex[i]) : std::string(",\"management\":\"unsupported\"");
+            out += record_field(base_hex[i]);
+            if (is_managed(base_hex[i])) {
+                out += removal_serial_field(base_hex[i]);
+            }
+        }
+        out += '}';
+    }
+    for (size_t i = 0; i < silent_managed.size(); i++) {
+        if (i != 0 || !bases.empty()) {
+            out += ',';
+        }
+        out += "{\"uuid\":";
+        AppendJsonString(out, silent_managed[i]);
+        out += ",\"online\":false,\"module_count\":0,\"online_module_count\":0";
+        out += managed_fields(silent_managed[i]);
+        out += record_field(silent_managed[i]);
+        out += removal_serial_field(silent_managed[i]);
         out += '}';
     }
     out += "],\"modules\":[";
@@ -275,7 +357,18 @@ std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registr
         first = false;
         AppendModuleJson(out, n);
     }
-    out += "]}";
+    out += ']';
+    if (management != nullptr) {
+        out += ",\"power_base_removals\":";
+        out += management->removals_json.empty() ? std::string("[]") : management->removals_json;
+        if (management->forget_supported) {
+            out += ",\"power_base_forgets\":";
+            out += management->forgets_json.empty() ? std::string("[]") : management->forgets_json;
+            out += ",\"power_base_departures\":";
+            out += management->departures_json.empty() ? std::string("[]") : management->departures_json;
+        }
+    }
+    out += '}';
     return out;
 }
 

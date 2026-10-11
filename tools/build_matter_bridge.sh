@@ -110,6 +110,30 @@ sed "s#__CHIP_ROOT__#${CHIP_ROOT}#g" \
     "$APP_DIR/bridge-common/pogo-matter-bridge.zap.in" \
     > "$APP_DIR/bridge-common/pogo-matter-bridge.zap"
 
+# --- The build identity (docs/versioning.md) --------------------------------
+# Component, product version (versions.json), commit, clean/dirty and source
+# fingerprint, as the header api/src/build_info.cpp includes -- what
+# `pogo_matter_bridge --version` and the health `build` field then say.
+# Generated here, before every build, into api/generated/ (never checked in).
+# POGO_RELEASE=1 makes it a release build, which the tool refuses unless the
+# tree is clean and its commit is known. Without python3 the build goes on
+# and the bridge reports "unknown" rather than a made-up version.
+POGO_REPO_ROOT="$(cd "$APP_DIR/../../.." && pwd)"
+POGO_STAMP_ARGS=(stamp --component linux_bridge --out "$APP_DIR/api/generated/pogo_build_info_gen.h" --variant gn-linux)
+if [ "${POGO_RELEASE:-0}" = "1" ]; then
+    POGO_STAMP_ARGS+=(--release)
+fi
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$POGO_REPO_ROOT/tools/pogo_version.py" "${POGO_STAMP_ARGS[@]}"
+else
+    if [ "${POGO_RELEASE:-0}" = "1" ]; then
+        echo "error: POGO_RELEASE=1 needs python3 for tools/pogo_version.py" >&2
+        exit 1
+    fi
+    rm -f "$APP_DIR/api/generated/pogo_build_info_gen.h"
+    echo "warning: python3 not found -- this build will report its version as \"unknown\"" >&2
+fi
+
 # --- gn gen + ninja --------------------------------------------------------
 GN_ARGS=(
     'target_os="linux"'

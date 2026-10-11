@@ -165,8 +165,11 @@ int64_t EnrollmentManager::NowUnixMs() const
 
 EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, const std::string &eui64,
                                                 std::string &pskd, EnrollmentSession &out,
-                                                const EnrollmentStartOptions &options)
+                                                const EnrollmentStartOptions &options, ManagementGrant *grant)
 {
+    if (grant != nullptr) {
+        *grant = ManagementGrant();
+    }
     // The PSKd lives on the heap in one place until the worker has used it.
     auto secret = std::make_unique<std::string>(pskd);
     SecureWipe(pskd);
@@ -175,11 +178,14 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
     ingest::Uuid uuid{};
     std::string normalized;
     if (!NormalizeEui64(eui64, normalized, &uuid) || !IsValidPskd(*secret) ||
-        (options.bridge_endpoint_version != 0 && options.bridge_endpoint_version != kBridgeEndpointVersion)) {
+        (options.bridge_endpoint_version != 0 && options.bridge_endpoint_version != kBridgeEndpointVersion) ||
+        (options.management_version != 0 && options.management_version != kPowerBaseManagementVersion) ||
+        (options.management_version != 0 && options.bridge_endpoint_version == 0)) {
         SecureWipe(*secret);
         return EnrollmentStartOutcome::InternalError; // the HTTP layer validates first
     }
     const bool deliver_endpoint = options.bridge_endpoint_version == kBridgeEndpointVersion;
+    const bool manage = options.management_version == kPowerBaseManagementVersion;
 
     std::thread previous;
     {
@@ -205,10 +211,28 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
             SecureWipe(*secret);
             return EnrollmentStartOutcome::AlreadyConnected;
         }
+        if (manage && (!config_.management || !config_.management->available())) {
+            SecureWipe(*secret);
+            return EnrollmentStartOutcome::ManagementUnavailable;
+        }
+        // A Base this hub unenrolled stays refused on the data path until a
+        // new authenticated generation of it is active; a session that issues
+        // none could never see its heartbeat.
+        if (!manage && config_.management && config_.management->IsBlocked(normalized)) {
+            SecureWipe(*secret);
+            return EnrollmentStartOutcome::ManagementRequired;
+        }
         std::string session_id = RandomHex(16);
         if (session_id.empty()) {
             SecureWipe(*secret);
             return EnrollmentStartOutcome::InternalError;
+        }
+        // Last, so that no credential is issued for a session that does not
+        // start. It is stored (provisional) before this returns.
+        ManagementGrant issued;
+        if (manage && !config_.management->IssueCredential(normalized, issued)) {
+            SecureWipe(*secret);
+            return EnrollmentStartOutcome::ManagementUnavailable;
         }
 
         previous = std::move(worker_); // finished its cleanup already
@@ -220,6 +244,12 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
         session_.state = EnrollmentState::Preparing;
         session_.joiner_entry = JoinerEntry::None;
         session_.bridge_endpoint_requested = deliver_endpoint;
+        session_.management_requested = manage;
+        session_.management_generation = issued.generation;
+        if (grant != nullptr) {
+            *grant = issued;
+        }
+        SecureWipe(issued.key);
         session_.window_seconds = static_cast<int>(config_.window.count());
         session_.created_at_unix_ms = NowUnixMs();
         session_.expires_at_unix_ms =
@@ -236,9 +266,10 @@ EnrollmentStartOutcome EnrollmentManager::Start(const std::string &device_id, co
             SecureWipe(*s);
         });
         out = CopyLocked();
-        std::fprintf(stdout, "pogohome_api: enrollment %s: device %s started it for Power Base %s (%d s window%s)\n",
+        std::fprintf(stdout, "pogohome_api: enrollment %s: device %s started it for Power Base %s (%d s window%s%s)\n",
                      ShortId(session_id).c_str(), device_id.c_str(), normalized.c_str(), session_.window_seconds,
-                     deliver_endpoint ? ", with bridge endpoint delivery" : "");
+                     deliver_endpoint ? ", with bridge endpoint delivery" : "",
+                     manage ? ", with a management credential" : "");
     }
     if (previous.joinable()) {
         previous.join();
@@ -446,6 +477,12 @@ bool EnrollmentManager::Get(const std::string &device_id, const std::string &ses
     }
     out = CopyLocked();
     return true;
+}
+
+bool EnrollmentManager::InProgressFor(const std::string &eui64)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return has_session_ && worker_running_ && !IsFinalState(session_.state) && session_.eui64 == eui64;
 }
 
 EnrollmentCancelOutcome EnrollmentManager::Cancel(const std::string &device_id, const std::string &session_id,

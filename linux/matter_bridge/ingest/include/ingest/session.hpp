@@ -7,10 +7,36 @@
 // representation stay decoupled).
 #pragma once
 
+#include <functional>
+#include <vector>
+
 #include "ingest/minicoap.hpp"
 #include "ingest/registry.hpp"
 
 namespace ingest {
+
+// The Power Base management resource "pogo/v1/mgmt"
+// (docs/power-base-management.md, section 6). This library only routes it:
+// the request payload goes to the handler as it arrived and the handler's
+// code and payload go back in the Acknowledgement. Authentication, state and
+// persistence are all the handler's (pogohome_api::PowerBaseManagement) --
+// nothing about a management message is decided here, and the handler is the
+// only thing that can make this server answer with a payload.
+struct ManagementReply {
+    uint8_t code = kCoapCodeNotFound;
+    std::vector<uint8_t> payload;
+    // The locate port only (server.hpp): true = send nothing at all. Never
+    // set for a request on the ingest port, where every Confirmable request
+    // is answered.
+    bool silent = false;
+};
+using ManagementHandler = std::function<ManagementReply(const std::vector<uint8_t> &request)>;
+constexpr char kManagementUriPath[] = "pogo/v1/mgmt";
+
+struct Response {
+    uint8_t code = kCoapCodeBadRequest;
+    std::vector<uint8_t> payload; // empty for every data resource
+};
 
 // Applies one already-envelope-and-payload-validated bridge_export_proto
 // message (matched against `req.uri_path`) to `registry`, prints one smoke
@@ -45,6 +71,14 @@ namespace ingest {
 // itself always finishes registry application before returning, so the
 // caller's ACK is only ever sent after that (this follow-up's own explicit
 // ordering requirement).
+//   4.03 Forbidden -- the sending Power Base was unenrolled from this hub
+//                       (Registry::set_power_base_blocked()); nothing applied
 uint8_t handle_request(Registry &registry, const CoapMessage &req);
+
+// The same, with the management resource: a request to kManagementUriPath is
+// handed to `management` (4.04 when there is none) and never reaches the
+// Registry through this function; every other request is handled exactly as
+// by handle_request(registry, req) above, with an empty payload.
+Response handle_request(Registry &registry, const CoapMessage &req, const ManagementHandler &management);
 
 } // namespace ingest

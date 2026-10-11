@@ -296,6 +296,32 @@ def main():
             record(f"project({expected_project_name})" in text,
                    f"{project}/CMakeLists.txt still declares project({expected_project_name}) (untouched)")
 
+    # --- Version and build identity (docs/versioning.md). The RCP takes its
+    # product version from the repository's versions.json and compiles its
+    # build identity from its OWN main/rcp_build_info.c -- without the shared
+    # components/pogo_build_info (check 6 above keeps that out), without a log
+    # line (the USB port is the Spinel link) and without touching esp_ot_rcp.c. ---
+    top_cmake = read(os.path.join(RCP_DIR, "CMakeLists.txt"))
+    record("pogo_version_setup(rcp)" in top_cmake and top_cmake.index("pogo_version_setup(rcp)") < top_cmake.index("project.cmake"),
+           "rcp/CMakeLists.txt takes the product version from versions.json before project.cmake is included")
+    main_cmake = read(os.path.join(RCP_DIR, "main", "CMakeLists.txt"))
+    record('"rcp_build_info.c"' in main_cmake and "pogo_build_info_attach(${COMPONENT_LIB})" in main_cmake
+           and "-u pogo_build_info_string" in main_cmake,
+           "rcp/main/CMakeLists.txt compiles rcp_build_info.c, refreshes its header at every build and keeps the string at link time")
+    record(not re.search(r"PRIV_REQUIRES[^)]*pogo_build_info", main_cmake),
+           "rcp/main does not require the shared pogo_build_info component")
+    build_info_path = os.path.join(RCP_DIR, "main", "rcp_build_info.c")
+    record(os.path.isfile(build_info_path), "rcp/main/rcp_build_info.c exists")
+    if os.path.isfile(build_info_path):
+        build_info = read(build_info_path)
+        code = re.sub(r"/\*.*?\*/", "", build_info, flags=re.S)
+        record("POGO_BUILD_INFO_STRING" in code and '#include "pogo_build_info_gen.h"' in code,
+               "rcp_build_info.c holds the generated identity string")
+        record(not re.search(r"ESP_LOG|printf|esp_log\.h|esp_console|otPlat", code),
+               "rcp_build_info.c prints nothing and touches neither the console nor the Spinel path")
+    record("pogo_build_info" not in read(os.path.join(RCP_DIR, "main", "esp_ot_rcp.c")),
+           "esp_ot_rcp.c was not changed for the version scheme (no build-info call or include)")
+
     if all(passed for passed, _ in _results):
         print("\nALL CHECKS PASSED")
         return 0

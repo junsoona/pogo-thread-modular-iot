@@ -147,6 +147,13 @@ uint8_t child_service_get_own_topology_depth(void)
     return 1;
 }
 
+/* module_wiring.c's parent_service context reads it; nothing in this test
+ * starts an UPSTREAM provisioning session. */
+uint32_t child_service_get_upstream_generation(void)
+{
+    return 0;
+}
+
 void parent_service_on_port_event(pogo_port_id_t port_id, pogo_port_event_t event, const pogo_port_event_data_t *data)
 {
     (void)port_id;

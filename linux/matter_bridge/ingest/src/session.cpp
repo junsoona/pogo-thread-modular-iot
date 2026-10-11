@@ -41,6 +41,8 @@ const char *result_str(ApplyResult r)
         return "precondition_failed";
     case ApplyResult::StaleSession:
         return "stale_session";
+    case ApplyResult::Blocked:
+        return "blocked_power_base";
     }
     return "?";
 }
@@ -59,6 +61,9 @@ uint8_t result_to_coap_code(ApplyResult r)
     case ApplyResult::PreconditionFailed:
     case ApplyResult::StaleSession:
         return kCoapCodePreconditionFailed;
+    case ApplyResult::Blocked:
+        // An explicit, final refusal: the exporter does not retry a 4.xx.
+        return kCoapCodeForbidden;
     }
     return kCoapCodeBadRequest;
 }
@@ -140,6 +145,11 @@ uint8_t handle_topology_removed(Registry &registry, const uint8_t *payload, uint
     Uuid pb_uuid = to_uuid(rem.power_base_uuid);
     Uuid mod_uuid = to_uuid(rem.module_uuid);
     ApplyResult result = registry.apply_removal(pb_uuid, mod_uuid);
+    if (result == ApplyResult::Blocked) {
+        std::printf("[topology-removed] ");
+        print_uuid_suffix("pb", pb_uuid);
+        std::printf(" %s\n", result_str(result));
+    }
     return result_to_coap_code(result);
 }
 
@@ -151,10 +161,14 @@ uint8_t handle_heartbeat(Registry &registry, const uint8_t *payload, uint16_t pa
         return kCoapCodeBadRequest;
     }
     Uuid pb_uuid = to_uuid(hb.power_base_uuid);
-    registry.apply_heartbeat(pb_uuid, hb.uptime_ms, hb.node_count);
+    ApplyResult result = registry.apply_heartbeat(pb_uuid, hb.uptime_ms, hb.node_count);
 
     std::printf("[heartbeat] ");
     print_uuid_suffix("pb", pb_uuid);
+    if (result == ApplyResult::Blocked) {
+        std::printf(" %s -- rejected (4.03)\n", result_str(result));
+        return result_to_coap_code(result);
+    }
     std::printf(" uptime_ms=%u node_count=%u\n", (unsigned)hb.uptime_ms, (unsigned)hb.node_count);
     return kCoapCodeChanged; // heartbeats have no duplicate concept -- see registry.hpp's own doc comment
 }
@@ -203,6 +217,25 @@ uint8_t handle_request(Registry &registry, const CoapMessage &req)
 
     std::printf("[unknown-resource] uri=%s -- rejected (4.00)\n", req.uri_path.c_str());
     return kCoapCodeBadRequest;
+}
+
+Response handle_request(Registry &registry, const CoapMessage &req, const ManagementHandler &management)
+{
+    Response response;
+    if (req.uri_path == kManagementUriPath) {
+        // Not a bridge_export_proto message and never applied to the
+        // Registry here. Without a handler the resource does not exist.
+        if (!management) {
+            response.code = kCoapCodeNotFound;
+            return response;
+        }
+        ManagementReply reply = management(req.payload);
+        response.code = reply.code;
+        response.payload = std::move(reply.payload);
+        return response;
+    }
+    response.code = handle_request(registry, req);
+    return response;
 }
 
 } // namespace ingest

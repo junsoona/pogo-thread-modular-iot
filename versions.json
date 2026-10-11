@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "about": "The ONE definition of the product versions of this repository's components (docs/versioning.md). MAJOR.MINOR.PATCH only: no suffix, no Git SHA, no 'dev' -- whether a build is a development build, and from which sources, is build metadata, not part of the version. A version changes only by editing this file on purpose; no build writes it.",
+  "components": {
+    "power_base": { "version": "0.3.0" },
+    "module": { "version": "0.1.1" },
+    "rcp": { "version": "0.1.0" },
+    "linux_bridge": { "version": "0.5.0" }
+  }
+}

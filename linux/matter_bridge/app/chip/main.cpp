@@ -79,6 +79,7 @@
 #include "ingest/server.hpp"
 #include "matter_bridge/bridge_manager.hpp"
 #include "matter_bridge/endpoint_store.hpp"
+#include "pogohome_api/build_info.hpp"
 #include "pogohome_api/atomic_file.hpp"
 #include "pogohome_api/commissioner.hpp"
 #include "pogohome_api/device_auth.hpp"
@@ -87,6 +88,7 @@
 #include "pogohome_api/hub_identity.hpp"
 #include "pogohome_api/interface_address.hpp"
 #include "pogohome_api/mdns_advertiser.hpp"
+#include "pogohome_api/power_base_management.hpp"
 #include "pogohome_api/settings_store.hpp"
 #include "pogohome_api/tls_identity.hpp"
 
@@ -265,6 +267,9 @@ std::unique_ptr<pogohome_api::MdnsAdvertiser> gApiAdvertiser;
 // Null unless --api-enroll-helper was given. Stopped after gApiServer, so
 // its Joiner entry is removed once no request can start another session.
 std::shared_ptr<pogohome_api::EnrollmentManager> gEnrollment;
+// Power Base management (docs/power-base-management.md): created with
+// enrollment, read by the ingest thread through ingest::ServerConfig.
+std::shared_ptr<pogohome_api::PowerBaseManagement> gPowerBaseManagement;
 
 // Runs on the Matter event-loop thread via
 // chip::DeviceLayer::PlatformMgr().ScheduleWork() -- see this file's own
@@ -417,6 +422,14 @@ int main(int argc, char *argv[])
     // as it is printed. No line printed to stdout contains a PSKd.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
+    // `pogo_matter_bridge --version`: which build this is (docs/versioning.md).
+    // Answered before the Matter stack, the state directory or any socket is
+    // touched, so it is safe to run next to a running bridge.
+    if (pogohome_api::WantsVersion(argc, argv)) {
+        printf("%s\n", pogohome_api::VersionLine("pogo_matter_bridge").c_str());
+        return 0;
+    }
+
     if (ChipLinuxAppInit(argc, argv, &gPogoOptions) != 0) {
         return -1;
     }
@@ -484,6 +497,8 @@ int main(int argc, char *argv[])
         api_config.address_family = resolved.family;
         api_config.port = gAppConfig.api_port;
         api_config.hub_id = hub_id;
+        // Health names the build that answers (docs/versioning.md).
+        api_config.report_build = true;
 
         // Home settings sharing. Anything wrong here (a damaged TLS key or
         // settings file) turns off only the settings routes -- they answer
@@ -534,6 +549,68 @@ int main(int argc, char *argv[])
         // probed here.
         if (!gAppConfig.api_enroll_helper.empty()) {
             api_config.enrollment_requested = true;
+
+            // Power Base management rides on enrollment: a board gets its
+            // management credential when it is enrolled, and is unenrolled
+            // through the removal routes. It needs the same private state
+            // directory and TLS as settings sharing. A damaged state file
+            // turns off only this (the removal routes answer 503, sessions
+            // that ask for a credential fail); it is never replaced.
+            api_config.management_requested = true;
+            if (api_config.tls) {
+                pogohome_api::PowerBaseManagementConfig management;
+                management.directory = gAppConfig.state_dir + "/pogohome";
+                management.hub_id = hub_id;
+                management.enrollment_in_progress = [](const std::string &eui64) {
+                    return gEnrollment && gEnrollment->InProgressFor(eui64);
+                };
+                // The room clean-up of a removed Base's modules. It reports
+                // failure instead of only logging it: management keeps the
+                // clean-up in its state file and retries it (also after a
+                // restart) until this returns true.
+                // LOCATE (docs/power-base-management.md, section 12): where a
+                // Power Base that lost this hub finds it again. The address
+                // is read from the Thread interface when it is asked for --
+                // an OTBR whose Mesh-Local EID changed is described as it is
+                // now -- and the port is the one the ingest listener below
+                // is really started on.
+                {
+                    const std::string thread_interface = gAppConfig.interface;
+                    const uint16_t ingest_port = gAppConfig.port;
+                    management.ingest_endpoint = [thread_interface, ingest_port](std::array<uint8_t, 16> &address,
+                                                                                 uint16_t &port) {
+                        port = ingest_port;
+                        return pogohome_api::ResolveThreadMeshLocalEid(thread_interface, address);
+                    };
+                }
+                management.unassign_rooms = pogohome_api::MakeRoomUnassigner(api_config.settings, []() {
+                    using namespace std::chrono;
+                    return static_cast<int64_t>(
+                        duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+                });
+                // What a clean-up is bound to: the room each module is in at
+                // the moment its Base leaves the list (read from the settings
+                // held in memory, under management's lock).
+                management.read_rooms = pogohome_api::MakeRoomReader(api_config.settings);
+                gPowerBaseManagement =
+                    std::make_shared<pogohome_api::PowerBaseManagement>(gRegistry, std::move(management));
+                std::string management_error;
+                if (!gPowerBaseManagement->Load(management_error)) {
+                    fprintf(stderr,
+                            "pogohome_api: Power Base management unavailable (%s) -- removal requests are refused "
+                            "until %s is repaired or moved aside; it is never replaced automatically\n",
+                            management_error.c_str(), gPowerBaseManagement->path().c_str());
+                } else {
+                    fprintf(stdout, "pogohome_api: Power Base management on (%zu Power Base(s) with a management "
+                                    "credential)\n",
+                            gPowerBaseManagement->ManagedPowerBases().size());
+                }
+                // Retries pending settings clean-ups (none of that work runs
+                // on the ingest or HTTP threads). Harmless when unavailable.
+                gPowerBaseManagement->StartCleanupWorker();
+                api_config.management = gPowerBaseManagement;
+            }
+
             pogohome_api::HelperCommissionerConfig helper;
             helper.command = {"/usr/bin/sudo", "-n", "--", gAppConfig.api_enroll_helper};
             pogohome_api::EnrollmentConfig enrollment;
@@ -543,6 +620,7 @@ int main(int argc, char *argv[])
             // that delivers a bridge endpoint reports this, with the OTBR's
             // own Mesh-Local EID read through the helper at that time.
             enrollment.bridge_port = gAppConfig.port;
+            enrollment.management = gPowerBaseManagement;
             gEnrollment = std::make_shared<pogohome_api::EnrollmentManager>(
                 gRegistry, std::make_shared<pogohome_api::HelperCommissioner>(helper), enrollment);
             api_config.enrollment = gEnrollment;
@@ -610,6 +688,22 @@ int main(int argc, char *argv[])
     ingest::ServerConfig ingest_config;
     ingest_config.interface_name = gAppConfig.interface;
     ingest_config.port = gAppConfig.port;
+    // The authenticated management resource (docs/power-base-management.md).
+    // Without management it answers 4.04, and every data resource is
+    // handled exactly as before.
+    if (gPowerBaseManagement) {
+        std::shared_ptr<pogohome_api::PowerBaseManagement> management = gPowerBaseManagement;
+        ingest_config.management = [management](const std::vector<uint8_t> &request) {
+            return management->HandleDatagram(request);
+        };
+        // A Power Base that lost this hub asks on PB_MGMT_LOCATE_PORT. When
+        // --port is another port, that one is opened as well and answers
+        // LOCATE only (ingest/server.hpp).
+        ingest_config.locate = [management](const std::vector<uint8_t> &request) {
+            return management->HandleLocateDatagram(request);
+        };
+        ingest_config.locate_port = PB_MGMT_LOCATE_PORT;
+    }
 
     gIngestThread = std::thread([&ingest_config]() {
         if (!ingest::run_server(ingest_config, gRegistry, &gStopIngest)) {

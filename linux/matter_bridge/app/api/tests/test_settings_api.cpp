@@ -290,8 +290,9 @@ void RunSettingsApiTests(int *failures)
                   "the certificate the client sees hashes to the hub's certificate_sha256");
 
         Response tls_snapshot = TlsRequest(port, Get("/api/v1/snapshot"));
-        API_CHECK(tls_snapshot.status == 200 && tls_snapshot.body.find("\"settings_revision\":null}") != std::string::npos,
-                  "the snapshot also reports the settings revision");
+        API_CHECK(tls_snapshot.status == 200 &&
+                      tls_snapshot.body.find("\"settings_revision\":null,\"snapshot_stream\":\"") != std::string::npos,
+                  "the snapshot also reports the settings revision (followed by where the snapshot stands)");
     }
 
     printf("\n-- scenario: pairing, then an authenticated first upload, update and conflict --\n");

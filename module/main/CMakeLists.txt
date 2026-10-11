@@ -6,4 +6,5 @@ idf_component_register(
              collector_endpoint
              bh1750 sht45 sgp40 sgp41 pms5003
              nvs_flash esp_event esp_netif esp_hw_support openthread
+             pogo_build_info
 )

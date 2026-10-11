@@ -9,7 +9,10 @@
 // "listen everywhere".
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace pogohome_api {
 
@@ -44,5 +47,28 @@ bool ResolveInterfaceAddress(const std::string &ifname, ResolvedAddress &out, st
 // going away) the server can no longer be reached there, which is what the
 // Bonjour advertiser uses this for (see mdns_advertiser.hpp).
 bool InterfaceHasAddress(const std::string &ifname, const std::string &address, int family);
+
+// The Thread Mesh-Local EID among the IPv6 addresses of ONE Thread interface
+// (the OTBR's wpan0), told apart by the shape of the addresses alone -- no
+// OTBR control socket, no helper, no privilege:
+//
+//   - a Thread interface carries its routing locator, and usually anycast
+//     locators, all in the Mesh-Local Prefix and all with the interface
+//     identifier 0000:00ff:fe00:xxxx. A /64 inside fd00::/8 that holds such an
+//     address is the Mesh-Local Prefix; no other prefix on the interface (the
+//     OMR prefix, a domain prefix, link-local) ever holds one;
+//   - the Mesh-Local EID is the one address in that /64 that is NOT a
+//     locator.
+//
+// False -- nothing is guessed -- when no /64 holds a locator (the interface
+// is not attached to a Thread network), when more than one does, or when the
+// Mesh-Local /64 holds no or several non-locator addresses. This is the
+// address `ot-ctl ipaddr mleid` prints and the one an enrollment hands to a
+// Power Base (commissioner.hpp); it is what a Power Base's LOCATE is answered
+// with (power_base_management.hpp), read at that moment, so an OTBR whose
+// EID changed is described as it is now.
+bool PickThreadMeshLocalEid(const std::vector<std::array<uint8_t, 16>> &addresses, std::array<uint8_t, 16> &out);
+// The same for the live interface `ifname` (getifaddrs()).
+bool ResolveThreadMeshLocalEid(const std::string &ifname, std::array<uint8_t, 16> &out);
 
 } // namespace pogohome_api

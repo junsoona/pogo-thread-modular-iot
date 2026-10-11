@@ -27,6 +27,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include "pogohome_api/build_info.hpp"
 #include "pogohome_api/atomic_file.hpp"
 #include "pogohome_api/crypto_util.hpp"
 #include "pogohome_api/device_auth.hpp"
@@ -43,6 +44,7 @@ void PrintUsage(FILE *out)
 {
     std::fprintf(out,
                  "Usage: pogohome-hubctl --state-dir <dir> <command>\n"
+                 "       pogohome-hubctl --version\n"
                  "\n"
                  "  <dir> is pogo_matter_bridge's --state-dir (e.g. /var/lib/pogo-matter-bridge).\n"
                  "\n"
@@ -216,6 +218,11 @@ int CommandSettings(const std::string &dir)
 
 int main(int argc, char **argv)
 {
+    // Before anything else: no state directory is opened for this.
+    if (pogohome_api::WantsVersion(argc, argv)) {
+        std::printf("%s\n", pogohome_api::VersionLine("pogohome-hubctl").c_str());
+        return 0;
+    }
     std::string state_dir;
     int index = 1;
     while (index < argc && argv[index][0] == '-') {

@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ingest/registry.hpp"
@@ -64,5 +65,53 @@ std::string BuildSnapshotJson(const std::vector<ingest::NodeState> &nodes, uint6
 // overload above is this with no tracked Power Bases.
 std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
                                int64_t generated_at_unix_ms);
+
+// What Power Base management adds to the snapshot
+// (docs/power-base-management.md), when the hub offers it.
+struct SnapshotManagement {
+    // EUI-64s (16 lowercase hex) this hub holds an ACTIVE management
+    // credential for: the Bases that can be unenrolled remotely.
+    std::vector<std::string> managed_power_bases;
+    // Those of them whose board announced that it sends its release receipt
+    // itself: a removal of such a Base needs no confirmation by hand.
+    std::vector<std::string> self_confirming_power_bases;
+    // The removal jobs, as a serialized JSON array ("[...]").
+    std::string removals_json = "[]";
+    // The hub can take an offline Power Base out of its list
+    // (docs/power-base-management.md, section 13). False: the snapshot is
+    // byte for byte the one of a hub without that.
+    bool forget_supported = false;
+    // With it: (EUI-64, record) of the listed Bases -- the registration a
+    // request to take one out of the list must name. A Base without an entry
+    // here gets no "record".
+    std::vector<std::pair<std::string, std::string>> records;
+    // (EUI-64, removal serial) of the managed Bases: how many removals were
+    // asked of the listed registration so far. A request for a removal names
+    // the value it was confirmed against (docs/power-base-management.md,
+    // section 16); a managed Base with an entry here gets "removal_serial".
+    std::vector<std::pair<std::string, uint32_t>> removal_serials;
+    // And the list removals, as a serialized JSON array ("[...]").
+    std::string forgets_json = "[]";
+    // The Power Bases that are out of the list now (their registration ended
+    // and they were not registered again), as a serialized JSON array. Given
+    // with `forget_supported`; none of them is among the listed Bases.
+    std::string departures_json = "[]";
+};
+
+// The snapshot above with management: every `power_bases` entry gets
+// `"management": "supported" | "unsupported"`, and a supported one also
+// `"erase_confirmation": "automatic" | "manual"` (how the erase of a removal
+// of that Base would be confirmed); a managed Base the Registry
+// does not list (it has been silent since the bridge started) is added as an
+// offline entry without modules, so that it can still be selected and
+// unenrolled; and a top-level `power_base_removals` array follows `modules`.
+// Additive only: with `management == nullptr` the output is byte for byte
+// the overload above. With `forget_supported` a listed Base also carries
+// `"record"` (when the hub has one for it) and a top-level
+// `power_base_forgets` array follows `power_base_removals`, and a top-level
+// `power_base_departures` array follows that. A managed Base named in
+// `removal_serials` carries `"removal_serial"` after `"record"`.
+std::string BuildSnapshotJson(const ingest::RegistryView &view, uint64_t registry_generation,
+                               int64_t generated_at_unix_ms, const SnapshotManagement *management);
 
 } // namespace pogohome_api

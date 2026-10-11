@@ -33,4 +33,52 @@ menu "Power Base"
             directory and SDKCONFIG file (see docs/power-base.md). It contains no
             pb_join console and no OpenThread CLI.
 
+    config POWER_BASE_REENROLL_BUTTON
+        bool "Local re-enrollment by a long press of a button (pb_thread:mode=2, BLE build only)"
+        depends on POWER_BASE_BLE_ENROLLMENT
+        default n
+        help
+            Lets the owner of an ENROLLED pb_thread:mode=2 Power Base move it to
+            another hub without a computer and without its old hub: holding the
+            button for 5 s and releasing it restarts the board into a 120 s
+            "re-enrollment window", in which Thread and every service stay off
+            and only the BLE service runs. A client that authenticates with the
+            board's own setup code (Security 2) and sends an explicitly
+            confirmed local reset command makes the board erase its own
+            enrollment record and stored Thread network and verify that. The
+            button alone, a BLE connection alone and a successful
+            authentication alone erase nothing; a window that ends without
+            such a command restarts into the ordinary boot, which resumes the
+            enrollment as it was. See docs/power-base.md "BOOT 버튼 로컬 재등록".
+
+            Off in the default, bench and plain BLE builds: those behave as
+            before. It is never available in pb_thread modes 0/1, in the module
+            firmware or in the RCP. The button GPIO is checked at boot against
+            the pins the board's cfg already uses (POGO UART, DETECT, power
+            enable) and against the chip's reserved pins; on a conflict the
+            feature stays off for that boot.
+
+    config POWER_BASE_REENROLL_BUTTON_GPIO
+        int "GPIO of the re-enrollment button"
+        depends on POWER_BASE_REENROLL_BUTTON
+        range 0 27
+        default 9
+        help
+            GPIO9 is the ESP32-H2 BOOT strapping pin, which development boards
+            usually wire to a "BOOT" push button to ground. The ROM samples it
+            at reset only (held low at reset = download mode); this feature
+            reads it as an ordinary input after boot and never asks for it to
+            be held at power-on or reset. Whether a given board really has a
+            button on this pin is a HARDWARE ASSUMPTION that must be checked on
+            that board -- see docs/power-base.md.
+
+    config POWER_BASE_REENROLL_BUTTON_ACTIVE_LOW
+        bool "The button pulls its GPIO low when pressed"
+        depends on POWER_BASE_REENROLL_BUTTON
+        default y
+        help
+            y: pressed = low, the internal pull-up is enabled (a button to
+            ground, like the usual BOOT button). n: pressed = high, the
+            internal pull-down is enabled.
+
 endmenu

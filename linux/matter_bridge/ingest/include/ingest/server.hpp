@@ -31,11 +31,31 @@
 #include <string>
 
 #include "ingest/registry.hpp"
+#include "ingest/session.hpp"
 
 namespace ingest {
 
 struct ServerConfig {
     uint16_t port = 5684;
+    // The Power Base management resource (see session.hpp). Empty: the
+    // resource answers 4.04 and this server behaves exactly as before.
+    // Called on the receive thread, one request at a time.
+    ManagementHandler management;
+    // "Where is the hub now?" (docs/power-base-management.md, section 12).
+    // A Power Base that lost its hub asks on `locate_port` of whatever
+    // address it has a hint for; it knows that port without being told
+    // (PB_MGMT_LOCATE_PORT, the default ingest port). When this server's own
+    // `port` IS that port, nothing more is opened: the ingest socket answers
+    // LOCATE like every other management message, through `management`.
+    // When it is another port, a second socket is bound on `locate_port` of
+    // the same interface, and it answers exactly one thing: a Confirmable
+    // POST to the management resource, handed to `locate`, whose reply is
+    // sent unless it is `silent`. Everything else that arrives there is
+    // dropped without an answer and never reaches the Registry.
+    // `locate` empty or `locate_port` 0: no second socket. A second socket
+    // that cannot be bound is logged and the server runs without it.
+    ManagementHandler locate;
+    uint16_t locate_port = 0;
     // REQUIRED (must be non-empty and must resolve via if_nametoindex()) --
     // the ONLY local network interface this server accepts datagrams from;
     // every other interface's traffic is dropped before it ever reaches

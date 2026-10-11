@@ -61,6 +61,7 @@ executable("pogo_matter_bridge") {
   sources = _settings_sources
   sources += _otbr_helper_core_sources
   sources += [
+    "api/include/pogohome_api/build_info.hpp",
     "api/include/pogohome_api/commissioner.hpp",
     "api/include/pogohome_api/enrollment.hpp",
     "api/include/pogohome_api/hex.hpp",
@@ -69,9 +70,12 @@ executable("pogo_matter_bridge") {
     "api/include/pogohome_api/interface_address.hpp",
     "api/include/pogohome_api/json_snapshot.hpp",
     "api/include/pogohome_api/mdns_advertiser.hpp",
+    "api/include/pogohome_api/power_base_management.hpp",
     "api/include/pogohome_api/sensor_kind.hpp",
+    "api/src/build_info.cpp",
     "api/src/commissioner.cpp",
     "api/src/enrollment.cpp",
+    "api/src/power_base_management.cpp",
     "api/src/hex.cpp",
     "api/src/http_server.cpp",
     "api/src/hub_identity.cpp",
@@ -104,14 +108,24 @@ executable("pogo_matter_bridge") {
     "${_pogo_repo}/components/bridge_export_proto/bridge_export_proto.c",
     "${_pogo_repo}/components/pogo_proto/pogo_crc16.c",
     "${_pogo_repo}/components/sensor_channel/sensor_channel.c",
+
+    # The Power Base management wire format (docs/power-base-management.md):
+    # the same pure C file the firmware compiles.
+    "${_pogo_repo}/components/power_base_mgmt/pb_mgmt_proto.c",
   ]
 
   include_dirs = [
     "api/include",
+
+    # pogo_build_info_gen.h, written by tools/build_matter_bridge.sh before
+    # `gn gen` (docs/versioning.md). Not checked in; without it
+    # api/src/build_info.cpp reports "unknown".
+    "api/generated",
     "core/include",
     "${_ingest_dir}/include",
     "${_pogo_repo}/components/bridge_export_proto/include",
     "${_pogo_repo}/components/pogo_proto/include",
+    "${_pogo_repo}/components/power_base_mgmt/include",
     "${_pogo_repo}/components/sensor_channel/include",
     "${_pogo_repo}/components/topology_proto/include",
   ]
@@ -149,8 +163,15 @@ executable("pogo_matter_bridge") {
 # api/tools/pogohome_hubctl.cpp). No Matter SDK code.
 executable("pogohome-hubctl") {
   sources = _settings_sources
-  sources += [ "api/tools/pogohome_hubctl.cpp" ]
-  include_dirs = [ "api/include" ]
+  sources += [
+    "api/include/pogohome_api/build_info.hpp",
+    "api/src/build_info.cpp",
+    "api/tools/pogohome_hubctl.cpp",
+  ]
+  include_dirs = [
+    "api/include",
+    "api/generated",
+  ]
   cflags = [ "-Wall" ]
   libs = [
     "ssl",

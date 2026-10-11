@@ -28,6 +28,14 @@
 // the OTBR: no Commissioner start, no Joiner entry. A session that did not
 // ask behaves exactly as before and never makes that call.
 //
+// Management credential (optional, asked for per session, only together with
+// bridge endpoint delivery; docs/power-base-management.md): the hub issues a
+// new enrollment generation and management key for the board when the
+// session is created and stores them as that board's provisional credential.
+// The key leaves the hub exactly once, in what Start() returns; the session
+// itself only remembers the generation. A board that was unenrolled from
+// this hub can only be enrolled again through such a session.
+//
 // Threading: all session state is under this class's own mutex. Commissioner
 // calls (which run a subprocess for seconds) happen on the session's worker
 // thread with NO lock held; the Registry is only read with its own short
@@ -46,6 +54,7 @@
 
 #include "ingest/registry.hpp"
 #include "pogohome_api/commissioner.hpp"
+#include "pogohome_api/power_base_management.hpp"
 
 namespace pogohome_api {
 
@@ -102,6 +111,10 @@ struct EnrollmentSession {
     // may be false while Preparing and for a session that ended first.
     bool has_bridge_endpoint = false;
     BridgeEndpoint bridge_endpoint;
+    // The session was started with a management credential; its generation
+    // (32 lowercase hex). Never the key.
+    bool management_requested = false;
+    std::string management_generation;
 };
 
 struct EnrollmentConfig {
@@ -117,12 +130,18 @@ struct EnrollmentConfig {
     // The UDP port the bridge's ingest listener is really bound to (the
     // program's --port). 0: not known, so no session can deliver an endpoint.
     uint16_t bridge_port = 0;
+    // Issues management credentials and knows which Bases were unenrolled.
+    // Null: no session can deliver a credential (and none is ever required).
+    std::shared_ptr<PowerBaseManagement> management;
 };
 
 struct EnrollmentStartOptions {
     // 0: no bridge endpoint (the session behaves as before this option
     // existed). kBridgeEndpointVersion: establish and report one.
     int bridge_endpoint_version = 0;
+    // 0: no management credential. kPowerBaseManagementVersion: issue one
+    // (needs bridge_endpoint_version as well).
+    int management_version = 0;
 };
 
 enum class EnrollmentStartOutcome {
@@ -134,6 +153,13 @@ enum class EnrollmentStartOutcome {
     // Bridge endpoint delivery was asked for but this bridge has no ingest
     // port to report (EnrollmentConfig::bridge_port == 0). Nothing started.
     BridgeEndpointUnavailable,
+    // A management credential was asked for but cannot be issued (no
+    // management on this bridge, its state unavailable, or the credential
+    // could not be stored). Nothing started.
+    ManagementUnavailable,
+    // This Base was unenrolled from this hub: only a session that issues a
+    // new management credential may enroll it again. Nothing started.
+    ManagementRequired,
 };
 
 enum class EnrollmentCancelOutcome {
@@ -157,8 +183,14 @@ public:
     // `eui64` normalized, `pskd` valid (the caller checked both); `pskd` is
     // wiped before this returns. On Busy, `out` is the running session only
     // if `device_id` started it (otherwise left empty).
+    // `grant` (optional) gets the management credential of a Started session
+    // that asked for one -- the only place its key is ever handed out.
     EnrollmentStartOutcome Start(const std::string &device_id, const std::string &eui64, std::string &pskd,
-                                 EnrollmentSession &out, const EnrollmentStartOptions &options = {});
+                                 EnrollmentSession &out, const EnrollmentStartOptions &options = {},
+                                 ManagementGrant *grant = nullptr);
+    // A session for this EUI-64 (16 lowercase hex) is running: started and
+    // not final yet.
+    bool InProgressFor(const std::string &eui64);
     // False when there is no such session for this device (another device's
     // session is indistinguishable from a missing one).
     bool Get(const std::string &device_id, const std::string &session_id, EnrollmentSession &out);

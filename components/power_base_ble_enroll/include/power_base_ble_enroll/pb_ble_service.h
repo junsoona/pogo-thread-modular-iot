@@ -46,12 +46,22 @@ extern "C" {
  * is an 8-byte session id followed by a big-endian counter that both sides
  * advance after every encrypt and decrypt). pb_enroll.proto stays 1;
  * pb_enroll.cap lists what this board takes beyond the first version 1
- * messages (PB_BLE_MSG_START_EP_REQ). A client that does not know "cap"
- * ignores it. Readable before authentication, so it is a hint for choosing
+ * messages (PB_BLE_MSG_START_EP_REQ, PB_BLE_MSG_START_MGMT_REQ,
+ * PB_BLE_MSG_RECEIPT_REQ). A client
+ * that does not know "cap", or one of its names, ignores it. Readable before authentication, so it is a hint for choosing
  * the message, never a reason to trust anything. */
 #define PB_BLE_VERSION_JSON                                                                                          \
     "{\"prov\":{\"ver\":\"v1.1\",\"sec_ver\":2,\"sec_patch_ver\":1,\"cap\":[]},\"pb_enroll\":{\"proto\":1,"       \
-    "\"cap\":[\"" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "\"]}}"
+    "\"cap\":[\"" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "\",\"" PB_BLE_CAP_MGMT_V1 "\",\"" PB_BLE_CAP_RELEASE_RECEIPT_V1    \
+    "\"]}}"
+/* The same with PB_BLE_CAP_LOCAL_RESET_V1: what a board answers whose build has
+ * the re-enrollment button and whose button GPIO passed its check
+ * (pb_ble_service_config_t.local_reset). Every other board answers the
+ * string above, byte for byte as before. */
+#define PB_BLE_VERSION_JSON_LOCAL_RESET                                                                              \
+    "{\"prov\":{\"ver\":\"v1.1\",\"sec_ver\":2,\"sec_patch_ver\":1,\"cap\":[]},\"pb_enroll\":{\"proto\":1,"       \
+    "\"cap\":[\"" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "\",\"" PB_BLE_CAP_MGMT_V1 "\",\"" PB_BLE_CAP_RELEASE_RECEIPT_V1    \
+    "\",\"" PB_BLE_CAP_LOCAL_RESET_V1 "\"]}}"
 
 typedef struct {
     uint8_t eui64[PB_BLE_EUI64_LEN];
@@ -66,6 +76,18 @@ typedef struct {
     pb_ble_worker_ops_t ctl;
     /* Monotonic milliseconds; NULL = FreeRTOS tick count. */
     uint32_t (*now_ms)(void);
+    /* The board's release receipt for PB_BLE_MSG_RECEIPT_REQ (reads the
+     * enrollment record; called in the NimBLE host task with no lock held).
+     * NULL = this board never has one. */
+    pb_ble_receipt_source_t receipt;
+    void *receipt_ctx;
+    /* Local reset (pb_ble_admission.h). `local_reset`: this board answers
+     * the two local reset messages and lists the capability; then
+     * ctl.local_reset and ctl.get_local_reset must be set. `reenroll_window`:
+     * this boot is a re-enrollment window boot. Both false = the service is
+     * exactly what it was. */
+    bool local_reset;
+    bool reenroll_window;
 } pb_ble_service_config_t;
 
 /* Creates the protocomm instance (version, Security 2, endpoints). The
@@ -75,6 +97,10 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
 
 /* Worker context only. See pb_ble_adm_worker_poll(). */
 pb_ble_close_reason_t pb_ble_service_poll(void);
+
+/* True while a BLE-started enrollment attempt or a local reset is queued or
+ * running. Any task. False when the service was never started. */
+bool pb_ble_service_busy(void);
 
 /* Frees the protocomm instance and wipes the secrets held by the admission
  * state. Only after the transport on it has been stopped, and never from a

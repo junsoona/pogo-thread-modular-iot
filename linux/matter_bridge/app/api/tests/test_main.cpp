@@ -15,6 +15,9 @@ void RunSettingsApiTests(int *failures);
 void RunOtbrHelperTests(int *failures);
 void RunEnrollmentTests(int *failures);
 void RunEnrollmentApiTests(int *failures);
+void RunPowerBaseManagementTests(int *failures);
+void RunRemovalApiTests(int *failures);
+void RunBuildInfoTests(int *failures);
 
 int main()
 {
@@ -34,6 +37,9 @@ int main()
     RunOtbrHelperTests(&failures);
     RunEnrollmentTests(&failures);
     RunEnrollmentApiTests(&failures);
+    RunPowerBaseManagementTests(&failures);
+    RunRemovalApiTests(&failures);
+    RunBuildInfoTests(&failures);
     std::printf("\n%d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

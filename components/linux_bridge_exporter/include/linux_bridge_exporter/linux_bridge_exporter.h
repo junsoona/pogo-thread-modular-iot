@@ -81,6 +81,42 @@ esp_err_t linux_bridge_exporter_init(const uint8_t power_base_uuid[TOPOLOGY_UUID
                                       const power_base_bridge_config_t *cfg);
 
 /*
+ * Stops the exporter for the rest of this boot (docs/power-base-management.md:
+ * the board is being unenrolled). From the next loop iteration on the
+ * exporter task sends nothing -- no SAMPLE, TOPOLOGY, removal tombstone or
+ * HEARTBEAT -- and the observer callbacks drop their events. A request
+ * already on the air is not cancelled. Safe to call from any task, also when
+ * the exporter was never started; there is no "resume" (the caller restarts
+ * the chip).
+ */
+void linux_bridge_exporter_suspend(void);
+
+/*
+ * The hub is at another endpoint from now on (docs/power-base-management.md,
+ * section 12: the caller has the new endpoint from the hub itself, and it is
+ * already stored in the enrollment record). Every request made after this
+ * call goes to `host_addr`:`port`.
+ *
+ * A request that was on the air when the destination changed is not taken
+ * for delivered, whatever its answer: it was put to the previous endpoint,
+ * and this exporter's state says what the hub at the CURRENT endpoint has
+ * been given. It is sent again (within the usual bounded attempts), and a
+ * removal tombstone it carried stays pending.
+ *
+ * Then, on the exporter task's next pass and before anything periodic, the
+ * new endpoint is given everything again: a heartbeat, the whole topology,
+ * the latest sample of every module and the undelivered removals -- what the
+ * periodic full resync sends, without waiting for its interval.
+ *
+ * Safe to call from any task. ESP_ERR_INVALID_STATE when the exporter was
+ * never started in this boot; ESP_ERR_INVALID_ARG for an endpoint
+ * power_base_bridge_config would not accept (unspecified, multicast,
+ * link-local, port 0) -- nothing changes then.
+ */
+esp_err_t linux_bridge_exporter_set_destination(const uint8_t host_addr[POWER_BASE_BRIDGE_CONFIG_ADDR_LEN],
+                                                 uint16_t port);
+
+/*
  * Correction pass (this follow-up, item 6: exporter timing host tests must
  * not depend on real wall-clock elapsed time -- see this header's own top
  * comment on exporter_task()'s periodic resync/heartbeat). TEST-ONLY: never

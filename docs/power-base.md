@@ -1,5 +1,8 @@
 # Power Base 설계
 
+> 공개용 기록: 보드 식별값·계정·포트·주소는 예시로 바꿨습니다. 명령 실행 시 자신의 실제 값으로 바꾸세요. 원본 근거는 비공개로 보존했습니다.
+
+
 `power_base/`는 센서 모듈과 별도로 빌드하는 ESP32-H2 프로젝트다. POGO 체인의 시작점,
 downstream 프로비저닝, 토폴로지 등록, 센서 데이터 집계, Linux 전송을 담당한다.
 
@@ -314,9 +317,10 @@ EXTERNAL_OTBR(1)의 부팅 동작은 바뀌지 않는다.
 | USB 콘솔 시험 경로 | 구현. 여분 보드의 USB-Serial/JTAG 콘솔에 앱 DEBUG 시험이 보여 준 PSKd를 입력한다. `sdkconfig.bench_joiner`로 만든 시험 빌드에만 있다. 여분 보드 1대에서 등록·재부팅 재가입을 실물로 확인했다는 보고가 있다([`validation-status.md`](validation-status.md)). |
 | Bridge 주소 | 두 가지 중 하나다. ① 준비 이미지(`pb_bridge`)에 운영자가 OTBR의 Mesh-Local 주소와 ingest 포트를 직접 넣는다(USB 콘솔 경로와 version 1 BLE start는 이것만 쓴다). ② BLE 등록 때 허브가 만든 목적지를 앱이 보드에 전달한다(아래 "허브 Thread 수신 주소 자동 전달". host·빌드 확인에 더해 2026-10-05에 여분 보드 1대에서 실물 확인, 범위는 아래 "허브 주소 자동 전달" 줄). 어느 쪽이든 코드·기본값에 특정 집 주소가 없다. |
 | 앱 DEBUG 시험 | PogoHome의 DEBUG 전용 "Power Base 등록 시험"이 허브 등록 세션(EUI-64, 일회용 PSKd, 120초 창)을 연다. 성공 판정은 허브가 그 EUI-64의 **새** heartbeat를 받았을 때뿐이다. |
-| BLE 전달 경로(펌웨어·통신 규약) | 구현. `sdkconfig.ble_enrollment`로 만든 시험 빌드에만 있다. 아래 "BLE 등록 전달 경로". 앱 쪽은 DEBUG 전용 BLE 등록 시험 화면까지 구현됐고, 제품용(Release) 등록 화면은 미구현이다. 여분 보드 1대에서 실물 확인: 등록 성공·취소·광고 창 만료(2026-10-02, 보드 로그), 주소 자동 전달 빌드의 등록과 앱 화면의 `heartbeat_received`(2026-10-05). 기본 MTU 23, 인증 실패 잠금, 물리 전원 재투입 뒤의 동작은 **실물 미확인**. 근거와 경계는 [`validation-status.md`](validation-status.md) "BLE 등록 실물 후속 검증 (2026-10-02)"과 "실물 후속 검증 (2026-10-05)". |
+| BLE 전달 경로(펌웨어·통신 규약) | 구현. `sdkconfig.ble_enrollment`로 만든 시험 빌드에만 있다. 아래 "BLE 등록 전달 경로". 앱 쪽은 DEBUG 전용 BLE 등록 시험 화면과, 2026-10-05에 추가된 제품용(Release) "Power Base 추가" 화면이 있다(아래 "일반 등록과 삭제" 줄). 여분 보드 1대에서 실물 확인(제품용 화면과 관리 자격증명 **이전** 코드의 결과다): 등록 성공·취소·광고 창 만료(2026-10-02, 보드 로그), 주소 자동 전달 빌드의 등록과 앱 화면의 `heartbeat_received`(2026-10-05). 기본 MTU 23, 인증 실패 잠금, 물리 전원 재투입 뒤의 동작은 **실물 미확인**. 근거와 경계는 [`validation-status.md`](validation-status.md) "BLE 등록 실물 후속 검증 (2026-10-02)"과 "실물 후속 검증 (2026-10-05)". |
 | 허브 주소 자동 전달 | 구현. host test와 빌드(2026-10-03, 2026-10-04), Linux 배포 검증(2026-10-05, 사용자 실행)에 더해 2026-10-05에 여분 보드 1대에서 실물 확인: 허브 → 앱 → 보드의 목적지 전달(`0x04` 수락과 capability는 보드 로그와 소스에 따른 간접 근거이고 패킷 캡처는 없다), record v2 저장, RTS 재시작 뒤의 복원과 새 heartbeat, 앱 화면의 `heartbeat_received`. **실물 미확인**: 물리 전원 차단 뒤의 복원, 구형 start(`0x02`) 거부, 기본 MTU 23, 두 Base 동시 등록, 백그라운드 경쟁 조건, 세션의 `bridge_endpoint` 원문과 OTBR 주소의 직접 대조. 근거와 경계는 [`validation-status.md`](validation-status.md) "실물 후속 검증 (2026-10-05)". 최초 전달과 재부팅 복원까지다. 등록 뒤 허브 주소가 바뀌는 경우(OTBR 교체, 네트워크 재구성)의 자동 갱신·재등록은 없다. |
-| QR | 미구현. 보드별 준비 이미지(BLE 자격 증명)와 설정 코드 전달에는 여전히 터미널이 필요하다. |
+| 일반 등록과 삭제(관리 자격증명) | 구현(2026-10-05). 앱의 제품용 "Power Base 추가"가 `pb-start` `0x06`으로 허브가 만든 관리 자격증명을 보드에 전달하고, 등록된 보드는 CoAP `pogo/v1/mgmt`로 인증된 삭제 명령을 받아 등록을 해제한다. 삭제는 두 단계다: 보드가 등록 사용 중지를 통지하면 허브가 Base를 목록에서 빼고(`released`), 보드가 저장된 네트워크를 지우고 확인한 뒤 만든 영수증을 허브가 검증하면 완료(`completed`)다. 영수증은 보드가 스스로 허브에 보내고(2026-10-08, Power Base 0.2.0: flash에 아무것도 쓰지 않는 마지막 Thread 세션), 그것이 되지 않은 경우와 이전 펌웨어에서는 앱이 BLE로 읽어 전달한다. 규약은 [`power-base-management.md`](power-base-management.md). **host test, 시뮬레이터 test, 빌드로만 확인했다. 실물 보드·실물 BLE·운영 Linux 허브·실제 iPhone으로는 실행하지 않았다.** `0x06`과 영수증 읽기(`0x07`)는 BLE 시험 빌드(`sdkconfig.ble_enrollment`)에만 있고, 관리 poll과 영수증 전달 세션은 mode 2로 등록된 모든 빌드에 있다. record v1/v2로 등록된 기존 보드는 키가 없어 원격 삭제가 되지 않는다. |
+| QR | 설정 코드의 **입력**만 구현(2026-10-06, 앱 1.1.0 (3)). 보드별 QR을 Mac 도구로 만들고, 앱의 세 화면(추가·다른 허브에 연결하기·삭제 확인)이 선택한 보드의 QR에서 설정 코드를 읽어 입력 칸에 넣는다. 읽는 것만으로는 아무것도 시작하지 않는다. 아래 "QR 설정 코드". **host test, 시뮬레이터·Mac Catalyst test, 실제 이미지 디코딩, 빌드로만 확인했다. 실제 카메라·iPhone·보드로는 실행하지 않았다.** 보드별 준비 이미지(BLE 자격 증명)의 생성·기록에는 여전히 터미널이 필요하다. |
 | 제품 빌드(`sdkconfig.defaults`) | Joiner, 콘솔 명령, BLE가 모두 없다. mode 2 보드는 안전 대기만 한다. |
 
 **동작 규칙** (`components/power_base_enrollment`, `power_base/main/enrollment_runtime.c`)
@@ -411,7 +415,8 @@ Thread Dataset 전달은 하지 않는다.
 따른다. Bridge 주소·포트를 BLE로 전달하는 start(`0x04`)는 아래 "허브 Thread 수신 주소 자동
 전달"에 따로 적는다(2026-10-03 추가. 추가 당시에는 실물 미검증이었고 2026-10-05에 여분 보드 1대에서
 실물 시험이 실행됐다. 확인된 범위와 남은 미확인 항목은 그 절의 "검증 상태"에 적었다). 보드별 준비
-이미지(BLE 자격 증명)의 생성·기록에는 여전히 터미널이 필요하고, QR 흐름은 후속 범위다.
+이미지(BLE 자격 증명)의 생성·기록에는 여전히 터미널이 필요하고, QR 흐름은 후속 범위다(2026-10-06에
+설정 코드의 QR **입력**이 추가됐다: 아래 "QR 설정 코드". 이 절의 규약은 바뀌지 않았다).
 
 **구성 요소**
 
@@ -485,7 +490,7 @@ g=5, SHA-512) + AES-256-GCM. 자체 암호 프로토콜이나 SRP 구현은 없�
   증명하지 않는다. `pb-*` endpoint는 Security 2 세션의 복호화가 성공해야만 handler에 도달한다.
 - BLE link 자체의 pairing·bonding·암호화는 쓰지 않는다(`ble_bonding=0`, `ble_sm_sc=0`,
   `ble_link_encryption=0`). 보호는 전부 Security 2 세션이다.
-- username = 보드 EUI-64의 소문자 16진수 16자(예: `744dbdfffe65c00a`). password = 설정 코드.
+- username = 보드 EUI-64의 소문자 16진수 16자(예: `020000fffe65c00a`). password = 설정 코드.
   username은 verifier 계산에 들어가므로 다른 EUI-64로는 같은 코드로도 인증되지 않는다.
 - 설정 코드와 Thread PSKd는 서로 다른 자격 증명이다. 설정 코드는 보드마다 한 번 만들고
   (CSPRNG 128비트, RFC 4648 base32 대문자 26자, 구분자 없음), PSKd는 등록 세션마다 허브용으로
@@ -516,7 +521,7 @@ flash 암호화는 쓰지 않는다.
 `Security2/SRP/*`와 ESP-IDF v6.1 `protocomm_nimble.c`, `security2.c`, `esp_srp.c`.
 
 - 광고: flags + 128비트 service UUID(전체 목록). scan response: 이름
-  `POGO-PB-<EUI-64 대문자 16진수 16자>`(예: `POGO-PB-744DBDFFFE65C00A`). 광고 간격 160 ms
+  `POGO-PB-<EUI-64 대문자 16진수 16자>`(예: `POGO-PB-020000fffe65c00a`). 광고 간격 160 ms
   (protocomm 고정값). 이름의 EUI-64는 목록에서 보드를 고르기 위한 힌트일 뿐이다.
   iOS 클라이언트는 이름 prefix(`POGO-PB-`, 대소문자 무시)로 고르고, 광고의 첫 service UUID로
   service를 찾는다.
@@ -733,7 +738,9 @@ queue의 각 명령에는 시도 generation이 붙어 있어서, 취소·종료�
 - 실물 미확인: 물리 전원 차단 뒤의 복원(확인한 것은 RTS 재시작이다), 목적지 없는 구형 start(`0x02`)의
   거부, 기본 MTU 23, 두 Base 동시 등록, 앱의 백그라운드 경쟁 조건, 세션 응답의 `bridge_endpoint` 원문과
   OTBR 주소의 직접 대조.
-- 미구현: 등록 뒤 허브 주소가 바뀌는 경우의 자동 갱신·재등록, 제품용(Release) 등록 화면, QR 흐름.
+- 미구현: 등록 뒤 허브 주소가 바뀌는 경우의 자동 갱신·재등록. (제품용 등록 화면과 삭제는
+  2026-10-05에 구현됐고 실물로는 실행하지 않았다: [`power-base-management.md`](power-base-management.md).
+  설정 코드의 QR 입력은 2026-10-06에 구현됐고 실물로는 실행하지 않았다: 아래 "QR 설정 코드".)
 
 **흐름**
 
@@ -742,6 +749,10 @@ queue의 각 명령에는 시도 generation이 붙어 있어서, 취소·종료�
    (`"bridge_endpoint_version": 1`, [`pogohome-api-v1.md`](pogohome-api-v1.md)).
 3. 허브가 자기 OTBR의 Mesh-Local EID(`ot-ctl ipaddr mleid`)와 실제 ingest port(`--port`)를 그
    세션의 목적지로 한 번 확정한다. 확정하기 전에는 Joiner를 열지 않는다.
+   이 목적지는 등록 때 한 번 전달된다. **그 뒤 같은 허브의 EID나 port가 바뀌면** 관리 자격증명을 가진 보드
+   (record v3)는 허브를 스스로 다시 찾아 목적지를 고친다(2026-10-09, Power Base 0.3.0 + Linux bridge 0.3.0.
+   [`power-base-management.md`](power-base-management.md) 12절). record v1·v2의 보드와 이전 펌웨어·허브는 그렇게
+   하지 않으며, 그 경우의 복구는 재등록이다.
 4. 세션이 목적지와 함께 `waiting_for_heartbeat`가 되면 앱이 challenge를 받고 `0x04` start로
    PSKd와 목적지를 보드에 전달한다.
 5. 보드는 목적지를 RAM에만 들고 Joiner → attach를 진행하고, 가입한 네트워크의 Mesh-Local
@@ -988,6 +999,311 @@ Bridge 주소를 어디서 받을지는 반드시 하나를 고른다. 기본값
    phase=enrolled도 성공으로 표시하지 않는다. 허브 세션이 `expired`/`failed`면 실패다.
    사용자가 취소하면 `pb-cancel`(같은 request id)과 허브 `DELETE`를 둘 다 보낸다.
 
+### BOOT 버튼 로컬 재등록 (mode 2 + BLE, 시험 구성, 2026-10-06)
+
+> **검증 상태.** 이 절의 동작은 host test(실제 C 소스 + NVS simulator), host harness를 통한 Swift ↔ C
+> 상호운용 시험, ESP-IDF 빌드로만 확인했다. **실물 보드에서는 아무것도 실행하지 않았다.** 물리 버튼의
+> 누름 판정, 재시작 뒤 BLE 광고, 실제 전원 차단, 새 Thread 네트워크로의 이동은 실물 시험 대상이다
+> ([`validation-status.md`](validation-status.md)).
+
+이전 허브가 없어졌거나 다른 Thread 네트워크로 옮겨야 할 때, PC·직렬 콘솔·이전 허브 없이 등록된 Power
+Base를 미등록 상태로 되돌리는 경로다. 그 뒤의 등록은 위 "BLE 등록 전달 경로" 그대로이고, 성공 판정도
+그대로 새 허브의 `heartbeat_received`뿐이다.
+
+**무엇이 지우는가.** 다음 셋이 모두 있어야 한다. 하나라도 없으면 아무것도 지워지지 않는다.
+
+1. 물리 버튼으로 연 재등록 창(120초),
+2. 그 보드의 설정 코드로 맺은 Security 2 세션,
+3. 그 세션 안에서, 그 세션의 새 challenge와 함께 보낸 **확인 표시가 있는** 로컬 초기화 명령.
+
+버튼만 누르는 것, BLE로 연결하는 것, 인증에 성공하는 것은 각각 아무것도 지우지 않는다.
+
+#### 구성과 하드웨어 가정
+
+| 항목 | 값 |
+|---|---|
+| Kconfig | `CONFIG_POWER_BASE_REENROLL_BUTTON`(기본 n, `POWER_BASE_BLE_ENROLLMENT` 필요), `…_BUTTON_GPIO`(0~27, 기본 9), `…_BUTTON_ACTIVE_LOW`(기본 y) |
+| 켜는 overlay | `power_base/sdkconfig.reenroll_button_gpio9` — `sdkconfig.defaults;sdkconfig.ble_enrollment` 위에만 얹는다 |
+| 기본·bench·일반 BLE 빌드, module, RCP | 기능 없음. capability도 알리지 않고 동작은 이전과 같다 |
+| `pb_thread` mode 0/1 | 기능 없음(코드가 mode 2 분기 안에만 있다) |
+
+**GPIO9는 하드웨어 가정이다.** ESP32-H2의 BOOT strapping 핀은 GPIO9이고 개발 보드는 보통 이 핀에
+GND로 떨어지는 "BOOT" 버튼을 단다([Espressif: Boot Mode
+Selection](https://docs.espressif.com/projects/esptool/en/latest/esp32h2/advanced-topics/boot-mode-selection.html)).
+이 프로젝트의 ESP32-H2 SuperMini 보드에서 실제로 그렇게 배선돼 있는지는 **확인하지 않았다.** 시험 전에
+보드에서 확인해야 한다.
+
+ROM은 GPIO9를 reset 순간에만 읽는다(그때 Low면 download mode). 이 기능은 부팅이 끝난 뒤의 일반 입력으로만
+읽고, **전원을 넣거나 RST를 누르는 동안 BOOT를 누르고 있으라는 절차는 없다.** 재시작은 버튼을 놓은 뒤에만
+일어난다.
+
+부팅 때 버튼 GPIO를 검사한다(`pb_reenroll_button_gpio_check()`): 범위 밖, flash(15~21)·USB(26·27)·
+bonding되지 않은 핀(6·7)·GPIO9가 아닌 strapping 핀(8·25), 그리고 이 보드의 `cfg`가 쓰는 POGO UART
+TX/RX·DETECT_IN·DETECT_OUT·`power_enable_gpio`와 같으면 그 부팅에서 기능을 끈다(로그 한 줄, 다른 동작은
+그대로).
+
+#### 버튼 판정 (`pb_reenroll_button.c`)
+
+인터럽트 핸들러가 없다. task가 20ms마다 핀을 읽어 순수 상태 머신에 넘긴다(그래서 ISR에서 실행되는 것이
+없다).
+
+- 부팅 뒤 **안정된 놓음(300ms)** 을 먼저 봐야 한다. 부팅 때부터 눌려 있던 입력은 얼마나 오래 눌려 있든,
+  놓아도 요청이 아니다.
+- 그 뒤 **연속 5초 누름**, 그리고 **안정된 놓음**에서 한 번만 요청이 된다. 누르고 있는 동안에는 아무 일도
+  일어나지 않는다.
+- 40ms보다 짧은 접점 튐은 누름을 끝내지도 시작하지도 않는다. 5초보다 짧은 누름, 15초보다 긴 누름(걸린
+  버튼), 놓음이 안정되기 전에 다시 누름, 250ms 넘게 sampling이 끊긴 누름은 버린다.
+- 시간은 `uint32_t` ms의 차이만 쓰므로 counter가 넘쳐도 같다.
+
+요청이 되면 gate(`pb_reenroll_gate()`)가 다른 작업을 확인한다. Joiner 실행·attach 중, BLE로 받은 시작이
+대기 중, 원격 삭제(unenroll) 수행 중, 이미 요청을 저장한 뒤면 무시한다(로그만 남고 아무것도 바뀌지 않는다).
+
+#### 창은 재시작으로 연다
+
+등록된 보드에서 enrollment worker는 이미 끝났고, 서비스(transport, exporter, parent_service, POGO
+downstream, 관리 poll)는 부팅당 한 번만 만든다. 그 위에 BLE를 다시 올리지 않고, **한 번의 부팅 동안 기존
+등록을 재개하지 않는 것**으로 일시 정지를 구현했다.
+
+```text
+정상 부팅 ── BOOT 5초 + 놓음 ── gate ── "win" 요청 record 저장(commit + 다시 읽기) ── esp_restart
+   └ 저장 실패: 아무것도 바뀌지 않고 재시작도 하지 않는다
+
+다음 부팅 (mode 2, Thread 정지 직후, 등록 record를 보기 전에)  pb_reenroll_boot()
+   1. 초기화 journal이 APPROVED → 초기화를 이어서 수행 → 검증되면 재시작, 아니면 안전 정지
+   2. journal을 읽을 수 없음·손상·다른 보드 → 안전 정지 (요청이 있으면 복구용 창)
+   3. "win" 요청을 먼저 지운다(지워진 것을 다시 읽어 확인). 그 다음에만:
+        버튼 기능이 있고, 이 보드의 요청이고, 재개할 등록이 있으면 → 창 부팅
+        그 밖에는 → 평소 부팅
+   (그 뒤) 진행 중인 원격 해제 마무리 → 부팅 규칙 → 안전 대기 또는 재개
+
+창 부팅: 부팅 규칙을 적용하지 않는다 → Thread 꺼짐, 기존 등록 재개 없음, on_enrollment_ready() 없음
+         (exporter·downstream·DETECT_OUT·관리 poll 없음). BLE만 120초.
+   창이 끝남(시간, 인증 5회 실패, BLE 시작 실패, 초기화 수행) → esp_restart
+      초기화가 없었으면 → 평소 부팅 → record와 Dataset이 그대로이므로 평소 규칙으로 재개
+```
+
+- 요청 record는 창을 열기 **전에** 소비하므로, 창 도중의 재시작·전원 차단은 평소 부팅이 된다. 요청이
+  반복 재부팅이나 자동 초기화로 이어지는 경로는 없다. 요청을 지우지 못하면 창을 열지 않는다.
+- 창 부팅에서 `pb-start`는 종류에 상관없이 `NOT_WAITING`으로 거절한다(challenge를 쓰지 않는다). controller도
+  Joiner 요청을 받지 않는다.
+- 120초는 창이 열린 때부터 센다. 연결이나 인증 시도는 연장하지 않는다. 수락된 초기화가 있으면 시간이
+  지나도 끝까지 수행한다.
+- 창이 열려 있는 동안(최대 약 2분 + 재시작) 이 Base는 Thread에 없고 DETECT_OUT도 놓여 있다. 아래 센서
+  모듈은 상위 연결을 잃었다가 Base가 돌아오면 기존 방식으로 다시 붙는다. 센서 모듈의 flash·Dataset은
+  건드리지 않는다.
+
+#### 영속 record (`pb_reenroll_store.c`, 동적 `nvs` 파티션의 namespace `pb_reenroll`)
+
+| key | 크기 | 내용 |
+|---|---|---|
+| `win` | 24 | `"PBW1"`, version 1, EUI-64, CRC-32. 창 요청. 창 말고는 아무것도 승인하지 않는다 |
+| `op` | 40 | `"PBR1"`, 형식 version 1, 단계(1 APPROVED, 2 VERIFIED), 대상 EUI-64, 작업 ID 16바이트, CRC-32 |
+
+모든 저장은 `set_blob` + `commit` + 다시 읽어 비교이고, 모든 삭제는 지운 뒤 다시 읽어 확인한다. 비밀은
+없다. `cfg` 파티션은 열지 않는다. 파티션이나 namespace 전체를 지우는 호출은 없다(OpenThread 저장소는
+OpenThread 자신의 `otInstanceErasePersistentInfo`로 지운다 — 원격 삭제와 같은 호출).
+
+#### 초기화 순서 (`pb_reenroll.c`)
+
+| 단계 | 하는 일 | 실패하면 |
+|---|---|---|
+| 1 | journal `APPROVED` 저장(commit, 다시 읽기) | **시작하지 않는다.** 아무것도 지워지지 않는다. 남은 APPROVED는 되돌린다 |
+| 2 | Joiner·Thread 정지 | — |
+| 3 | 등록 record 삭제(표식·허브 주소·관리 키), 다시 읽어 없음을 확인. 원격 삭제의 최종 record(영수증)는 남긴다 | journal은 APPROVED 그대로 |
+| 4 | OpenThread 저장소 삭제 → 저장소를 다시 읽어 비었는지 확인 | 위와 같음 |
+| 5 | journal `VERIFIED` 저장(commit, 다시 읽기) → 재시작 | 위와 같음(다음 부팅이 전부 다시 확인) |
+
+1단계의 결과에 따라 그 뒤의 부팅이 달라진다. 세 경우를 구분한다.
+
+| 1단계 뒤에 남은 것 | 지워진 것 | 다음 부팅 |
+|---|---|---|
+| journal 없음 — 저장이 실패했고 승인 기록이 남지 않았다(남았더라도 되돌렸다) | 없음. 등록 record와 Dataset은 바이트 단위로 그대로 | 평소 부팅. **기존 등록을 재개한다.** 초기화는 시작되지 않은 것이다(사유 `JOURNAL_STORE_FAILED`, 그 작업 ID는 `REQUEST_CONFLICT`) |
+| 영속 `APPROVED` — 저장이 성공했다 | 2~5단계가 진행된 만큼 | **기존 등록을 재개하지 않는다.** 등록 record를 보기 전에 `pb_reenroll_boot()`가 초기화를 이어서 수행하고, 끝내지 못하면 그 부팅은 안전 정지다(Thread 꺼짐, 재개 없음, 새 가입 없음, BLE 등록 없음) |
+| 읽을 수 없는 journal — 원래 그랬거나, 실패한 저장이 그런 것을 남기고 되돌리지도 못했다 | 없음 | 안전 정지. 재개하지 않고 지우지도 않는다(아래) |
+
+- "어떤 부팅도 기존 등록을 재개하지 않는다"는 **영속 `APPROVED`가 남은 뒤**에만 성립한다. 저장에 실패해
+  아무 기록도 남지 않은 경우에는 반대로, 삭제가 시작되지 않았으므로 기존 등록이 그대로 재개된다
+  (host test: "the next boot resumes the enrollment: nothing was reset").
+- 실패한 저장이 유효한 `APPROVED`를 남겼는데 되돌리는 것까지 실패한 경우에는 이번 부팅에서 아무것도
+  지우지 않고, 다음 부팅이 그때의 journal에 따라 동작한다(`APPROVED`면 둘째 줄). 이 조합(저장 실패 +
+  되돌리기 실패)은 코드 경로로만 있고 전용 host test는 없다.
+- 버튼 기능이 없는 빌드도 `APPROVED` journal이 있으면 이어서 끝낸다.
+
+journal을 읽을 수 없거나 손상됐거나 다른 보드의 것이면 안전 정지다. 이 상태에서 벗어나는 방법은 버튼으로
+창을 열고 인증·확인된 새 초기화가 그 journal을 대체하는 것뿐이다(창만으로는 고쳐지지 않는다).
+
+보존되는 것: `cfg`(보드 배선, 식별 정보, BLE 설정 코드 verifier, `pb_thread`, `pb_bridge`), 펌웨어, `nvs`의
+다른 namespace. 로컬 초기화는 관리 메시지나 삭제 영수증을 만들지 않고 이전 허브에 아무것도 알리지 않는다.
+**이전 허브의 목록·방 배정·차단 기록은 그대로 남는다**(정리는 별도 작업이다).
+
+#### 통신 규약 추가 (`pb_ble_proto.h`, capability `local_reset_v1`)
+
+기존 message 번호·길이·필드·capability는 바꾸지 않았다. 새 endpoint도 없다(기존 앱은 모르는 endpoint가
+있는 GATT 서비스를 거절한다). 두 message를 기존 endpoint에 더했다.
+
+| message | endpoint | 길이 | 내용 |
+|---|---|---|---|
+| `0x09` 로컬 초기화 명령 | `pb-start` | 48 | `[2]` 형식 1, `[4..11]` 대상 EUI-64, `[12..27]` 작업 ID, `[28..43]` challenge, `[44]` 확인 표시 `0x01`, `[45..47]` 0 |
+| `0x89` 응답 | | 4 | `ACCEPTED`, `DUPLICATE`, `MALFORMED`, `WRONG_TARGET`, `CHALLENGE_INVALID`, `CHALLENGE_EXPIRED`, `BUSY`, `REQUEST_CONFLICT`, `CLOSED`, `WINDOW_CLOSED`(0x1f), `NOT_ENROLLED`(0x20) |
+| `0x08` 초기화 상태 조회 | `pb-status` | 28 | `[4..11]` 대상 EUI-64, `[12..27]` 물어볼 작업 ID(0 = 없음). challenge도 창도 필요 없다 |
+| `0x88` 응답 | | 32 | `[4..11]` EUI-64, `[12]` 형식 1, `[13]` 보드 상태, `[14]` flag(0x01 창 열림, 0x02 그 작업을 앎), `[15]` 작업 단계, `[16]` 사유, `[18..19]` 창의 남은 초 |
+
+- 보드 상태(`[13]`): 0 미등록(초기화할 것 없음), 1 등록됨, 2 원격 해제 진행 중, 3 로컬 초기화 미완료,
+  4 읽을 수 없음.
+- 작업 단계(`[15]`): 1 대기(수락됨, worker가 아직 journal을 쓰지 않음), 2 진행 중(journal 기록됨, 검증 전),
+  3 검증 완료, 4 시작하지 않음(아무것도 바뀌지 않음).
+- capability는 버튼 구성이 있고 GPIO 검사를 통과한 보드만 알린다. 그런 보드는 **모든** 부팅에서 알린다
+  (재시작 뒤 결과를 물을 수 있어야 하므로). 명령은 창 부팅에서만 받는다.
+- capability가 없는 보드는 두 message를 그 endpoint의 다른 모르는 type과 똑같이 답한다(`pb-start`는
+  `0x82`·`MALFORMED`, `pb-status`는 40바이트 `0x81`·`MALFORMED`). 클라이언트는 capability가 없는 보드에
+  두 message를 보내지 않고, 다른 message로 대신하지도 않는다.
+- 명령은 BLE callback에서 판정만 하고 queue에 넣는다. journal·삭제·검증은 worker가 lock을 푼 채로 한다.
+- 같은 작업 ID를 다시 보내면(재전송, 재접속 뒤) `DUPLICATE`이고 새로 시작하는 것이 없다. 다른 작업이
+  대기·진행 중이면 `BUSY`. 시작하지 못하고 끝난 작업 ID, 검증된 뒤 보드가 다시 등록된 작업 ID는
+  `REQUEST_CONFLICT`다. 중복·충돌·창 없음은 challenge를 쓰지 않는다.
+- 초기화가 끝나면(검증됐든 아니든) BLE를 3초 더 열어 두어 연결된 클라이언트가 결과를 읽게 하고 재시작한다.
+  그 뒤에는 평소 부팅의 BLE에서 같은 작업 ID로 물으면 된다.
+
+**네 가지는 서로 다른 것이다.** 명령 수락(`ACCEPTED`) ≠ 초기화 진행(단계 2) ≠ 초기화 검증 완료(단계 3 +
+보드 상태 0) ≠ 새 등록 완료(여기서 말하지 않는다. 새 허브의 `heartbeat_received`).
+
+#### 원격 삭제와의 관계
+
+| 상황 | 동작 |
+|---|---|
+| 원격 삭제 수행 중에 버튼 | gate가 무시한다 |
+| record가 `UNENROLLING` 또는 `RELEASED`(삭제 대기)인 보드에서 창 요청 | 창을 열지 않는다. 요청은 소비되고, 평소대로 원격 해제를 먼저 마친다 |
+| 그런 보드에 초기화 명령 | `BUSY` |
+| 최종 `RELEASED`(영수증 보관)인 보드 | 이미 초기화된 보드다. 창을 열지 않고 평소 안전 대기(BLE 등록)로 간다. 명령은 `NOT_ENROLLED`, 영수증은 그대로 |
+| journal이 APPROVED인 보드에서 창 요청 | 초기화를 먼저 끝낸다. 요청은 버린다 |
+| 로컬 초기화가 끝난 보드 | 허브의 삭제 작업은 `completed`가 되지 않는다(영수증이 없다). 허브에는 그 Base가 offline으로 남는다 |
+
+#### 구현 위치
+
+| 파일 | 역할 |
+|---|---|
+| `components/power_base_reenroll/pb_reenroll_button.{c,h}` | 버튼 상태 머신, GPIO 검사(순수) |
+| `components/power_base_reenroll/pb_reenroll_store.{c,h}` | `win`·`op` record |
+| `components/power_base_reenroll/pb_reenroll.{c,h}` | gate, 부팅 순서, 초기화 순서 |
+| `components/power_base_ble_enroll/pb_ble_admission.{c,h}`, `pb_ble_proto.h`, `pb_ble_service.{c,h}` | `0x08`·`0x09`, 창, worker 호출, capability |
+| `power_base/main/enrollment_reenroll.{c,h}` | GPIO task, OpenThread 호출, BLE worker 연결 |
+| `power_base/main/enrollment_runtime.c` | 창 부팅용 worker(`reenroll_window_task`), Joiner 요청 차단 |
+| `power_base/main/app_main.c` | mode 2 부팅 순서 |
+| `tools/test_power_base_reenroll.c` | host test(실제 소스 + NVS simulator) |
+
+빌드(새 출력 디렉터리, `power_base/sdkconfig`를 쓰지 않는다):
+
+```bash
+B="$HOME/esp-builds/<새 디렉터리>"
+idf.py -C power_base -B "$B" -D SDKCONFIG="$B/sdkconfig" -D IDF_TARGET=esp32h2 \
+  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ble_enrollment;sdkconfig.reenroll_button_gpio9" build
+```
+
+이번 범위가 아닌 것: QR 입력, 등록 뒤 허브 주소가 바뀐 경우의 복구, 영구 오프라인 Base를 허브에서 빼는
+것, 이전 허브의 기록 정리.
+
+### QR 설정 코드 (2026-10-06)
+
+> **검증 상태.** 이 절의 동작은 Mac의 host test(생성 도구와 파서), iOS 시뮬레이터·Mac Catalyst test,
+> 생성 도구가 만든 PNG를 앱의 실제 판독 경로(ImageIO → Vision)로 읽는 시험, SDK 빌드로만 확인했다.
+> **실제 카메라, 실제 iPhone·iPad, 실제 보드·BLE·허브에서는 아무것도 실행하지 않았다.** 근거는
+> [`validation-status.md`](validation-status.md) "QR 설정 코드 입력 검증 (2026-10-06)".
+
+26자리 설정 코드를 손으로 옮겨 적는 대신 보드의 QR에서 읽어 **입력 칸에 넣는** 기능이다. 설정 코드의
+뜻(Security 2 비밀번호, 보드마다 하나, `tools/gen_power_base_ble_config.py`가 만든다)과 BLE 규약,
+보드의 인증·잠금 규칙, 허브 API는 바뀌지 않았다. 펌웨어와 Linux bridge는 QR을 모른다.
+
+**형식 (버전 1).** QR의 내용은 다음 ASCII 문자열 하나, 정확히 53바이트다.
+
+```
+POGO-PB:1:<eui64>:<setup_code>
+```
+
+| 부분 | 규칙 |
+|---|---|
+| `POGO-PB:1` | prefix와 형식 버전. 버전 `1`은 제품 버전·BLE 프로토콜 번호·API 스키마와 별개의 숫자다 |
+| `<eui64>` | 보드의 EUI-64, 소문자 ASCII 16진수 16자리. 모두 0이면 거부 |
+| `<setup_code>` | 16바이트의 RFC 4648 Base32, 대문자(`A`–`Z`, `2`–`7`) 26자리, padding 없음. 디코딩하면 정확히 16바이트이고 다시 인코딩한 결과가 원문과 같아야 한다(마지막 문자의 남는 2비트가 0이 아니면 거부) |
+
+- 그 밖의 것은 모두 거부한다: 공백·개행·제어 문자, 추가 필드, 다른 구분자, 다른 버전, 소문자 코드,
+  대문자 EUI-64, ASCII처럼 보이는 Unicode 문자. 바이트 단위로 비교하며, 다듬거나 일부만 골라 쓰지
+  않는다. 수동 입력의 규칙(주변 공백 제거, 소문자 허용)은 그대로이고 QR에는 적용하지 않는다.
+- 일반 URL, Matter·HomeKit 코드, 허브 연결 코드, 설정 코드만 담은 26자리 QR은 이 형식이 아니다.
+  앱은 QR의 내용을 열지 않고(URL scheme 없음) 설정 코드 입력에만 쓴다.
+- 두 구현(Mac의 생성 도구, 앱의 파서 `PowerBaseSetupQRPayload`)은 같은 벡터 파일
+  `tools/power_base_setup_qr_vectors.json`으로 시험한다. 벡터의 코드는 Python `base64`로 만들었고
+  거부 사례는 이유와 함께 손으로 적었다. 앱 저장소의 사본은 바이트 단위로 같아야 한다(양쪽 test가
+  대조한다).
+
+**EUI-64는 증거가 아니다.** QR의 EUI-64는 "이 코드가 어느 보드의 것인가"를 알려 줄 뿐이다. 보드는
+이전과 똑같이 설정 코드로 인증하고(Security 2), 앱은 인증된 세션에서 보드가 말하는 EUI-64를 다시
+확인한 뒤에만 다음 단계로 간다. QR이 다른 보드를 가리키도록 위조돼도 그 검사는 그대로 걸린다.
+
+**앱의 동작 (앱 저장소, 1.1.0 (3)).** 세 화면의 설정 코드 입력 칸 아래에 QR 줄이 있다: "Power Base
+추가", "다른 허브에 연결하기"의 보드 확인, "삭제 확인". 수동 입력과 붙여넣기는 그대로다.
+
+- **입력만 한다.** QR을 읽으면 설정 코드가 입력 칸에 들어가고 스캐너가 닫힌다. Bluetooth 검색·연결·
+  인증, 허브의 등록 세션, 보드 초기화·재등록·삭제·영수증 전달은 이전처럼 사용자가 각 화면의 버튼을
+  눌러야 시작하고, 성공은 계속 허브의 결과로 판단한다.
+- **보드를 먼저 고른다.** 목록에서 보드를 선택한 뒤에만 QR을 읽을 수 있다. QR의 EUI-64가 선택한 보드의
+  EUI-64와 같을 때만 코드를 넣는다("삭제 확인"에서는 그 삭제의 대상 보드와도 같아야 한다). 다르면
+  입력 칸과 선택을 그대로 두고 이유를 보여 준다. 메시지에는 QR의 내용이 들어가지 않는다.
+- **QR로 넣은 코드는 그 보드의 것으로 기억한다.** 다른 보드를 선택하면 그 코드는 지워진다. 사용자가
+  한 글자라도 고치면 그때부터는 직접 입력한 코드다(보드 정보가 남지 않는다). "다른 허브에 연결하기"가
+  끝나 일반 등록으로 넘어갈 때 코드는 인증한 그 보드에 묶여 전달되고, 등록 화면에서 다른 보드를
+  고르면 전달되지 않는다.
+- **늦게 도착한 결과는 버린다.** 화면을 떠났거나, 허브가 바뀌었거나, 다른 보드를 선택했거나, 스캔을
+  닫았거나, 앱이 백그라운드에 있는 동안 도착한 판독 결과는 입력 칸을 바꾸지 않는다. 한 번 받아들인
+  뒤의 반복 결과도 마찬가지다.
+- **여러 코드.** 서로 다른 QR이 함께 보이면 어느 것도 고르지 않고 하나만 보이게 하라고 안내한다. 같은
+  QR이 여러 번 검출되면 하나로 본다. 한 QR의 EUI-64와 다른 QR의 코드를 합치지 않는다.
+- 설정 코드와 QR의 내용은 메모리에만 있다. 로그, 분석, UserDefaults, 상태 복원, 파일, 클립보드에 넣지
+  않는다.
+
+| | iPhone·iPad | Mac (Mac Catalyst) |
+|---|---|---|
+| 카메라 | "카메라로 QR 코드 읽기". 이 줄을 누를 때 처음 카메라 권한을 묻는다. AVFoundation의 QR 메타데이터 검출만 쓰고 영상 프레임은 앱 코드에 오지 않는다(저장도 없다). 백그라운드에서는 카메라를 끄고, 돌아왔을 때 스캐너가 아직 열려 있으면 다시 켠다 | 없음(Mac 빌드에는 카메라 코드도 sandbox의 카메라 권한도 없다) |
+| 이미지 | "사진에서 QR 코드 가져오기". 시스템 사진 선택기(PhotosPicker)가 고른 사진만 넘겨준다. 사진 보관함 접근 권한을 요청하지 않는다 | "QR 코드 이미지 파일 불러오기". 파일 선택 창에서 고른 파일만 읽는다 |
+| 판독 | Vision, 기기 안에서. 파일 32MB 이하, 헤더 기준 6,400만 화소·한 변 16,384픽셀 이하만 받고, 긴 변 2,048픽셀(QR을 못 찾았고 원본이 더 크면 4,096픽셀)로 줄여 디코딩한다. 이미지의 방향 정보를 반영한다 | 같음 |
+
+카메라 권한 거부·제한, 카메라 없음, 이미지가 아닌 파일, QR 없는 이미지, 너무 큰 이미지는 각각 다른
+안내로 끝나고 입력 칸은 바뀌지 않는다. 카메라 사용 설명은 앱 타깃에만 있고 Watch 앱과 위젯의
+Info.plist에는 없다. 사진 보관함 사용 설명은 어디에도 없다.
+
+**QR 만들기 (Mac).** 보드가 **이미 가진** 설정 코드로 만든다. 새 코드를 만들지 않고, cfg 이미지와
+보드를 건드리지 않는다.
+
+```bash
+swift tools/gen_power_base_setup_qr.swift \
+    --eui64 <이 보드의 EUI-64, 16진수 16자리> \
+    --setup-code-file "$HOME/pogo-setup-codes/<eui64>.setup-code" \
+    --out "$HOME/pogo-setup-codes/<eui64>.setup-qr.png"
+```
+
+- macOS 13 이상과 Xcode 명령행 도구만 필요하다(Core Image, ImageIO, Vision. 설치할 라이브러리 없음).
+  자주 쓰면 `xcrun swiftc -O tools/gen_power_base_setup_qr.swift -o <저장소 밖의 경로>`로 한 번
+  컴파일해 둔다. ESP-IDF 환경은 필요 없다.
+- 입력은 세 개뿐이다. **설정 코드는 인자·환경 변수로 받지 않고 출력하지도 않는다.** 설정 코드
+  파일은 준비 도구가 쓴 그대로여야 한다: 본인 소유의 일반 파일, mode 0600, 심볼릭 링크 아님, 내용은
+  26자리 코드와 줄바꿈 하나 이하. EUI-64는 준비 도구와 같은 규칙으로 받는다(대소문자 무관, 모두 0·
+  모두 f 거부).
+- 출력: 8비트 흑백 PNG, 모듈당 12픽셀(정수 배율), 사방 4모듈의 여백, 오류 정정 수준 M, 메타데이터
+  없음. 파일은 mode 0600, 디렉터리는 없으면 mode 0700으로 만들고, 이미 있으면 mode 0700(본인만
+  접근)이어야 한다. 사람이 읽는 코드는 그림에 넣지 않는다.
+- 거부하고 아무것도 남기지 않는 경우: 출력 경로가 Git 작업 트리 안(이 저장소 포함), 출력 파일이 이미
+  있음(덮어쓰지 않는다), 디렉터리가 다른 사용자에게 열려 있거나 심볼릭 링크임, 설정 코드 파일이
+  위 조건에 맞지 않음. 완성한 PNG를 Vision으로 다시 읽어 그 보드의 코드와 같을 때만 최종 이름을
+  준다.
+- **QR PNG는 설정 코드 그 자체다.** 이것을 본 사람은 그 보드를 등록·이동·삭제 확인할 수 있다. 설정
+  코드 파일과 똑같이 다루고, 저장소·문서·채팅·공개 산출물에 넣지 않는다. 인쇄물도 마찬가지다. 공개
+  기록에는 QR의 내용도 그 해시도 적지 않는다.
+
+**버전과 호환성.** QR 형식 버전은 `1`이다. 앱은 1.1.0 (3)이 됐고(사용자 기능 추가), Power Base·센서
+모듈·RCP·Linux bridge는 0.1.0 그대로다(런타임 동작이 바뀌지 않았다). BLE 등록 프로토콜 번호, HTTP
+API `schema_version`, 영속 레코드 버전은 바뀌지 않았다. 생성 도구와 그 test·벡터는 펌웨어 빌드
+입력이 아니며 어느 구성요소의 소스 지문에도 들어가지 않는다(`tools/test_gen_power_base_setup_qr.py`가
+확인한다). 버전 2 이상의 QR을 이 앱이 만나면 "읽을 수 없는 형식"이라고 안내하고 아무것도 넣지 않는다.
+
 ### 기존 수동 추가 절차
 
 Power Base를 둘 이상 쓸 때는 모두 같은 Linux OTBR Thread 네트워크에 EXTERNAL_OTBR 모드로
@@ -998,10 +1314,12 @@ Linux Bridge 한 인스턴스가 모든 Base의 CoAP 메시지를 같은 포트(
   `power_base_otbr_bridge_config.bin`을 두 번째 Base에도 그대로 쓸 수 있다.
 - 모듈의 소속 Base는 POGO 유선 `SET_COLLECTOR`로 정해진다. 모듈은 그 Base의 Mesh-Local EID로만
   보고하므로, 같은 종류의 센서가 두 Base에 있어도 섞이지 않는다.
-- 이 절차는 운영용 경로다. 앱 등록은 위의 mode 2 시험 경로(USB 콘솔 PSKd 입력, 또는 BLE 시험 빌드와
-  앱의 DEBUG BLE 등록 시험; 모두 여분 보드용이고 실물 결과도 여분 보드 1대의 것뿐이다)만 있고,
-  제품용(Release) 등록 화면과 QR 전달은 아직 없다. Linux API의 센서 데이터 경로는 읽기 전용이며, 등록 세션
-  경로는 TLS·페어링된 기기 전용이다(`pogohome-api-v1.md`).
+- 이 절차는 운영용 경로다. 앱 등록은 위의 mode 2 경로(USB 콘솔 PSKd 입력, BLE 시험 빌드와 앱의 DEBUG
+  BLE 등록 시험, 그리고 2026-10-05에 추가된 제품용 "Power Base 추가")가 있다. 실물 결과는 여분 보드
+  1대의 것뿐이고 제품용 화면과 삭제는 실물로 실행하지 않았다. 설정 코드의 QR 입력은 2026-10-06에
+  추가됐고(위 "QR 설정 코드") 실물로 실행하지 않았다. 이 절차(설정 이미지)로
+  연결한 Base는 관리 자격증명이 없으므로 앱에서 삭제할 수 없다. Linux API의 센서 데이터 경로는 읽기
+  전용이며, 등록 세션과 삭제 경로는 TLS·페어링된 기기 전용이다(`pogohome-api-v1.md`).
 
 절차:
 

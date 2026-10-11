@@ -1,3 +1,4 @@
+#include "pogohome_api/build_info.hpp"
 #include "pogohome_api/http_server.hpp"
 
 #include <cerrno>
@@ -19,6 +20,7 @@
 #include <openssl/ssl.h>
 
 #include "pogohome_api/crypto_util.hpp"
+#include "pogohome_api/hex.hpp"
 #include "pogohome_api/json_snapshot.hpp"
 #include "pogohome_api/json_value.hpp"
 #include "pogohome_api/otbr_helper_protocol.hpp"
@@ -389,7 +391,44 @@ std::string EnrollmentIdOf(const std::string &path)
     return path.size() > n ? path.substr(n + 1) : std::string();
 }
 
-std::string EnrollmentSessionJson(const EnrollmentSession &s)
+constexpr char kRemovalsPath[] = "/api/v1/power-base-removals";
+
+bool IsRemovalPath(const std::string &path)
+{
+    const size_t n = sizeof(kRemovalsPath) - 1;
+    return path.compare(0, n, kRemovalsPath) == 0 && (path.size() == n || path[n] == '/');
+}
+
+// The removal id of "/api/v1/power-base-removals/<id>", "" for the
+// collection itself.
+std::string RemovalIdOf(const std::string &path)
+{
+    const size_t n = sizeof(kRemovalsPath) - 1;
+    return path.size() > n ? path.substr(n + 1) : std::string();
+}
+
+constexpr char kForgetsPath[] = "/api/v1/power-base-forgets";
+
+bool IsForgetPath(const std::string &path)
+{
+    const size_t n = sizeof(kForgetsPath) - 1;
+    return path.compare(0, n, kForgetsPath) == 0 && (path.size() == n || path[n] == '/');
+}
+
+std::string ErrorWithRemovalJson(const char *error, const RemovalJob &job)
+{
+    std::string out = "{\"error\":";
+    AppendJsonStringLiteral(out, error);
+    out += ",\"removal\":";
+    out += RemovalJobJson(job);
+    out += '}';
+    return out;
+}
+
+// `grant`: only for the answer to the POST that started the session -- the
+// one place the management key is ever written out. Every other answer names
+// the generation alone.
+std::string EnrollmentSessionJson(const EnrollmentSession &s, const ManagementGrant *grant = nullptr)
 {
     std::string out = "{\"session_id\":";
     AppendJsonStringLiteral(out, s.session_id);
@@ -431,6 +470,19 @@ std::string EnrollmentSessionJson(const EnrollmentSession &s)
             out += "null";
         }
     }
+    // Only a session that asked for a management credential has this key.
+    if (s.management_requested) {
+        out += ",\"management\":{\"version\":" + std::to_string(kPowerBaseManagementVersion);
+        out += ",\"generation\":";
+        AppendJsonStringLiteral(out, s.management_generation);
+        if (grant != nullptr && !grant->key.empty()) {
+            out += ",\"hub_id\":";
+            AppendJsonStringLiteral(out, grant->hub_id);
+            out += ",\"key\":";
+            AppendJsonStringLiteral(out, grant->key);
+        }
+        out += '}';
+    }
     out += '}';
     return out;
 }
@@ -461,7 +513,14 @@ struct ConnectionGuard {
 
 } // namespace
 
-Server::Server(ingest::Registry &registry, ServerConfig config) : registry_(registry), config_(std::move(config)) {}
+Server::Server(ingest::Registry &registry, ServerConfig config) : registry_(registry), config_(std::move(config))
+{
+    // One value per run of the bridge (SnapshotBody()). Not a secret.
+    snapshot_stream_ = RandomHex(16);
+    if (!IsLowerHex(snapshot_stream_, 32)) {
+        snapshot_stream_.clear();
+    }
+}
 
 Server::~Server()
 {
@@ -749,6 +808,8 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
         std::string body = BuildHealthJson(generation, module_count, view.power_bases.size(), config_.hub_id);
         AppendSettingsFields(body);
         AppendEnrollmentField(body);
+        AppendManagementFields(body);
+        AppendBuildField(body);
         SendJsonResponse(stream, 200, "OK", body);
         return;
     }
@@ -760,9 +821,10 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
         }
         ingest::RegistryView view = registry_.view();
         uint64_t generation = registry_.generation();
-        std::string body = BuildSnapshotJson(view, generation, CurrentUnixMillis());
-        AppendSettingsFields(body);
-        SendJsonResponse(stream, 200, "OK", body);
+        if (config_.after_registry_copy) {
+            config_.after_registry_copy();
+        }
+        SendJsonResponse(stream, 200, "OK", SnapshotBody(std::move(view), generation));
         return;
     }
 
@@ -783,6 +845,16 @@ void Server::HandleConnection(int client_fd, std::shared_ptr<std::atomic<bool>> 
 
     if (IsEnrollmentPath(path)) {
         HandleEnrollmentRoute(stream, request, buf);
+        return;
+    }
+
+    if (IsRemovalPath(path)) {
+        HandleRemovalRoute(stream, request, buf);
+        return;
+    }
+
+    if (IsForgetPath(path)) {
+        HandleForgetRoute(stream, request, buf);
         return;
     }
 
@@ -841,6 +913,484 @@ void Server::AppendEnrollmentField(std::string &json) const
     json += ",\"power_base_enrollment\":\"";
     json += SettingsEnabled() && config_.enrollment ? "available" : "unavailable";
     json += "\"}";
+}
+
+// Which build of the bridge answers (docs/versioning.md): identification
+// only, after every earlier field. A client that does not know the field
+// ignores it; a bridge built without the version stamp leaves it out.
+void Server::AppendBuildField(std::string &json) const
+{
+    const std::string build = config_.report_build ? BuildInfoJson() : std::string();
+    if (build.empty() || json.empty() || json.back() != '}') {
+        return;
+    }
+    json.pop_back();
+    json += ",\"build\":" + build + "}";
+}
+
+void Server::AppendManagementFields(std::string &json) const
+{
+    if (!config_.management_requested || json.empty() || json.back() != '}') {
+        return;
+    }
+    json.pop_back();
+    // The version of the management credential and removal API this bridge
+    // speaks, and whether it can be used right now.
+    json += ",\"power_base_management\":" + std::to_string(kPowerBaseManagementVersion);
+    json += ",\"power_base_removal\":\"";
+    json += ManagementEnabled() ? "available" : "unavailable";
+    // Taking an offline Power Base out of this hub's list
+    // (/api/v1/power-base-forgets): a client that does not find this field
+    // must not assume the routes exist.
+    json += "\",\"power_base_forget\":" + std::to_string(kPowerBaseForgetVersion);
+    // What POST /api/v1/power-base-removals has to say: 2 is the request that
+    // names the registration it was confirmed for. A client that does not
+    // find this field (or finds a number it does not know) must not send a
+    // removal request at all -- the request of version 1 named the Base
+    // alone, and this hub does not carry that out.
+    json += ",\"power_base_removal_request\":" + std::to_string(kPowerBaseRemovalRequestVersion);
+    json += "}";
+}
+
+std::string Server::SnapshotBody(ingest::RegistryView view, uint64_t generation) const
+{
+    std::lock_guard<std::mutex> order(snapshot_order_mutex_);
+    // The caller copied the Registry before it came here, and another caller
+    // may have built a snapshot from a later copy meanwhile: this one would
+    // then get the larger number for the older state. Such a copy is replaced
+    // by one made now.
+    if (view.generation < snapshot_view_generation_) {
+        view = registry_.view();
+        generation = view.generation;
+    }
+    std::string body = SnapshotJson(view, generation);
+    // Without management the snapshot was built from `view`. With management
+    // it may have been built from a later copy that management made itself --
+    // and management remembers that one: it takes in no copy older than the
+    // last (PowerBaseManagement::DescribeForSnapshot()).
+    if (view.generation > snapshot_view_generation_) {
+        snapshot_view_generation_ = view.generation;
+    }
+    AppendSettingsFields(body);
+    if (snapshot_stream_.empty() || body.empty() || body.back() != '}') {
+        return body;
+    }
+    body.pop_back();
+    body += ",\"snapshot_stream\":";
+    AppendJsonStringLiteral(body, snapshot_stream_);
+    body += ",\"snapshot_sequence\":" + std::to_string(++snapshot_sequence_);
+    body += '}';
+    return body;
+}
+
+std::string Server::SnapshotJson(const ingest::RegistryView &view, uint64_t generation) const
+{
+    if (!config_.management_requested || !ManagementEnabled()) {
+        // Exactly the snapshot of a bridge without management.
+        return BuildSnapshotJson(view, generation, CurrentUnixMillis());
+    }
+    // The caller copied the Registry some time ago; management is read now.
+    // Both are made to agree in one critical section of management: its
+    // lists are read together, and a copy from before it last changed which
+    // Bases are listed is replaced by one made at that moment.
+    ingest::RegistryView listed = view;
+    PowerBaseManagement::Description described;
+    if (!config_.management->DescribeForSnapshot(listed, described)) {
+        return BuildSnapshotJson(view, generation, CurrentUnixMillis());
+    }
+    SnapshotManagement management;
+    management.managed_power_bases = std::move(described.managed_power_bases);
+    management.self_confirming_power_bases = std::move(described.self_confirming_power_bases);
+    std::string list = RemovalListJson(described.removals); // {"removals":[...]}
+    const size_t open = list.find('[');
+    const size_t close = list.rfind(']');
+    if (open != std::string::npos && close != std::string::npos && close > open) {
+        management.removals_json = list.substr(open, close - open + 1);
+    }
+    // The registration behind every listed Base, and the list removals.
+    management.forget_supported = true;
+    management.records = std::move(described.records);
+    management.removal_serials = std::move(described.removal_serials);
+    std::string forgets = ForgetListJson(described.forgets); // {"forgets":[...]}
+    const size_t forgets_open = forgets.find('[');
+    const size_t forgets_close = forgets.rfind(']');
+    if (forgets_open != std::string::npos && forgets_close != std::string::npos && forgets_close > forgets_open) {
+        management.forgets_json = forgets.substr(forgets_open, forgets_close - forgets_open + 1);
+    }
+    // And the Bases that are out of the list for good until they are
+    // registered again: why a Base (and its modules) is not above.
+    management.departures_json = DeparturesJson(described.departures);
+    return BuildSnapshotJson(listed, generation, CurrentUnixMillis(), &management);
+}
+
+void Server::HandleForgetRoute(Stream &stream, Request &request, std::string &buf)
+{
+    // The gates of the removal routes, in the same order. This is NOT a
+    // removal and not its DELETE (that cancels a pending removal): these
+    // routes take an offline Power Base out of this hub's list and say
+    // nothing about the board.
+    if (!config_.management_requested) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("forget_disabled"));
+        return;
+    }
+    if (!stream.is_tls()) {
+        SendJsonResponse(stream, 403, "Forbidden", ErrorJson("tls_required"));
+        return;
+    }
+    if (!ManagementEnabled()) {
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("forget_unavailable", "reason", "startup"));
+        return;
+    }
+    const bool is_collection = request.path == kForgetsPath;
+    const std::string forget_id = is_collection ? std::string() : request.path.substr(sizeof(kForgetsPath));
+    const bool method_ok = is_collection ? (request.method == "POST" || request.method == "GET") : request.method == "GET";
+    if (!method_ok) {
+        // In particular no DELETE: there is nothing to cancel or to undo. A
+        // Base comes back by being registered again.
+        SendJsonResponse(stream, 405, "Method Not Allowed", ErrorJson("method_not_allowed"));
+        return;
+    }
+    if (!ParseHeaders(buf, request.headers)) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("malformed_headers"));
+        return;
+    }
+    DeviceRecord device;
+    if (!AuthenticateDevice(stream, request, device)) {
+        return;
+    }
+    if (is_collection && request.method == "POST") {
+        if (ReadRequestBody(stream, request, buf, config_.max_forget_body_bytes)) {
+            HandleForgetStart(stream, request, device);
+        }
+        return;
+    }
+    if (is_collection) {
+        SendJsonResponse(stream, 200, "OK", ForgetListJson(config_.management->ListForgets()));
+        return;
+    }
+    ForgetRecord record;
+    if (!IsLowerHex(forget_id, 32) || !config_.management->GetForget(forget_id, record)) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("forget_not_found"));
+        return;
+    }
+    SendJsonResponse(stream, 200, "OK", ForgetRecordJson(record));
+}
+
+void Server::HandleForgetStart(Stream &stream, Request &request, const DeviceRecord &device)
+{
+    // Exactly {"power_base_uuid": "<16 hex>", "record": "<32 hex>",
+    // "request_id": "<32 hex>"}. Error answers never echo a value.
+    JsonValue root;
+    std::string parse_error;
+    JsonParseLimits limits;
+    limits.max_depth = 2;
+    limits.max_string_bytes = 64;
+    limits.max_values = 8;
+    const bool parsed = ParseJson(request.body, root, parse_error, limits);
+    const JsonValue *uuid = parsed && root.IsObject() ? root.Find("power_base_uuid") : nullptr;
+    const JsonValue *record = parsed && root.IsObject() ? root.Find("record") : nullptr;
+    const JsonValue *request_id = parsed && root.IsObject() ? root.Find("request_id") : nullptr;
+    if (uuid == nullptr || !uuid->IsString() || record == nullptr || !record->IsString() || request_id == nullptr ||
+        !request_id->IsString() || root.object_members.size() != 3) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
+        return;
+    }
+    std::string eui64;
+    if (!NormalizeEui64(uuid->string_value, eui64)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_power_base_uuid"));
+        return;
+    }
+    if (!IsLowerHex(record->string_value, 32)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_record"));
+        return;
+    }
+    if (!IsLowerHex(request_id->string_value, 32)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_request_id"));
+        return;
+    }
+
+    ForgetRecord done;
+    switch (config_.management->ForgetPowerBase(device.id, eui64, record->string_value, request_id->string_value, done)) {
+    case ForgetOutcome::Removed: {
+        std::string location = "Location: ";
+        location += kForgetsPath;
+        location += "/" + done.forget_id + "\r\n";
+        SendResponse(stream, 201, "Created", ForgetRecordJson(done), location.c_str());
+        return;
+    }
+    case ForgetOutcome::Existing:
+        // The same request again: the same record, nothing done twice.
+        SendJsonResponse(stream, 200, "OK", ForgetRecordJson(done));
+        return;
+    case ForgetOutcome::UnknownPowerBase:
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("unknown_power_base"));
+        return;
+    case ForgetOutcome::Online:
+        // Heard from right now: this is what the removal is for.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("power_base_online"));
+        return;
+    case ForgetOutcome::StaleRecord:
+        // Registered again (or a registration was started) since the list
+        // was read: that registration is not this request's to remove.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("stale_record"));
+        return;
+    case ForgetOutcome::EnrollmentInProgress:
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("enrollment_in_progress"));
+        return;
+    case ForgetOutcome::RequestConflict:
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("request_id_conflict"));
+        return;
+    case ForgetOutcome::CapacityFull:
+        SendJsonResponse(stream, 409, "Conflict",
+                         ErrorJson("forget_capacity_full", "limit", std::to_string(kMaxBlockedPowerBases)));
+        return;
+    case ForgetOutcome::TooMany:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("too_many_forgets"));
+        return;
+    case ForgetOutcome::Unavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("forget_unavailable", "reason", "storage"));
+        return;
+    }
+}
+
+void Server::HandleRemovalRoute(Stream &stream, Request &request, std::string &buf)
+{
+    // The same gate order as the enrollment routes: nothing from a
+    // plain-HTTP request is used, and nothing happens without a paired
+    // device's token. This is NOT the enrollment session's DELETE: that one
+    // cancels a registration attempt; these routes unenroll a registered
+    // Power Base.
+    if (!config_.management_requested) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("removal_disabled"));
+        return;
+    }
+    if (!stream.is_tls()) {
+        SendJsonResponse(stream, 403, "Forbidden", ErrorJson("tls_required"));
+        return;
+    }
+    if (!ManagementEnabled()) {
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("removal_unavailable", "reason", "startup"));
+        return;
+    }
+    const std::string removal_id = RemovalIdOf(request.path);
+    const bool is_collection = request.path == kRemovalsPath;
+    // "receipt" is not a removal id (those are 32 hex digits).
+    const bool is_receipt = removal_id == "receipt";
+    const bool method_ok = is_collection ? (request.method == "POST" || request.method == "GET")
+                                         : is_receipt ? request.method == "POST"
+                                                      : (request.method == "GET" || request.method == "DELETE");
+    if (!method_ok) {
+        SendJsonResponse(stream, 405, "Method Not Allowed", ErrorJson("method_not_allowed"));
+        return;
+    }
+    if (!ParseHeaders(buf, request.headers)) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("malformed_headers"));
+        return;
+    }
+    DeviceRecord device;
+    if (!AuthenticateDevice(stream, request, device)) {
+        return;
+    }
+
+    if (is_collection && request.method == "POST") {
+        if (ReadRequestBody(stream, request, buf, config_.max_removal_body_bytes)) {
+            HandleRemovalStart(stream, request, device);
+        }
+        return;
+    }
+    if (is_collection) {
+        SendJsonResponse(stream, 200, "OK", RemovalListJson(config_.management->ListRemovals()));
+        return;
+    }
+    if (is_receipt) {
+        if (ReadRequestBody(stream, request, buf, config_.max_receipt_body_bytes)) {
+            HandleRemovalReceipt(stream, request);
+        }
+        return;
+    }
+
+    RemovalJob job;
+    if (!IsLowerHex(removal_id, 32)) {
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("removal_not_found"));
+        return;
+    }
+    if (request.method == "GET") {
+        if (!config_.management->GetRemoval(removal_id, job)) {
+            SendJsonResponse(stream, 404, "Not Found", ErrorJson("removal_not_found"));
+            return;
+        }
+        SendJsonResponse(stream, 200, "OK", RemovalJobJson(job));
+        return;
+    }
+    switch (config_.management->CancelRemoval(removal_id, job)) {
+    case RemovalCancelOutcome::Cancelled:
+        SendJsonResponse(stream, 200, "OK", RemovalJobJson(job));
+        return;
+    case RemovalCancelOutcome::NotCancellable:
+        // The command may already be on the board (or the job is over):
+        // nothing a cancel could promise.
+        SendJsonResponse(stream, 409, "Conflict", ErrorWithRemovalJson("removal_not_cancellable", job));
+        return;
+    case RemovalCancelOutcome::NotFound:
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("removal_not_found"));
+        return;
+    case RemovalCancelOutcome::Unavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("removal_unavailable", "reason", "storage"));
+        return;
+    }
+}
+
+void Server::HandleRemovalStart(Stream &stream, Request &request, const DeviceRecord &device)
+{
+    // Exactly {"power_base_uuid": "<16 hex>", "record": "<32 hex>",
+    // "removal_serial": <integer>, "request_id": "<32 hex>"}: the Base, the
+    // registration the device was shown and confirmed, how many removals had
+    // been asked of that registration then, and an id of this confirmation.
+    // Error answers never echo a value.
+    JsonValue root;
+    std::string parse_error;
+    JsonParseLimits limits;
+    limits.max_depth = 2;
+    limits.max_string_bytes = 64;
+    limits.max_values = 8;
+    const bool parsed = ParseJson(request.body, root, parse_error, limits);
+    const JsonValue *uuid = parsed && root.IsObject() ? root.Find("power_base_uuid") : nullptr;
+    const JsonValue *record = parsed && root.IsObject() ? root.Find("record") : nullptr;
+    const JsonValue *serial = parsed && root.IsObject() ? root.Find("removal_serial") : nullptr;
+    const JsonValue *request_id = parsed && root.IsObject() ? root.Find("request_id") : nullptr;
+    if (uuid != nullptr && uuid->IsString() && root.object_members.size() == 1) {
+        // What a client older than this contract sends: the Base alone. It
+        // names no registration, so it cannot be told from the same request
+        // made for an earlier registration of that Base -- and is not carried
+        // out, for any Base, whatever is listed. Nothing was looked up.
+        std::fprintf(stdout,
+                     "pogohome_api: power base removal: a request of device %s that names no registration was "
+                     "refused (the app is older than this hub's removal request, version %d)\n",
+                     device.id.c_str(), kPowerBaseRemovalRequestVersion);
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("removal_registration_required"));
+        return;
+    }
+    if (uuid == nullptr || !uuid->IsString() || record == nullptr || !record->IsString() || serial == nullptr ||
+        serial->type != JsonValue::Type::Number || request_id == nullptr || !request_id->IsString() ||
+        root.object_members.size() != 4) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
+        return;
+    }
+    std::string eui64;
+    if (!NormalizeEui64(uuid->string_value, eui64)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_power_base_uuid"));
+        return;
+    }
+    if (!IsLowerHex(record->string_value, 32)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_record"));
+        return;
+    }
+    if (!serial->IsInteger() || serial->int_value < 0 || serial->int_value > 0xffffffffLL) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_removal_serial"));
+        return;
+    }
+    if (!IsLowerHex(request_id->string_value, 32)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_request_id"));
+        return;
+    }
+
+    RemovalJob job;
+    switch (config_.management->RequestRemoval(device.id, eui64, record->string_value,
+                                               static_cast<uint32_t>(serial->int_value), request_id->string_value,
+                                               job)) {
+    case RemovalRequestOutcome::Created: {
+        std::string location = "Location: ";
+        location += kRemovalsPath;
+        location += "/" + job.removal_id + "\r\n";
+        SendResponse(stream, 202, "Accepted", RemovalJobJson(job), location.c_str());
+        return;
+    }
+    case RemovalRequestOutcome::Existing:
+        // This request again, or the registration it names is being removed
+        // already: that job, whoever asks, and nothing new.
+        SendJsonResponse(stream, 200, "OK", RemovalJobJson(job));
+        return;
+    case RemovalRequestOutcome::StaleRecord:
+        // Registered again (or a registration was started), or a removal was
+        // asked of this registration and ended, since the device read the
+        // list: what is listed now is not what this request confirmed.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("stale_record"));
+        return;
+    case RemovalRequestOutcome::RequestConflict:
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("request_id_conflict"));
+        return;
+    case RemovalRequestOutcome::UnknownPowerBase:
+        SendJsonResponse(stream, 404, "Not Found", ErrorJson("unknown_power_base"));
+        return;
+    case RemovalRequestOutcome::Unsupported:
+        // No fallback: hiding the Base in a list is not unenrolling it.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("power_base_management_unsupported"));
+        return;
+    case RemovalRequestOutcome::EnrollmentInProgress:
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("enrollment_in_progress"));
+        return;
+    case RemovalRequestOutcome::TooMany:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("too_many_removals"));
+        return;
+    case RemovalRequestOutcome::CapacityFull:
+        // Not "try again later": the hub remembers as many removed Power
+        // Bases as it can, and forgets none of them to make room. Nothing
+        // was stored and the board gets no command.
+        SendJsonResponse(stream, 409, "Conflict",
+                         ErrorJson("removal_capacity_full", "limit", std::to_string(kMaxBlockedPowerBases)));
+        return;
+    case RemovalRequestOutcome::Unavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("removal_unavailable", "reason", "storage"));
+        return;
+    }
+}
+
+void Server::HandleRemovalReceipt(Stream &stream, Request &request)
+{
+    // Exactly {"receipt": "<192 lowercase hex>"}: the board's release receipt
+    // (its UNENROLL_DONE/ERASED management message) as an app read it over
+    // BLE. The device token only says who relays it; what the receipt says
+    // is believed only if its MAC verifies with the key of that enrollment.
+    JsonValue root;
+    std::string parse_error;
+    JsonParseLimits limits;
+    limits.max_depth = 2;
+    limits.max_string_bytes = 2 * PB_MGMT_UNENROLL_DONE_LEN;
+    limits.max_values = 4;
+    const bool parsed = ParseJson(request.body, root, parse_error, limits);
+    const JsonValue *hex = parsed && root.IsObject() ? root.Find("receipt") : nullptr;
+    if (hex == nullptr || !hex->IsString() || root.object_members.size() != 1) {
+        SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
+        return;
+    }
+    if (!IsLowerHex(hex->string_value, 2 * PB_MGMT_UNENROLL_DONE_LEN)) {
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_receipt"));
+        return;
+    }
+    std::vector<uint8_t> receipt(PB_MGMT_UNENROLL_DONE_LEN);
+    auto nibble = [](char c) { return static_cast<uint8_t>(c <= '9' ? c - '0' : c - 'a' + 10); };
+    for (size_t i = 0; i < receipt.size(); i++) {
+        receipt[i] = static_cast<uint8_t>(nibble(hex->string_value[2 * i]) << 4 | nibble(hex->string_value[2 * i + 1]));
+    }
+    RemovalJob job;
+    switch (config_.management->SubmitReleaseReceipt(receipt, job)) {
+    case ReceiptOutcome::Completed:
+    case ReceiptOutcome::AlreadyCompleted:
+        // The same receipt again is the same answer.
+        SendJsonResponse(stream, 200, "OK", RemovalJobJson(job));
+        return;
+    case ReceiptOutcome::Malformed:
+        SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("invalid_receipt"));
+        return;
+    case ReceiptOutcome::Rejected:
+        // One answer for another hub's receipt, an unknown or superseded
+        // enrollment, a cancelled job and a wrong MAC.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("receipt_rejected"));
+        return;
+    case ReceiptOutcome::Unavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("removal_unavailable", "reason", "storage"));
+        return;
+    }
 }
 
 bool Server::AuthenticateDevice(Stream &stream, const Request &request, DeviceRecord &device)
@@ -977,16 +1527,28 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
     const JsonValue *eui = parsed && root.IsObject() ? root.Find("eui64") : nullptr;
     const JsonValue *pskd_value = parsed && root.IsObject() ? root.Find("pskd") : nullptr;
     const JsonValue *endpoint_version = parsed && root.IsObject() ? root.Find("bridge_endpoint_version") : nullptr;
-    // Exactly the two fields, or those two and the option; the option must
-    // be a plain integer.
-    const size_t expected_members = endpoint_version != nullptr ? 3 : 2;
+    const JsonValue *management_version = parsed && root.IsObject() ? root.Find("management_version") : nullptr;
+    // Exactly the two fields, or those two and the options; each option must
+    // be a plain integer. "management_version" (docs/power-base-management.md)
+    // is only accepted together with "bridge_endpoint_version": the
+    // credential is used on the endpoint that option establishes.
+    const size_t expected_members = 2 + (endpoint_version != nullptr ? 1 : 0) + (management_version != nullptr ? 1 : 0);
     if (eui == nullptr || !eui->IsString() || pskd_value == nullptr || !pskd_value->IsString() ||
-        root.object_members.size() != expected_members || (endpoint_version != nullptr && !endpoint_version->IsInteger())) {
+        root.object_members.size() != expected_members || (endpoint_version != nullptr && !endpoint_version->IsInteger()) ||
+        (management_version != nullptr && (!management_version->IsInteger() || endpoint_version == nullptr))) {
         wipe_json();
         SendJsonResponse(stream, 400, "Bad Request", ErrorJson("invalid_request"));
         return;
     }
     EnrollmentStartOptions options;
+    if (management_version != nullptr) {
+        if (management_version->int_value != kPowerBaseManagementVersion) {
+            wipe_json();
+            SendJsonResponse(stream, 422, "Unprocessable Entity", ErrorJson("unsupported_management_version"));
+            return;
+        }
+        options.management_version = kPowerBaseManagementVersion;
+    }
     if (endpoint_version != nullptr) {
         if (endpoint_version->int_value != kBridgeEndpointVersion) {
             wipe_json();
@@ -1010,14 +1572,21 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
     wipe_json();
 
     EnrollmentSession session;
-    EnrollmentStartOutcome outcome = config_.enrollment->Start(device.id, eui64, pskd, session, options);
+    ManagementGrant grant;
+    EnrollmentStartOutcome outcome = config_.enrollment->Start(device.id, eui64, pskd, session, options, &grant);
     SecureWipe(pskd);
     switch (outcome) {
     case EnrollmentStartOutcome::Started: {
         std::string location = "Location: ";
         location += kEnrollmentsPath;
         location += "/" + session.session_id + "\r\n";
-        SendResponse(stream, 202, "Accepted", EnrollmentSessionJson(session), location.c_str());
+        // The one answer that carries the management key: over TLS, to the
+        // paired device that started the session, with Cache-Control:
+        // no-store like every answer of this API. It is never logged.
+        std::string body = EnrollmentSessionJson(session, &grant);
+        SecureWipe(grant.key);
+        SendResponse(stream, 202, "Accepted", body, location.c_str());
+        SecureWipe(body);
         return;
     }
     case EnrollmentStartOutcome::Busy:
@@ -1038,6 +1607,14 @@ void Server::HandleEnrollmentStart(Stream &stream, Request &request, const Devic
     case EnrollmentStartOutcome::BridgeEndpointUnavailable:
         SendJsonResponse(stream, 503, "Service Unavailable",
                          ErrorJson("enrollment_unavailable", "reason", "bridge_endpoint"));
+        return;
+    case EnrollmentStartOutcome::ManagementUnavailable:
+        SendJsonResponse(stream, 503, "Service Unavailable", ErrorJson("enrollment_unavailable", "reason", "management"));
+        return;
+    case EnrollmentStartOutcome::ManagementRequired:
+        // This Base was unenrolled from this hub; only a new authenticated
+        // enrollment generation brings it back.
+        SendJsonResponse(stream, 409, "Conflict", ErrorJson("management_required"));
         return;
     }
 }
@@ -1209,9 +1786,7 @@ void Server::HandleSse(Stream &stream)
     }
 
     auto snapshot_json = [this](const ingest::RegistryView &view, uint64_t generation) {
-        std::string json = BuildSnapshotJson(view, generation, CurrentUnixMillis());
-        AppendSettingsFields(json);
-        return json;
+        return SnapshotBody(view, generation);
     };
 
     // Ordering note: generation() is read BEFORE snapshot() so the worst
@@ -1226,6 +1801,9 @@ void Server::HandleSse(Stream &stream)
     uint64_t last_seen = registry_.generation();
     uint64_t last_settings = config_.settings ? config_.settings->change_counter() : 0;
     ingest::RegistryView view = registry_.view();
+    if (config_.after_registry_copy) {
+        config_.after_registry_copy();
+    }
     if (!SendSseEvent(stream, "snapshot", snapshot_json(view, last_seen))) {
         return;
     }
@@ -1248,6 +1826,9 @@ void Server::HandleSse(Stream &stream)
         }
         if (changed) {
             ingest::RegistryView latest = registry_.view();
+            if (config_.after_registry_copy) {
+                config_.after_registry_copy();
+            }
             if (!SendSseEvent(stream, "snapshot", snapshot_json(latest, last_seen))) {
                 return;
             }

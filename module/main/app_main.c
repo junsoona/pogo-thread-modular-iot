@@ -98,6 +98,7 @@
 #include "topology_gate/topology_gate.h"
 #include "collector_endpoint/collector_endpoint.h"
 #include "module_wiring.h"
+#include "pogo_build_info/pogo_build_info.h"
 
 static const char *TAG = "module_main";
 
@@ -129,6 +130,9 @@ void app_main(void)
      * these). esp_reset_reason() first, before anything else can fail.
      */
     ESP_LOGI(TAG, "app_main: entry (reset_reason=%d)", (int)esp_reset_reason());
+    /* Which image this is: component, product version, build id (once per
+     * boot; docs/versioning.md). */
+    pogo_build_info_log();
 
     if (!pogo_crc16_selftest()) {
         ESP_LOGE(TAG, "CRC16 self-test failed -- refusing to start");

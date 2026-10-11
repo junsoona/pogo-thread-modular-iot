@@ -55,6 +55,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -155,10 +156,36 @@ struct PowerBaseState {
     uint64_t last_heartbeat_serial = 0;
 };
 
+// When a module was last newly listed under a Power Base: the value
+// Registry::generation() got when a (Power Base, module) node of it was
+// created -- its first report under that Base, or its first one again after
+// a confirmed detach there. Kept after the node is gone (detached again, its
+// Base removed), which is the point: "was this module listed under any Power
+// Base after generation G?" has an answer even when no copy of the Registry
+// was made while it was (docked and detached between two looks).
+struct ModuleListing {
+    Uuid module_uuid{};
+    uint64_t generation = 0;
+};
+
 // One consistent copy of nodes and Power Bases taken under a single lock.
 struct RegistryView {
     std::vector<NodeState> nodes;
     std::vector<PowerBaseState> power_bases;
+    // Registry::generation() at the moment this copy was made (read under the
+    // same lock). 0 for a view that was not made by Registry::view(). A reader
+    // that combines the copy with something else that changes the Registry
+    // (pogohome_api::PowerBaseManagement) tells from it whether the copy is
+    // from before or after such a change.
+    uint64_t generation = 0;
+    // One entry per module that was ever listed under a Power Base since this
+    // process started, bounded at Registry::kMaxListings. When the table was
+    // full the oldest entries were dropped: a module WITHOUT an entry may
+    // then have been listed at or before `listings_dropped_through` (0 while
+    // nothing was ever dropped). A reader that must not take "no entry" for
+    // "never listed" compares that value with the moment it asks about.
+    std::vector<ModuleListing> listings;
+    uint64_t listings_dropped_through = 0;
 };
 
 enum class ApplyResult {
@@ -171,6 +198,11 @@ enum class ApplyResult {
                            // and this report does not itself carry online=true -- see that method's own doc
                            // comment
     StaleSession,         // apply_topology only: an old-generation/reordered-seq snapshot, rejected (4.12)
+    // Power Base management milestone: the sending Power Base was unenrolled
+    // from this hub (set_power_base_blocked()) and has not been enrolled
+    // again since. Nothing was applied and the Base was not even marked as
+    // heard from (4.03) -- see docs/power-base-management.md.
+    Blocked,
 };
 
 // Thread-safe (one mutex guards both the writer/CoAP-handling thread and any
@@ -184,6 +216,10 @@ public:
     // not tracked (its nodes are still applied -- the API then derives that
     // Base's entry from its modules, see pogohome_api::BuildSnapshotJson()).
     static constexpr size_t kMaxPowerBases = 16;
+    // The modules whose last listing is remembered (see ModuleListing): four
+    // times what can be listed at once. Beyond it the oldest listing of a
+    // module that has no node now is dropped first.
+    static constexpr size_t kMaxListings = 4 * kMaxNodes;
 
     // Default bounded timeout used to demote a node's reported `online`
     // to false, purely from elapsed wall-clock time since the last message
@@ -305,8 +341,67 @@ public:
     // from (see PowerBaseState), so a Base with no modules docked yet is
     // still visible. generation() advances only when that Base is first seen
     // or comes back online -- a steady 10 s heartbeat never wakes SSE.
-    void apply_heartbeat(const Uuid &power_base_uuid, uint32_t uptime_ms, uint16_t node_count,
-                         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    // Returns AppliedNew, or Blocked for a blocked Base (see
+    // set_power_base_blocked()): then nothing is recorded, not even "heard
+    // from", and heartbeat_serial() does not advance.
+    ApplyResult apply_heartbeat(const Uuid &power_base_uuid, uint32_t uptime_ms, uint16_t node_count,
+                                std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+
+    // --- Power Base management milestone (docs/power-base-management.md) ---
+    //
+    // A Power Base that was unenrolled from this hub -- its authenticated
+    // completion proof was verified -- must not come back through the
+    // unauthenticated data path: a late heartbeat, topology report, sample
+    // or removal tombstone from it (still queued in the mesh, or sent by a
+    // board whose stored network was not erased yet) would otherwise list
+    // the Base and its modules again and re-create their Matter endpoints.
+    // While a Base is blocked every apply_*() for it returns Blocked and
+    // changes nothing. Only the hub's management code sets and clears this,
+    // and it clears it only when a NEW authenticated enrollment generation
+    // of that Base becomes active -- never because a heartbeat arrived.
+    // The list is the caller's to persist; it is not bounded here beyond
+    // what the caller stores (pogohome_api::PowerBaseManagement caps it).
+    void set_power_base_blocked(const Uuid &power_base_uuid, bool blocked);
+    bool is_power_base_blocked(const Uuid &power_base_uuid) const;
+
+    // Erases the Power Base itself and every node registered UNDER IT --
+    // nodes are keyed (Base, module), so the same module already registered
+    // under another Base is a different node and stays. Also drops this
+    // Base's removed-module markers. Returns the module UUIDs of the erased
+    // nodes. generation() advances once if anything was erased, so SSE and
+    // the Matter watcher (BridgeManager::Reconcile(): a module gone from the
+    // snapshot gets its endpoint removed) see it like any other change.
+    std::vector<Uuid> remove_power_base(const Uuid &power_base_uuid);
+
+    // "Remove this Power Base from the hub's list" (docs/power-base-management.md,
+    // section 13): what set_power_base_blocked(true) and remove_power_base()
+    // do together, but only for a Base that is NOT online at this very moment
+    // -- and decided, made durable and applied as one step under this
+    // Registry's lock, so no message of that Base can be applied in between.
+    //
+    //   Online        the Base was heard from within the stale timeout, or a
+    //                 node registered under it is online. Nothing changed and
+    //                 `commit` was not called.
+    //   CommitFailed  the Base is offline, but `commit` returned false (the
+    //                 caller could not store the removal). Nothing changed.
+    //   Removed       `commit` returned true: the Base is blocked and it and
+    //                 the nodes registered under it are erased (their module
+    //                 UUIDs in `erased`, when given). generation() advanced
+    //                 once if anything was erased.
+    //
+    // `commit` runs with this Registry's lock held: it must not call back into
+    // the Registry. It is where the caller writes its state file -- a short
+    // file write, during which the ingest thread waits like it already does
+    // for every stored management change.
+    enum class OfflineRemoval { Removed, Online, CommitFailed };
+    OfflineRemoval block_and_remove_power_base_if_offline(
+        const Uuid &power_base_uuid, const std::function<bool()> &commit, std::vector<Uuid> *erased = nullptr,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+
+    // Something a reader of this Registry shows next to its contents changed
+    // outside it (a Power Base removal job's state): advances generation()
+    // and wakes wait_for_change() exactly like an applied message.
+    void notify_external_change();
 
     // Power Base enrollment milestone (see PowerBaseState::
     // last_heartbeat_serial): the serial the most recent heartbeat got, 0
@@ -355,6 +450,22 @@ public:
     // staleness correction applied to both.
     RegistryView view(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
 
+    // The same copy, handed to `fn` while this Registry's lock is STILL HELD:
+    // until `fn` returns nothing is applied -- no report lists a module under
+    // a Power Base, no node is erased, no Base is blocked or removed. For a
+    // decision that has to stay true while it is carried out
+    // (pogohome_api::PowerBaseManagement clears a module's room assignment
+    // only while that module is listed under no Power Base: it decides from
+    // this copy and writes the settings before the lock is given up, so no
+    // listing can fall between the two).
+    //
+    // `fn` runs with the lock held: it must not call back into the Registry
+    // (that would wait for itself), and it is expected to be short -- at most
+    // one small file write, during which the ingest thread waits like it
+    // already does for block_and_remove_power_base_if_offline()'s `commit`.
+    void hold(const std::function<void(const RegistryView &)> &fn,
+              std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
     // Blocks the calling thread until generation() differs from
     // `last_seen_generation` or `timeout` elapses -- a condition_variable
     // wait, never a busy/polling loop. On a real change, updates
@@ -382,6 +493,11 @@ private:
     // even though it has no entry in nodes_ to check against.
     std::vector<std::pair<Uuid, Uuid>> removed_; // (power_base_uuid, module_uuid)
     std::vector<PowerBaseState> power_bases_;
+    // Power Bases whose data is refused (see set_power_base_blocked()).
+    std::vector<Uuid> blocked_;
+    // See ModuleListing and RegistryView::listings.
+    std::vector<ModuleListing> listings_;
+    uint64_t listings_dropped_through_ = 0;
     uint64_t attach_counter_ = 0;
     uint64_t heartbeat_counter_ = 0;
     uint64_t generation_ = 0;
@@ -399,6 +515,16 @@ private:
 
     // Caller must hold mutex_. Returns nullptr if not found.
     NodeState *find_locked(const Uuid &power_base_uuid, const Uuid &module_uuid);
+    // Caller must hold mutex_.
+    bool blocked_locked(const Uuid &power_base_uuid) const;
+    // Caller must hold mutex_. The body of remove_power_base().
+    std::vector<Uuid> remove_power_base_locked(const Uuid &power_base_uuid);
+    // Caller must hold mutex_. The body of view().
+    RegistryView view_locked(std::chrono::steady_clock::time_point now) const;
+    // Caller must hold mutex_, right after note_applied_locked() for the
+    // report that created a node of `module_uuid`: that module was newly
+    // listed under a Power Base at the generation() of this moment.
+    void note_listing_locked(const Uuid &module_uuid);
 
     // Caller must hold mutex_. Records that power_base_uuid was just heard
     // from. Returns true if that Base is new or was offline -- a visible

@@ -155,10 +155,32 @@ class Harness:
                 "thread": thread, "services": services, "marker": marker,
                 "pskd": s[17:50].split(b"\0")[0].decode(),
                 # the bridge endpoint: held in RAM by the controller / of an enrolled controller / in the record
-                "pending_ep": endpoint(50), "active_ep": endpoint(69), "stored_ep": endpoint(88)}
+                "pending_ep": endpoint(50), "active_ep": endpoint(69), "stored_ep": endpoint(88),
+                # the management credential (docs/power-base-management.md): RAM / enrolled / stored record
+                "pending_mgmt": s[107] if len(s) > 107 else 0, "active_mgmt": s[108] if len(s) > 108 else 0,
+                "stored_mgmt": s[109] if len(s) > 109 else 0, "stored_mgmt_state": s[110] if len(s) > 110 else 0,
+                "stored_hub_id": bytes(s[111:127]), "stored_generation": bytes(s[127:143]),
+                "stored_key": bytes(s[143:175])}
 
     def stop_service(self):
         self.cmd("D")
+
+    def store_final_release(self, hub_id, generation, command_id, mac):
+        """The record a board holds after an unenroll whose erase was verified (test values)."""
+        return self.cmd("F", hub_id + generation + command_id + mac)[0]
+
+    def network_store(self, op, arg=0):
+        """The board's two network stores, behind the REAL store check (tools/host_ble_sec2/main/
+        store_glue.h). op 0 wipe; 1 put `arg` into them with nothing looking (1 only an old Network
+        Key, 2 a whole network, 3 only the key OpenThread made in an earlier boot); 2 faults (bit 0
+        the Network Key cannot be removed, bit 1 the key storage cannot be read); 3 a restart in the
+        firmware's order -- erase and read back before OpenThread starts, then OpenThread starts
+        (arg 1: without that erase)."""
+        status, r = self.cmd("N", bytes([op, arg]))
+        if status != 0 or len(r) != 7:
+            raise RuntimeError("the harness did not take the network-store command (rebuild tools/host_ble_sec2)")
+        return {"prestart": r[0], "key": r[1] == 1, "whose": chr(r[2]) if r[2] else "", "settings": r[3] == 1,
+                "writes_seen": r[4], "removes_seen": r[5], "no_network": r[6] == 1}
 
     def quit(self):
         try:
@@ -517,8 +539,10 @@ def main():
         h.connect(1)
         err, ver = h.request(1, "proto-ver", b"ESP")
         info = json.loads(ver.decode())
-        check(info["pb_enroll"] == {"proto": 1, "cap": ["bridge_endpoint_v1"]} and info["prov"]["cap"] == [],
-              "proto-ver: pb_enroll.proto is still 1 and pb_enroll.cap lists bridge_endpoint_v1; prov is unchanged")
+        check(info["pb_enroll"] == {"proto": 1, "cap": ["bridge_endpoint_v1", "mgmt_v1", "release_receipt_v1"]} and
+              info["prov"]["cap"] == [],
+              "proto-ver: pb_enroll.proto is still 1 and pb_enroll.cap lists bridge_endpoint_v1, mgmt_v1 and "
+              "release_receipt_v1; prov is unchanged")
         ep_addr = ipaddress.IPv6Address("fd11:2233:4455:0:8c1f:2e3d:4c5b:6a79").packed  # inside the harness's network
         ep_port = 5701
         rid_ep = bytes(range(0x70, 0x80))
@@ -581,6 +605,186 @@ def main():
         check(s["marker"] == 1 and s["stored_ep"] == (ep_addr, ep_port) and s["active_ep"] == (ep_addr, ep_port) and
               s["pending_ep"] is None and s["services"] == 1,
               "the enrollment record holds the delivered endpoint, and it is the one the services would be given")
+        check(s["stored_mgmt"] == 0 and s["active_mgmt"] == 0,
+              "an endpoint-only (0x04) enrollment stores no management credential (record version 2)")
+        h.quit()
+
+        # ------------------------------------------------------------------
+        print("\n-- pb-start with the management credential (0x06), sent by ESP-IDF's official client --")
+        # Made-up test credential (the documentation's golden values).
+        hub_id = bytes(range(0x10, 0x20))
+        generation = bytes(range(0x20, 0x30))
+        mgmt_key = bytes(range(0x30, 0x50))
+        rid_mg = bytes(range(0xa0, 0xb0))
+
+        def start_mgmt(cl, challenge, key=mgmt_key, gen=generation, hub=hub_id, mgmt_version=1, port=ep_port):
+            plain06 = (bytes([1, 0x06, len(PSKD), 0]) + bytes.fromhex(EUI) + rid_mg + challenge + bytes([1, 0]) +
+                       struct.pack(">H", port) + ep_addr + bytes([mgmt_version, 0]) + hub + gen + key + PSKD.encode())
+            e, resp06 = cl.call("pb-start", plain06)
+            if e != ESP_OK or len(resp06) != 4:
+                return e, None, None
+            return e, resp06[1], resp06[2]
+
+        h, _ = boot()
+        h.connect(1)
+        plain06 = (bytes([1, 0x06, len(PSKD), 0]) + bytes.fromhex(EUI) + rid_mg + bytes(16) + bytes([1, 0]) +
+                   struct.pack(">H", ep_port) + ep_addr + bytes([1, 0]) + hub_id + generation + mgmt_key + PSKD.encode())
+        err, resp = h.request(1, "pb-start", plain06)
+        check(err != ESP_OK and resp == b"" and h.stats()["pending_mgmt"] == 0,
+              "plaintext management start before any handshake: refused by protocomm, nothing taken")
+        c = client(h, 1)
+        check(c.handshake()[0], "the right setup code authenticates")
+        _, st = c.status(issue=True)
+        err, rtype, code = start_mgmt(c, st["challenge"], key=bytes(32))
+        check(err == ESP_OK and rtype == 0x86 and code == 0x1e, "an all-zero key: answered 0x86 / INVALID_MANAGEMENT (0x1e)")
+        _, st = c.status(issue=True)
+        err, rtype, code = start_mgmt(c, st["challenge"], mgmt_version=2)
+        check(code == 0x1e, "management format version 2: INVALID_MANAGEMENT")
+        h.poll()
+        check(h.stats()["joiner_starts"] == 0 and h.stats()["pending_mgmt"] == 0,
+              "neither refused start reached the Joiner or the controller")
+        _, st = c.status(issue=True)
+        err, rtype, code = start_mgmt(c, st["challenge"])
+        check(err == ESP_OK and rtype == 0x86 and CODE[code] == "ACCEPTED", "a valid management start: 0x86 / ACCEPTED")
+        err, rtype, code = start_mgmt(c, st["challenge"])
+        check(CODE[code] == "DUPLICATE", "the same request again: DUPLICATE")
+        err, rtype, code = start_mgmt(c, st["challenge"], key=bytes(range(0x31, 0x51)))
+        check(CODE[code] == "REQUEST_CONFLICT", "the same request id with another key: REQUEST_CONFLICT")
+        check(h.poll() == CLOSE_OPEN, "the worker runs it")
+        s = h.stats()
+        check(s["joiner_starts"] == 1 and s["pending_mgmt"] == 1 and s["pending_ep"] == (ep_addr, ep_port) and
+              s["stored_mgmt"] == 0 and s["marker"] == 0,
+              "one Joiner; the controller holds the credential and the endpoint in RAM; nothing is stored yet")
+        h.joiner_done(0)
+        h.poll()
+        h.tick(True, True)
+        check(h.poll() == CLOSE_ENROLLED, "attached with the complete Dataset: enrolled")
+        s = h.stats()
+        check(s["marker"] == 1 and s["stored_mgmt"] == 1 and s["stored_mgmt_state"] == 1 and s["active_mgmt"] == 1 and
+              s["pending_mgmt"] == 0 and s["stored_hub_id"] == hub_id and s["stored_generation"] == generation and
+              s["stored_key"] == mgmt_key and s["stored_ep"] == (ep_addr, ep_port),
+              "record version 3 (state ENROLLED) holds exactly the hub id, generation, key and endpoint that were sent")
+        h.quit()
+
+        print("\n-- the release receipt (0x07 on pb-status), read by ESP-IDF's official client --")
+        # What the board's final release record holds after an unenroll whose
+        # erase was verified: the documentation's golden command and the MAC of
+        # its UNENROLL_DONE/ERASED message (computed here with Python's hmac).
+        import hashlib
+        import hmac as hmac_mod
+        command_id = bytes(range(0xe0, 0xf0))
+        unsigned = (bytes([1, 0x03, 0, 0]) + bytes.fromhex(EUI) + hub_id + generation + command_id + bytes([2, 0, 0, 0]))
+        receipt_mac = hmac_mod.new(mgmt_key, b"pogo-pb-mgmt-v1\0" + unsigned, hashlib.sha256).digest()
+        expected_receipt = unsigned + receipt_mac
+        receipt_req = bytes([1, 0x07, 0, 0]) + bytes.fromhex(EUI)
+
+        def read_receipt(cl, req=receipt_req):
+            e, resp = cl.call("pb-status", req)
+            return e, resp
+
+        h, _ = boot()
+        h.connect(1)
+        err, resp = h.request(1, "pb-status", receipt_req)
+        check(err != ESP_OK and resp == b"", "plaintext receipt request before any handshake: refused by protocomm")
+        c = client(h, 1)
+        check(c.handshake()[0], "the right setup code authenticates")
+        err, resp = read_receipt(c)
+        check(err == ESP_OK and len(resp) == 112 and resp[0] == 1 and resp[1] == 0x87 and CODE[resp[2]] == "OK" and
+              resp[3] == 0 and resp[4:12].hex() == EUI and resp[12] == 1 and resp[13] == 0 and resp[14:16] == bytes(2) and
+              resp[16:] == bytes(96),
+              "a board that was never unenrolled: 112 bytes, type 0x87, OK, its EUI-64, 'none', zeros")
+        check(h.store_final_release(hub_id, generation, command_id, receipt_mac) == 0,
+              "(the board's record becomes a final release, as after a verified erase)")
+        err, resp = read_receipt(c)
+        check(err == ESP_OK and len(resp) == 112 and resp[1] == 0x87 and CODE[resp[2]] == "OK" and resp[12] == 1 and
+              resp[13] == 1 and resp[16:] == expected_receipt,
+              "now: 'present', and the receipt is the UNENROLL_DONE/ERASED message byte for byte (golden MAC)")
+        check(expected_receipt.hex().endswith("efd7833baf44c006d3f980b77630e2250e2d7f61328cceee83ac30a4a41fe01b"),
+              "(the same MAC the firmware and hub tests pin)")
+        err, again = read_receipt(c)
+        check(again == resp, "reading it again: the same bytes")
+        # The record alone does not hand one out: the stores are read for every request -- by the
+        # real store check (components/power_base_ot_store), over a fake key storage.
+        present = resp
+        PRESTART_NONE, PRESTART_CLEARED, PRESTART_NOT_CLEARED = 0, 1, 2
+
+        def receipt_is_none(cl):
+            e, r = read_receipt(cl)
+            return (e == ESP_OK and len(r) == 112 and r[1] == 0x87 and CODE[r[2]] == "OK" and r[12] == 1 and
+                    r[13] == 0 and r[16:] == bytes(96))
+
+        def receipt_is_present(cl):
+            e, r = read_receipt(cl)
+            return e == ESP_OK and r == present
+
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_CLEARED and st["key"] and st["whose"] == "b" and st["writes_seen"] == 1 and
+              st["removes_seen"] == 0 and st["no_network"],
+              "(a restart of the released board: stores erased and read back before OpenThread starts, then "
+              "OpenThread's own key -- seen being stored)")
+        check(receipt_is_present(c), "after a restart: the receipt is handed out, the same bytes")
+
+        st = h.network_store(1, 2)
+        check(st["settings"] and not st["no_network"], "(a network is found in the board's stores, under that same final record)")
+        check(receipt_is_none(c), "the same request now: 'none' and zeros -- a final record on a stored network hands out no receipt")
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_CLEARED and not st["settings"] and st["whose"] == "b",
+              "(a restart: the stored network is erased before OpenThread starts)")
+        check(receipt_is_present(c), "and the receipt is handed out again")
+
+        # The fault of the second review: nothing left of the network but its key.
+        h.network_store(0)
+        st = h.network_store(1, 1)
+        check(st["key"] and st["whose"] == "N" and not st["settings"] and not st["no_network"],
+              "(nothing in the stores but an old Network Key, under that same final record)")
+        check(receipt_is_none(c),
+              "[key origin review] a final record and only the old Network Key: 'none' and zeros over the real BLE "
+              "service -- the key is not taken for OpenThread's own")
+        st = h.network_store(3, 1)
+        check(st["prestart"] == 0xff and st["whose"] == "N" and st["writes_seen"] == 0 and not st["no_network"],
+              "(a restart that only looks: OpenThread starts, finds a key under the Network Key's id and leaves it)")
+        check(receipt_is_none(c), "still 'none': a key OpenThread did not make is not accepted for lying where its own would")
+        h.network_store(2, 1)
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_NOT_CLEARED and st["whose"] == "N" and not st["no_network"],
+              "(a restart in which the old key cannot be erased: not cleared; OpenThread leaves it)")
+        check(receipt_is_none(c), "the erase failed: 'none'")
+        h.network_store(2, 2)
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_NOT_CLEARED and not st["no_network"], "(a restart in which the key storage cannot be read)")
+        check(receipt_is_none(c), "the stores cannot be read: 'none'")
+        check(h.stats()["stored_mgmt_state"] == 3 and h.stats()["stored_key"] == bytes(32),
+              "the record is untouched by the refusals")
+        h.network_store(2, 0)
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_CLEARED and st["whose"] == "b" and st["writes_seen"] == 1 and st["no_network"],
+              "(a restart in which the erase works: the old key is erased and read back before OpenThread starts, "
+              "and what is stored afterwards is OpenThread's own)")
+        check(receipt_is_present(c),
+              "now the receipt is handed out again, the same bytes: the manual confirmation works once the old key is gone")
+
+        # The key of an earlier boot is of unknown origin to this one, too.
+        h.network_store(0)
+        st = h.network_store(1, 3)
+        check(st["whose"] == "b" and not st["no_network"] and receipt_is_none(c),
+              "OpenThread's own key of an EARLIER boot, with nothing known about it in this boot: 'none' as well -- "
+              "where it lies decides nothing")
+        st = h.network_store(3)
+        check(st["prestart"] == PRESTART_CLEARED and st["no_network"] and receipt_is_present(c),
+              "the firmware's restart erases it and lets OpenThread make a new one: the receipt is handed out")
+        h.network_store(0)
+        check(receipt_is_present(c), "(stores with nothing at all in them: the receipt is handed out)")
+        err, resp = read_receipt(c, bytes([1, 0x07, 0, 0]) + bytes.fromhex("6055f9fffe005678"))
+        check(err == ESP_OK and resp[1] == 0x87 and CODE[resp[2]] == "WRONG_TARGET" and resp[13] == 0 and resp[16:] == bytes(96),
+              "another board's EUI-64: WRONG_TARGET, no receipt")
+        err, resp = read_receipt(c, receipt_req + b"\0")
+        check(err == ESP_OK and resp[1] == 0x87 and CODE[resp[2]] == "MALFORMED" and resp[13] == 0, "one byte long: MALFORMED")
+        err, st = c.status()
+        check(err == ESP_OK and CODE[st["code"]] == "OK" and st["state"] == STATE_WAITING,
+              "pb-status still answers as before on the same endpoint; the board is waiting for enrollment")
+        s = h.stats()
+        check(s["joiner_starts"] == 0 and s["stored_mgmt"] == 1 and s["stored_mgmt_state"] == 3 and s["stored_key"] == bytes(32),
+              "reading the receipt started nothing and changed nothing: record RELEASED, no key in it")
         h.quit()
 
         print("\n-- a board whose image REQUIRES the endpoint: the official client's 0x02 start is refused --")

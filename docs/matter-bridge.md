@@ -1,5 +1,8 @@
 # Linux Matter Bridge
 
+> 공개용 기록: 보드 식별값·계정·포트·주소는 예시로 바꿨습니다. 명령 실행 시 자신의 실제 값으로 바꾸세요. 원본 근거는 비공개로 보존했습니다.
+
+
 `pogo_matter_bridge`는 Power Base가 보낸 CoAP 데이터를 받아 Matter 동적 endpoint로
 공개하는 Linux 애플리케이션이다. `linux/matter_bridge/ingest`와 connectedhomeip
 v1.6.0.0 Matter stack을 한 프로세스에서 실행한다.
@@ -239,6 +242,14 @@ sudo journalctl -u pogo-matter-bridge.service -f -o cat
 5684 port를 이미 `ingest_server`가 쓰고 있으면 Matter Bridge가 시작하지 못한다. 독립
 ingest smoke server를 종료한 뒤 하나만 실행한다.
 
+**`--port`를 5684가 아닌 값으로 줄 때 (Linux bridge 0.3.0부터).** 관리 기능이 켜져 있으면(`--api-enroll-helper`)
+bridge는 5684에도 socket을 하나 더 연다. 등록된 Power Base가 "허브가 지금 어디 있는가"를 묻는 `LOCATE`에만
+답하는 socket이다([`power-base-management.md`](power-base-management.md) 12절 "locate 포트"). 시작 로그에
+`ingest: locate port=5684 (answers a Power Base's LOCATE only)`가 나온다. 5684를 다른 프로그램이 쓰고 있으면
+`the locate port 5684 could not be opened`를 남기고 그 socket 없이 돈다: 데이터 수신은 그대로지만, 이미
+등록된 Power Base는 새 port를 스스로 찾지 못한다(재등록이 필요하다). `--port 5684`(기본)에서는 새로 여는
+것이 없다.
+
 ## commissioning과 확인
 
 프로세스가 처음 시작할 때 출력하는 QR code 또는 manual pairing code로 commissioner에
@@ -276,7 +287,7 @@ KVS를 유지한 채 서비스를 다시 시작했고 endpoint ID도 유지됐�
 BH1750:
 
 - endpoint 3
-- UniqueID `744dbdfffe65d357`
+- UniqueID `020000fffe65d357`
 - `MeasuredValue`가 센서를 가리고 밝히는 동안 0~22369 범위에서 변화
 - `IdentifyTime: 0`
 - Identify command status `SUCCESS`
@@ -284,7 +295,7 @@ BH1750:
 PMS5003:
 
 - endpoint 4
-- UniqueID `744dbdfffe65d07a`
+- UniqueID `020000fffe65d07a`
 - `AirQuality: 0` (`Unknown`)
 - `IdentifyTime: 0`
 - Identify command status `SUCCESS`

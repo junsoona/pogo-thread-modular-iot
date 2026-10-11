@@ -196,7 +196,7 @@ esp_err_t thread_manager_init(void)
                 .host_config = {.host_connection_mode = HOST_CONNECTION_MODE_NONE},
                 .port_config =
                     {
-                        .storage_partition_name = "nvs",
+                        .storage_partition_name = THREAD_MANAGER_OT_STORAGE_PARTITION,
                         .netif_queue_size = 10,
                         .task_queue_size = 10,
                     },

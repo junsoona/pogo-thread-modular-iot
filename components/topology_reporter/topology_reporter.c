@@ -449,6 +449,9 @@ static void topology_reporter_task(void *arg)
 {
     (void)arg;
     bool has_attached = false;
+    /* The UPSTREAM provisioning generation (child_service.h) the accepted
+     * ATTACHED report was built under. */
+    uint32_t attached_generation = 0;
     module_role_t last_role = MODULE_ROLE_UNASSIGNED;
     TickType_t last_heartbeat = xTaskGetTickCount();
     /* Rate-limits the "still not registered" warning below -- an ATTACHED
@@ -510,6 +513,25 @@ static void topology_reporter_task(void *arg)
             topology_gate_close();
         }
 
+        /*
+         * A new UPSTREAM provisioning generation: this module was given a new
+         * collector, Dataset, depth and parent, so the registration made
+         * under the old one says nothing any more -- the collector may be a
+         * different one altogether. Compared by number rather than by
+         * watching upstream_ready drop and return: this task can be inside
+         * transmit()'s retries for longer than a whole re-provisioning
+         * takes, and would never see that dip. Read BEFORE `ready` below, so
+         * a report built while a later session is replacing the state is
+         * recorded under the older number and sent again.
+         */
+        uint32_t upstream_generation = child_service_get_upstream_generation();
+        if (has_attached && upstream_generation != attached_generation) {
+            ESP_LOGI(TAG, "upstream provisioning generation changed -- closing the data-plane gate and registering "
+                          "again");
+            has_attached = false;
+            topology_gate_close();
+        }
+
         bool ready = role_manager_is_upstream_ready();
         module_role_t role = role_manager_get_role();
         bool settled = ready && (role == MODULE_ROLE_LEAF || role == MODULE_ROLE_INTERMEDIATE);
@@ -519,6 +541,7 @@ static void topology_reporter_task(void *arg)
             last_role = role;
             if (send_live_report(TOPOLOGY_REPORT_ATTACHED)) {
                 has_attached = true;
+                attached_generation = upstream_generation;
                 last_heartbeat = now;
                 /* The ONLY place the data-plane gate ever opens (section 5):
                  * a real CoAP 2.xx response to THIS ATTACHED report, never

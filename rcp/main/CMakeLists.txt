@@ -31,8 +31,22 @@
 # `espcoredump`) compiles out to nothing -- see docs/otbr-rcp.md section 10.
 idf_component_register(SRCS "esp_ot_rcp.c" "rcp_uart_tx_retry.c" "rcp_uart_tx_io.c" "esp_ot_uart_send_wrap.c"
                              "esp_openthread_platform_process_wrap.c" "rcp_usb_rx_recovery_restart.c"
+                             "rcp_build_info.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES openthread nvs_flash esp_event vfs console esp_timer esp_hal_usb espcoredump)
+
+# Build identity (docs/versioning.md): rcp_build_info.c holds one string --
+# component, product version, commit, clean/dirty, source fingerprint -- from
+# a header that tools/pogo_version.py writes into the BUILD directory at every
+# build. Nothing calls it (the production RCP prints nothing: its USB port is
+# the Spinel link), so `-u` keeps it through the linker's section garbage
+# collection, the way ESP-IDF keeps its own application description. It is
+# read back from the .bin (tools/pogo_version.py appdesc), never from a
+# running RCP.
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    pogo_build_info_attach(${COMPONENT_LIB})
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u pogo_build_info_string")
+endif()
 
 # USB Spinel TX retry fix (RESET_FAULT under real hardware load -- see
 # rcp_uart_tx_retry.c/esp_ot_uart_send_wrap.c and docs/otbr-rcp.md's "USB

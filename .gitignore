@@ -31,3 +31,12 @@
 
 # Local hardware capture. Keep the original outside Git.
 /power-base-bridge.log
+
+# Build identity header for the GN build of the bridge, written by
+# tools/build_matter_bridge.sh at every build (docs/versioning.md). The CMake
+# and ESP-IDF builds keep theirs in the build directory.
+/linux/matter_bridge/app/api/generated/
+
+# Private install / hardware-test records (docs/release-records/README.md):
+# board identifiers, addresses, accounts, configuration image hashes.
+/docs/release-records/private/

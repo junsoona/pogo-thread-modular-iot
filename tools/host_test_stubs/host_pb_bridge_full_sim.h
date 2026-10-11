@@ -92,6 +92,12 @@ size_t host_pb_bridge_full_sim_captured_count(void);
 /* Returns false if index is out of range. */
 bool host_pb_bridge_full_sim_get_captured(size_t index, host_pb_bridge_full_sim_sent_t *out);
 
+/* Called (when set) from inside every outgoing send, after it was captured
+ * and BEFORE its outcome is delivered -- "while the request is on the air".
+ * Added for tools/test_linux_bridge_exporter_destination.c; never set (NULL)
+ * it changes nothing, which is every other test. */
+void host_pb_bridge_full_sim_set_send_hook(void (*hook)(const host_pb_bridge_full_sim_sent_t *sent));
+
 #ifdef __cplusplus
 }
 #endif

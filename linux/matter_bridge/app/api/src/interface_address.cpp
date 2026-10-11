@@ -97,4 +97,72 @@ bool InterfaceHasAddress(const std::string &ifname, const std::string &address, 
     return found;
 }
 
+namespace {
+
+// 0000:00ff:fe00:xxxx -- a Thread routing or anycast locator.
+bool IsThreadLocatorIid(const std::array<uint8_t, 16> &a)
+{
+    return a[8] == 0x00 && a[9] == 0x00 && a[10] == 0x00 && a[11] == 0xff && a[12] == 0xfe && a[13] == 0x00;
+}
+
+} // namespace
+
+bool PickThreadMeshLocalEid(const std::vector<std::array<uint8_t, 16>> &addresses, std::array<uint8_t, 16> &out)
+{
+    // The /64 that holds a locator. Two different ones: not one Thread
+    // interface as this function knows it.
+    const std::array<uint8_t, 16> *prefix_of = nullptr;
+    for (const auto &a : addresses) {
+        if (a[0] != 0xfd || !IsThreadLocatorIid(a)) {
+            continue;
+        }
+        if (prefix_of != nullptr && std::memcmp(prefix_of->data(), a.data(), 8) != 0) {
+            return false;
+        }
+        prefix_of = &a;
+    }
+    if (prefix_of == nullptr) {
+        return false;
+    }
+    const std::array<uint8_t, 16> *eid = nullptr;
+    for (const auto &a : addresses) {
+        if (std::memcmp(prefix_of->data(), a.data(), 8) != 0 || IsThreadLocatorIid(a)) {
+            continue;
+        }
+        if (eid != nullptr && *eid != a) {
+            return false; // two candidates: not decided here
+        }
+        eid = &a;
+    }
+    if (eid == nullptr) {
+        return false;
+    }
+    out = *eid;
+    return true;
+}
+
+bool ResolveThreadMeshLocalEid(const std::string &ifname, std::array<uint8_t, 16> &out)
+{
+    if (ifname.empty()) {
+        return false;
+    }
+    struct ifaddrs *addrs = nullptr;
+    if (getifaddrs(&addrs) != 0) {
+        return false;
+    }
+    std::vector<std::array<uint8_t, 16>> found;
+    for (struct ifaddrs *a = addrs; a != nullptr; a = a->ifa_next) {
+        if (a->ifa_addr == nullptr || a->ifa_name == nullptr || ifname != a->ifa_name ||
+            a->ifa_addr->sa_family != AF_INET6) {
+            continue;
+        }
+        const auto *sin6 = reinterpret_cast<const struct sockaddr_in6 *>(a->ifa_addr);
+        std::array<uint8_t, 16> bytes{};
+        std::memcpy(bytes.data(), sin6->sin6_addr.s6_addr, bytes.size());
+        found.push_back(bytes);
+    }
+    freeifaddrs(addrs);
+    return PickThreadMeshLocalEid(found, out);
+}
+
 } // namespace pogohome_api

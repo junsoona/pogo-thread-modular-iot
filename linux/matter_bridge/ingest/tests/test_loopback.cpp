@@ -467,6 +467,164 @@ int main()
         }
     }
 
+    printf("\n-- scenario: the locate port -- a second socket that answers one thing "
+           "(docs/power-base-management.md, section 12) --\n");
+    {
+        const uint16_t ingest_port = static_cast<uint16_t>(kTestPort + 2);
+        const uint16_t locate_port = static_cast<uint16_t>(kTestPort + 3);
+        ingest::Registry registry3;
+        std::atomic<bool> stop3{false};
+        std::atomic<int> management_calls{0};
+        std::atomic<int> locate_calls{0};
+        ingest::ServerConfig config3;
+        config3.port = ingest_port;
+        config3.interface_name = loopback_name;
+        config3.management = [&](const std::vector<uint8_t> &) {
+            management_calls++;
+            ingest::ManagementReply reply;
+            reply.code = ingest::kCoapCodeContent;
+            reply.payload = {0x11, 0x22};
+            return reply;
+        };
+        // What PowerBaseManagement::HandleLocateDatagram does, by shape: a
+        // payload starting with 'L' is "a LOCATE" and is answered, anything
+        // else gets no answer at all.
+        config3.locate = [&](const std::vector<uint8_t> &request) {
+            locate_calls++;
+            ingest::ManagementReply reply;
+            if (request.empty() || request[0] != 'L') {
+                reply.silent = true;
+                return reply;
+            }
+            reply.code = ingest::kCoapCodeContent;
+            reply.payload = {0xA0, 0xA1, 0xA2};
+            return reply;
+        };
+        config3.locate_port = locate_port;
+        bool start_ok3 = true;
+        std::thread server_thread3([&] { start_ok3 = ingest::run_server(config3, registry3, &stop3); });
+        nanosleep(&settle, nullptr);
+
+        int client3 = socket(AF_INET6, SOCK_DGRAM, 0);
+        timeval short_tv{};
+        short_tv.tv_sec = 0;
+        short_tv.tv_usec = 600000;
+        setsockopt(client3, SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
+        sockaddr_in6 ingest_addr = server_addr;
+        ingest_addr.sin6_port = htons(ingest_port);
+        sockaddr_in6 locate_addr = server_addr;
+        locate_addr.sin6_port = htons(locate_port);
+        auto exchange = [&](const sockaddr_in6 &to, const std::vector<uint8_t> &request, uint8_t *resp, size_t cap,
+                            sockaddr_in6 *from) {
+            sendto(client3, request.data(), request.size(), 0, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+            socklen_t from_len = sizeof(*from);
+            return recvfrom(client3, resp, cap, 0, reinterpret_cast<sockaddr *>(from), &from_len);
+        };
+        uint8_t resp[512];
+        sockaddr_in6 from{};
+
+        ssize_t n = exchange(locate_addr, build_request("pogo/v1/mgmt", {'L', 1, 2, 3}, 700), resp, sizeof(resp), &from);
+        CHECK(n >= 8 && resp[1] == ingest::kCoapCodeContent && resp[n - 3] == 0xA0 && resp[n - 1] == 0xA2,
+              "a Confirmable POST to the management resource on the locate port is answered with the locate "
+              "handler's reply");
+        CHECK(ntohs(from.sin6_port) == locate_port &&
+                  std::memcmp(&from.sin6_addr, &server_addr.sin6_addr, sizeof(in6_addr)) == 0,
+              "the answer comes from the locate port, from the address the request was sent to");
+        CHECK(locate_calls == 1 && management_calls == 0, "it went to the locate handler, not to the ingest one");
+
+        n = exchange(locate_addr, build_request("pogo/v1/mgmt", {'P', 1, 2, 3}, 701), resp, sizeof(resp), &from);
+        CHECK(n < 0 && locate_calls == 2, "a management message the locate handler stays silent on: no datagram comes back");
+
+        size_t nodes_before = registry3.node_count();
+        n = exchange(locate_addr, build_request("pogo/v1/topology", pack_topology_wire(0x31, true, 1, 1, 1), 702), resp,
+                     sizeof(resp), &from);
+        CHECK(n < 0 && registry3.node_count() == nodes_before && locate_calls == 2,
+              "a data message on the locate port: no answer, the Registry untouched, no handler called");
+        n = exchange(locate_addr, build_request("pogo/v1/heartbeat", pack_heartbeat_wire(0xAB, 5000, 2), 703), resp,
+                     sizeof(resp), &from);
+        CHECK(n < 0, "a heartbeat on the locate port: no answer");
+        n = exchange(locate_addr,
+                     build_request("pogo/v1/mgmt", {'L', 1, 2, 3}, 704, ingest::CoapType::NonConfirmable), resp,
+                     sizeof(resp), &from);
+        CHECK(n < 0 && locate_calls == 2, "a Non-confirmable request on the locate port: no answer, no handler called");
+        n = exchange(locate_addr, build_request("pogo/v1/mgmt", {'L', 1, 2, 3}, 705, ingest::CoapType::Confirmable, 0x01),
+                     resp, sizeof(resp), &from);
+        CHECK(n < 0 && locate_calls == 2, "a GET on the locate port: no answer, no handler called");
+
+        n = exchange(ingest_addr, build_request("pogo/v1/mgmt", {'L', 1, 2, 3}, 706), resp, sizeof(resp), &from);
+        CHECK(n >= 7 && resp[1] == ingest::kCoapCodeContent && resp[n - 2] == 0x11 && management_calls == 1 &&
+                  ntohs(from.sin6_port) == ingest_port,
+              "the ingest port still serves the management resource through the ingest handler");
+        n = exchange(ingest_addr, build_request("pogo/v1/topology", pack_topology_wire(0x32, true, 1, 1, 1), 707), resp,
+                     sizeof(resp), &from);
+        CHECK(n >= 4 && resp[1] == ingest::kCoapCodeChanged && registry3.node_count() == nodes_before + 1,
+              "and data as always");
+        n = exchange(locate_addr, build_request("pogo/v1/mgmt", {'L', 9}, 708), resp, sizeof(resp), &from);
+        CHECK(n >= 8 && resp[1] == ingest::kCoapCodeContent, "both sockets keep being served in turn");
+
+        close(client3);
+        stop3.store(true);
+        server_thread3.join();
+        CHECK(start_ok3, "the server with a locate port started and stopped cleanly");
+    }
+
+    printf("\n-- scenario: no second socket when the ingest port IS the locate port, or the port is taken --\n");
+    {
+        const uint16_t port = static_cast<uint16_t>(kTestPort + 4);
+        ingest::Registry registry4;
+        std::atomic<bool> stop4{false};
+        std::atomic<int> locate_calls{0};
+        ingest::ServerConfig config4;
+        config4.port = port;
+        config4.interface_name = loopback_name;
+        config4.management = [&](const std::vector<uint8_t> &) {
+            ingest::ManagementReply reply;
+            reply.code = ingest::kCoapCodeContent;
+            return reply;
+        };
+        config4.locate = [&](const std::vector<uint8_t> &) {
+            locate_calls++;
+            return ingest::ManagementReply{};
+        };
+        config4.locate_port = port; // the same port: the ingest socket answers everything itself
+        bool start_ok4 = true;
+        std::thread server_thread4([&] { start_ok4 = ingest::run_server(config4, registry4, &stop4); });
+        nanosleep(&settle, nullptr);
+
+        // A second server whose locate port is the first one's (taken) port:
+        // it must still start and serve its own ingest port.
+        const uint16_t port5 = static_cast<uint16_t>(kTestPort + 5);
+        ingest::Registry registry5;
+        std::atomic<bool> stop5{false};
+        ingest::ServerConfig config5 = config4;
+        config5.port = port5;
+        config5.locate_port = port;
+        bool start_ok5 = true;
+        std::thread server_thread5([&] { start_ok5 = ingest::run_server(config5, registry5, &stop5); });
+        nanosleep(&settle, nullptr);
+
+        int client4 = socket(AF_INET6, SOCK_DGRAM, 0);
+        setsockopt(client4, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        uint8_t resp[512];
+        for (uint16_t p : {port, port5}) {
+            sockaddr_in6 to = server_addr;
+            to.sin6_port = htons(p);
+            auto request = build_request("pogo/v1/mgmt", {'L', 1}, 800);
+            sendto(client4, request.data(), request.size(), 0, reinterpret_cast<sockaddr *>(&to), sizeof(to));
+            ssize_t n = recv(client4, resp, sizeof(resp), 0);
+            CHECK(n >= 4 && resp[1] == ingest::kCoapCodeContent,
+                  p == port ? "locate port == ingest port: the one socket answers through the ingest handler"
+                            : "a locate port that is taken: the server runs without it and serves its ingest port");
+        }
+        CHECK(locate_calls == 0, "the locate handler was never used in either");
+        close(client4);
+        stop4.store(true);
+        stop5.store(true);
+        server_thread4.join();
+        server_thread5.join();
+        CHECK(start_ok4 && start_ok5, "both servers started and stopped cleanly");
+    }
+
     printf("\n%d failures\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

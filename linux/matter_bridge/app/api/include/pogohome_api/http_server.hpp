@@ -24,6 +24,19 @@
 // /api/v1/power-base-enrollments; without it they answer 404
 // enrollment_disabled and nothing else changes. See enrollment.hpp.
 //
+// Power Base management (ServerConfig::management_requested/management) adds
+// the TLS-only, bearer-authenticated removal routes under
+// /api/v1/power-base-removals, the management fields of the snapshot, and the
+// management credential of an enrollment session that asks for one. Without
+// it those routes answer 404 removal_disabled and nothing else changes. See
+// power_base_management.hpp and docs/power-base-management.md.
+//
+// With it also come the routes under /api/v1/power-base-forgets (the same
+// gates): taking an OFFLINE Power Base out of this hub's list. That is not a
+// removal -- nothing is said about the board -- and it is announced on its
+// own: "power_base_forget" in health, "record" on a listed Power Base and
+// "power_base_forgets" in the snapshot.
+//
 // Threading model: one acceptor thread (Start()) that poll()s the listening
 // socket on a short bounded timeout (mirrors
 // linux/matter_bridge/ingest/src/server.cpp's own SO_RCVTIMEO-poll pattern)
@@ -115,6 +128,30 @@ struct ServerConfig {
     std::shared_ptr<EnrollmentManager> enrollment;
     // Largest accepted POST /api/v1/power-base-enrollments body.
     size_t max_enrollment_body_bytes = 256;
+
+    // Power Base management (docs/power-base-management.md): removal jobs
+    // and management credentials. Off unless requested; like enrollment it
+    // needs settings sharing (TLS and paired devices). Requested but
+    // `management` missing, or its state file damaged: the removal routes
+    // answer 503 removal_unavailable.
+    bool management_requested = false;
+    std::shared_ptr<PowerBaseManagement> management;
+    // Largest accepted POST /api/v1/power-base-removals body.
+    size_t max_removal_body_bytes = 256;
+    // Largest accepted POST /api/v1/power-base-forgets body.
+    size_t max_forget_body_bytes = 256;
+    // Tests only. Runs right after GET /api/v1/snapshot or the SSE loop
+    // copied the Registry, and before the snapshot is built from that copy:
+    // the place where another request can change what the hub lists.
+    // Production never sets it.
+    std::function<void()> after_registry_copy;
+    // {"receipt":"<192 hex>"} and nothing else.
+    size_t max_receipt_body_bytes = 512;
+    // GET /api/v1/health ends with the optional `build` object
+    // (build_info.hpp, docs/versioning.md). Off unless asked for: a Server
+    // made without it serves byte for byte the health it always served. The
+    // bridge (chip/main.cpp) asks for it.
+    bool report_build = false;
 };
 
 class Server {
@@ -174,6 +211,13 @@ private:
     // `buf` is the raw request read so far (it may hold the start of a body).
     void HandleEnrollmentRoute(Stream &stream, Request &request, std::string &buf);
     void HandleEnrollmentStart(Stream &stream, Request &request, const DeviceRecord &device);
+    // Every /api/v1/power-base-removals route, from the TLS check on.
+    void HandleRemovalRoute(Stream &stream, Request &request, std::string &buf);
+    void HandleRemovalStart(Stream &stream, Request &request, const DeviceRecord &device);
+    void HandleRemovalReceipt(Stream &stream, Request &request);
+    // Every /api/v1/power-base-forgets route, from the TLS check on.
+    void HandleForgetRoute(Stream &stream, Request &request, std::string &buf);
+    void HandleForgetStart(Stream &stream, Request &request, const DeviceRecord &device);
 
     // Shared by the settings and enrollment routes: the bearer token check
     // (answers 401/503 itself and returns false), and the body read (answers
@@ -187,6 +231,39 @@ private:
     void AppendSettingsFields(std::string &json) const;
     // Appends power_base_enrollment to the health JSON (only when requested).
     void AppendEnrollmentField(std::string &json) const;
+    // Appends power_base_management / power_base_removal /
+    // power_base_removal_request / power_base_forget to the health JSON (only
+    // when requested).
+    void AppendManagementFields(std::string &json) const;
+    // Appends the optional `build` object to the health JSON (nothing in a
+    // build without the version stamp; see build_info.hpp).
+    void AppendBuildField(std::string &json) const;
+    bool ManagementEnabled() const { return SettingsEnabled() && config_.management && config_.management->available(); }
+    // The snapshot body (GET /api/v1/snapshot and SSE), with the management
+    // fields when management is on. `view` is the caller's copy of the
+    // Registry. With management it is used only if it is not from before
+    // management last changed which Bases are listed -- otherwise a copy made
+    // at the moment management is read takes its place
+    // (PowerBaseManagement::DescribeForSnapshot()): a snapshot never shows a
+    // Base together with the record that took it out of the list.
+    std::string SnapshotJson(const ingest::RegistryView &view, uint64_t generation) const;
+    // The complete body of one snapshot, for GET /api/v1/snapshot and for an
+    // SSE event alike: SnapshotJson(), the settings fields, and -- last --
+    // where this snapshot stands among all the snapshots this process makes:
+    //   "snapshot_stream"    32 lowercase hex made when this Server was
+    //                        constructed: one value per run of the bridge;
+    //   "snapshot_sequence"  1, 2, 3, ... in the order the snapshots were made.
+    // Made one at a time (snapshot_order_mutex_), with everything a snapshot
+    // says read inside that section: management and the settings under their
+    // own locks, and the Registry copy replaced by one made now when it is
+    // older than the copy the previous snapshot was built from. So of two
+    // snapshots of one stream, the one with the larger sequence says nothing
+    // older than the other -- whichever of them reaches a client first, and
+    // whether it travelled as a GET answer or as an event. A client that got
+    // the larger one must not go back to the smaller. Across two streams the
+    // numbers say nothing: another stream is another run of the bridge.
+    // Without randomness for the stream id both fields are left out.
+    std::string SnapshotBody(ingest::RegistryView view, uint64_t generation) const;
     int64_t NowUnixMs() const;
 
     ingest::Registry &registry_;
@@ -201,6 +278,14 @@ private:
 
     std::mutex workers_mutex_;
     std::vector<Worker> workers_;
+
+    // See SnapshotBody().
+    std::string snapshot_stream_;
+    mutable std::mutex snapshot_order_mutex_;
+    mutable uint64_t snapshot_sequence_ = 0;
+    // Registry::generation() of the newest copy a caller brought to
+    // SnapshotBody() so far.
+    mutable uint64_t snapshot_view_generation_ = 0;
 };
 
 } // namespace pogohome_api

@@ -61,6 +61,7 @@ add_executable(matter_bridge_core_unit_tests
     tests/test_endpoint_store.cpp
     tests/test_bridge_manager.cpp
     tests/test_removal_convergence.cpp
+    tests/test_power_base_removal.cpp
     tests/test_main.cpp
     # The real ingest::Registry, so test_removal_convergence.cpp drives
     # BridgeManager from actual registry snapshots (header-only types

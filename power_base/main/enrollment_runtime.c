@@ -6,7 +6,11 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_system.h"
 #include "thread_manager/thread_manager.h"
+#if CONFIG_POWER_BASE_BLE_ENROLLMENT
+#include "power_base_ble_enroll/pb_ble_service.h"
+#endif
 
 static const char *TAG = "pb_enroll_rt";
 
@@ -42,6 +46,8 @@ static pb_enroll_ctl_t s_ctl;
 static pb_enrollment_ready_cb_t s_ready;
 static bool s_ready_fired;
 static bool s_joiner_eui64_matches;
+/* A re-enrollment window boot: nothing is resumed and nothing may join. */
+static bool s_reenroll_window;
 
 static uint32_t now_ms(void)
 {
@@ -232,6 +238,92 @@ esp_err_t pb_enrollment_runtime_start(const uint8_t eui64[PB_ENROLL_EUI64_LEN],
     return ESP_OK;
 }
 
+void pb_enrollment_note_bridge_endpoint(const pb_enroll_bridge_endpoint_t *endpoint)
+{
+    if (s_lock == NULL || endpoint == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_ctl.state == PB_ENROLL_STATE_ENROLLED && s_ctl.has_bridge_endpoint) {
+        s_ctl.bridge_endpoint = *endpoint;
+    }
+    xSemaphoreGive(s_lock);
+}
+
+bool pb_enrollment_busy(void)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool busy = s_ctl.state == PB_ENROLL_STATE_JOINING || s_ctl.state == PB_ENROLL_STATE_ATTACHING;
+    xSemaphoreGive(s_lock);
+#if CONFIG_POWER_BASE_BLE_ENROLLMENT
+    busy = busy || pb_ble_service_busy();
+#endif
+    return busy;
+}
+
+#if CONFIG_POWER_BASE_REENROLL_BUTTON
+bool pb_enrollment_in_reenroll_window(void)
+{
+    return s_reenroll_window;
+}
+
+/* Owns BLE for the whole window boot: starts it, polls it (which also runs
+ * an accepted local reset, here, never in a BLE callback) and takes it down.
+ * Every way out of the loop is a restart; the next boot is an ordinary one
+ * because the window request was used up before this boot opened anything. */
+static void reenroll_window_task(void *arg)
+{
+    (void)arg;
+    esp_err_t ble_err = pb_enrollment_ble_start();
+    if (ble_err != ESP_OK) {
+        ESP_LOGE(TAG, "re-enrollment window: BLE is not available on this board (%s) -- nothing was changed",
+                 esp_err_to_name(ble_err));
+    } else {
+        while (!pb_enrollment_ble_is_down()) {
+            vTaskDelay(pdMS_TO_TICKS(ENROLLMENT_POLL_MS));
+            pb_enrollment_ble_poll();
+        }
+    }
+    ESP_LOGW(TAG, "re-enrollment window over -- restarting into the ordinary boot (it resumes the stored enrollment "
+                  "unless a reset was confirmed and carried out)");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+}
+
+esp_err_t pb_enrollment_runtime_start_reenroll_window(const uint8_t eui64[PB_ENROLL_EUI64_LEN],
+                                                      pb_enroll_endpoint_policy_t endpoint_policy)
+{
+    s_ready = NULL;
+    s_lock = xSemaphoreCreateMutex();
+    s_joiner_q = xQueueCreate(4, sizeof(joiner_event_t));
+    if (s_lock == NULL || s_joiner_q == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    uint8_t factory[PB_ENROLL_EUI64_LEN];
+    s_joiner_eui64_matches = thread_manager_get_factory_eui64(factory) == ESP_OK &&
+                             memcmp(factory, eui64, PB_ENROLL_EUI64_LEN) == 0;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* Initialised for its EUI-64 and status only. pb_enroll_ctl_boot() is
+     * deliberately NOT called: it is what would enable Thread on the stored
+     * Dataset. */
+    pb_enroll_ctl_init(&s_ctl, &k_ops, eui64);
+    pb_enroll_ctl_set_endpoint_policy(&s_ctl, endpoint_policy);
+    s_reenroll_window = true;
+    xSemaphoreGive(s_lock);
+
+    if (xTaskCreate(reenroll_window_task, "pb_reenroll", ENROLLMENT_TASK_STACK, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGW(TAG, "re-enrollment window boot: the stored enrollment is NOT resumed; Thread, the exporter, the "
+                  "downstream port and the management poll stay off");
+    return ESP_OK;
+}
+#endif /* CONFIG_POWER_BASE_REENROLL_BUTTON */
+
 void pb_enrollment_get_status(pb_enrollment_status_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -246,27 +338,52 @@ void pb_enrollment_get_status(pb_enrollment_status_t *out)
         out->has_bridge_endpoint = true;
         out->bridge_endpoint = s_ctl.bridge_endpoint;
     }
+    out->has_mgmt = s_ctl.state == PB_ENROLL_STATE_ENROLLED && s_ctl.has_mgmt;
     xSemaphoreGive(s_lock);
     out->joiner_eui64_matches = s_joiner_eui64_matches;
 }
 
-static esp_err_t request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint)
+static esp_err_t request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                              const pb_enroll_mgmt_credential_t *mgmt)
 {
+    if (s_reenroll_window) {
+        /* The BLE admission rules refuse every start in such a boot already;
+         * this holds for any other caller. Nothing is started or erased. */
+        pb_enroll_wipe(pskd, PB_ENROLL_PSKD_BUF_LEN);
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     /* Drop any outcome left from an earlier attempt; the attempt number
      * would reject it anyway. */
     joiner_event_t stale;
     while (xQueueReceive(s_joiner_q, &stale, 0) == pdTRUE) {
     }
-    esp_err_t err = endpoint != NULL ? pb_enroll_ctl_request_join_with_endpoint(&s_ctl, pskd, endpoint, now_ms())
-                                     : pb_enroll_ctl_request_join(&s_ctl, pskd, now_ms());
+    esp_err_t err;
+    if (mgmt != NULL) {
+        err = pb_enroll_ctl_request_join_managed(&s_ctl, pskd, endpoint, mgmt, now_ms());
+    } else if (endpoint != NULL) {
+        err = pb_enroll_ctl_request_join_with_endpoint(&s_ctl, pskd, endpoint, now_ms());
+    } else {
+        err = pb_enroll_ctl_request_join(&s_ctl, pskd, now_ms());
+    }
     xSemaphoreGive(s_lock);
     return err;
 }
 
 esp_err_t pb_enrollment_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN])
 {
-    return request_join(pskd, NULL);
+    return request_join(pskd, NULL, NULL);
+}
+
+esp_err_t pb_enrollment_request_join_managed(char pskd[PB_ENROLL_PSKD_BUF_LEN],
+                                             const pb_enroll_bridge_endpoint_t *endpoint,
+                                             const pb_enroll_mgmt_credential_t *mgmt)
+{
+    if (endpoint == NULL || mgmt == NULL) {
+        pb_enroll_wipe(pskd, PB_ENROLL_PSKD_BUF_LEN);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return request_join(pskd, endpoint, mgmt);
 }
 
 esp_err_t pb_enrollment_request_join_with_endpoint(char pskd[PB_ENROLL_PSKD_BUF_LEN],
@@ -276,7 +393,7 @@ esp_err_t pb_enrollment_request_join_with_endpoint(char pskd[PB_ENROLL_PSKD_BUF_
         pb_enroll_wipe(pskd, PB_ENROLL_PSKD_BUF_LEN);
         return ESP_ERR_INVALID_ARG;
     }
-    return request_join(pskd, endpoint);
+    return request_join(pskd, endpoint, NULL);
 }
 
 esp_err_t pb_enrollment_cancel(void)

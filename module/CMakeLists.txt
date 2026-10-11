@@ -4,5 +4,12 @@ cmake_minimum_required(VERSION 3.16)
 
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../components")
 
+# Product version (PROJECT_VER -> the application description) from the
+# repository's one definition, versions.json -- see docs/versioning.md. One
+# version for the common sensor module: which sensors a board carries is its
+# cfg image, not another firmware version.
+include(${CMAKE_CURRENT_LIST_DIR}/../tools/cmake/pogo_version.cmake)
+pogo_version_setup(module)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(pogo_module)

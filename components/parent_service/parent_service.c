@@ -34,6 +34,17 @@ static const char *TAG = "parent_service";
 #define PS_SENSOR_STATUS_OK          0
 #define PS_SENSOR_STATUS_CONDITIONING 7
 
+/* How long a wait inside a provisioning session may go without looking at
+ * the upstream generation (parent_service_context_t.get_upstream_generation).
+ * Only the JOIN_RESULT wait is long enough for this to matter. */
+#define PS_GENERATION_CHECK_MS 100
+/* A failed session is retried while the child stays docked, after
+ * CONFIG_POGO_PING_INTERVAL_MS -- doubled for every further failure in a
+ * row, up to 2^PS_RETRY_BACKOFF_MAX_SHIFT times that (16 s with the default
+ * 1 s). A success, a new handshake, a detach or a new upstream generation
+ * starts over at the short pause. */
+#define PS_RETRY_BACKOFF_MAX_SHIFT 4
+
 typedef enum {
     PS_STATE_IDLE = 0,
     PS_STATE_PROVISIONING,
@@ -51,19 +62,6 @@ typedef struct {
     uint8_t   retry_count;
     otDeviceRole child_role;
     TickType_t last_seen;
-    /* JOIN_RESULT reliability (section 7 of the follow-up spec): the seq of
-     * the JOIN_RESULT this session has already processed and ACKed, kept
-     * alive PAST run_provisioning_session() returning (unlike everything
-     * else session-scoped above, which a NEW session simply overwrites) so
-     * a late retransmit of the SAME JOIN_RESULT -- the child never saw our
-     * first ACK -- gets re-ACKed without re-running provisioning or
-     * touching this record again. Reset to false only by memset(&s_node,...)
-     * at the start of a new run_provisioning_session() or on DETACHED --
-     * i.e. only a new provisioning generation or an explicit session
-     * teardown clears it, matching child_service's own retry-cancellation
-     * policy. */
-    bool      has_join_result;
-    uint8_t   last_join_result_seq;
 } node_record_t;
 
 typedef struct {
@@ -79,6 +77,148 @@ static bool s_peer_ready_pending = false;
 static volatile bool s_session_aborted = false;
 static node_record_t s_node;
 static uint8_t s_seq;
+
+/*
+ * Upstream generation (see parent_service_context_t.get_upstream_generation).
+ * s_session_generation is the number the current -- or last -- DOWNSTREAM
+ * session was started under; PS_STATE_JOINED means "joined for that number".
+ * s_session_superseded is set by the session's own waits when the number
+ * moved on under it: the session is dropped at once, without the failure
+ * pause, and started again for the new number.
+ */
+static uint32_t s_session_generation;
+static bool s_session_superseded;
+/*
+ * What is known of the docked child's JOIN_RESULTs. This belongs to the
+ * HANDSHAKE with that child, not to a session: it is set by whatever
+ * JOIN_RESULT arrives -- in a session's join wait, during a session's earlier
+ * steps, between sessions -- and it is forgotten only when the handshake is
+ * (ATTACHED / DETACHED / ERROR / PEER_READY, where a child may have
+ * restarted and counts from 1 again). A session that starts, fails, times
+ * out or is superseded changes nothing here.
+ *
+ * Why that is enough to tell an old result from a session's own, with the
+ * frames as they are (JOIN_RESULT carries the child's own seq and nothing of
+ * the session it answers):
+ *   - the child numbers its JOIN_RESULTs with a counter that goes on across
+ *     its sessions (child_service.c, s_join_result_seq_counter: +1 for every
+ *     result, 0 skipped), and repeats only its LATEST one, with that same
+ *     seq, until it is ACKed -- or until a new session's IDENTIFY_REQ, which
+ *     cancels the repeat for good;
+ *   - it does all of that in one task, and the UART and the event queue keep
+ *     the order: whatever it sent before it answered this session's
+ *     IDENTIFY_REQ arrives here before that answer.
+ * So a result of an earlier session can only be the newest one seen here so
+ * far (`seen_seq`), and this session's own result is always another number.
+ * A JOIN_RESULT with the newest seq seen so far is therefore never taken as
+ * a session's result: it is ACKed (its sender may have missed the ACK) and
+ * the session keeps waiting for its own. Every other numbered JOIN_RESULT in
+ * a join wait is this session's.
+ *
+ * What the frames cannot tell: a result this parent has NEVER seen arriving
+ * for the first time after this session's SET_DATASET was ACKed. A child
+ * running child_service cannot send one (see above); a sender that does not
+ * follow those rules could, and nothing short of a session number in
+ * JOIN_RESULT itself would show it.
+ *
+ * `processed_seq` is the result a session took as its own, for the re-ACK of
+ * its repeats outside any session. seq 0 is not a number (the child never
+ * uses it): it is neither recorded nor compared.
+ */
+static struct {
+    bool seen;
+    uint8_t seen_seq;
+    bool processed;
+    uint8_t processed_seq;
+} s_child_results;
+/* The running session has sent its SET_DATASET. Until then a JOIN_RESULT can
+ * only be an earlier session's; from then on one that arrives early -- while
+ * the ACK of SET_DATASET is still awaited -- is this session's own, and is
+ * left to be taken when it is repeated in the join wait. */
+static bool s_session_dataset_sent;
+/* Retry pacing for a failed session, see PS_RETRY_BACKOFF_MAX_SHIFT. */
+static uint8_t s_failed_sessions_in_a_row;
+static bool s_retry_gated;
+static TickType_t s_retry_not_before;
+
+static uint32_t upstream_generation(void)
+{
+    return (s_provider.get_upstream_generation != NULL) ? s_provider.get_upstream_generation(s_provider.ctx) : 0;
+}
+
+/* True (and the session marked as dropped) once the upstream generation is
+ * no longer the one this session was started under. */
+static bool session_superseded(void)
+{
+    if (upstream_generation() == s_session_generation) {
+        return false;
+    }
+    s_session_superseded = true;
+    s_session_aborted = true;
+    return true;
+}
+
+static void forget_child_results(void)
+{
+    memset(&s_child_results, 0, sizeof(s_child_results));
+}
+
+/* Every JOIN_RESULT that arrives, wherever it arrives. */
+static void note_join_result_seen(uint8_t seq)
+{
+    if (seq == 0) {
+        return;
+    }
+    s_child_results.seen = true;
+    s_child_results.seen_seq = seq;
+}
+
+/* True for the JOIN_RESULT this parent has already seen from the docked
+ * child: an earlier session's, sent again. */
+static bool join_result_is_known(uint8_t seq)
+{
+    return seq != 0 && s_child_results.seen && seq == s_child_results.seen_seq;
+}
+
+static void reset_retry_pacing(void)
+{
+    s_failed_sessions_in_a_row = 0;
+    s_retry_gated = false;
+}
+
+/* DETACHED/ERROR seen by a session's own wait: what the main loop's switch
+ * would have done, since it never sees an event consumed here. */
+static void note_port_lost_during_session(void)
+{
+    s_session_aborted = true;
+    s_peer_currently_ready = false;
+    s_peer_ready_pending = false;
+    forget_child_results();
+    reset_retry_pacing();
+}
+
+/* Blocks on the event queue until `deadline`, in slices short enough to
+ * notice a new upstream generation. Returns false at the deadline or when
+ * the session was superseded. */
+static bool receive_event_until(ps_evt_t *evt, TickType_t deadline)
+{
+    while (1) {
+        if (session_superseded()) {
+            return false;
+        }
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(now - deadline) >= 0) {
+            return false;
+        }
+        TickType_t slice = deadline - now;
+        if (s_provider.get_upstream_generation != NULL && slice > pdMS_TO_TICKS(PS_GENERATION_CHECK_MS)) {
+            slice = pdMS_TO_TICKS(PS_GENERATION_CHECK_MS);
+        }
+        if (xQueueReceive(s_evt_queue, evt, slice) == pdTRUE) {
+            return true;
+        }
+    }
+}
 
 esp_err_t parent_service_calc_polling_period_ms(uint32_t response_time_ms, uint32_t *out_period_ms)
 {
@@ -105,19 +245,16 @@ static void log_nack_if_any(const pogo_frame_t *frame)
 
 /* Drains the event queue looking for a FRAME_RECEIVED with the given seq
  * and one of two accepted types (expect_b==0: "don't care"). Any
- * DETACHED/ERROR aborts the whole session immediately (section 6). */
+ * DETACHED/ERROR aborts the whole session immediately (section 6), and so
+ * does a new upstream generation. */
 static bool wait_for_frame(pogo_frame_t *out, uint8_t match_seq, uint8_t expect_a, uint8_t expect_b,
                             TickType_t timeout)
 {
     TickType_t deadline = xTaskGetTickCount() + timeout;
     while (1) {
-        TickType_t now = xTaskGetTickCount();
-        if ((int32_t)(now - deadline) >= 0) {
-            return false;
-        }
         ps_evt_t evt;
-        if (xQueueReceive(s_evt_queue, &evt, deadline - now) != pdTRUE) {
-            continue;
+        if (!receive_event_until(&evt, deadline)) {
+            return false;
         }
         if (evt.event == POGO_PORT_EVENT_DETACHED || evt.event == POGO_PORT_EVENT_ERROR) {
             /* This event is consumed here, inside run_provisioning_session(),
@@ -126,9 +263,7 @@ static bool wait_for_frame(pogo_frame_t *out, uint8_t match_seq, uint8_t expect_
              * s_peer_currently_ready would stay stale-true and the caller
              * would retry the whole provisioning sequence against a peer
              * that is no longer physically there. */
-            s_session_aborted = true;
-            s_peer_currently_ready = false;
-            s_peer_ready_pending = false;
+            note_port_lost_during_session();
             return false;
         }
         if (evt.event == POGO_PORT_EVENT_FRAME_RECEIVED && evt.data.frame.seq == match_seq &&
@@ -136,23 +271,29 @@ static bool wait_for_frame(pogo_frame_t *out, uint8_t match_seq, uint8_t expect_
             *out = evt.data.frame;
             return true;
         }
-        /* stray/mismatched frame while waiting: ignore, keep waiting */
+        /* stray/mismatched frame while waiting: ignore, keep waiting. A
+         * JOIN_RESULT among them, before this session handed out its
+         * Dataset, is an earlier session's: remembered as such, so that it
+         * is not taken for this session's own if it comes again in the join
+         * wait. */
+        if (evt.event == POGO_PORT_EVENT_FRAME_RECEIVED && evt.data.frame.type == POGO_MSG_JOIN_RESULT &&
+            !s_session_dataset_sent) {
+            note_join_result_seen(evt.data.frame.seq);
+        }
     }
 }
 
-/* Same idea but for the unsolicited JOIN_RESULT, which the child sends with
- * seq=0 (not a reply to any specific request) -- see pogo_protocol.h. */
-static bool wait_for_type(pogo_frame_t *out, uint8_t type, TickType_t timeout)
+/* Same idea but for the unsolicited JOIN_RESULT, which is not a reply to any
+ * specific request (its seq is the child's own -- see pogo_protocol.h). A
+ * JOIN_RESULT this parent has seen before is not this session's result: see
+ * s_child_results. */
+static bool wait_for_join_result(pogo_frame_t *out, TickType_t timeout)
 {
     TickType_t deadline = xTaskGetTickCount() + timeout;
     while (1) {
-        TickType_t now = xTaskGetTickCount();
-        if ((int32_t)(now - deadline) >= 0) {
-            return false;
-        }
         ps_evt_t evt;
-        if (xQueueReceive(s_evt_queue, &evt, deadline - now) != pdTRUE) {
-            continue;
+        if (!receive_event_until(&evt, deadline)) {
+            return false;
         }
         if (evt.event == POGO_PORT_EVENT_DETACHED || evt.event == POGO_PORT_EVENT_ERROR) {
             /* This event is consumed here, inside run_provisioning_session(),
@@ -161,12 +302,18 @@ static bool wait_for_type(pogo_frame_t *out, uint8_t type, TickType_t timeout)
              * s_peer_currently_ready would stay stale-true and the caller
              * would retry the whole provisioning sequence against a peer
              * that is no longer physically there. */
-            s_session_aborted = true;
-            s_peer_currently_ready = false;
-            s_peer_ready_pending = false;
+            note_port_lost_during_session();
             return false;
         }
-        if (evt.event == POGO_PORT_EVENT_FRAME_RECEIVED && evt.data.frame.type == type) {
+        if (evt.event == POGO_PORT_EVENT_FRAME_RECEIVED && evt.data.frame.type == POGO_MSG_JOIN_RESULT) {
+            if (join_result_is_known(evt.data.frame.seq)) {
+                ESP_LOGI(TAG, "JOIN_RESULT of an earlier session again (seq=%u) -- re-sending ACK only, still "
+                              "waiting for this session's own",
+                         evt.data.frame.seq);
+                pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, evt.data.frame.seq, NULL, 0);
+                continue;
+            }
+            note_join_result_seen(evt.data.frame.seq);
             *out = evt.data.frame;
             return true;
         }
@@ -204,6 +351,10 @@ static bool send_and_wait(uint8_t type, const uint8_t *payload, uint16_t len, ui
 static bool run_provisioning_session(void)
 {
     s_session_aborted = false;
+    s_session_superseded = false;
+    s_session_dataset_sent = false;
+    /* The node record is this session's. What is known of the child's
+     * JOIN_RESULTs (s_child_results) is not, and is left alone. */
     memset(&s_node, 0, sizeof(s_node));
 
     const TickType_t ack_timeout =
@@ -381,6 +532,7 @@ static bool run_provisioning_session(void)
         ESP_LOGE(TAG, "DATASET_ERROR: failed to read our own active dataset TLVs -> abandoning session");
         return false;
     }
+    s_session_dataset_sent = true;
     if (!send_and_wait(POGO_MSG_SET_DATASET, tlvs.mTlvs, tlvs.mLength, POGO_MSG_ACK, POGO_MSG_NACK, &frame, max_retry,
                         ack_timeout) ||
         frame.type != POGO_MSG_ACK) {
@@ -392,19 +544,24 @@ static bool run_provisioning_session(void)
     ESP_LOGI(TAG, "dataset accepted (%u bytes) -- waiting for join result (timeout %dms)", (unsigned)tlvs.mLength,
              CONFIG_POGO_JOIN_TIMEOUT_MS);
 
-    if (!wait_for_type(&frame, POGO_MSG_JOIN_RESULT, join_timeout)) {
-        ESP_LOGW(TAG, "THREAD_JOIN_TIMEOUT: no JOIN_RESULT from child -> abandoning session");
+    if (!wait_for_join_result(&frame, join_timeout)) {
+        if (s_session_superseded) {
+            ESP_LOGI(TAG, "upstream generation changed while waiting for the join result -> dropping this session");
+        } else {
+            ESP_LOGW(TAG, "THREAD_JOIN_TIMEOUT: no JOIN_RESULT from child -> abandoning session");
+        }
         return false;
     }
     /* Record + ACK this JOIN_RESULT's seq BEFORE deciding success/failure --
      * section 7: "parent는 성공/실패 결과를 처리한 뒤 ACK" (processed here
      * means "the frame was validated and its seq captured", not necessarily
-     * "join succeeded"). Once has_join_result is set, a later retransmit of
-     * this exact seq (our ACK got lost) is re-ACKed by the main task loop's
-     * FRAME_RECEIVED handling below without ever re-entering this function
-     * or touching s_node again. */
-    s_node.has_join_result = true;
-    s_node.last_join_result_seq = frame.seq;
+     * "join succeeded"). From here on a later retransmit of this exact seq
+     * (our ACK got lost) is re-ACKed by the main task loop's FRAME_RECEIVED
+     * handling below without ever re-entering this function or touching
+     * s_node again -- and, should it come in a later session's join wait,
+     * by wait_for_join_result(), which does not take it for that session's. */
+    s_child_results.processed = true;
+    s_child_results.processed_seq = frame.seq;
     pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, frame.seq, NULL, 0);
 
     pogo_join_result_t result;
@@ -430,61 +587,121 @@ static void parent_service_task(void *arg)
             switch (evt.event) {
             case POGO_PORT_EVENT_ATTACHED:
                 s_state = PS_STATE_IDLE;
+                forget_child_results();
+                reset_retry_pacing();
                 break;
             case POGO_PORT_EVENT_DETACHED:
                 s_state = PS_STATE_IDLE;
                 s_peer_currently_ready = false;
                 s_peer_ready_pending = false;
                 memset(&s_node, 0, sizeof(s_node));
+                forget_child_results();
+                reset_retry_pacing();
                 break;
             case POGO_PORT_EVENT_PEER_READY:
                 s_peer_currently_ready = true;
                 s_peer_ready_pending = true;
+                forget_child_results();
+                reset_retry_pacing();
                 break;
             case POGO_PORT_EVENT_ERROR:
                 ESP_LOGW(TAG, "DOWNSTREAM port error=%d", (int)evt.data.error_code);
                 s_state = PS_STATE_IDLE;
                 s_peer_currently_ready = false;
                 s_peer_ready_pending = false;
+                forget_child_results();
+                reset_retry_pacing();
                 break;
             case POGO_PORT_EVENT_FRAME_RECEIVED:
                 /* Mid-session frames are drained by run_provisioning_session()
-                 * itself via wait_for_frame()/wait_for_type() and never reach
+                 * itself via wait_for_frame()/wait_for_join_result() and never reach
                  * here. A JOIN_RESULT arriving here (i.e. AFTER the session
                  * that processed it already returned) means the child never
                  * saw our JOIN_RESULT_ACK and is retrying with the same seq
                  * (section 7) -- re-ACK it without re-running provisioning or
                  * touching the node record again. Anything else arriving
                  * outside any session is a stray retransmit/protocol error
-                 * and is simply ignored, as before. */
-                if (evt.data.frame.type == POGO_MSG_JOIN_RESULT && s_node.has_join_result &&
-                    evt.data.frame.seq == s_node.last_join_result_seq) {
-                    ESP_LOGI(TAG, "duplicate JOIN_RESULT (seq=%u) -- re-sending ACK only", evt.data.frame.seq);
-                    pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, evt.data.frame.seq, NULL, 0);
+                 * and is simply ignored, as before -- except that a
+                 * JOIN_RESULT no session waited for (it came after its
+                 * session had given up) is remembered, so that no later
+                 * session takes it for its own. It is not ACKed: nothing
+                 * processed it. */
+                if (evt.data.frame.type == POGO_MSG_JOIN_RESULT) {
+                    if (s_child_results.processed && evt.data.frame.seq == s_child_results.processed_seq) {
+                        ESP_LOGI(TAG, "duplicate JOIN_RESULT (seq=%u) -- re-sending ACK only", evt.data.frame.seq);
+                        pogo_port_send(POGO_PORT_DOWNSTREAM, POGO_MSG_JOIN_RESULT_ACK, evt.data.frame.seq, NULL, 0);
+                    }
+                    note_join_result_seen(evt.data.frame.seq);
                 }
                 break;
             }
         }
 
-        if (s_peer_ready_pending && s_state == PS_STATE_IDLE) {
+        /* Read before the gate below: what the session then hands down can
+         * only be this generation's or a newer one's, and a newer one is
+         * caught by the comparisons that follow. */
+        uint32_t generation = upstream_generation();
+
+        if (s_state == PS_STATE_JOINED && generation != s_session_generation) {
+            /* Everything the docked child was given came from an upstream
+             * generation that no longer exists. It is still docked and
+             * handshaken (nothing on the port changed), so it is simply
+             * provisioned again from the first step. */
+            ESP_LOGI(TAG, "upstream generation changed (%u -> %u) -- the docked child is provisioned again",
+                     (unsigned)s_session_generation, (unsigned)generation);
+            s_state = PS_STATE_IDLE;
+            s_peer_ready_pending = s_peer_currently_ready;
+            reset_retry_pacing();
+        }
+
+        bool retry_due = !s_retry_gated || (int32_t)(xTaskGetTickCount() - s_retry_not_before) >= 0;
+        if (s_peer_ready_pending && s_state == PS_STATE_IDLE && s_retry_gated && generation != s_session_generation) {
+            /* The pause was for a failure under a generation that is gone. */
+            reset_retry_pacing();
+            retry_due = true;
+        }
+
+        if (s_peer_ready_pending && s_state == PS_STATE_IDLE && retry_due) {
             if (s_provider.provisioning_allowed(s_provider.ctx)) {
                 s_peer_ready_pending = false;
+                s_retry_gated = false;
                 s_state = PS_STATE_PROVISIONING;
+                s_session_generation = generation;
                 ESP_LOGI(TAG, "starting downstream provisioning as %s", s_provider.role_name(s_provider.ctx));
                 bool joined = run_provisioning_session();
                 if (joined) {
+                    /* JOINED for s_session_generation. If the generation
+                     * moved on in the meantime, the check above sends the
+                     * child through provisioning again on the next pass. */
                     s_state = PS_STATE_JOINED;
+                    reset_retry_pacing();
                 } else {
                     s_state = PS_STATE_IDLE;
                     if (s_peer_currently_ready) {
                         /* Peer is still physically docked: retry the whole
-                         * sequence after a short cooldown rather than
-                         * waiting forever for a PEER_READY that already
-                         * happened once (section 16: bounded retries per
-                         * step, but the outer sequence itself may be
-                         * retried while still docked). */
-                        vTaskDelay(pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS));
+                         * sequence rather than waiting forever for a
+                         * PEER_READY that already happened once (section 16:
+                         * bounded retries per step, but the outer sequence
+                         * itself may be retried while still docked). */
                         s_peer_ready_pending = true;
+                        if (s_session_superseded) {
+                            reset_retry_pacing(); /* not a failure: start over for the new generation now */
+                        } else {
+                            /* A pause that grows with every failure in a
+                             * row, kept as a deadline so this task goes on
+                             * handling port events (a detach above all)
+                             * while it lasts. */
+                            uint8_t shift = s_failed_sessions_in_a_row;
+                            if (shift > PS_RETRY_BACKOFF_MAX_SHIFT) {
+                                shift = PS_RETRY_BACKOFF_MAX_SHIFT;
+                            }
+                            if (s_failed_sessions_in_a_row < UINT8_MAX) {
+                                s_failed_sessions_in_a_row++;
+                            }
+                            s_retry_gated = true;
+                            s_retry_not_before =
+                                xTaskGetTickCount() + (pdMS_TO_TICKS(CONFIG_POGO_PING_INTERVAL_MS) << shift);
+                        }
                     }
                 }
             }

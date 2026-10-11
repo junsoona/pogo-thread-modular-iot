@@ -65,9 +65,45 @@
  *             is refused the same way, with or without an endpoint. Boot is
  *             as with OPTIONAL: an already enrolled board is not taken down
  *             because its cfg image went bad.
- * What is NOT here: following a hub whose address changes
- * later (OTBR replaced, network re-formed). The endpoint is delivered once
- * and restored at boot; nothing refreshes it.
+ * What is NOT here: following a hub whose address changes later. This
+ * component stores the endpoint it is given and restores it at boot; it
+ * never refreshes it by itself. A version 3 record's endpoint can be
+ * replaced by components/power_base_mgmt (pb_mgmt_client.h, "locate") after
+ * the same hub -- same hub id, generation and key -- confirmed a new one
+ * inside the same Thread network: one more store of the whole record with
+ * only the endpoint changed. Versions 1 and 2 hold no key to check such an
+ * answer with, so their endpoint is never replaced; a hub that moved needs
+ * a new enrollment there. A network that was re-formed (another Dataset) is
+ * a new enrollment in every version.
+ *
+ * Management credential (docs/power-base-management.md): an enrollment may
+ * also deliver the hub's id, an enrollment generation and a 32-byte
+ * management key -- what later authenticates a remote "unenroll". Such an
+ * enrollment always has a bridge endpoint too, and is stored as
+ *   version 3 (200 bytes)  marker, endpoint, credential and the release
+ *                          state, in one blob under one CRC.
+ * Unlike versions 1 and 2, a version 3 record HOLDS A SECRET (the key)
+ * until its release is final. Nothing here logs it. Its state:
+ *   ENROLLED     resumed at boot exactly like version 2.
+ *   UNENROLLING  an authenticated unenroll command was journaled. Never
+ *                resumed: the caller (power_base/main) finishes the release.
+ *   RELEASED     this enrollment is out of use for good. Never resumed.
+ *                With PB_ENROLL_RELEASE_F_ERASE_PENDING the stored join
+ *                information (the Thread Dataset) has NOT been confirmed
+ *                erased yet: the record still names the network, the
+ *                endpoint and the hub and still holds the key, because the
+ *                board has to tell the hub "released" and, once the erase
+ *                is verified, has to make its release receipt with it.
+ *                Without that flag the record is final: the Dataset erase
+ *                was verified BEFORE it was written, the key and everything
+ *                about the network are gone, and what is left is the
+ *                release receipt (hub id, generation, command id and the MAC
+ *                of the UNENROLL_DONE/ERASED message) -- no secret.
+ * The controller treats UNENROLLING and RELEASED as "not enrolled": the
+ * board waits, Thread untouched, last result NONE. Versions 1 and 2 are read
+ * and resumed exactly as before and are never rewritten as version 3 by
+ * reading them; only a new enrollment that delivered a credential writes
+ * version 3.
  *
  * Threading: pb_enroll_ctl_* are not internally locked. The caller serialises
  * every call (power_base/main uses one mutex) and never calls them from the
@@ -95,6 +131,17 @@ extern "C" {
 #define PB_ENROLL_NVS_KEY "done"
 #define PB_ENROLL_MARKER_LEN 36    /* record version 1 */
 #define PB_ENROLL_MARKER_V2_LEN 56 /* record version 2: with the bridge endpoint */
+#define PB_ENROLL_RECORD_V3_LEN 200 /* record version 3: with the management credential */
+#define PB_ENROLL_RECORD_MAX_LEN PB_ENROLL_RECORD_V3_LEN
+
+#define PB_ENROLL_HUB_ID_LEN 16
+#define PB_ENROLL_GENERATION_LEN 16
+#define PB_ENROLL_MGMT_KEY_LEN 32
+#define PB_ENROLL_COMMAND_ID_LEN 16
+#define PB_ENROLL_MAC_LEN 32
+/* Byte [50] of a version 3 record and byte [64] of the BLE start that
+ * delivers the credential. */
+#define PB_ENROLL_MGMT_FORMAT_VERSION 1u
 
 #define PB_ENROLL_BRIDGE_ADDR_LEN 16
 
@@ -156,12 +203,70 @@ const char *pb_enroll_endpoint_check_name(pb_enroll_endpoint_check_t check);
 /* True when the endpoint's first 64 bits are `id`'s Mesh-Local Prefix. */
 bool pb_enroll_bridge_endpoint_in_network(const pb_enroll_bridge_endpoint_t *ep, const pb_enroll_network_id_t *id);
 
-/* The stored record: the marker, and for version 2 the endpoint with it. */
+/* What the hub issued for one enrollment. `key` is a secret. */
+typedef struct {
+    uint8_t hub_id[PB_ENROLL_HUB_ID_LEN];
+    uint8_t generation[PB_ENROLL_GENERATION_LEN];
+    uint8_t key[PB_ENROLL_MGMT_KEY_LEN];
+} pb_enroll_mgmt_credential_t;
+
+/* True when hub id, generation and key are each not all zero. */
+bool pb_enroll_mgmt_credential_is_valid(const pb_enroll_mgmt_credential_t *cred);
+
+/* Byte [6] of a version 3 record. */
+typedef enum {
+    PB_ENROLL_MGMT_NONE = 0,        /* versions 1 and 2: no credential */
+    PB_ENROLL_MGMT_ENROLLED = 1,
+    PB_ENROLL_MGMT_UNENROLLING = 2, /* command journaled, release not yet stored */
+    PB_ENROLL_MGMT_RELEASED = 3,    /* out of use for good; see the release flags */
+} pb_enroll_mgmt_state_t;
+
+/* Byte [7] of a RELEASED version 3 record. */
+/* The stored join information is not confirmed erased yet. Alone: no other
+ * flag is ever set with it. */
+#define PB_ENROLL_RELEASE_F_ERASE_PENDING 0x01u
+/* Final records only: the hub acknowledged the "released" notice (a note for
+ * logs; it changes nothing). */
+#define PB_ENROLL_RELEASE_F_NOTICE_ACKED 0x02u
+/* Final records only, and always set in one: the erase was verified and the
+ * record holds the release receipt. */
+#define PB_ENROLL_RELEASE_F_ERASED 0x04u
+
+/* The stored record: the marker, for version 2 the endpoint with it, and for
+ * version 3 the management credential and release state as well. */
 typedef struct {
     pb_enroll_network_id_t id;
-    bool has_bridge_endpoint; /* version 2 */
+    bool has_bridge_endpoint; /* versions 2 and 3 (not a final RELEASED record) */
     pb_enroll_bridge_endpoint_t bridge_endpoint;
+
+    /* Version 3 only; everything below is zero for versions 1 and 2. */
+    bool has_mgmt;
+    pb_enroll_mgmt_state_t mgmt_state;
+    uint8_t release_flags; /* RELEASED only */
+    /* hub_id and generation: every state. key: every state but a final
+     * RELEASED record. */
+    pb_enroll_mgmt_credential_t mgmt;
+    uint8_t command_id[PB_ENROLL_COMMAND_ID_LEN]; /* UNENROLLING, RELEASED */
+    /* A final RELEASED record only: the MAC of this release's
+     * UNENROLL_DONE/ERASED message -- the release receipt. */
+    uint8_t done_mac[PB_ENROLL_MAC_LEN];
+    uint8_t ack_mac[PB_ENROLL_MAC_LEN]; /* always zero (kept for the layout) */
 } pb_enroll_record_t;
+
+/* True for a record that must be resumed as an enrollment: version 1, 2, or
+ * version 3 in state ENROLLED. */
+static inline bool pb_enroll_record_is_enrolled(const pb_enroll_record_t *rec)
+{
+    return !rec->has_mgmt || rec->mgmt_state == PB_ENROLL_MGMT_ENROLLED;
+}
+
+/* True for a RELEASED version 3 record whose Dataset erase was verified: no
+ * network, no endpoint, no key -- only the release receipt. */
+static inline bool pb_enroll_record_is_final_release(const pb_enroll_record_t *rec)
+{
+    return rec->has_mgmt && rec->mgmt_state == PB_ENROLL_MGMT_RELEASED &&
+           (rec->release_flags & PB_ENROLL_RELEASE_F_ERASE_PENDING) == 0;
+}
 
 typedef enum {
     PB_ENROLL_MARKER_ABSENT = 0,
@@ -173,16 +278,22 @@ typedef enum {
     PB_ENROLL_MARKER_READ_ERROR, /* NVS itself failed */
 } pb_enroll_marker_status_t;
 
-/* Either version. *out is zeroed unless the result is VALID. */
+/* Any version. *out is zeroed unless the result is VALID. A VALID version 3
+ * record may be in any of its states: check pb_enroll_record_is_enrolled()
+ * before treating it as an enrollment. The caller wipes *out when it is done
+ * with a record that holds a key (pb_enroll_wipe). */
 pb_enroll_marker_status_t pb_enroll_record_load(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enroll_record_t *out);
 /* set_blob + commit of ONE blob: version 1 without an endpoint (the same 36
- * bytes as before), version 2 with one. ESP_ERR_INVALID_ARG for an endpoint
- * that fails the check or lies outside rec->id's Mesh-Local Prefix (nothing
- * is written). On any other failure the caller must not treat the board as
- * enrolled; the stored value is then unspecified (see pb_enroll_ctl_tick). */
+ * bytes as before), version 2 with one, version 3 when rec->has_mgmt.
+ * ESP_ERR_INVALID_ARG for an endpoint that fails the check or lies outside
+ * rec->id's Mesh-Local Prefix, and for a version 3 record whose fields do not
+ * fit its state (nothing is written). On any other failure the caller must
+ * not treat the board as enrolled; the stored value is then unspecified (see
+ * pb_enroll_ctl_tick). */
 esp_err_t pb_enroll_record_store(const uint8_t eui64[PB_ENROLL_EUI64_LEN], const pb_enroll_record_t *rec);
 
-/* The marker part only, of either record version. */
+/* The marker part only, of a record that is an enrollment. A version 3
+ * record in state UNENROLLING or RELEASED has no marker: ABSENT. */
 pb_enroll_marker_status_t pb_enroll_marker_load(const uint8_t eui64[PB_ENROLL_EUI64_LEN], pb_enroll_network_id_t *out);
 /* A version 1 record. Same failure contract as pb_enroll_record_store(). */
 esp_err_t pb_enroll_marker_store(const uint8_t eui64[PB_ENROLL_EUI64_LEN], const pb_enroll_network_id_t *id);
@@ -290,6 +401,13 @@ typedef struct {
      * delivered; the exporter keeps the prepared image's cfg/pb_bridge. */
     bool has_bridge_endpoint;
     pb_enroll_bridge_endpoint_t bridge_endpoint;
+    /* The management credential delivered with the attempt in progress. RAM
+     * only, wiped on every way back to WAITING and once it is stored. */
+    bool pending_mgmt;
+    pb_enroll_mgmt_credential_t pending_mgmt_cred;
+    /* ENROLLED only: the stored record is version 3 in state ENROLLED. The
+     * key itself is not kept here; whoever needs it reads the record. */
+    bool has_mgmt;
 } pb_enroll_ctl_t;
 
 void pb_enroll_ctl_init(pb_enroll_ctl_t *c, const pb_enroll_ops_t *ops, const uint8_t eui64[PB_ENROLL_EUI64_LEN]);
@@ -319,6 +437,14 @@ esp_err_t pb_enroll_ctl_request_join(pb_enroll_ctl_t *c, char pskd[PB_ENROLL_PSK
  * ESP_ERR_NOT_ALLOWED only under an INVALID endpoint policy. */
 esp_err_t pb_enroll_ctl_request_join_with_endpoint(pb_enroll_ctl_t *c, char pskd[PB_ENROLL_PSKD_BUF_LEN],
                                                    const pb_enroll_bridge_endpoint_t *endpoint, uint32_t now_ms);
+
+/* The same, for an attempt that also delivers the management credential
+ * (copied; kept in RAM until enrolled, then stored in the version 3 record;
+ * the caller wipes its own copy). ESP_ERR_INVALID_ARG also for a credential
+ * that fails pb_enroll_mgmt_credential_is_valid(). */
+esp_err_t pb_enroll_ctl_request_join_managed(pb_enroll_ctl_t *c, char pskd[PB_ENROLL_PSKD_BUF_LEN],
+                                             const pb_enroll_bridge_endpoint_t *endpoint,
+                                             const pb_enroll_mgmt_credential_t *mgmt, uint32_t now_ms);
 
 /* JOINING/ATTACHING -> WAITING (CANCELLED). ESP_ERR_INVALID_STATE otherwise. */
 esp_err_t pb_enroll_ctl_cancel(pb_enroll_ctl_t *c);

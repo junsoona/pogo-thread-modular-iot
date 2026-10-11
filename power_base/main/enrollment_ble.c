@@ -45,6 +45,9 @@
 #include "protocomm_ble.h"
 #include "power_base_ble_auth/power_base_ble_auth.h"
 #include "power_base_ble_enroll/pb_ble_service.h"
+#include "power_base_mgmt/pb_mgmt_client.h"
+#include "enrollment_mgmt.h"
+#include "enrollment_reenroll.h"
 
 static const char *TAG = "pb_enroll_ble";
 
@@ -86,9 +89,14 @@ static pb_ble_auth_cred_t s_cred;
  * that delivered the bridge endpoint hands the checked copy to the
  * controller, which keeps it in RAM until the board is enrolled. */
 static esp_err_t ctl_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
-                                  void *ctx)
+                                  const pb_enroll_mgmt_credential_t *mgmt, void *ctx)
 {
     (void)ctx;
+    if (mgmt != NULL) {
+        /* A start that also delivered the hub's management credential: the
+         * controller stores it with the marker (record version 3). */
+        return pb_enrollment_request_join_managed(pskd, endpoint, mgmt);
+    }
     if (endpoint != NULL) {
         return pb_enrollment_request_join_with_endpoint(pskd, endpoint);
     }
@@ -101,6 +109,9 @@ static esp_err_t ctl_cancel(void *ctx)
     return pb_enrollment_cancel();
 }
 
+/* A re-enrollment window boot (set in pb_enrollment_ble_start()). */
+static bool s_window_boot;
+
 static void ctl_get_status(pb_ble_ctl_status_t *out, void *ctx)
 {
     (void)ctx;
@@ -109,6 +120,39 @@ static void ctl_get_status(pb_ble_ctl_status_t *out, void *ctx)
     out->state = st.state;
     out->last = st.last;
     out->attempt = st.attempt;
+#if CONFIG_POWER_BASE_REENROLL_BUTTON
+    if (s_window_boot) {
+        /* The controller was not booted, so it says "waiting". What this
+         * board holds is an enrollment that was only not resumed: pb-status
+         * says so until a reset has removed it. */
+        pb_reenroll_snapshot_t snap;
+        pb_reenroll_snapshot(st.eui64, &snap);
+        if (snap.condition == PB_REENROLL_COND_ENROLLED) {
+            out->state = PB_ENROLL_STATE_ENROLLED;
+        }
+    }
+#endif
+}
+
+_Static_assert(PB_BLE_RECEIPT_LEN == PB_MGMT_RECEIPT_LEN, "the BLE receipt is the management message, byte for byte");
+
+static uint8_t s_receipt_eui64[PB_ENROLL_EUI64_LEN];
+
+static bool receipt_no_network_stored(void *ctx)
+{
+    (void)ctx;
+    return pb_network_store_holds_no_network();
+}
+
+/* PB_BLE_MSG_RECEIPT_REQ: the release receipt, when the stored record is a
+ * final release AND the network stores, read back for this very request,
+ * hold no network (docs/power-base-management.md): the record alone does not
+ * hand one out. Reads the record and the stores; no secret is involved. Runs
+ * in the NimBLE host task. */
+static bool release_receipt_source(uint8_t receipt[PB_BLE_RECEIPT_LEN], void *ctx)
+{
+    (void)ctx;
+    return pb_mgmt_receipt_load(s_receipt_eui64, receipt_no_network_stored, NULL, receipt);
 }
 
 esp_err_t pb_enrollment_ble_start(void)
@@ -123,7 +167,12 @@ esp_err_t pb_enrollment_ble_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (st.endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_INVALID) {
+#if CONFIG_POWER_BASE_REENROLL_BUTTON
+    s_window_boot = pb_enrollment_in_reenroll_window();
+#endif
+    /* A window boot enrolls nothing, so the enrollment endpoint policy does
+     * not decide whether it may open. */
+    if (!s_window_boot && st.endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_INVALID) {
         /* No start could be taken anyway (the admission rules and the
          * controller both refuse): do not advertise an enrollment that
          * cannot happen. */
@@ -155,8 +204,21 @@ esp_err_t pb_enrollment_ble_start(void)
                 .ctx = NULL,
             },
         .now_ms = NULL,
+        .receipt = release_receipt_source,
+        .receipt_ctx = NULL,
     };
+    if (pb_reenroll_runtime_enabled()) {
+        /* This board has the re-enrollment button: it answers the local
+         * reset messages and lists the capability -- in every boot, so that
+         * a client can ask what became of a reset after the restart. The
+         * command itself is only taken in a window boot. */
+        svc.local_reset = true;
+        svc.reenroll_window = s_window_boot;
+        svc.ctl.local_reset = pb_reenroll_runtime_local_reset;
+        svc.ctl.get_local_reset = pb_reenroll_runtime_snapshot;
+    }
     memcpy(svc.eui64, st.eui64, sizeof(svc.eui64));
+    memcpy(s_receipt_eui64, st.eui64, sizeof(s_receipt_eui64));
     esp_err_t err = pb_ble_service_start(&svc, &s_pc);
     if (err != ESP_OK) {
         pb_enroll_wipe(&s_cred, sizeof(s_cred));
@@ -190,10 +252,22 @@ esp_err_t pb_enrollment_ble_start(void)
         return err;
     }
     s_ble = BLE_RUNNING;
-    ESP_LOGW(TAG, "safe wait: BLE enrollment open as '%s' for up to %u s (authenticated start only; Thread and "
-                  "services stay off until enrolled)",
-             ble.device_name, (unsigned)(PB_BLE_ADV_WINDOW_MS / 1000u));
+    if (s_window_boot) {
+        ESP_LOGW(TAG, "re-enrollment window open as '%s' for %u s: nothing is changed unless a client authenticates "
+                      "with this board's setup code and sends a confirmed local reset; no join is accepted in this "
+                      "boot",
+                 ble.device_name, (unsigned)(PB_BLE_REENROLL_WINDOW_MS / 1000u));
+    } else {
+        ESP_LOGW(TAG, "safe wait: BLE enrollment open as '%s' for up to %u s (authenticated start only; Thread and "
+                      "services stay off until enrolled)",
+                 ble.device_name, (unsigned)(PB_BLE_ADV_WINDOW_MS / 1000u));
+    }
     return ESP_OK;
+}
+
+bool pb_enrollment_ble_is_down(void)
+{
+    return s_ble == BLE_STOPPED || s_ble == BLE_STOP_FAILED;
 }
 
 void pb_enrollment_ble_poll(void)

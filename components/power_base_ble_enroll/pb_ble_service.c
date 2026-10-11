@@ -105,12 +105,41 @@ static esp_err_t ep_status(uint32_t session_id, const uint8_t *inbuf, ssize_t in
 {
     (void)session_id;
     (void)priv_data;
+    const size_t in_n = inlen > 0 ? (size_t)inlen : 0;
+    if (pb_ble_adm_is_receipt_request(inbuf, in_n)) {
+        /* The second message on this endpoint. It reads the stored record
+         * (flash), so it runs without the struct lock; it uses nothing of
+         * s_adm but the EUI-64, which never changes after start. */
+        uint8_t *receipt = malloc(PB_BLE_RECEIPT_RESP_LEN);
+        if (receipt == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        size_t rn = pb_ble_adm_handle_receipt(s_cfg.eui64, inbuf, in_n, receipt, s_cfg.receipt, s_cfg.receipt_ctx);
+        *outbuf = receipt;
+        *outlen = (ssize_t)rn;
+        return ESP_OK;
+    }
+    /* lr_supported never changes after start, so it is read without the lock. */
+    if (pb_ble_adm_is_local_reset_status_request(&s_adm, inbuf, in_n)) {
+        /* The third message on this endpoint. It reads only what the worker
+         * published into the struct: no flash, nothing changed. */
+        uint8_t *lr = malloc(PB_BLE_LOCAL_RESET_STATUS_RESP_LEN);
+        if (lr == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        leaf_lock(NULL);
+        size_t ln = pb_ble_adm_handle_local_reset_status(&s_adm, inbuf, in_n, lr, now_ms());
+        leaf_unlock(NULL);
+        *outbuf = lr;
+        *outlen = (ssize_t)ln;
+        return ESP_OK;
+    }
     uint8_t *resp = malloc(PB_BLE_STATUS_RESP_LEN);
     if (resp == NULL) {
         return ESP_ERR_NO_MEM;
     }
     leaf_lock(NULL);
-    size_t n = pb_ble_adm_handle_status(&s_adm, inbuf, inlen > 0 ? (size_t)inlen : 0, resp, now_ms());
+    size_t n = pb_ble_adm_handle_status(&s_adm, inbuf, in_n, resp, now_ms());
     leaf_unlock(NULL);
     *outbuf = resp;
     *outlen = (ssize_t)n;
@@ -165,6 +194,9 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
         cfg->ctl.cancel == NULL || cfg->ctl.get_status == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (cfg->local_reset && (cfg->ctl.local_reset == NULL || cfg->ctl.get_local_reset == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (s_pc != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -183,10 +215,22 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
     pb_ble_ctl_status_t st;
     memset(&st, 0, sizeof(st));
     cfg->ctl.get_status(&st, cfg->ctl.ctx);
+    /* What the board holds, read from flash here (the worker's context)
+     * before any client can ask. */
+    pb_ble_lr_snapshot_t lr_snap;
+    memset(&lr_snap, 0, sizeof(lr_snap));
+    if (cfg->local_reset) {
+        cfg->ctl.get_local_reset(&lr_snap, cfg->ctl.ctx);
+    }
     leaf_lock(NULL);
     pb_ble_adm_init(&s_adm, &adm_ops, cfg->eui64, cfg->joiner_eui64_ok, now_ms());
     pb_ble_adm_set_endpoint_policy(&s_adm, cfg->endpoint_policy);
     s_adm.ctl = st;
+    if (cfg->local_reset) {
+        pb_ble_adm_set_local_reset(&s_adm, true, cfg->reenroll_window, now_ms());
+        s_adm.lr_snap = lr_snap;
+        s_adm.lr_refresh = false;
+    }
     leaf_unlock(NULL);
 
     protocomm_t *pc = protocomm_new();
@@ -205,7 +249,8 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
         .verifier_len = PB_BLE_AUTH_VERIFIER_LEN,
     };
 
-    esp_err_t err = protocomm_set_version(pc, PB_BLE_EP_VERSION, PB_BLE_VERSION_JSON);
+    esp_err_t err = protocomm_set_version(pc, PB_BLE_EP_VERSION,
+                                          cfg->local_reset ? PB_BLE_VERSION_JSON_LOCAL_RESET : PB_BLE_VERSION_JSON);
     if (err == ESP_OK) {
         err = protocomm_set_security(pc, PB_BLE_EP_SESSION, &s_sec, &s_sec_params);
     }
@@ -239,6 +284,17 @@ pb_ble_close_reason_t pb_ble_service_poll(void)
     return pb_ble_adm_worker_poll(&s_adm, &w, now_ms());
 }
 
+bool pb_ble_service_busy(void)
+{
+    if (s_leaf == NULL) {
+        return false;
+    }
+    leaf_lock(NULL);
+    bool busy = pb_ble_adm_attempt_active(&s_adm) || pb_ble_adm_local_reset_active(&s_adm);
+    leaf_unlock(NULL);
+    return busy;
+}
+
 void pb_ble_service_stop(void)
 {
     if (s_pc != NULL) {
@@ -268,6 +324,11 @@ esp_err_t pb_ble_service_start(const pb_ble_service_config_t *cfg, protocomm_t *
 pb_ble_close_reason_t pb_ble_service_poll(void)
 {
     return PB_BLE_OPEN;
+}
+
+bool pb_ble_service_busy(void)
+{
+    return false;
 }
 
 void pb_ble_service_stop(void)

@@ -97,6 +97,9 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
                                       std::chrono::steady_clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (blocked_locked(power_base_uuid)) {
+        return ApplyResult::Blocked; // an unenrolled Base: nothing of it is applied
+    }
 
     auto removed_it = std::find(removed_.begin(), removed_.end(), std::make_pair(power_base_uuid, module_uuid));
     if (removed_it != removed_.end()) {
@@ -148,6 +151,9 @@ ApplyResult Registry::apply_topology(const Uuid &power_base_uuid, const Uuid &mo
         n->last_seen_at = now;
         (void)note_power_base_seen_locked(power_base_uuid, now); // covered by the bump below
         note_applied_locked();
+        // The one place a (Power Base, module) node comes into being: the
+        // module is listed under a Power Base from this generation on.
+        note_listing_locked(module_uuid);
         return ApplyResult::AppliedNew;
     }
 
@@ -238,6 +244,9 @@ ApplyResult Registry::apply_removal(const Uuid &power_base_uuid, const Uuid &mod
                                      std::chrono::steady_clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (blocked_locked(power_base_uuid)) {
+        return ApplyResult::Blocked;
+    }
     // The tombstone proves its Power Base is alive; it says nothing about the
     // removed module's own liveness.
     bool base_changed = note_power_base_seen_locked(power_base_uuid, now);
@@ -292,6 +301,9 @@ ApplyResult Registry::apply_sample(const Uuid &power_base_uuid, const Uuid &modu
                                     std::chrono::steady_clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (blocked_locked(power_base_uuid)) {
+        return ApplyResult::Blocked;
+    }
     NodeState *n = find_locked(power_base_uuid, module_uuid);
     if (n == nullptr || !n->has_topology) {
         // No topology at all for this (power_base_uuid, module_uuid) --
@@ -345,12 +357,18 @@ ApplyResult Registry::apply_sample(const Uuid &power_base_uuid, const Uuid &modu
     return ApplyResult::AppliedNew;
 }
 
-void Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms*/, uint16_t /*node_count*/,
-                               std::chrono::steady_clock::time_point now)
+ApplyResult Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms*/, uint16_t /*node_count*/,
+                                      std::chrono::steady_clock::time_point now)
 {
     // Still never touches node state (see this header's own doc comment:
     // never authoritative for modules) -- only the Power Base's own record.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (blocked_locked(power_base_uuid)) {
+        // Not listed, not "heard from", and no heartbeat serial: an
+        // enrollment session waiting for this Base's heartbeat must not be
+        // satisfied by a Base that was unenrolled and not enrolled again.
+        return ApplyResult::Blocked;
+    }
     const bool changed = note_power_base_seen_locked(power_base_uuid, now);
     for (auto &b : power_bases_) {
         if (b.power_base_uuid == power_base_uuid) {
@@ -363,6 +381,112 @@ void Registry::apply_heartbeat(const Uuid &power_base_uuid, uint32_t /*uptime_ms
     if (changed) {
         note_applied_locked();
     }
+    return ApplyResult::AppliedNew;
+}
+
+bool Registry::blocked_locked(const Uuid &power_base_uuid) const
+{
+    return std::find(blocked_.begin(), blocked_.end(), power_base_uuid) != blocked_.end();
+}
+
+void Registry::set_power_base_blocked(const Uuid &power_base_uuid, bool blocked)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = std::find(blocked_.begin(), blocked_.end(), power_base_uuid);
+    if (blocked && it == blocked_.end()) {
+        blocked_.push_back(power_base_uuid);
+        std::printf("[power-base] ");
+        print_uuid_suffix("pb", power_base_uuid);
+        std::printf(" blocked -- unenrolled from this hub; its data is refused until it is enrolled again\n");
+    } else if (!blocked && it != blocked_.end()) {
+        blocked_.erase(it);
+        std::printf("[power-base] ");
+        print_uuid_suffix("pb", power_base_uuid);
+        std::printf(" unblocked -- a new enrollment of it is active\n");
+    }
+}
+
+bool Registry::is_power_base_blocked(const Uuid &power_base_uuid) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return blocked_locked(power_base_uuid);
+}
+
+std::vector<Uuid> Registry::remove_power_base(const Uuid &power_base_uuid)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return remove_power_base_locked(power_base_uuid);
+}
+
+Registry::OfflineRemoval Registry::block_and_remove_power_base_if_offline(const Uuid &power_base_uuid,
+                                                                          const std::function<bool()> &commit,
+                                                                          std::vector<Uuid> *erased,
+                                                                          std::chrono::steady_clock::time_point now)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Online as every reader sees it: the Base itself heard from within the
+    // stale timeout, or -- for a Base this Registry does not track -- one of
+    // its nodes online (pogohome_api::BuildSnapshotJson() derives the same).
+    for (const PowerBaseState &b : power_bases_) {
+        if (b.power_base_uuid == power_base_uuid && with_staleness_applied(b, now).online) {
+            return OfflineRemoval::Online;
+        }
+    }
+    for (const NodeState &n : nodes_) {
+        if (n.power_base_uuid == power_base_uuid && with_staleness_applied(n, now).online) {
+            return OfflineRemoval::Online;
+        }
+    }
+    if (!commit || !commit()) {
+        return OfflineRemoval::CommitFailed;
+    }
+    if (!blocked_locked(power_base_uuid)) {
+        blocked_.push_back(power_base_uuid);
+        std::printf("[power-base] ");
+        print_uuid_suffix("pb", power_base_uuid);
+        std::printf(" blocked -- removed from this hub's list while offline; its data is refused until it is "
+                    "enrolled again\n");
+    }
+    std::vector<Uuid> gone = remove_power_base_locked(power_base_uuid);
+    if (erased != nullptr) {
+        *erased = std::move(gone);
+    }
+    return OfflineRemoval::Removed;
+}
+
+std::vector<Uuid> Registry::remove_power_base_locked(const Uuid &power_base_uuid)
+{
+    std::vector<Uuid> erased;
+    // Exactly the nodes registered under this Base. A module that moved to
+    // another Base has its own (other Base, module) node, which stays.
+    for (const NodeState &n : nodes_) {
+        if (n.power_base_uuid == power_base_uuid) {
+            erased.push_back(n.module_uuid);
+        }
+    }
+    nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(),
+                                [&](const NodeState &n) { return n.power_base_uuid == power_base_uuid; }),
+                 nodes_.end());
+    removed_.erase(std::remove_if(removed_.begin(), removed_.end(),
+                                  [&](const std::pair<Uuid, Uuid> &key) { return key.first == power_base_uuid; }),
+                   removed_.end());
+    const size_t bases_before = power_bases_.size();
+    power_bases_.erase(std::remove_if(power_bases_.begin(), power_bases_.end(),
+                                      [&](const PowerBaseState &b) { return b.power_base_uuid == power_base_uuid; }),
+                       power_bases_.end());
+    if (!erased.empty() || power_bases_.size() != bases_before) {
+        std::printf("[power-base] ");
+        print_uuid_suffix("pb", power_base_uuid);
+        std::printf(" removed with %zu module(s) registered under it\n", erased.size());
+        note_applied_locked();
+    }
+    return erased;
+}
+
+void Registry::notify_external_change()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    note_applied_locked();
 }
 
 uint64_t Registry::heartbeat_serial() const
@@ -485,9 +609,58 @@ std::vector<NodeState> Registry::snapshot(std::chrono::steady_clock::time_point 
     return out;
 }
 
+void Registry::note_listing_locked(const Uuid &module_uuid)
+{
+    for (ModuleListing &listing : listings_) {
+        if (listing.module_uuid == module_uuid) {
+            listing.generation = generation_;
+            return;
+        }
+    }
+    if (listings_.size() >= kMaxListings) {
+        // The oldest listing of a module that has no node now; when every
+        // remembered module has one (it cannot: kMaxListings > kMaxNodes),
+        // the oldest of all. What was dropped is said, so that "no entry" is
+        // never taken for "never listed" (RegistryView::listings_dropped_through).
+        auto has_node = [&](const Uuid &module) {
+            return std::any_of(nodes_.begin(), nodes_.end(), [&](const NodeState &n) { return n.module_uuid == module; });
+        };
+        auto victim = listings_.end();
+        for (auto it = listings_.begin(); it != listings_.end(); ++it) {
+            if (!has_node(it->module_uuid) && (victim == listings_.end() || it->generation < victim->generation)) {
+                victim = it;
+            }
+        }
+        if (victim == listings_.end()) {
+            victim = std::min_element(listings_.begin(), listings_.end(), [](const ModuleListing &a, const ModuleListing &b) {
+                return a.generation < b.generation;
+            });
+        }
+        listings_dropped_through_ = std::max(listings_dropped_through_, victim->generation);
+        listings_.erase(victim);
+    }
+    ModuleListing listing;
+    listing.module_uuid = module_uuid;
+    listing.generation = generation_;
+    listings_.push_back(listing);
+}
+
 RegistryView Registry::view(std::chrono::steady_clock::time_point now) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    return view_locked(now);
+}
+
+void Registry::hold(const std::function<void(const RegistryView &)> &fn, std::chrono::steady_clock::time_point now) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fn) {
+        fn(view_locked(now));
+    }
+}
+
+RegistryView Registry::view_locked(std::chrono::steady_clock::time_point now) const
+{
     RegistryView v;
     v.nodes.reserve(nodes_.size());
     for (const auto &n : nodes_) {
@@ -497,6 +670,9 @@ RegistryView Registry::view(std::chrono::steady_clock::time_point now) const
     for (const auto &b : power_bases_) {
         v.power_bases.push_back(with_staleness_applied(b, now));
     }
+    v.generation = generation_;
+    v.listings = listings_;
+    v.listings_dropped_through = listings_dropped_through_;
     return v;
 }
 

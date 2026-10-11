@@ -252,8 +252,11 @@ static int g_ctl_calls_under_lock;
 static int g_join_calls;
 static bool g_join_had_endpoint;
 static pb_enroll_bridge_endpoint_t g_join_endpoint;
+static bool g_join_had_mgmt;
+static pb_enroll_mgmt_credential_t g_join_mgmt;
 
 static esp_err_t w_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enroll_bridge_endpoint_t *endpoint,
+                                const pb_enroll_mgmt_credential_t *mgmt,
                                 void *ctx)
 {
     (void)ctx;
@@ -262,7 +265,16 @@ static esp_err_t w_request_join(char pskd[PB_ENROLL_PSKD_BUF_LEN], const pb_enro
     }
     g_join_calls++;
     g_join_had_endpoint = endpoint != NULL;
+    g_join_had_mgmt = mgmt != NULL;
     memset(&g_join_endpoint, 0, sizeof(g_join_endpoint));
+    memset(&g_join_mgmt, 0, sizeof(g_join_mgmt));
+    if (mgmt != NULL) {
+        g_join_mgmt = *mgmt;
+        if (endpoint != NULL) {
+            g_join_endpoint = *endpoint;
+        }
+        return pb_enroll_ctl_request_join_managed(&g_ctl, pskd, endpoint, mgmt, g_now);
+    }
     if (endpoint != NULL) {
         g_join_endpoint = *endpoint;
         return pb_enroll_ctl_request_join_with_endpoint(&g_ctl, pskd, endpoint, g_now);
@@ -2093,6 +2105,418 @@ static void scenario_endpoint_policy_other(void)
           "an endpoint start afterwards is accepted and started");
 }
 
+/* ---- pb-start with the bridge endpoint AND the management credential (0x06) ---- */
+
+/*
+ * The same bytes are in the app repository's
+ * PowerBaseBLEKit/Tests/PowerBaseBLEKitTests/CodecTests.swift and in
+ * docs/power-base-management.md (section 5):
+ *   the endpoint vector above, then management format 1, hub id 10..1f,
+ *   generation 20..2f, key 30..4f, PSKd "J01NME7K"
+ */
+#define GOLDEN_START_MGMT_HEX                                                                                        \
+    "01060800" "6055f9fffe001234" "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"               \
+    "0100" "1634" "fd112233445500008c1f2e3d4c5b6a79"                                                                 \
+    "0100" "101112131415161718191a1b1c1d1e1f" "202122232425262728292a2b2c2d2e2f"                                       \
+    "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f" "4a30314e4d45374b"
+#define GOLDEN_START_MGMT_RESP_ACCEPTED_HEX "01860100"
+#define GOLDEN_START_MGMT_RESP_INVALID_HEX "01861e00"
+
+static pb_enroll_mgmt_credential_t golden_mgmt(void)
+{
+    pb_enroll_mgmt_credential_t m;
+    for (int i = 0; i < 16; i++) {
+        m.hub_id[i] = (uint8_t)(0x10 + i);
+        m.generation[i] = (uint8_t)(0x20 + i);
+    }
+    for (int i = 0; i < 32; i++) {
+        m.key[i] = (uint8_t)(0x30 + i);
+    }
+    return m;
+}
+
+static size_t build_start_mgmt(uint8_t out[PB_BLE_START_MGMT_REQ_MAX_LEN + 8], const uint8_t target[8],
+                               const uint8_t request_id[16], const uint8_t challenge[16],
+                               const pb_enroll_bridge_endpoint_t *ep, const pb_enroll_mgmt_credential_t *mgmt,
+                               const char *pskd)
+{
+    size_t n = strlen(pskd);
+    memset(out, 0, PB_BLE_START_MGMT_REQ_MAX_LEN + 8);
+    out[0] = PB_BLE_PROTO_VERSION;
+    out[1] = PB_BLE_MSG_START_MGMT_REQ;
+    out[2] = (uint8_t)n;
+    memcpy(&out[4], target, 8);
+    memcpy(&out[12], request_id, 16);
+    memcpy(&out[28], challenge, 16);
+    out[44] = PB_BLE_BRIDGE_ENDPOINT_VERSION;
+    out[46] = (uint8_t)(ep->port >> 8);
+    out[47] = (uint8_t)ep->port;
+    memcpy(&out[48], ep->addr, 16);
+    out[64] = PB_BLE_MGMT_VERSION;
+    memcpy(&out[66], mgmt->hub_id, 16);
+    memcpy(&out[82], mgmt->generation, 16);
+    memcpy(&out[98], mgmt->key, 32);
+    memcpy(&out[130], pskd, n);
+    return 130 + n;
+}
+
+/* Sends a copy (the handler wipes what it is given) and reports whether the
+ * handler really wiped it. */
+static uint8_t send_mgmt(const uint8_t *msg, size_t len, uint8_t resp[PB_BLE_SHORT_RESP_LEN], bool *wiped)
+{
+    uint8_t copy[PB_BLE_START_MGMT_REQ_MAX_LEN + 16];
+    memcpy(copy, msg, len);
+    pb_ble_adm_handle_start(&g_adm, copy, len, resp, g_now);
+    if (wiped != NULL) {
+        *wiped = all_zero(copy, len);
+    }
+    return resp[2];
+}
+
+static bool mgmt_slot_empty(void)
+{
+    return !g_adm.mgmt_pending && all_zero(&g_adm.mgmt, sizeof(g_adm.mgmt));
+}
+
+static void scenario_management_start(void)
+{
+    printf("\n-- pb-start with the management credential (0x06): golden vector, checks, secrets --\n");
+    const pb_enroll_mgmt_credential_t cred = golden_mgmt();
+    uint8_t golden[PB_BLE_START_MGMT_REQ_MAX_LEN + 8];
+    size_t golden_len = hex_to_bytes(GOLDEN_START_MGMT_HEX, golden, sizeof(golden));
+    CHECK(golden_len == 138 && golden_len == PB_BLE_START_MGMT_REQ_FIXED_LEN + 8, "the vector is 130 + 8 bytes");
+
+    uint8_t id[16], ch[16];
+    for (int i = 0; i < 16; i++) {
+        id[i] = (uint8_t)(0xa0 + i);
+        ch[i] = (uint8_t)(0xc0 + i);
+    }
+    uint8_t built[PB_BLE_START_MGMT_REQ_MAX_LEN + 8];
+    size_t n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    CHECK(n == golden_len && memcmp(built, golden, golden_len) == 0,
+          "the layout in pb_ble_proto.h produces exactly the vector's bytes");
+    CHECK(PB_BLE_MAX_REQUEST_LEN == 162, "the largest request is now 130 + 32 bytes");
+
+    /* The real admission code takes those bytes. */
+    fresh();
+    g_rand_fixed = ch;
+    uint8_t issued[16];
+    CHECK(get_challenge(issued) == PB_BLE_CODE_OK && memcmp(issued, ch, 16) == 0, "(setup) the vector's challenge");
+    uint8_t resp[PB_BLE_SHORT_RESP_LEN], expect[PB_BLE_SHORT_RESP_LEN];
+    bool wiped = false;
+    hex_to_bytes(GOLDEN_START_MGMT_RESP_ACCEPTED_HEX, expect, sizeof(expect));
+    send_mgmt(golden, golden_len, resp, &wiped);
+    CHECK(memcmp(resp, expect, sizeof(expect)) == 0, "answer is 01 86 01 00: its own response type, ACCEPTED");
+    CHECK(wiped, "the decrypted request buffer (it held the key and the PSKd) is wiped");
+    CHECK(g_adm.mgmt_pending && memcmp(&g_adm.mgmt, &cred, sizeof(cred)) == 0 && g_adm.endpoint_pending &&
+              ep_equal(&g_adm.endpoint, &EP_OTBR) && g_adm.pskd_pending && strcmp(g_adm.pskd, PSKD) == 0,
+          "hub id, generation, key, endpoint and PSKd were read from the vector's offsets");
+    CHECK(g_ot.joiner_start_calls == 0 && no_record(), "accepted: nothing started and nothing stored in the BLE callback");
+
+    /* The same request again, and the same id with another key. */
+    send_mgmt(golden, golden_len, resp, NULL);
+    CHECK(resp[1] == PB_BLE_MSG_START_MGMT_RESP && resp[2] == PB_BLE_CODE_DUPLICATE, "the exact retransmission: DUPLICATE");
+    memcpy(built, golden, golden_len);
+    built[98 + 31] ^= 0x01;
+    send_mgmt(built, golden_len, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_REQUEST_CONFLICT, "the same request id with another key: REQUEST_CONFLICT, never a duplicate");
+    memcpy(built, golden, golden_len);
+    built[82] ^= 0x01;
+    send_mgmt(built, golden_len, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_REQUEST_CONFLICT, "the same request id with another generation: REQUEST_CONFLICT");
+    CHECK(g_adm.mgmt_pending && memcmp(&g_adm.mgmt, &cred, sizeof(cred)) == 0, "the accepted request's credential is unchanged");
+
+    CHECK(poll() == PB_BLE_OPEN && g_join_calls == 1 && g_join_had_mgmt && g_join_had_endpoint &&
+              memcmp(&g_join_mgmt, &cred, sizeof(cred)) == 0 && ep_equal(&g_join_endpoint, &EP_OTBR),
+          "the worker hands exactly that credential and endpoint to the controller");
+    CHECK(g_ctl_calls_under_lock == 0, "with the leaf lock released");
+    CHECK(mgmt_slot_empty() && endpoint_slot_empty() && all_zero(g_adm.pskd, sizeof(g_adm.pskd)),
+          "the admission slot is wiped once taken: no key left there");
+    CHECK(g_ctl.state == PB_ENROLL_STATE_JOINING && g_ctl.pending_mgmt &&
+              memcmp(&g_ctl.pending_mgmt_cred, &cred, sizeof(cred)) == 0 && no_record(),
+          "the controller holds it in RAM while joining; nothing in NVS yet");
+
+    /* Enrolled: one version 3 record. */
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    pb_enroll_record_t rec;
+    CHECK(g_ctl.state == PB_ENROLL_STATE_ENROLLED && g_ctl.has_mgmt && !g_ctl.pending_mgmt &&
+              all_zero(&g_ctl.pending_mgmt_cred, sizeof(g_ctl.pending_mgmt_cred)),
+          "enrolled; the controller's RAM copy of the key is wiped");
+    CHECK(pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_VALID && rec.has_mgmt &&
+              rec.mgmt_state == PB_ENROLL_MGMT_ENROLLED && memcmp(&rec.mgmt, &cred, sizeof(cred)) == 0 &&
+              rec.has_bridge_endpoint && ep_equal(&rec.bridge_endpoint, &EP_OTBR) &&
+              memcmp(&rec.id, &NET_OTBR, sizeof(rec.id)) == 0,
+          "one record (version 3) holds the marker, the endpoint and the credential");
+    CHECK(poll() == PB_BLE_CLOSE_ENROLLED, "BLE enrollment closes");
+
+    /* What is not a usable credential. */
+    static const struct {
+        int offset;
+        int len;
+        uint8_t set;
+        const char *what;
+    } bad[] = {
+        {64, 1, 2, "management format 2 is INVALID_MANAGEMENT"},
+        {64, 1, 0, "management format 0 is INVALID_MANAGEMENT"},
+        {66, 16, 0, "an all-zero hub id is INVALID_MANAGEMENT"},
+        {82, 16, 0, "an all-zero generation is INVALID_MANAGEMENT"},
+        {98, 32, 0, "an all-zero key is INVALID_MANAGEMENT"},
+    };
+    hex_to_bytes(GOLDEN_START_MGMT_RESP_INVALID_HEX, expect, sizeof(expect));
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        fresh();
+        get_challenge(ch);
+        n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+        memset(&built[bad[i].offset], bad[i].set, (size_t)bad[i].len);
+        send_mgmt(built, n, resp, &wiped);
+        CHECK(memcmp(resp, expect, sizeof(expect)) == 0 && wiped && g_adm.q_count == 0 && mgmt_slot_empty() &&
+                  !g_adm.pskd_pending && g_adm.rec_phase == PB_BLE_REC_NONE,
+              bad[i].what);
+    }
+    CHECK(expect[1] == 0x86 && expect[2] == 0x1e, "(answered 01 86 1e 00; nothing queued, no attempt record, nothing kept)");
+
+    /* Malformed: its layout, not its values. */
+    fresh();
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    built[65] = 1;
+    send_mgmt(built, n, resp, NULL);
+    CHECK(resp[1] == PB_BLE_MSG_START_MGMT_RESP && resp[2] == PB_BLE_CODE_MALFORMED, "a non-zero reserved byte [65]: MALFORMED");
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n - 1, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_MALFORMED, "one byte short: MALFORMED");
+    send_mgmt(built, n + 1, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_MALFORMED, "one byte long: MALFORMED");
+    /* The 0x04 bytes with the type changed to 0x06 are not a 0x06 message. */
+    uint8_t ep_msg[PB_BLE_START_EP_REQ_MAX_LEN + 8];
+    size_t ep_len = build_start_ep(ep_msg, EUI_A, id, ch, &EP_OTBR, PSKD);
+    ep_msg[1] = PB_BLE_MSG_START_MGMT_REQ;
+    send_mgmt(ep_msg, ep_len, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_MALFORMED && g_adm.q_count == 0, "a 0x04-sized message with type 0x06: MALFORMED");
+    /* ... and the challenge was not used up by any of those. */
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    CHECK(send_mgmt(built, n, resp, NULL) == PB_BLE_CODE_ACCEPTED, "the malformed attempts did not spend the challenge");
+
+    /* The other rules are the ones of the start with an endpoint. */
+    fresh();
+    get_challenge(ch);
+    pb_enroll_bridge_endpoint_t bad_ep = EP_OTBR;
+    bad_ep.port = 0;
+    n = build_start_mgmt(built, EUI_A, id, ch, &bad_ep, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    CHECK(resp[1] == PB_BLE_MSG_START_MGMT_RESP && resp[2] == PB_BLE_CODE_INVALID_ENDPOINT && mgmt_slot_empty(),
+          "port 0: INVALID_ENDPOINT, answered with this message's own type");
+    fresh();
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_B, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_WRONG_TARGET && mgmt_slot_empty(), "another board's EUI-64: WRONG_TARGET, the credential is not kept");
+    fresh();
+    get_challenge(ch);
+    ch[0] ^= 1;
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    CHECK(resp[2] == PB_BLE_CODE_CHALLENGE_INVALID && mgmt_slot_empty(), "a wrong challenge: CHALLENGE_INVALID");
+
+    /* An image that requires the endpoint takes it (it carries one); an
+     * unusable policy takes nothing. */
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_REQUIRED, PB_ENROLL_ENDPOINT_POLICY_REQUIRED, false);
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    CHECK(send_mgmt(built, n, resp, NULL) == PB_BLE_CODE_ACCEPTED, "'endpoint required' image: the 0x06 start is accepted");
+    fresh_with_policy(PB_ENROLL_ENDPOINT_POLICY_INVALID, PB_ENROLL_ENDPOINT_POLICY_INVALID, false);
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    CHECK(send_mgmt(built, n, resp, NULL) == PB_BLE_CODE_UNAVAILABLE && mgmt_slot_empty(),
+          "unusable image policy: UNAVAILABLE, nothing kept");
+
+    /* A queued credential leaves with the attempt. */
+    fresh();
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    uint8_t cancel[PB_BLE_CANCEL_REQ_LEN] = {PB_BLE_PROTO_VERSION, PB_BLE_MSG_CANCEL_REQ, 0, 0};
+    memcpy(&cancel[4], EUI_A, 8);
+    memcpy(&cancel[12], id, 16);
+    pb_ble_adm_handle_cancel(&g_adm, cancel, sizeof(cancel), resp);
+    CHECK(resp[2] == PB_BLE_CODE_OK && mgmt_slot_empty() && !g_adm.pskd_pending,
+          "cancelling a queued start wipes its credential with its PSKd");
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    pb_ble_adm_wipe(&g_adm);
+    CHECK(mgmt_slot_empty(), "pb_ble_adm_wipe() leaves no credential");
+
+    /* The older starts are untouched: no credential, older record versions. */
+    fresh();
+    uint8_t id2[16];
+    make_id(id2, 0x90);
+    CHECK(start_ep_new(id2, &EP_OTBR, PSKD) == PB_BLE_CODE_ACCEPTED && !g_adm.mgmt_pending, "(the 0x04 start still carries none)");
+    poll();
+    CHECK(g_join_had_endpoint && !g_join_had_mgmt && !g_ctl.pending_mgmt, "and the controller is given none");
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    CHECK(pb_enroll_record_load(EUI_A, &rec) == PB_ENROLL_MARKER_VALID && !rec.has_mgmt && rec.has_bridge_endpoint &&
+              !g_ctl.has_mgmt,
+          "a 0x04 enrollment still writes record version 2, without a credential");
+}
+
+/* The key never reaches the log, as hex or as bytes. */
+static void scenario_management_never_logged(void)
+{
+    printf("\n-- the management key never reaches the log output --\n");
+    char path[] = "/tmp/pb_ble_mgmt_logXXXXXX";
+    int fd = mkstemp(path);
+    fflush(stderr);
+    int saved = dup(STDERR_FILENO);
+    dup2(fd, STDERR_FILENO);
+
+    const pb_enroll_mgmt_credential_t cred = golden_mgmt();
+    uint8_t id[16], ch[16], built[PB_BLE_START_MGMT_REQ_MAX_LEN + 8], resp[PB_BLE_SHORT_RESP_LEN];
+    make_id(id, 0x91);
+    fresh();
+    get_challenge(ch);
+    size_t n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    built[64] = 9; /* refused */
+    send_mgmt(built, n, resp, NULL);
+    get_challenge(ch);
+    n = build_start_mgmt(built, EUI_A, id, ch, &EP_OTBR, &cred, PSKD);
+    send_mgmt(built, n, resp, NULL);
+    poll();
+    g_ot.has_key = true;
+    pb_enroll_ctl_on_joiner_done(&g_ctl, g_ot.last_attempt, PB_ENROLL_JOINER_OK, g_now);
+    g_ot.complete = true;
+    g_ot.id = NET_OTBR;
+    pb_enroll_ctl_tick(&g_ctl, true, g_now);
+    poll();
+
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    static char log[65536];
+    memset(log, 0, sizeof(log));
+    lseek(fd, 0, SEEK_SET);
+    ssize_t len = read(fd, log, sizeof(log) - 1);
+    close(fd);
+    unlink(path);
+    CHECK(len > 0, "the scenario produced log output");
+    bool leaked = false;
+    const struct {
+        const uint8_t *p;
+        size_t n;
+    } secrets[] = {{cred.key, 32}, {cred.generation, 16}, {cred.hub_id, 16}};
+    for (size_t s2 = 0; s2 < sizeof(secrets) / sizeof(secrets[0]); s2++) {
+        for (size_t i = 0; i + 4 <= secrets[s2].n; i++) {
+            char lower[9] = {0}, upper[9] = {0};
+            for (int b = 0; b < 4; b++) {
+                sprintf(&lower[2 * b], "%02x", secrets[s2].p[i + b]);
+                sprintf(&upper[2 * b], "%02X", secrets[s2].p[i + b]);
+            }
+            leaked = leaked || strstr(log, lower) != NULL || strstr(log, upper) != NULL;
+        }
+        for (ssize_t i = 0; i + (ssize_t)secrets[s2].n <= len; i++) {
+            leaked = leaked || memcmp(&log[i], secrets[s2].p, secrets[s2].n) == 0;
+        }
+    }
+    CHECK(!leaked, "no key, generation or hub id in the log, as hex or as bytes");
+    CHECK(strstr(log, PSKD) == NULL, "and no PSKd");
+}
+
+/* ---- the release receipt (PB_BLE_MSG_RECEIPT_REQ on pb-status) ---- */
+
+static int g_receipt_calls;
+static bool g_receipt_present;
+
+static bool fake_receipt_source(uint8_t receipt[PB_BLE_RECEIPT_LEN], void *ctx)
+{
+    (void)ctx;
+    g_receipt_calls++;
+    /* A source that fails still scribbles: what it leaves must not leak. */
+    for (size_t i = 0; i < PB_BLE_RECEIPT_LEN; i++) {
+        receipt[i] = (uint8_t)(0x40 + i);
+    }
+    return g_receipt_present;
+}
+
+static void scenario_release_receipt(void)
+{
+    printf("\n-- the release receipt: read inside the session, changes nothing --\n");
+    uint8_t req[PB_BLE_RECEIPT_REQ_LEN] = {PB_BLE_PROTO_VERSION, PB_BLE_MSG_RECEIPT_REQ, 0, 0};
+    uint8_t out[PB_BLE_RECEIPT_RESP_LEN];
+    uint8_t expected[PB_BLE_RECEIPT_LEN];
+    uint8_t zeros[PB_BLE_RECEIPT_LEN] = {0};
+    for (size_t i = 0; i < PB_BLE_RECEIPT_LEN; i++) {
+        expected[i] = (uint8_t)(0x40 + i);
+    }
+    memcpy(&req[4], EUI_A, 8);
+    CHECK(PB_BLE_RECEIPT_RESP_LEN == 16 + PB_BLE_RECEIPT_LEN && PB_BLE_MAX_RESPONSE_LEN >= PB_BLE_RECEIPT_RESP_LEN,
+          "the response is a 16-byte header and the 96-byte management message");
+    CHECK(pb_ble_adm_is_receipt_request(req, sizeof(req)) && !pb_ble_adm_is_receipt_request(NULL, 0),
+          "the transport recognises the message by its type");
+    uint8_t status_req[PB_BLE_STATUS_REQ_LEN] = {PB_BLE_PROTO_VERSION, PB_BLE_MSG_STATUS_REQ};
+    CHECK(!pb_ble_adm_is_receipt_request(status_req, sizeof(status_req)), "a pb-status request is not one");
+
+    g_receipt_calls = 0;
+    g_receipt_present = true;
+    size_t n = pb_ble_adm_handle_receipt(EUI_A, req, sizeof(req), out, fake_receipt_source, NULL);
+    CHECK(n == PB_BLE_RECEIPT_RESP_LEN && out[0] == PB_BLE_PROTO_VERSION && out[1] == PB_BLE_MSG_RECEIPT_RESP &&
+              out[2] == PB_BLE_CODE_OK && out[3] == 0 && memcmp(&out[4], EUI_A, 8) == 0 &&
+              out[12] == PB_BLE_RECEIPT_VERSION && out[13] == 1 && out[14] == 0 && out[15] == 0 &&
+              memcmp(&out[16], expected, PB_BLE_RECEIPT_LEN) == 0 && g_receipt_calls == 1,
+          "a board with a receipt: OK, its own EUI-64, 'present', and the receipt byte for byte");
+
+    g_receipt_present = false;
+    n = pb_ble_adm_handle_receipt(EUI_A, req, sizeof(req), out, fake_receipt_source, NULL);
+    CHECK(n == PB_BLE_RECEIPT_RESP_LEN && out[2] == PB_BLE_CODE_OK && out[13] == 0 &&
+              memcmp(&out[16], zeros, PB_BLE_RECEIPT_LEN) == 0,
+          "a board without one: OK, 'none', and zeros -- not whatever the source left in the buffer");
+    n = pb_ble_adm_handle_receipt(EUI_A, req, sizeof(req), out, NULL, NULL);
+    CHECK(n == PB_BLE_RECEIPT_RESP_LEN && out[2] == PB_BLE_CODE_OK && out[13] == 0, "a build without a source: 'none'");
+
+    g_receipt_present = true;
+    g_receipt_calls = 0;
+#define REFUSED(stmt, len_expr, code, why)                                                                           \
+    do {                                                                                                             \
+        uint8_t r[PB_BLE_RECEIPT_REQ_LEN + 1] = {0};                                                                 \
+        memcpy(r, req, sizeof(req));                                                                                 \
+        stmt;                                                                                                        \
+        n = pb_ble_adm_handle_receipt(EUI_A, r, (len_expr), out, fake_receipt_source, NULL);                         \
+        CHECK(n == PB_BLE_RECEIPT_RESP_LEN && out[1] == PB_BLE_MSG_RECEIPT_RESP && out[2] == (code) && out[13] == 0 && \
+                  memcmp(&out[16], zeros, PB_BLE_RECEIPT_LEN) == 0,                                                  \
+              why);                                                                                                  \
+    } while (0)
+    REFUSED(memcpy(&r[4], EUI_B, 8), sizeof(req), PB_BLE_CODE_WRONG_TARGET, "another board's EUI-64: WRONG_TARGET, no receipt");
+    REFUSED(r[0] = 2, sizeof(req), PB_BLE_CODE_UNSUPPORTED_VERSION, "another protocol version: refused");
+    REFUSED(r[2] = 1, sizeof(req), PB_BLE_CODE_MALFORMED, "a non-zero reserved byte: MALFORMED");
+    REFUSED(r[3] = 1, sizeof(req), PB_BLE_CODE_MALFORMED, "the other reserved byte: MALFORMED");
+    REFUSED((void)0, sizeof(req) - 1, PB_BLE_CODE_MALFORMED, "one byte short: MALFORMED");
+    REFUSED((void)0, sizeof(req) + 1, PB_BLE_CODE_MALFORMED, "one byte long: MALFORMED");
+    REFUSED(r[1] = PB_BLE_MSG_STATUS_REQ, sizeof(req), PB_BLE_CODE_MALFORMED, "another type: MALFORMED");
+#undef REFUSED
+    CHECK(g_receipt_calls == 0, "a refused request never reads the record");
+    n = pb_ble_adm_handle_receipt(EUI_A, NULL, 0, out, fake_receipt_source, NULL);
+    CHECK(n == PB_BLE_RECEIPT_RESP_LEN && out[2] == PB_BLE_CODE_MALFORMED, "an empty request: MALFORMED");
+
+    /* A board from before the capability gets this message on pb-status and
+     * answers like for any unknown type there. */
+    fresh();
+    uint8_t st[PB_BLE_STATUS_RESP_LEN];
+    n = pb_ble_adm_handle_status(&g_adm, req, sizeof(req), st, g_now);
+    CHECK(n == PB_BLE_STATUS_RESP_LEN && st[1] == PB_BLE_MSG_STATUS_RESP && st[2] == PB_BLE_CODE_MALFORMED,
+          "the status handler itself refuses the type (what firmware without the capability answers)");
+    uint8_t status_ok[PB_BLE_STATUS_RESP_LEN];
+    n = pb_ble_adm_handle_status(&g_adm, status_req, sizeof(status_req), status_ok, g_now);
+    CHECK(n == PB_BLE_STATUS_RESP_LEN && status_ok[2] == PB_BLE_CODE_OK && g_join_calls == 0,
+          "and pb-status works as before; reading a receipt started nothing");
+}
+
 int main(void)
 {
     uint8_t d[32];
@@ -2124,6 +2548,9 @@ int main(void)
     scenario_endpoint_never_logged();
     scenario_endpoint_policy_required();
     scenario_endpoint_policy_other();
+    scenario_management_start();
+    scenario_management_never_logged();
+    scenario_release_receipt();
 
     printf("\n%s: %d failure(s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

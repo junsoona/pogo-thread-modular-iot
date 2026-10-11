@@ -81,6 +81,30 @@ typedef struct {
      * power_base_config's handshake_timeout_ms field genuinely control
      * something instead of being a decorative field nobody reads. */
     uint32_t ack_timeout_ms;
+    /*
+     * Optional (NULL: this parent's identity towards its child never changes
+     * while the child stays docked). A number that changes whenever
+     * everything this parent hands down -- collector endpoint, Dataset, own
+     * depth, own parent -- has been replaced as a whole. A sensor module
+     * wires it to child_service_get_upstream_generation(): its own UPSTREAM
+     * was provisioned and joined again.
+     *
+     * parent_service remembers the number each DOWNSTREAM session was
+     * started under. A session is good only for that number: when the
+     * current one differs, a session under way is dropped, a JOINED one is
+     * no longer JOINED, and the still-docked child is provisioned again from
+     * the first step -- no physical re-dock, no new PEER_READY needed. The
+     * number is compared, never edge-detected, so a change is acted on once
+     * however late parent_service looks, and a number that stays the same
+     * never causes a session. Must be callable from parent_service's own
+     * task at any time and must not block.
+     *
+     * The power base leaves this NULL: being removed and enrolled again
+     * takes its downstream port down and restarts the chip
+     * (power_base/main/app_main.c), which its child sees as a physical
+     * detach.
+     */
+    uint32_t (*get_upstream_generation)(void *ctx);
     void *ctx;
 } parent_service_context_t;
 

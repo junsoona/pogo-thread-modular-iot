@@ -1,0 +1,18 @@
+#
+# Re-enrollment button TRIAL overlay for a spare Power Base (pb_thread:mode=2),
+# on top of the BLE enrollment overlay -- never without it, never in a default
+# or bench build. Separate build directory and sdkconfig file, e.g.:
+#
+#   B="$HOME/esp-builds/<a new directory>"
+#   idf.py -C power_base -B "$B" -D SDKCONFIG="$B/sdkconfig" \
+#       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ble_enrollment;sdkconfig.reenroll_button_gpio9" build
+#
+# HARDWARE ASSUMPTION, NOT A VERIFIED FACT: GPIO9 is the ESP32-H2 BOOT strapping
+# pin and development boards usually wire a "BOOT" push button from it to
+# ground. That this is so on the ESP32-H2 SuperMini boards used here has not
+# been checked on a board. Check it before relying on this build
+# (docs/power-base.md "BOOT 버튼 로컬 재등록").
+#
+CONFIG_POWER_BASE_REENROLL_BUTTON=y
+CONFIG_POWER_BASE_REENROLL_BUTTON_GPIO=9
+CONFIG_POWER_BASE_REENROLL_BUTTON_ACTIVE_LOW=y

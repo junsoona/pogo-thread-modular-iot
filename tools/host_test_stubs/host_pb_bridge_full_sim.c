@@ -326,6 +326,13 @@ otError otCoapSendResponse(otInstance *instance, otMessage *message, const otMes
     return OT_ERROR_NONE;
 }
 
+static void (*s_send_hook)(const host_pb_bridge_full_sim_sent_t *sent);
+
+void host_pb_bridge_full_sim_set_send_hook(void (*hook)(const host_pb_bridge_full_sim_sent_t *sent))
+{
+    s_send_hook = hook;
+}
+
 otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message, const otMessageInfo *messageInfo,
                                          otCoapResponseHandler handler, void *context,
                                          const otCoapTxParameters *txParameters)
@@ -349,6 +356,9 @@ otError otCoapSendRequestWithParameters(otInstance *instance, otMessage *message
     if (messageInfo != NULL) {
         memcpy(cap->peer_addr, messageInfo->mPeerAddr.mFields.m8, sizeof(cap->peer_addr));
         cap->peer_port = messageInfo->mPeerPort;
+    }
+    if (s_send_hook != NULL) {
+        s_send_hook(cap);
     }
 
     outcome_entry_t default_entry = {0};

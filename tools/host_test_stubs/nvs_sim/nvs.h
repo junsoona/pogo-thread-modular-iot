@@ -61,6 +61,27 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, 
 esp_err_t nvs_erase_key(nvs_handle_t handle, const char *key);
 esp_err_t nvs_commit(nvs_handle_t handle);
 
+/* "Is there any entry in this namespace?" (added for
+ * components/power_base_ot_store/pb_stored_network.c and
+ * tools/test_power_base_ot_store.c). Only what that code uses of ESP-IDF's
+ * iterator: nvs_entry_find() answers ESP_OK with an iterator when the
+ * namespace of that partition holds at least one entry and
+ * ESP_ERR_NVS_NOT_FOUND when it holds none or does not exist, like ESP-IDF's;
+ * the iterator can only be released. */
+typedef struct nvs_sim_iterator *nvs_iterator_t;
+typedef enum {
+    NVS_TYPE_BLOB = 0x42,
+    NVS_TYPE_ANY = 0xff,
+} nvs_type_t;
+esp_err_t nvs_entry_find(const char *part_name, const char *namespace_name, nvs_type_t type,
+                         nvs_iterator_t *output_iterator);
+void nvs_release_iterator(nvs_iterator_t iterator);
+
+/* Erases every entry of the handle's namespace (added for
+ * pb_stored_network_settings_erase()). Durable once nvs_commit() succeeds,
+ * like nvs_erase_key(). */
+esp_err_t nvs_erase_all(nvs_handle_t handle);
+
 #ifdef __cplusplus
 }
 #endif

@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -39,6 +40,38 @@ bool rate_limit_ok(std::chrono::steady_clock::time_point &last, std::chrono::mil
 }
 
 constexpr auto kLogRateLimit = std::chrono::milliseconds(5000);
+
+// The second socket of ServerConfig::locate_port: the same options and the
+// same any-address bind as the ingest socket (the per-datagram interface
+// check applies to both). -1 when it cannot be opened; the caller goes on
+// without it.
+int open_locate_socket(uint16_t port)
+{
+    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::perror("ingest: locate socket");
+        return -1;
+    }
+    int on = 1;
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port);
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;
+    if (setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on)) < 0 ||
+        bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        std::fprintf(stderr,
+                     "ingest: the locate port %u could not be opened (%s) -- a Power Base that only knows that port "
+                     "cannot ask this hub where it is; everything else runs as usual\n",
+                     (unsigned)port, std::strerror(errno));
+        close(sock);
+        return -1;
+    }
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return sock;
+}
 
 } // namespace
 
@@ -90,6 +123,18 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
     std::fprintf(stdout, "ingest: bound to interface '%s' (ifindex=%u) port=%u\n", config.interface_name.c_str(),
                  required_ifindex, (unsigned)config.port);
 
+    // See ServerConfig::locate_port. Not needed when the ingest socket is
+    // already on that port.
+    int locate_sock = -1;
+    if (config.locate && config.locate_port != 0 && config.locate_port != config.port) {
+        locate_sock = open_locate_socket(config.locate_port);
+        if (locate_sock >= 0) {
+            std::fprintf(stdout, "ingest: locate port=%u (answers a Power Base's LOCATE only)\n",
+                         (unsigned)config.locate_port);
+        }
+    }
+    bool prefer_locate = false;
+
     std::chrono::steady_clock::time_point last_recv_err_log{};
     std::chrono::steady_clock::time_point last_wrong_iface_log{};
     std::chrono::steady_clock::time_point last_trunc_log{};
@@ -98,6 +143,27 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
     uint8_t buf[2048];
     uint8_t cmsg_buf[256];
     while (should_stop == nullptr || !should_stop->load()) {
+        // One datagram per pass, from whichever socket has one; when both
+        // do, they take turns.
+        int active = sock;
+        bool locate_only = false;
+        if (locate_sock >= 0) {
+            pollfd fds[2] = {{sock, POLLIN, 0}, {locate_sock, POLLIN, 0}};
+            if (poll(fds, 2, 200) <= 0) {
+                continue;
+            }
+            const bool ingest_ready = (fds[0].revents & POLLIN) != 0;
+            const bool locate_ready = (fds[1].revents & POLLIN) != 0;
+            if (!ingest_ready && !locate_ready) {
+                continue;
+            }
+            if (locate_ready && (!ingest_ready || prefer_locate)) {
+                active = locate_sock;
+                locate_only = true;
+            }
+            prefer_locate = !locate_only;
+        }
+
         sockaddr_in6 peer{};
         iovec iov{};
         iov.iov_base = buf;
@@ -110,7 +176,7 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         msg.msg_control = cmsg_buf;
         msg.msg_controllen = sizeof(cmsg_buf);
 
-        ssize_t n = recvmsg(sock, &msg, 0);
+        ssize_t n = recvmsg(active, &msg, 0);
         if (n < 0) {
             // Correction pass: distinguish an expected recv timeout
             // (EAGAIN/EWOULDBLOCK, from SO_RCVTIMEO above -- silent, just
@@ -192,7 +258,20 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         }
 
         uint8_t code;
-        if (status == ParseStatus::UnknownCriticalOption) {
+        std::vector<uint8_t> response_payload;
+        if (locate_only) {
+            // The locate port answers one thing (ServerConfig::locate_port).
+            // Whatever else arrives gets no answer and touches nothing.
+            if (status != ParseStatus::Ok || req.code != kCoapCodePost || req.uri_path != kManagementUriPath) {
+                continue;
+            }
+            ManagementReply reply = config.locate(req.payload);
+            if (reply.silent) {
+                continue;
+            }
+            code = reply.code;
+            response_payload = std::move(reply.payload);
+        } else if (status == ParseStatus::UnknownCriticalOption) {
             // The header (type/message_id/token) parsed fine -- only an
             // option was unrecognized-and-critical -- so a proper 4.02 ACK
             // can still be built and sent (RFC 7252 5.4.1).
@@ -206,7 +285,9 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
                         (unsigned)req.code);
             code = kCoapCodeMethodNotAllowed;
         } else {
-            code = handle_request(registry, req);
+            Response response = handle_request(registry, req, config.management);
+            code = response.code;
+            response_payload = std::move(response.payload);
         }
 
         // Every request reaching this point is Confirmable and therefore
@@ -224,7 +305,7 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         // the ACK's source, which a Power Base awaiting the ACK for a
         // specific CoAP transaction to its configured OTBR MLEID will not
         // match, causing it to retry (see docs/matter-bridge.md).
-        std::vector<uint8_t> ack = coap_build_ack(req, code);
+        std::vector<uint8_t> ack = coap_build_ack(req, code, response_payload);
 
         iovec send_iov{};
         send_iov.iov_base = ack.data();
@@ -251,7 +332,7 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         send_cmsg->cmsg_len = CMSG_LEN(sizeof(send_pktinfo));
         std::memcpy(CMSG_DATA(send_cmsg), &send_pktinfo, sizeof(send_pktinfo));
 
-        ssize_t sent = sendmsg(sock, &send_msg, 0);
+        ssize_t sent = sendmsg(active, &send_msg, 0);
         if (sent < 0) {
             if (rate_limit_ok(last_send_err_log, kLogRateLimit)) {
                 std::fprintf(stderr, "ingest: sendmsg() failed while ACKing uri=%s: %s\n", req.uri_path.c_str(),
@@ -263,6 +344,9 @@ bool run_server(const ServerConfig &config, Registry &registry, std::atomic<bool
         }
     }
     close(sock);
+    if (locate_sock >= 0) {
+        close(locate_sock);
+    }
     return true;
 }
 

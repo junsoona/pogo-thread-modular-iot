@@ -121,6 +121,29 @@ static bool module_parent_get_collector(pogo_collector_endpoint_t *out, void *ct
     return true;
 }
 
+/*
+ * Counts the times the MODULE_DEV_MODE_DEV_ROOT fixture's own network became
+ * ready (root_ready_watcher_task()). A ROOT has no UPSTREAM session, so this
+ * is its share of the number below; it stays 0 on every AUTO module.
+ */
+static volatile uint32_t s_root_ready_generation;
+
+/*
+ * parent_service_context_t.get_upstream_generation for a sensor module:
+ * changes exactly when what this module hands to the module docked below --
+ * the collector endpoint it was given, the Dataset it joined with, its depth
+ * -- has been replaced as a whole, i.e. when child_service carried a new
+ * UPSTREAM provisioning session through to a Thread join (see
+ * child_service_get_upstream_generation()). A role change, a ROUTER
+ * promotion or a radio detach does not move it. The two terms only ever
+ * grow, so their sum changes whenever either does.
+ */
+static uint32_t module_parent_get_upstream_generation(void *ctx)
+{
+    (void)ctx;
+    return child_service_get_upstream_generation() + s_root_ready_generation;
+}
+
 static const parent_service_context_t s_module_parent_ctx = {
     .provisioning_allowed = module_parent_provisioning_allowed,
     .get_own_depth = module_parent_get_own_depth,
@@ -129,6 +152,7 @@ static const parent_service_context_t s_module_parent_ctx = {
     .is_power_base = false,
     .get_collector = module_parent_get_collector,
     .ack_timeout_ms = 0, /* use CONFIG_POGO_ACK_TIMEOUT_MS, unchanged from before this refactor */
+    .get_upstream_generation = module_parent_get_upstream_generation,
     .ctx = NULL,
 };
 
@@ -164,6 +188,7 @@ static void root_ready_watcher_task(void *arg)
             if (my_gen == s_root_watch_generation) {
                 ESP_LOGI(TAG, "ROOT ready: otDeviceRole=%u -- downstream provisioning may now proceed",
                          (unsigned)role);
+                s_root_ready_generation++; /* before "ready", as child_service does for a joined session */
                 role_manager_set_upstream_ready(true);
             }
             vTaskDelete(NULL);

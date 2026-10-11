@@ -133,18 +133,37 @@ def main():
     check(poll is not None and calls and bad == 0 and depth == 0,
           "pb_ble_adm_worker_poll(): every controller call is made with the leaf lock released")
 
-    print("\n-- 2. BLE is started, polled and stopped only by the enrollment task --")
+    print("\n-- 2. BLE is started, polled and stopped only by the worker task of the boot --")
     sources = {"enrollment_runtime.c": rt, "enrollment_ble.c": ble, "pb_ble_service.c": svc,
                "app_main.c": strip_c_comments(read("power_base/main/app_main.c")),
                "enrollment_console.c": strip_c_comments(read("power_base/main/enrollment_console.c"))}
     task = function_body(rt, r"static\s+void\s+enrollment_task\s*\(")
     check(task is not None, "enrollment_task() found")
+    # A re-enrollment window boot (docs/power-base.md "BOOT 버튼 로컬 재등록") has its own worker,
+    # reenroll_window_task(), INSTEAD of enrollment_task(): one of the two exists in a boot, never both.
+    window_task = function_body(rt, r"static\s+void\s+reenroll_window_task\s*\(")
+    check(window_task is not None, "reenroll_window_task() found")
     for fn in ("pb_enrollment_ble_start", "pb_enrollment_ble_poll"):
         users = [n for n, c in sources.items() if re.search(r"\b" + fn + r"\s*\(\s*\)\s*;", c)
                  or re.search(r"=\s*" + fn + r"\s*\(\s*\)", c)]
-        check(users == ["enrollment_runtime.c"] and task is not None and fn in task and
-              len(re.findall(r"\b" + fn + r"\s*\(", rt)) == 1,
-              f"{fn}() is called from exactly one place: enrollment_task()")
+        check(users == ["enrollment_runtime.c"] and task is not None and task.count(fn + "(") == 1 and
+              window_task is not None and window_task.count(fn + "(") == 1 and
+              len(re.findall(r"\b" + fn + r"\s*\(", rt)) == 2,
+              f"{fn}() is called from exactly two places, the two worker tasks: enrollment_task() and "
+              "reenroll_window_task()")
+    start_fn = function_body(rt, r"esp_err_t\s+pb_enrollment_runtime_start\s*\(")
+    window_start = function_body(rt, r"esp_err_t\s+pb_enrollment_runtime_start_reenroll_window\s*\(")
+    check(start_fn is not None and window_start is not None and
+          "xTaskCreate(enrollment_task" in start_fn and "reenroll_window_task" not in start_fn and
+          "xTaskCreate(reenroll_window_task" in window_start and "enrollment_task," not in window_start and
+          len(re.findall(r"xTaskCreate\(", rt)) == 2,
+          "each runtime start creates its own worker and only that one")
+    app = sources["app_main.c"]
+    win_call = app.find("pb_enrollment_runtime_start_reenroll_window(")
+    normal_call = app.find("pb_enrollment_runtime_start(")
+    check(-1 < win_call < normal_call and re.search(r"return;\s*\}\s*#else", app[win_call:normal_call]) is not None and
+          len(re.findall(r"pb_enrollment_runtime_start(_reenroll_window)?\(", app)) == 2,
+          "app_main.c starts exactly one of the two in a boot: the window boot returns before the ordinary start")
     stop_callers = [n for n, c in sources.items() if "protocomm_ble_stop" in c]
     ble_poll = function_body(ble, r"void\s+pb_enrollment_ble_poll\s*\(")
     ble_start = function_body(ble, r"esp_err_t\s+pb_enrollment_ble_start\s*\(")
@@ -212,14 +231,77 @@ def main():
     for field in ("ble_bonding", "ble_sm_sc", "ble_link_encryption", "keep_ble_on"):
         check(re.search(r"ble\." + field + r"\s*=\s*0\s*;", ble) is not None, f"protocomm BLE config: {field} = 0")
     check("factory" not in ble and "erase" not in ble.lower() and "dataset" not in ble.lower() and
-          "esp_console" not in ble and "pb_enrollment_forget" not in ble,
-          "enrollment_ble.c offers no factory reset, Dataset access or console")
+          "esp_console" not in ble and "pb_enrollment_forget" not in ble and "nvs_" not in ble and
+          "thread_manager" not in ble,
+          "enrollment_ble.c itself erases nothing and has no Dataset, NVS, Thread or console access")
+    wiring = re.search(r"if\s*\(\s*pb_reenroll_runtime_enabled\(\)\s*\)\s*\{(.*?)\n    \}", ble, re.S)
+    check(wiring is not None and "svc.ctl.local_reset = pb_reenroll_runtime_local_reset" in wiring.group(1) and
+          ble.count("pb_reenroll_runtime_local_reset") == 1 and "svc.local_reset = true" in wiring.group(1) and
+          ble.count("svc.local_reset") == 1,
+          "the local reset it hands to the worker is enrollment_reenroll.c's, and only on a board whose button "
+          "passed its check")
+
+    print("\n-- 4b. re-enrollment window boot and the button (docs/power-base.md) --")
+    reenroll = strip_c_comments(read("power_base/main/enrollment_reenroll.c"))
+    comp = "".join(strip_c_comments(read("components/power_base_reenroll/" + f))
+                   for f in ("pb_reenroll.c", "pb_reenroll_store.c", "pb_reenroll_button.c"))
+    check(window_start is not None and "pb_enroll_ctl_boot(" not in window_start and "s_ready(" not in window_start and
+          "thread_manager_start" not in window_start,
+          "the window boot never applies the boot rule: no resume, no Thread start, no service start")
+    check(window_task is not None and "s_ready(" not in window_task and "esp_restart(" in window_task and
+          "pb_enroll_ctl_" not in window_task,
+          "its worker only runs BLE and ends in a restart")
+    join = function_body(rt, r"static\s+esp_err_t\s+request_join\s*\(")
+    check(join is not None and -1 < join.find("if (s_reenroll_window)") < join.find("xSemaphoreTake(s_lock"),
+          "every Joiner request is refused in a window boot before the controller is reached")
+    button = function_body(reenroll, r"static\s+void\s+button_task\s*\(")
+    forbidden = ("nvs_flash_erase", "protocomm", "thread_manager", "pb_enroll_marker_clear", "pb_reenroll_reset",
+                 "pb_network_store", "pb_enrollment_ble", "pb_reenroll_journal")
+    check(button is not None and not any(f in button for f in forbidden) and
+          "pb_reenroll_gate(" in button and "pb_reenroll_window_store(" in button and "esp_restart" not in button and
+          "restart_now(" in button,
+          "the button task only samples, asks the gate, stores the window request and restarts")
+    check(button is not None and -1 < button.find("pb_reenroll_gate(") < button.find("pb_reenroll_window_store(") <
+          button.find("restart_now("),
+          "in that order: gate, then the stored request, then the restart")
+    check("gpio_isr" not in reenroll and "gpio_install_isr_service" not in reenroll and
+          re.findall(r"GPIO_INTR_\w+", reenroll) == ["GPIO_INTR_DISABLE"],
+          "the button has no interrupt handler at all (so nothing can run in an ISR)")
+    for name, text in (("enrollment_reenroll.c", reenroll), ("components/power_base_reenroll", comp)):
+        check("nvs_flash_erase" not in text and "nvs_erase_all" not in text and "\"cfg\"" not in text and
+              "POWER_BASE_CONFIG_NVS_PARTITION" not in text and "nvs_open_from_partition" not in text,
+              f"{name}: never erases a partition or a whole namespace and never opens the cfg partition")
+    check("pb_mgmt_" not in comp and "PB_MGMT_" not in comp and "done_mac" not in comp,
+          "the local reset builds no management message and no release receipt")
+    first = app.find("pb_reenroll_runtime_")
+    last = app.rfind("pb_reenroll_runtime_")
+    m2 = re.search(r"if\s*\(s_thread_cfg\.mode == POWER_BASE_THREAD_MODE_AWAIT_COMMISSIONING\)\s*\{\s*"
+                   r"ESP_ERROR_CHECK\(thread_manager_stop\(\)\);", app)
+    mode2 = m2.start() if m2 else -1
+    other_modes = app.find("thread_manager_start_as_always_on_ftd_with_dataset(")
+    check(-1 < mode2 < first <= last < other_modes,
+          "app_main.c: everything of the re-enrollment is inside the mode 2 branch (modes 0/1 untouched)")
+    check(-1 < app.find("pb_reenroll_runtime_boot(") < app.find("pb_mgmt_runtime_finish_pending_release(") <
+          app.find("pb_enrollment_runtime_start_reenroll_window("),
+          "boot order: journaled local reset, then a pending remote release, then (maybe) the window")
 
     print("\n-- 5. build configurations --")
     defaults = read("power_base/sdkconfig.defaults")
     bench = read("power_base/sdkconfig.bench_joiner")
     overlay = read("power_base/sdkconfig.ble_enrollment")
     module_defaults = read("module/sdkconfig.defaults")
+    button_overlay = read("power_base/sdkconfig.reenroll_button_gpio9")
+    kconfig = read("power_base/main/Kconfig.projbuild")
+    button_opt = re.search(r"config POWER_BASE_REENROLL_BUTTON\n(.*?)\n\s*help", kconfig, re.S)
+    check(button_opt is not None and "depends on POWER_BASE_BLE_ENROLLMENT" in button_opt.group(1) and
+          "default n" in button_opt.group(1),
+          "the re-enrollment button needs the BLE enrollment build and is off by default")
+    check(all("POWER_BASE_REENROLL_BUTTON" not in c for c in (defaults, bench, overlay, module_defaults,
+                                                               read("rcp/sdkconfig.defaults"))),
+          "default, bench, plain BLE, module and RCP configurations do not have it")
+    check("CONFIG_POWER_BASE_REENROLL_BUTTON=y" in button_overlay and
+          "CONFIG_POWER_BASE_REENROLL_BUTTON_GPIO=9" in button_overlay and "HARDWARE ASSUMPTION" in button_overlay,
+          "only the GPIO9 trial overlay sets it, and says that the wiring is an assumption")
     for name, text in (("power_base/sdkconfig.defaults", defaults), ("power_base/sdkconfig.bench_joiner", bench),
                        ("module/sdkconfig.defaults", module_defaults)):
         check(not re.search(r"^CONFIG_(BT_|POWER_BASE_BLE|ESP_PROTOCOMM|ESP_COEX)", text, re.MULTILINE),
@@ -322,9 +404,20 @@ def main():
           "the endpoint start: type 0x04 / 0x84, 64 + PSKd bytes, endpoint format 1, code 0x1d, capability name")
     version_json = re.search(r"#define PB_BLE_VERSION_JSON(.*?)\n\n", svc_h, re.DOTALL)
     version_plain = version_json.group(1).replace("\\", "") if version_json else ""
-    check(re.search(r'"pb_enroll":\{"proto":1,"\s*"?"cap":\["" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 ""\]\}\}', version_plain)
-          is not None,
-          "proto-ver: pb_enroll.proto stays 1 and pb_enroll.cap lists the capability")
+    check(re.search(r'"pb_enroll":\{"proto":1,"\s*"?"cap":\["" PB_BLE_CAP_BRIDGE_ENDPOINT_V1 "","" PB_BLE_CAP_MGMT_V1 "","" '
+                    r'PB_BLE_CAP_RELEASE_RECEIPT_V1\s*"?"\]\}\}', re.sub(r"\s*\n\s*", "", version_plain)) is not None,
+          "proto-ver: pb_enroll.proto stays 1 and pb_enroll.cap lists the three capabilities")
+    check(define(proto_h, "PB_BLE_MSG_RECEIPT_REQ") == "0x07u" and define(proto_h, "PB_BLE_MSG_RECEIPT_RESP") == "0x87u" and
+          define(proto_h, "PB_BLE_RECEIPT_REQ_LEN") == "12" and define(proto_h, "PB_BLE_RECEIPT_RESP_LEN") == "112" and
+          define(proto_h, "PB_BLE_RECEIPT_LEN") == "96" and
+          define(proto_h, "PB_BLE_CAP_RELEASE_RECEIPT_V1") == '"release_receipt_v1"',
+          "the release receipt: type 0x07 / 0x87 on pb-status, 12 and 112 bytes, capability name")
+    check(define(proto_h, "PB_BLE_MSG_START_MGMT_REQ") == "0x06u" and define(proto_h, "PB_BLE_MSG_START_MGMT_RESP") == "0x86u" and
+          define(proto_h, "PB_BLE_START_MGMT_REQ_FIXED_LEN") == "130" and
+          define(proto_h, "PB_BLE_START_MGMT_REQ_MAX_LEN") == "162" and define(proto_h, "PB_BLE_MGMT_VERSION") == "1u" and
+          define(proto_h, "PB_BLE_CAP_MGMT_V1") == '"mgmt_v1"' and
+          re.search(r"PB_BLE_CODE_INVALID_MANAGEMENT\s*=\s*0x1e\b", proto_h) is not None,
+          "the management start: type 0x06 / 0x86, 130 + PSKd bytes, management format 1, code 0x1e, capability name")
     check('sec_ver":2' in version_json.group(1).replace("\\", "") and
           'sec_patch_ver":1' in version_json.group(1).replace("\\", ""),
           "proto-ver still announces Security 2, patch 1")
@@ -425,8 +518,8 @@ def main():
     check(req is not None and -1 < pol_at < req.find("pb_enroll_marker_clear()") < req.find("c->ops.joiner_start(") and
           pol_at < req.find("c->attempt++") and "ESP_ERR_NOT_ALLOWED" in req,
           "the controller refuses before it erases the old record, counts an attempt or starts the Joiner")
-    check(len(re.findall(r"\brequest_join\(c, pskd, (NULL|endpoint), now_ms\)", ctl_c)) == 2,
-          "both public request functions go through that one check")
+    check(len(re.findall(r"\brequest_join\(c, pskd, (NULL|endpoint), (NULL|mgmt), now_ms\)", ctl_c)) == 3,
+          "all three public request functions (plain, with endpoint, managed) go through that one check")
     boot_fn = function_body(ctl_c, r"pb_enroll_state_t\s+pb_enroll_ctl_boot\s*\(")
     guard_at = boot_fn.find("c->endpoint_policy == PB_ENROLL_ENDPOINT_POLICY_REQUIRED")
     check(-1 < guard_at < boot_fn.find("c->ops.thread_start_stored(") and

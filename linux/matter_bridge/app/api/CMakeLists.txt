@@ -60,6 +60,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_library(pogohome_api STATIC
+    src/build_info.cpp
     src/hex.cpp
     src/sensor_kind.cpp
     src/json_snapshot.cpp
@@ -76,17 +77,49 @@ add_library(pogohome_api STATIC
     src/tls_identity.cpp
     src/commissioner.cpp
     src/enrollment.cpp
+    src/power_base_management.cpp
     ${REPO_ROOT}/linux/matter_bridge/ingest/src/registry.cpp
+    # The REAL management wire format the Power Base firmware compiles
+    # (pure C, no ESP-IDF dependency) -- never reimplemented here.
+    ${REPO_ROOT}/components/power_base_mgmt/pb_mgmt_proto.c
 )
 target_include_directories(pogohome_api PUBLIC
     include
     ${REPO_ROOT}/linux/matter_bridge/ingest/include
     ${REPO_ROOT}/components/sensor_channel/include
     ${REPO_ROOT}/components/topology_proto/include
+    ${REPO_ROOT}/components/power_base_mgmt/include
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(pogohome_api PRIVATE -Wall -Wextra)
 endif()
+
+# The build identity (docs/versioning.md): component, product version from
+# the repository's versions.json, commit, clean/dirty, source fingerprint --
+# as a header in the BUILD directory, never in the source tree.
+# tools/pogo_version.py writes it only when its content changes and is asked
+# at every build, so an incremental build after a source change or a commit
+# recompiles build_info.cpp with the new identity. -DPOGO_RELEASE=ON makes it
+# a release build, which the tool refuses for a dirty tree or unknown commit.
+option(POGO_RELEASE "Stamp this build as a release (needs a clean tree and a known commit)" OFF)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(POGO_BUILD_INFO_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen")
+set(POGO_BUILD_INFO_STAMP ${Python3_EXECUTABLE} "${REPO_ROOT}/tools/pogo_version.py" stamp --component linux_bridge
+    --out "${POGO_BUILD_INFO_DIR}/pogo_build_info_gen.h" --variant "cmake-host-${CMAKE_BUILD_TYPE}" --quiet)
+if(POGO_RELEASE)
+    list(APPEND POGO_BUILD_INFO_STAMP --release)
+endif()
+execute_process(COMMAND ${POGO_BUILD_INFO_STAMP} RESULT_VARIABLE POGO_BUILD_INFO_RESULT)
+if(NOT POGO_BUILD_INFO_RESULT EQUAL 0)
+    message(FATAL_ERROR "tools/pogo_version.py stamp failed (${POGO_BUILD_INFO_RESULT})")
+endif()
+add_custom_target(pogo_build_info_stamp
+    COMMAND ${POGO_BUILD_INFO_STAMP}
+    BYPRODUCTS "${POGO_BUILD_INFO_DIR}/pogo_build_info_gen.h"
+    COMMENT "POGO build identity"
+    VERBATIM)
+add_dependencies(pogohome_api pogo_build_info_stamp)
+target_include_directories(pogohome_api PRIVATE "${POGO_BUILD_INFO_DIR}")
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -153,7 +186,31 @@ add_executable(pogohome_api_unit_tests
     tests/test_otbr_helper.cpp
     tests/test_enrollment.cpp
     tests/test_enrollment_api.cpp
+    tests/test_power_base_management.cpp
+    tests/test_removal_api.cpp
+    tests/test_build_info.cpp
     tests/test_main.cpp
+    # Power Base management is tested against the REAL firmware side
+    # (docs/power-base-management.md): the board's management client and
+    # enrollment record code, unmodified, over the firmware host tests' NVS
+    # simulator -- and through the real ingest dispatch (session.cpp), which
+    # needs the data path's wire formats to link.
+    ${REPO_ROOT}/components/power_base_mgmt/pb_mgmt_client.c
+    ${REPO_ROOT}/components/power_base_enrollment/power_base_enrollment.c
+    ${REPO_ROOT}/tools/host_test_stubs/nvs_sim/nvs_sim.c
+    ${REPO_ROOT}/linux/matter_bridge/ingest/src/session.cpp
+    ${REPO_ROOT}/linux/matter_bridge/ingest/src/minicoap.cpp
+    ${REPO_ROOT}/components/bridge_export_proto/bridge_export_proto.c
+    ${REPO_ROOT}/components/sensor_channel/sensor_channel.c
+    ${REPO_ROOT}/components/pogo_proto/pogo_crc16.c
+)
+target_include_directories(pogohome_api_unit_tests PRIVATE
+    # nvs_sim first: its nvs.h is the functional simulator's.
+    ${REPO_ROOT}/tools/host_test_stubs/nvs_sim
+    ${REPO_ROOT}/tools/host_test_stubs
+    ${REPO_ROOT}/components/power_base_enrollment/include
+    ${REPO_ROOT}/components/bridge_export_proto/include
+    ${REPO_ROOT}/components/pogo_proto/include
 )
 target_link_libraries(pogohome_api_unit_tests PRIVATE pogohome_api)
 target_compile_definitions(pogohome_api_unit_tests PRIVATE
@@ -165,3 +222,23 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(pogohome_api_unit_tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME pogohome_api_unit_tests COMMAND pogohome_api_unit_tests)
+
+# The version a built binary prints is the one in versions.json -- read here
+# from the file itself, independently of the stamp the binary was built with.
+file(READ "${REPO_ROOT}/versions.json" POGO_VERSIONS_JSON)
+string(JSON POGO_LINUX_BRIDGE_VERSION GET "${POGO_VERSIONS_JSON}" components linux_bridge version)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${REPO_ROOT}/versions.json")
+string(REPLACE "." "\\." POGO_LINUX_BRIDGE_VERSION_RE "${POGO_LINUX_BRIDGE_VERSION}")
+add_test(NAME pogohome_build_info_matches_versions COMMAND pogohome-hubctl --version)
+set_tests_properties(pogohome_build_info_matches_versions PROPERTIES PASS_REGULAR_EXPRESSION
+    "^pogohome-hubctl ${POGO_LINUX_BRIDGE_VERSION_RE} \\(linux_bridge, build [0-9a-f]+(\\+dirty)?\\.[0-9a-f]+, (development|release)\\)")
+
+# The same source built WITHOUT the stamp header (what a GN build without
+# python3 gets): it must say "unknown", never a made-up version, and leave
+# the health field out.
+add_executable(pogohome_build_info_nostamp_test tests/test_build_info_nostamp.cpp src/build_info.cpp)
+target_include_directories(pogohome_build_info_nostamp_test PRIVATE include)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(pogohome_build_info_nostamp_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME pogohome_build_info_nostamp COMMAND pogohome_build_info_nostamp_test)

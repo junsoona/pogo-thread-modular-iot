@@ -1,5 +1,8 @@
 # POGO 기반 모듈형 Thread 센서 시스템
 
+> 공개용 기록: 보드 식별값·계정·포트·주소는 예시로 바꿨습니다. 명령 실행 시 자신의 실제 값으로 바꾸세요. 원본 근거는 비공개로 보존했습니다.
+
+
 ESP32-H2 센서 모듈을 POGO 커넥터로 이어 붙이면 각 모듈이 자신의 위치를 판단하고,
 Thread 네트워크에 가입해 측정값을 전원 모듈로 보내는 졸업작품 프로젝트다. 센서별로
 펌웨어를 따로 만들지 않고 `module/`의 공통 바이너리와 NVS 설정 이미지를 사용한다.
@@ -45,9 +48,11 @@ Thread 네트워크에 가입해 측정값을 전원 모듈로 보내는 졸업�
 - [`docs/state-machine.md`](docs/state-machine.md): POGO·프로비저닝·Thread 상태 머신
 - [`docs/pogo-lifecycle.md`](docs/pogo-lifecycle.md): 모듈 자동 등록·삭제와 offline 구분
 - [`docs/power-base.md`](docs/power-base.md): 전원 모듈, 토폴로지, Dataset, 전원 회로 계획
+- [`docs/power-base-management.md`](docs/power-base-management.md): Power Base 일반 등록과 삭제·등록 해제(관리 자격증명, 통신 규약, 상태 전이)
 - [`docs/otbr-rcp.md`](docs/otbr-rcp.md): RCP 빌드, OTBR 연결, USB 복구 설계
 - [`docs/matter-bridge.md`](docs/matter-bridge.md): Linux Matter Bridge 구조와 검증 방법
 - [`docs/validation-status.md`](docs/validation-status.md): 기능별 시험 상태
+- [`docs/versioning.md`](docs/versioning.md): 구성요소 버전, 빌드 식별 정보, manifest, 설치 기록 ([`CHANGELOG.md`](CHANGELOG.md), [`docs/release-records/`](docs/release-records/README.md))
 
 ## 개발 환경
 
@@ -60,7 +65,7 @@ Thread 네트워크에 가입해 측정값을 전원 모듈로 보내는 졸업�
 경로 문제를 피하기 위해 홈 디렉터리 아래의 ASCII 경로를 사용한다.
 
 ```bash
-cd "/Users/junsoona/no-icloud/main project_1"
+cd "$HOME/pogo-thread-modular-iot"
 source ~/.espressif/v6.1/esp-idf/export.sh
 
 idf.py -C module     -B ~/esp-builds/pogo_module     set-target esp32h2
@@ -179,9 +184,9 @@ ls /dev/cu.usbmodem*
 앱과 부트로더, 파티션 테이블을 플래시한다.
 
 ```bash
-BASE_PORT=/dev/cu.usbmodem113301
-MIDDLE_PORT=/dev/cu.usbmodem113401
-LEAF_PORT=/dev/cu.usbmodem11401
+BASE_PORT=/dev/cu.usbmodemXXXX
+MIDDLE_PORT=/dev/cu.usbmodemXXXX
+LEAF_PORT=/dev/cu.usbmodemXXXX
 
 idf.py -C power_base -B ~/esp-builds/pogo_power_base -p "$BASE_PORT" flash
 idf.py -C module     -B ~/esp-builds/pogo_module     -p "$MIDDLE_PORT" flash

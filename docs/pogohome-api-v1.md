@@ -1,5 +1,8 @@
 # PogoHome Local API v1
 
+> 공개용 기록: 보드 식별값·계정·포트·주소는 예시로 바꿨습니다. 명령 실행 시 자신의 실제 값으로 바꾸세요. 원본 근거는 비공개로 보존했습니다.
+
+
 An HTTP/SSE API (read-only for sensor data; see "Home settings" for the
 TLS-only settings-sharing routes), served by the existing `pogo_matter_bridge` process
 itself (see [`matter-bridge.md`](matter-bridge.md)), that lets a client on the
@@ -129,6 +132,36 @@ online/offline) -- the same set `/api/v1/snapshot` lists. `power_base_count`
 (multi-Power-Base revision) counts the Power Bases in the snapshot's
 `power_bases` array.
 
+`build` (version revision, 2026-10-06, additive and optional) says which
+build of the bridge is answering:
+
+```json
+"build": {
+  "component": "linux_bridge",
+  "version": "0.1.0",
+  "build_id": "590e2a11d2cb+dirty.cfbfdd18c5bd",
+  "build_kind": "development"
+}
+```
+
+It is always the last field of the health object. `version` is the
+component's product version from `versions.json`; `build_id` is
+`<commit, 12 digits>[+dirty].<source fingerprint, 12 digits>` (or
+`unknown.<fingerprint>` for a build from a tree without Git); `build_kind` is
+`development` or `release` (`docs/versioning.md`). The same values are printed
+by `pogo_matter_bridge --version` and `pogohome-hubctl --version`, which
+answer before the Matter stack, the state directory or any socket is touched.
+
+`build` is **identification only**. Nothing may be decided from it: what a
+bridge supports is said by `schema_version`, by the presence of the optional
+fields, and by the capability values of the routes that have them. A bridge
+that was built without the version stamp, and every bridge from before this
+revision, serves no `build` at all; a client must work the same way without
+it. PogoHome iOS decodes it leniently (a missing, `null` or malformed `build`
+is "not known", never an error) and does not show or use it for any decision.
+The field carries no board version: the bridge does not know the firmware
+versions of Power Bases or modules, and no protocol reports them.
+
 ### `GET /api/v1/snapshot`
 
 The full current state in one response:
@@ -139,13 +172,13 @@ The full current state in one response:
   "generated_at_unix_ms": 1732000000000,
   "registry_generation": 42,
   "power_bases": [
-    {"uuid": "744dbdfffe650a00", "online": true, "module_count": 1, "online_module_count": 1}
+    {"uuid": "020000fffe650a00", "online": true, "module_count": 1, "online_module_count": 1}
   ],
   "modules": [
     {
-      "uuid": "744dbdfffe65d357",
-      "power_base_uuid": "744dbdfffe650a00",
-      "parent_uuid": "744dbdfffe650a00",
+      "uuid": "020000fffe65d357",
+      "power_base_uuid": "020000fffe650a00",
+      "parent_uuid": "020000fffe650a00",
       "online": true,
       "depth": 1,
       "role": "intermediate",
@@ -171,6 +204,38 @@ The full current state in one response:
 `generated_at_unix_ms` is this *response's* generation time (wall clock,
 `system_clock`) -- not a measurement timestamp; the Registry does not store
 one, and this API never fabricates one for an individual reading.
+
+**Where a snapshot stands (Linux bridge 0.5.0).** Every snapshot -- this
+answer and every `snapshot` event of `GET /api/v1/events` -- ends with two
+more fields, after every other field (also after the settings fields):
+
+```json
+"snapshot_stream": "9c1f…32 lowercase hex…", "snapshot_sequence": 41
+```
+
+- `snapshot_stream` is made when the bridge process starts: one value per
+  run. Not a secret, and not the `hub_id`.
+- `snapshot_sequence` counts the snapshots of that run in the order they
+  were **made**: 1, 2, 3, …, `GET` answers and events in one line. The
+  bridge makes its snapshots one at a time and reads everything a snapshot
+  says inside that section (the Registry, management, the settings
+  revision), so of two snapshots of one stream the one with the larger
+  sequence says nothing older than the other -- whichever reaches a client
+  first. The number is the order of making, not a version of the state: a
+  `GET` when nothing changed still gets the next number, and so does a
+  snapshot in which only the settings revision changed.
+
+A client that follows the hub over a `GET` poll **and** the event stream
+(separate connections: what arrives later is not always what was said
+later) must not apply a snapshot whose sequence is not larger than the
+largest one it applied of the same stream. Across two streams the numbers
+say nothing: another stream is another run of the bridge, and which run is
+the later one is not said here (a client knows it from the order in which
+it started its own requests; see
+[`power-base-management.md`](power-base-management.md), section 16). No
+time is compared: `generated_at_unix_ms` is the hub's clock and can be set
+back. A hub that predates the fields sends neither; its snapshots can only
+be taken in the order they arrive.
 
 #### Module fields
 
@@ -328,6 +393,31 @@ reconstructs the original integer exactly:
   position. A host test (`app/api/tests/test_multi_power_base.cpp`) removes
   only the added fields from a single-Base snapshot and compares the rest
   byte for byte with the pre-revision output.
+- The Power Base management revision (2026-10-05) is additive too: health
+  `power_base_management`/`power_base_removal`, snapshot
+  `power_base_removals`, a `management` word per `power_bases` entry, a
+  `management` object in enrollment sessions that asked for one, and silent
+  Power Bases the hub holds a management credential for listed as
+  `"online": false` entries. None of them is served unless management was
+  requested at startup (host test `test_removal_api.cpp` compares a snapshot
+  without management byte for byte). See "Power Base management and removal".
+- The version revision (2026-10-06) is additive as well: health gains the
+  optional `build` object as its last field, and only in the served bridge
+  (`ServerConfig::report_build`, set by `chip/main.cpp`). Without it the
+  health body is byte for byte the previous one, and with it the previous
+  body with only `,"build":{…}` appended (host test `test_build_info.cpp`).
+  `schema_version` stays `1`.
+- The removal request revision (2026-10-11, Linux bridge 0.5.0) is **not**
+  only additive, and it is the one change of this kind since the routes
+  exist: `POST /api/v1/power-base-removals` now takes four members instead
+  of one, and the request of an earlier client (`power_base_uuid` alone) is
+  refused with `422 removal_registration_required`. `schema_version` stays
+  `1` -- it describes the snapshot and health bodies, which only gained
+  fields (`power_base_removal_request` in health; `removal_serial` per
+  managed `power_bases` entry, `request_id` per job, `snapshot_stream` and
+  `snapshot_sequence` at the end of a snapshot). A client reads
+  `power_base_removal_request` (or the presence of `removal_serial`) to know
+  which request to send; see "Removal routes".
 - A client detects the revision by the presence of `power_bases`. Absent means
   "this bridge does not report Power Bases", not "no Power Bases". PogoHome
   iOS decodes all three fields as optional and keeps working against an older
@@ -350,17 +440,17 @@ Base `..0b00` has the same two sensor kinds:
   "generated_at_unix_ms": 1790154064727,
   "registry_generation": 72,
   "power_bases": [
-    {"uuid": "744dbdfffe650a00", "online": true, "module_count": 2, "online_module_count": 2},
-    {"uuid": "744dbdfffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
+    {"uuid": "020000fffe650a00", "online": true, "module_count": 2, "online_module_count": 2},
+    {"uuid": "020000fffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
   ],
   "modules": [
-    {"uuid": "744dbdfffe650a01", "power_base_uuid": "744dbdfffe650a00", "parent_uuid": "744dbdfffe650a00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
+    {"uuid": "020000fffe650a01", "power_base_uuid": "020000fffe650a00", "parent_uuid": "020000fffe650a00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
      "readings": [{"kind": "temperature", "raw_value": 22270, "scale": 1, "value": 22.270, "unit": "celsius", "status": "ok", "sample_seq": 27}, ...]},
-    {"uuid": "744dbdfffe650a02", "power_base_uuid": "744dbdfffe650a00", "parent_uuid": "744dbdfffe650a01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
+    {"uuid": "020000fffe650a02", "power_base_uuid": "020000fffe650a00", "parent_uuid": "020000fffe650a01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
      "readings": [{"kind": "pm1", "raw_value": 4, "scale": 3, "value": 4, "unit": "ug/m3", "status": "ok", "sample_seq": 27}, ...]},
-    {"uuid": "744dbdfffe650b01", "power_base_uuid": "744dbdfffe650b00", "parent_uuid": "744dbdfffe650b00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
+    {"uuid": "020000fffe650b01", "power_base_uuid": "020000fffe650b00", "parent_uuid": "020000fffe650b00", "online": true, "depth": 1, "role": "intermediate", "sensor_bitmap": 6, "generation": 1, "last_seq": 1,
      "readings": [{"kind": "temperature", "raw_value": 22060, "scale": 1, "value": 22.060, "unit": "celsius", "status": "ok", "sample_seq": 6}, ...]},
-    {"uuid": "744dbdfffe650b02", "power_base_uuid": "744dbdfffe650b00", "parent_uuid": "744dbdfffe650b01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
+    {"uuid": "020000fffe650b02", "power_base_uuid": "020000fffe650b00", "parent_uuid": "020000fffe650b01", "online": true, "depth": 2, "role": "leaf", "sensor_bitmap": 896, "generation": 1, "last_seq": 1,
      "readings": [{"kind": "pm1", "raw_value": 4, "scale": 3, "value": 4, "unit": "ug/m3", "status": "ok", "sample_seq": 6}, ...]}
   ]
 }
@@ -372,8 +462,8 @@ host test `test_multi_power_base.cpp`:
 
 ```json
 "power_bases": [
-  {"uuid": "744dbdfffe650a00", "online": false, "module_count": 2, "online_module_count": 0},
-  {"uuid": "744dbdfffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
+  {"uuid": "020000fffe650a00", "online": false, "module_count": 2, "online_module_count": 0},
+  {"uuid": "020000fffe650b00", "online": true, "module_count": 2, "online_module_count": 2}
 ]
 ```
 
@@ -406,6 +496,12 @@ the last values received.
    is freed then -- there is no separate liveness ping between those.
 7. Closing the TCP connection (client-side) is all that's needed to
    disconnect -- no explicit unsubscribe request.
+
+Every event carries `snapshot_stream` and `snapshot_sequence` (see
+`GET /api/v1/snapshot`): events and `GET` answers are numbered in one line,
+in the order the bridge made them. The bridge makes one snapshot at a time
+(a section of its own, which the ingest path never enters) and sends it
+after leaving that section.
 
 A slow/blocked SSE client can never stall ingest, Matter attribute pushes, or
 any other client: this server only ever holds `ingest::Registry`'s internal
@@ -602,7 +698,7 @@ Test vectors shared by `tests/test_device_auth.cpp` and the app's
 {"home_name": "우리 집" | null,
  "rooms": [{"id": "8A3B1C10-…", "name_kind": "custom", "name": "거실", "symbol": "sofa.fill"},
            {"id": "…", "name_kind": "suggestion", "suggestion_symbol": "bed.double.fill", "suggestion_ordinal": 1, "symbol": "bed.double.fill"}],
- "modules": [{"uuid": "744dbdfffe65d357", "name": "공기" | null, "room_id": "…" | null}]}
+ "modules": [{"uuid": "020000fffe65d357", "name": "공기" | null, "room_id": "…" | null}]}
 ```
 
 - Rooms are in display order and keyed by UUID, never by name. A
@@ -742,7 +838,7 @@ Request (`Content-Length` only, at most 256 bytes, exactly these two fields,
 or these two and the option described under "Bridge endpoint delivery"):
 
 ```json
-{"eui64": "744dbdfffe65d357", "pskd": "J01NME7K2"}
+{"eui64": "020000fffe65d357", "pskd": "J01NME7K2"}
 ```
 
 - `eui64`: exactly 16 hex digits (either case; answered lowercase), not all
@@ -756,7 +852,7 @@ or these two and the option described under "Bridge endpoint delivery"):
 Session:
 
 ```json
-{"session_id": "5f0c…(32 hex)", "eui64": "744dbdfffe65d357",
+{"session_id": "5f0c…(32 hex)", "eui64": "020000fffe65d357",
  "state": "waiting_for_heartbeat", "finished": false, "joiner_entry": "allowed",
  "error": null, "window_seconds": 120,
  "created_at_unix_ms": 1790000000000, "expires_at_unix_ms": 1790000120000,
@@ -819,7 +915,7 @@ image. A session can instead carry it, so that the app hands it to the board
 during BLE enrollment:
 
 ```json
-{"eui64": "744dbdfffe65d357", "pskd": "J01NME7K2", "bridge_endpoint_version": 1}
+{"eui64": "020000fffe65d357", "pskd": "J01NME7K2", "bridge_endpoint_version": 1}
 ```
 
 `bridge_endpoint_version` is the explicit request. It must be the integer `1`
@@ -1272,17 +1368,531 @@ Host tests prove the logic against fakes only. Before relying on it:
   before that change still shows the old behavior until it is rebuilt and
   redeployed.
 
+## Power Base management and removal (management revision, 2026-10-05)
+
+The protocol, the board's record and the meaning of "removed" are specified
+in [`power-base-management.md`](power-base-management.md); this section is
+the HTTP side. **Verified by host tests and builds only** -- not run on the
+operating hub, with a board, or built with GN/CHIP (see
+[`validation-status.md`](validation-status.md)).
+
+Management is on whenever enrollment is requested (`--api-enroll-helper`)
+and the API port has TLS. There is no separate flag. Its state lives in
+`<--state-dir>/pogohome/power_base_mgmt.json` (0600, written atomically):
+management credentials per enrollment generation, removal jobs, the blocked
+Power Bases and the pending settings clean-ups. A file that exists but cannot be read turns off only
+this feature (`power_base_removal: "unavailable"`, the routes below answer
+`503 removal_unavailable`, enrollment sessions that ask for a credential
+answer `503 enrollment_unavailable` with `"reason":"management"`); the file
+is never replaced. The key of a credential is written only to that file and
+to the one `202` answer described below -- never to a log, a `GET`, the
+snapshot, SSE or Bonjour.
+
+### Health and snapshot
+
+`GET /api/v1/health` adds `"power_base_management": 1` and
+`"power_base_removal": "available"` or `"unavailable"`. Since Linux bridge
+0.5.0 it also says `"power_base_removal_request": 2` (after
+`power_base_forget`): what `POST /api/v1/power-base-removals` has to carry.
+`2` is the request that names the registration it was confirmed for (below);
+a hub without the field takes the Base's id alone, which names no
+registration. A client that does not find the field, or finds a number it
+does not know, must not send a removal request to that hub.
+
+The snapshot (GET and SSE) adds:
+
+- `"management": "supported"` or `"unsupported"` in each `power_bases` entry:
+  whether the hub holds an **active** management credential for that Base's
+  current enrollment. Only a `supported` Base can be removed.
+- `"erase_confirmation": "automatic"` or `"manual"` in each `supported`
+  `power_bases` entry, after `management` (added 2026-10-08, Linux bridge
+  0.2.0; optional -- a hub that predates it sends none): how the erase behind
+  a removal of that Base would be confirmed. `automatic`: its board announced
+  (an authenticated management message) that it sends its release receipt to
+  the hub itself, so a removal needs nothing but the request. `manual`: it
+  announced nothing (older firmware); someone will have to collect the
+  receipt over BLE. A hint for what a client tells its user before asking.
+- `"removal_serial": <n>` in each `supported` `power_bases` entry, after
+  `record` (added 2026-10-11, Linux bridge 0.5.0): how many removals were
+  asked of the listed registration so far. A removal request names it,
+  together with `record`; see "Removal routes".
+- Entries for Power Bases the hub holds a credential for but has not heard
+  since it started (`"online": false`, `module_count` 0), so that a Base
+  waiting for its removal does not vanish from clients after a hub restart.
+- `"power_base_removals": [ … ]`: every removal job the hub still lists
+  (same JSON as below). The Registry generation is bumped whenever a job
+  or its settings clean-up changes, so SSE clients see it without polling.
+  A `released` job is listed until it is completed or superseded, however
+  long that takes -- its Base is no longer in `power_bases`.
+
+**One point in time (Linux bridge 0.4.1).** A snapshot (GET and SSE) never
+lists a Power Base together with the record that took it out of the list --
+a `released`/`completed` removal of that registration, or a list removal
+(`power_base_forgets`). The server copies the Registry and then reads
+management; everything management contributes is read in one critical
+section, and a Registry copy that was made before management last took a
+Base out of the list is replaced there by one made at that moment
+([`power-base-management.md`](power-base-management.md), section 14).
+Decided from the Registry's generation counter, never from a time. Hubs
+before 0.4.1 could send such a mixed snapshot when another request was
+carried out between the copy and the reading; a client must not read "the
+Base is listed again" from a Base that is listed without a `record`, or
+under the very `record` the removal names.
+
+**Out of the list (Linux bridge 0.4.2): `power_base_departures`.** A
+top-level array after `power_base_forgets`, with one entry per Power Base
+that is **not in this hub's list now** because its registration here ended
+and it has not been registered again -- exactly the blocked Bases (see
+"Blocked Power Bases"):
+
+```json
+"power_base_departures": [
+  {"power_base_uuid":"<16 hex>","record":"<32 hex>","reason":"removed","since_unix_ms":1790000100000}
+]
+```
+
+- `record`: the registration that ended (what `record` was while the Base
+  was listed; a removal job's `generation`). `reason`: `"removed"` -- the
+  board released the registration (a removal's notice or receipt) -- or
+  `"forgotten"` -- it was taken out of the list while offline; nothing says
+  the board erased anything. Both keys are **left out** for a block a hub
+  before 0.4.2 stored; the entry then says only that the Base is out of the
+  list.
+- This is the hub's present state, not history. It is in **every** snapshot
+  for as long as the Base stays unregistered -- hours later, after a hub
+  restart -- and it is gone with the snapshot that lists the Base again.
+  How long a finished removal job or a list-removal record is *shown*
+  (below) has nothing to do with it. A client that kept the modules of a
+  Base on screen while the list was incomplete drops them when the Base is
+  named here; it needs no job and no record for that, and must not remember
+  an entry from an earlier snapshot.
+- A Base named here is never in `power_bases` of the same snapshot. If a
+  client ever sees both, the list stands.
+- At most one entry per blocked Base, and the blocks are capped (64).
+- Absent from a hub without management, and from hubs before 0.4.2: a client
+  then falls back to the removal jobs and list-removal records it sees.
+
+### Enrollment with a management credential
+
+`POST /api/v1/power-base-enrollments` accepts one more optional field,
+`"management_version": 1`, only together with `"bridge_endpoint_version": 1`.
+
+- Without it the request and the answer are exactly as before (no
+  `management` key anywhere).
+- With it the hub creates a new enrollment generation (16 random bytes) and a
+  management key (32 random bytes, `RAND_bytes`), stores them as a
+  provisional credential **before** the session's worker starts, and answers
+  `202` with `"management": {"version": 1, "generation": "<32 hex>",
+  "hub_id": "<32 hex>", "key": "<64 hex>"}` inside the session. `key` and
+  `hub_id` appear in that one answer only; `GET` and `DELETE` answers of the
+  same session carry `{"version": 1, "generation": …}`.
+- Errors: `400 invalid_request` (`management_version` without
+  `bridge_endpoint_version`, or a wrong type), `422
+  unsupported_management_version` (not 1), `503 enrollment_unavailable` with
+  `"reason":"management"` (management is not usable right now; no session is
+  made), and `409 management_required` (see "Blocked Power Bases").
+- The credential becomes active when the board's first authenticated
+  management poll arrives. Until then the Base is `"management":
+  "unsupported"` in the snapshot and cannot be removed.
+
+### Removal routes (TLS, `Authorization: Bearer <token>`)
+
+Checked like the enrollment routes: not requested → `404 removal_disabled`;
+plain HTTP → `403 tls_required`; management unusable → `503
+removal_unavailable`; wrong method → `405`; no/unknown token → `401`. Every
+answer has `Cache-Control: no-store`. These routes are separate from the
+enrollment session's `DELETE`, which only cancels a session.
+
+| route | result |
+|---|---|
+| `POST /api/v1/power-base-removals` `{"power_base_uuid":"<16 hex>","record":"<32 hex>","removal_serial":<n>,"request_id":"<32 hex>"}` (`Content-Length` only, at most 256 bytes, exactly these four members) | `202` + job (new), `Location: /api/v1/power-base-removals/<removal_id>`; `200` + job when this very request made a job before, or a removal of the registration it names is under way; see "The removal request" |
+| `GET /api/v1/power-base-removals` | `200` `{"removals":[…]}` |
+| `GET /api/v1/power-base-removals/<removal_id>` | `200` + job; `404 removal_not_found` |
+| `DELETE /api/v1/power-base-removals/<removal_id>` | cancels a `pending` job: `200` + job (`cancelled`); otherwise `409 removal_not_cancellable` with the job as it is |
+| `POST /api/v1/power-base-removals/receipt` `{"receipt":"<192 lowercase hex>"}` (at most 512 bytes, exactly this field) | the board's release receipt: `200` + job (`completed`); the same receipt again is the same answer |
+
+Errors of the request: `400 invalid_request` (not exactly the four members,
+or one of the wrong JSON type), `422 invalid_power_base_uuid`, `422
+invalid_record`, `422 invalid_removal_serial` (not an integer from 0 to
+2^32-1), `422 invalid_request_id`, `422 removal_registration_required` (the
+body is `power_base_uuid` alone: the request of a client older than this
+contract), `409 stale_record`, `409 request_id_conflict`, `404
+unknown_power_base` (neither in the Registry nor a Base the hub holds a
+credential for), `409 power_base_management_unsupported` (no active
+credential -- the hub offers no fallback and removes nothing), `409
+enrollment_in_progress` (a session for that EUI-64 is running), `503
+too_many_removals` (32 jobs waiting for their board), `409
+removal_capacity_full` with `"limit":"64"` (see "Blocked Power Bases"). No
+error answer echoes a value of the request.
+
+#### The removal request (Linux bridge 0.5.0)
+
+A removal is asked of **one registration** of a Power Base, not of the
+Base. The Base keeps its EUI-64 for as long as the board exists; a
+registration ends (the Base is removed) and another begins (somebody
+registers it again), under another `record`. A request that named the
+EUI-64 alone and arrived -- or was sent once more after a lost answer --
+after that would create a removal job for a registration nobody asked to
+remove, and the hub would hand that registration's board an UNENROLL.
+([`power-base-management.md`](power-base-management.md), section 16.)
+
+| member | what it is |
+|---|---|
+| `power_base_uuid` | the Base |
+| `record` | the registration the user was shown and confirmed: the `record` of that Base's `power_bases` entry |
+| `removal_serial` | how many removals had been asked of that registration then: the entry's `removal_serial` |
+| `request_id` | 32 lowercase hex the client chooses for **this confirmation**. The same request again -- after a lost answer -- carries the same id; a new confirmation by the user carries a new one |
+
+The hub creates a job only when the Base is listed under `record` now, no
+removal of it is under way, and `removal_serial` is that registration's
+present value; creating the job moves the serial on, in the same stored
+change. What follows from that:
+
+| the request… | answer |
+|---|---|
+| names what is listed, with the present serial | `202`, the new job (it carries `request_id`) |
+| has the `request_id` of a job the hub still has (under way, or finished and still listed) | `200`, that job as it is now -- `cancelled`, `completed` or `superseded` as it may be. Nothing new |
+| names a registration whose removal is under way, whoever asked for it (also after `released`, when the Base has left the list) | `200`, that job |
+| names another registration than the one listed (the Base was removed and registered again, or a registration was started) | `409 stale_record`: nothing is created, the board gets no command |
+| carries a serial that has passed (a removal was asked of this registration since, and has ended) | `409 stale_record` |
+| uses a `request_id` that belongs to a job of another Base | `409 request_id_conflict` |
+
+So one request creates at most one job, and only for the registration it
+names. That does not depend on the hub remembering the request: when the
+finished job has left the hub's list (after ten minutes), or the hub was
+started again, the same request is no longer answered with its job -- it is
+refused, by the registration or by the serial, both of which are kept with
+the registration itself. Nothing turns a forgotten request into a request
+for what is listed now.
+
+The request of an earlier client -- `{"power_base_uuid":"<16 hex>"}` and
+nothing else -- names no registration and cannot be told from any of the
+cases above. It is refused for every Base, listed or not (`422
+removal_registration_required`), before anything is looked up. There is no
+compatibility path that applies it to "the registration listed now": that
+path is the defect. Such a client can still read the jobs, cancel one and
+relay a receipt.
+
+Errors of the receipt: `400 invalid_request` (not exactly that one field),
+`422 invalid_receipt` (not 192 lowercase hex digits, or not an
+`UNENROLL_DONE` management message with result `ERASED` -- the board's
+"released" notice handed in here is refused this way), `409
+receipt_rejected` (well formed, but not one this hub can verify for one of
+its removals: another hub, an unknown or superseded generation, a cancelled
+job, a wrong MAC; one answer for all of them).
+
+```json
+{"removal_id":"<32 hex>","power_base_uuid":"<16 hex>","generation":"<32 hex>",
+ "state":"pending","result_unknown":false,"cancellable":true,
+ "created_at_unix_ms":0,"updated_at_unix_ms":0,"completed_at_unix_ms":null,
+ "requested_by_device_id":"<16 hex>","affected_module_count":2,
+ "settings_cleanup_pending":false,"erase_confirmation":"automatic",
+ "request_id":"<32 hex>"}
+```
+
+`request_id` (added 2026-10-11, Linux bridge 0.5.0; optional, last) is the id
+of the request that created the job: how the client that asked recognises its
+own request's job when the answer to it was lost. Absent on a job stored by a
+hub that did not write it down. `generation` is the registration the job is
+about (what `record` was for the Base when it was listed).
+
+`erase_confirmation` (added 2026-10-08, Linux bridge 0.2.0; optional) is the
+last field of a job that is **not final**, and absent from a final one --
+whose JSON is exactly what it was. A hub that predates it sends none.
+
+| value | when |
+|---|---|
+| `automatic` | the board of that enrollment announced that it sends its receipt itself, the job is not `result_unknown`, and -- once `released` -- no more than 4 minutes have passed since. Nothing for anyone to do |
+| `manual` | the board announced nothing; or it did and no receipt arrived within 4 minutes of `released`; or the job is `result_unknown`. The receipt has to be read from the board over BLE and handed in (`POST …/receipt`), or the board enrolled again |
+
+It is a hint for what a client shows and offers. It changes no state, and a
+receipt that arrives after `manual` was reported completes the job like any
+other. Clients must treat an absent or unknown value like `manual`.
+
+`state`:
+
+| state | meaning |
+|---|---|
+| `pending` | stored; the command has not been given to the board (where an offline Base waits). Cancellable |
+| `sent` | the command went out in an answer to the board's authenticated poll |
+| `accepted` | the board's authenticated `UNENROLL_ACCEPTED` arrived |
+| `released` | the board's authenticated `UNENROLL_DONE`/`RELEASED` arrived: it stored that this enrollment is out of use for good, and the hub has removed it (below). **Not complete**: the erase of the board's stored join information is not confirmed |
+| `completed` | final: the board's authenticated release receipt (`UNENROLL_DONE`/`ERASED`) was verified. The board makes it only after it erased its stored network, read the store back empty and stored its final record. The receipt arrives from the board itself (CoAP `pogo/v1/mgmt`, see below) or relayed by a client (`POST …/receipt`); it is the same message either way |
+| `cancelled` | final: cancelled while `pending` |
+| `superseded` | final: a new enrollment generation of the same board became active first |
+
+`result_unknown` turns `true` when `sent`/`accepted` made no progress for 5
+minutes; it is a hint, not a state. Nothing but the verified receipt makes a
+job `completed`: not the released notice, not a timeout, not silence, not a
+restart. A `released` job stays `released` for as long as no receipt arrives
+and no new enrollment supersedes it. `completed_at_unix_ms` is `null` unless
+`completed`. `settings_cleanup_pending` is a separate matter (below). Jobs
+survive a hub restart, the app closing and the requesting device being
+unpaired. A finished job is listed for 10 minutes (longer while its settings
+clean-up is pending), and at most 32 finished ones are kept.
+
+`generation` names the registration the job is about -- the same value as
+the `record` of that Base in `power_bases` while that registration is the
+listed one. A job whose `generation` differs from the listed Base's `record`
+is about an earlier registration of the board.
+
+`"list_removed": true` (added 2026-10-10, Linux bridge 0.4.1; present only
+when true) on a `sent` or `accepted` job: the Base was taken out of this
+hub's list (below, "Removing a Power Base from the hub's list") while the
+command may be with the board. Two separate answers: the **list** is settled
+-- the Base is not in `power_bases`, its data is refused -- and the **board**
+is not: `state` is unchanged, `completed_at_unix_ms` stays `null`, and the
+job, its key and the block are kept so that the board's receipt is still
+verified should it ever arrive. The field is gone once the board's
+`released` notice moves the job on; a new registration of the board ends the
+job as `superseded`. It never stands for `completed`.
+
+The hub never sends anything to a board on its own: the command travels in
+the answer to the board's authenticated poll on the ingest port (CoAP
+`pogo/v1/mgmt`), once per poll, always with the same command id.
+
+**The two ways a receipt comes in.** A board erases its stored network only
+after it told the hub "released" (OpenThread refuses to erase while Thread
+runs), and afterwards nothing of the network is left in its flash.
+
+- **From the board itself (Power Base 0.2.0).** After its final record is
+  stored, the board brings Thread up once more from a copy it kept in RAM --
+  with OpenThread's persistent stores switched to RAM, so that nothing is
+  stored again -- and posts the receipt to `pogo/v1/mgmt` on the ingest port
+  (`docs/power-base-management.md`, section 4). The hub verifies it, completes
+  the job and answers `RESULT_ACK`. No client takes part. The same receipt
+  again gets the same acknowledgement (the hub keeps its MAC with the
+  completed job; the key is gone).
+- **Relayed by a client.** The board keeps the receipt in its final enrollment
+  record and hands it out over BLE, inside a Security 2 session; the app
+  relays it with `POST …/receipt`. This is the way for a board that does not
+  send it (older firmware) and for a receipt that did not get through (the
+  board lost power in that last session, or the hub was not reachable).
+
+Either way the device token, the Thread address or the route say nothing
+about the receipt. What it says is believed only because its HMAC verifies
+with the management key of that enrollment generation, which no client ever
+has.
+
+### What a released removal changes on the hub
+
+Done once, when the released notice is verified (or, if that notice was
+lost, when the receipt completes the job). The job state, the block and the
+clean-up list are one file write; the Registry follows only after it
+succeeded.
+
+1. The EUI-64 is blocked (persistently). Its `heartbeat`, `topology`,
+   `sample` and module-removal messages are answered `4.03` and change
+   nothing in the Registry.
+2. The Base and the nodes registered **under that Base** leave the Registry.
+   A module that already moved to another Base is registered under that
+   Base and stays.
+3. Matter endpoints go through the existing reconcile path (a module that
+   left the snapshot → `remove_endpoint`). `endpoint_map.bin` keeps the
+   UUID → endpoint id record, so the same module gets the same id if it
+   comes back. Other endpoints, the KVS, pairings, the TLS identity and
+   `hub_id` are untouched.
+4. The modules whose room assignment has to be cleared are written into the
+   state file (see "Settings clean-up").
+
+`pending`, `sent`, `accepted`, `cancelled` and `superseded` block and remove
+nothing. `completed` changes nothing more on the data path: it records that
+the erase was confirmed and drops the generation's key.
+
+### Settings clean-up
+
+The modules that left with a Base -- unenrolled, or taken out of the list --
+and are not registered under another Base lose their room assignment in the
+shared settings (name kept), saved through the normal revision rule. This is
+tracked separately from the removal itself: `settings_cleanup_pending` in
+the job (or in the list removal's record).
+
+- The modules and the retry state are in the state file (`cleanups`), written
+  by the same write that stored the release, so a process that ends right
+  afterwards still knows what is owed.
+- **Bound to one registration's assignment (0.4.1).** With each module the
+  entry holds the room it was in at that moment (`rooms`; absent when the
+  settings could not be read then, and in entries written by an earlier
+  hub). The clean-up clears *that* assignment: a module that is in another
+  room by the time it runs was given that room since, and keeps it. A module
+  without a room at that moment is not in the entry at all.
+- A worker thread does the settings write: never the ingest or an HTTP
+  thread.
+- Every attempt asks the Registry where each module is **now** -- when the
+  pass starts, and then **decides and writes in one section** (0.4.2): the
+  settings are read first, then the management and Registry locks are
+  taken and kept, the Registry is copied under its lock, the modules of this
+  attempt are decided from that copy, and the conditional settings write is
+  made before either lock is given up. No report can be applied in between,
+  so a module that is listed under a Base keeps the room it has -- also when
+  nobody saved the settings since they were read (then the write is no
+  revision conflict; 0.4.1 asked first and wrote afterwards, and cleared
+  that room). A module registered under
+  any Base at that moment (it moved, or its Base was registered again)
+  leaves the clean-up for good. So does one that was listed under a Base at
+  any time since the clean-up was noted, even if it is on none now and
+  nobody looked while it was: the Registry remembers when each module was
+  last newly listed. Whoever saves a room in between makes the clean-up's
+  write a revision conflict, and the next attempt starts from their
+  settings and goes through the same section. (Before 0.4.1 the question
+  was asked once, before the write, and the write cleared by module UUID
+  alone: a module that docked elsewhere and got a new room in between lost
+  it.)
+- While that section runs -- one settings file write -- reports and snapshot
+  requests wait. Lock order: management, Registry, settings store; nothing
+  takes them the other way round.
+- After a restart (empty Registry) a clean-up read from the file -- or one
+  that rests on `members` read from the file -- waits 120 seconds before its
+  first attempt.
+- **What is known of a Base that has not reported since the restart
+  (0.4.1).** The state file lists, per listed Base, the modules the Registry
+  last had under it (`members`). Unenrolling such a Base, or taking it out of
+  the list, names those modules for the clean-up. A module another Base
+  reported since belongs to that Base. What was never written down -- a file
+  from an earlier hub, a process that ended first -- is not cleaned: no
+  module is made up.
+- A failure (settings file cannot be written or is damaged, or other writers
+  win four attempts in a row) is retried with a backoff from 5 seconds up to
+  10 minutes, without limit. Success removes the entry. If the clean-up was
+  done but that could not be stored, it stays pending and is done again;
+  clearing a room that is already cleared changes nothing and saves no
+  revision.
+- Repeated notices, the receipt and restarts never create a second clean-up.
+
+### Blocked Power Bases
+
+A blocked EUI-64 is unblocked in exactly one way: a **new enrollment
+generation** becomes active (the board's first poll authenticated with the
+new key). A heartbeat, an edit in an app, a hub restart, time, the job being
+completed or dropped from the history, and an enrollment session without
+`management_version` do not unblock it; the latter is refused with `409
+management_required`.
+
+The list holds at most 64 blocks and **none is ever dropped to make room**.
+Room for a block is reserved when a removal is requested: the slots in use
+are the blocked Bases plus the jobs that may still end in a block (`pending`,
+`sent`, `accepted`). When all 64 are in use a request answers `409
+removal_capacity_full`; no job is stored, so that board never gets a
+command. A cancelled or superseded job gives its slot back. The count is
+derived from the stored jobs and blocks, so it is the same after a restart;
+a request that could not be stored reserves nothing; asking again for a Base
+that already has a job takes no second slot. The only way to free a slot of
+a blocked Base is to enroll that board again.
+
+Credentials are bounded too (96): a new session makes room only by dropping
+the oldest *provisional* one and is refused otherwise. Active credentials
+and those of `released` jobs (needed to verify their receipts) are never
+dropped for it; a credential is released when its receipt completed the job.
+
+### Removing a Power Base from the hub's list (2026-10-10)
+
+For a Power Base that does not come back (broken, lost, reset by its button
+and registered at another hub). Specified in
+[`power-base-management.md`](power-base-management.md), section 13. **This
+is not a removal**: the hub drops its own record of one registration; the
+board's stored join information is not erased and no field ever says it was;
+no removal job becomes `completed` by it. Verified by host tests on a Mac
+only.
+
+Announced on its own, so that a client never assumes it:
+
+- `GET /api/v1/health` adds `"power_base_forget": 1` after
+  `power_base_removal`.
+- Every `power_bases` entry of the snapshot (GET and SSE) the hub has a
+  record for adds `"record": "<32 hex>"` after its management fields: the
+  registration a request must name. Not a secret (for a Base with a
+  credential it is the generation of the newest registration the hub issued
+  for that board -- one that was only started counts; for a Base known from
+  its data alone, a value this hub process made up, gone with a restart).
+- A top-level `"power_base_forgets": [...]` follows `power_base_removals`.
+- Since 0.4.2 a top-level `"power_base_departures": [...]` follows that (see
+  "Out of the list" above). `power_base_forget` in health stays `1`: no
+  route and no request changed.
+
+A hub without the feature (0.3.0 and earlier) sends none of the three. A
+client that does not know them ignores them (they are additive;
+`schema_version` stays 1).
+
+Routes -- the gates of the removal routes: TLS, `Authorization: Bearer
+<token>` of a paired device, management available. An EUI-64 or a Thread
+address is never an authorization.
+
+| Request | Answer |
+|---|---|
+| `POST /api/v1/power-base-forgets` with exactly `{"power_base_uuid":"<16 hex>","record":"<32 hex>","request_id":"<32 hex>"}` | `201` + the record and `Location`: carried out. `200` + the same record: this `request_id` was carried out before (nothing is done twice) |
+| `GET /api/v1/power-base-forgets` | `200 {"forgets":[...]}`, most recent first |
+| `GET /api/v1/power-base-forgets/<forget_id>` | `200` + the record, or `404 forget_not_found` |
+| any other method (in particular `DELETE`) | `405`: there is nothing to cancel or undo |
+
+The record:
+
+```json
+{"forget_id":"<32 hex>","request_id":"<32 hex>","power_base_uuid":"<16 hex>",
+ "record":"<32 hex>","state":"removed_from_hub","managed":true,
+ "created_at_unix_ms":1790000000000,"requested_by_device_id":"<16 hex>",
+ "affected_module_count":2,"cancelled_removal_id":null,"kept_removal_id":null,
+ "settings_cleanup_pending":false}
+```
+
+`state` is always `removed_from_hub`. `cancelled_removal_id`: a removal of
+that Base that was still `pending` ended as `cancelled` in the same stored
+change. `kept_removal_id`: a removal whose command may be with the board
+(`sent`/`accepted`) was left exactly as it is, with its key, and stays in
+`power_base_removals` until the board's proof arrives or the board is
+registered again. A record is listed as long as a finished removal (10
+minutes), longer while its settings clean-up is pending, and (Linux bridge
+0.4.1) **for as long as it is the reason its Base is not listed**: the last
+record of a Base stays until that Base is registered again. A client that
+was away when the Base was taken out -- in the background for an hour --
+finds the record in the same snapshot that no longer lists the Base. At most
+one such record per blocked Base.
+
+Refusals of the `POST` (nothing changed in any of them):
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 400 | `invalid_request` | not exactly the three members |
+| 422 | `invalid_power_base_uuid`, `invalid_record`, `invalid_request_id` | |
+| 404 | `unknown_power_base` | the hub does not list that Base: never heard of, already taken out of the list, or released by a removal |
+| 409 | `power_base_online` | the hub hears the Base (or a module under it) at this moment. Decided, stored and applied as one step under the Registry's lock -- what an app displayed plays no part |
+| 409 | `stale_record` | `record` is not the registration the hub lists now: the board was registered again, or a registration was started, after the client read the list |
+| 409 | `enrollment_in_progress` | an enrollment session for that EUI-64 is running |
+| 409 | `request_id_conflict` | the `request_id` was used for another Base |
+| 409 | `forget_capacity_full` | no block slot is free (64; none is ever dropped to make room) |
+| 503 | `too_many_forgets` | 64 records, none of which can be dropped yet |
+| 503 | `forget_unavailable` | `reason` `startup` (state file damaged) or `storage` (it could not be written) |
+| 404 | `forget_disabled` | management is not configured |
+
+What it does on the hub: the credentials of that registration are dropped,
+the Base is blocked exactly like a released one ("Blocked Power Bases"
+above -- only a new authenticated enrollment generation unblocks it), it and
+the modules registered under it leave the Registry (and with that the
+snapshot, SSE and their Matter endpoints), and the rooms of the modules that
+left are cleared by the settings clean-up above. A lost answer is not a
+"no": send the same `request_id` again.
+
+### Still to verify
+
+Everything here on real hardware and the operating hub: the GN/CHIP build of
+`pogo_matter_bridge` with `power_base_management.cpp` (including the
+clean-up worker started from `main.cpp`), the routes over the real TLS
+listener, persistence across a real service restart, the ingest block
+against a real board, a receipt read from a real board over BLE and relayed
+by a real phone, Matter endpoint removal seen by a real controller, and the
+settings revision seen by two real devices.
+
 ## Future work
 
-- Registering a Power Base end to end as a product. The hub side, the app's
-  DEBUG test and a bench-only firmware path (PSKd typed on the spare board's
-  USB console, bridge address pre-set in its `cfg` image) exist. So does a
-  DEBUG-only BLE path that delivers the PSKd and the hub's bridge endpoint
-  (a firmware test build and the app's DEBUG BLE test; run on one spare
-  board, see [`validation-status.md`](validation-status.md)). A QR flow and
-  a release app flow do not exist. Operating Bases are
-  still added by flashing firmware and `cfg` (see [`power-base.md`](power-base.md)
-  "여러 Power Base 추가").
+- Registering and removing a Power Base as a product (removal in two steps:
+  released, then completed by the board's receipt) is implemented in the
+  hub, the firmware (BLE build) and the app's Release screens
+  ("Power Base management and removal" above) but has only been run in host
+  and simulator tests. The earlier paths still exist: the app's DEBUG tests
+  and a bench-only firmware path (PSKd typed on the spare board's USB
+  console, bridge address pre-set in its `cfg` image). A QR flow does not
+  exist. Operating Bases added by flashing firmware and `cfg` (see
+  [`power-base.md`](power-base.md) "여러 Power Base 추가") have no management
+  credential and cannot be removed from the app.
 - The PogoHome iOS app (`pogo-sensor-ios`, a separate repository) connecting
   to this API is its own, later milestone -- this follow-up only implements
   and documents the server side.

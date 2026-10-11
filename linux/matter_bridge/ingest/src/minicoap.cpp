@@ -173,4 +173,15 @@ std::vector<uint8_t> coap_build_ack(const CoapMessage &request, uint8_t response
     return out;
 }
 
+std::vector<uint8_t> coap_build_ack(const CoapMessage &request, uint8_t response_code,
+                                    const std::vector<uint8_t> &payload)
+{
+    std::vector<uint8_t> out = coap_build_ack(request, response_code);
+    if (!payload.empty()) {
+        out.push_back(0xFF);
+        out.insert(out.end(), payload.begin(), payload.end());
+    }
+    return out;
+}
+
 } // namespace ingest
